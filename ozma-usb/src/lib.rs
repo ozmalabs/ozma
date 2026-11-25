@@ -126,6 +126,7 @@ pub mod mass_storage;
 pub mod mass_storage_loop;
 pub mod media;
 pub mod media_hotplug;
+pub mod media_restart;
 pub mod nbd;
 pub mod nbd_server;
 pub mod overlay;
@@ -199,6 +200,12 @@ pub use mass_storage_loop::{
 pub use media::{MassStorageImage, MediaFormat, MediaMode, MediaState, VirtualMedia};
 pub use media_hotplug::{
     UsbMediaHotplugEvent, UsbMediaHotplugKind, UsbMediaHotplugLog, MAX_USB_MEDIA_HOTPLUG_EVENTS,
+};
+pub use media_restart::{
+    MediaRestartAttempt, MediaRestartPolicy, MediaRestartTracker,
+    USB_MEDIA_RESTART_DEFAULT_BACKOFF_MS, USB_MEDIA_RESTART_DEFAULT_MAX_ATTEMPTS,
+    USB_MEDIA_RESTART_DEFAULT_MAX_BACKOFF_MS, USB_MEDIA_RESTART_MAX_ATTEMPTS_LIMIT,
+    USB_MEDIA_RESTART_MAX_BACKOFF_LIMIT_MS,
 };
 pub use nbd::{
     validate_nbd_descriptor, NbdCommand, NbdExport, NbdExportDescriptor, NbdHandshake, NbdReply,

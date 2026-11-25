@@ -14,6 +14,7 @@ use ozma_display::vm::{VmConsoleBackend, MAX_VM_CONSOLES};
 use ozma_input::SinkKind;
 use ozma_protocol::NodeId;
 use ozma_qmp::QmpConfig;
+use ozma_usb::MediaRestartPolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::display_outputs::{self, DisplayOutput, DisplayOutputSelection};
@@ -1224,6 +1225,33 @@ pub struct NodeConfig {
     pub usb_media_ro: bool,
     /// Present the image as a read-only CD-ROM (`--usb-media-cdrom`).
     pub usb_media_cdrom: bool,
+    /// Auto-start the userspace SCSI export from this image
+    /// (`--usb-media-export`). Distinct from the ConfigFS kernel LUN above.
+    pub usb_media_export: Option<PathBuf>,
+    /// Auto-start export format (`raw`, `fat32`, `iso9660`).
+    pub usb_media_export_format: String,
+    /// Serve the auto-start raw export read-write through the bounded overlay.
+    pub usb_media_export_read_write: bool,
+    /// Optional absolute overlay persistence file for the auto-start export.
+    pub usb_media_export_persist: Option<PathBuf>,
+    /// Commit the auto-start overlay on SCSI flush.
+    pub usb_media_export_persist_on_flush: bool,
+    /// Commit the auto-start overlay on stop/shutdown.
+    pub usb_media_export_persist_on_stop: bool,
+    /// Load an existing auto-start overlay before serving.
+    pub usb_media_export_reload: bool,
+    /// Optional per-transfer deadline for the auto-start export.
+    pub usb_media_export_timeout_ms: Option<u64>,
+    /// Optional data-phase bound for the auto-start export.
+    pub usb_media_export_max_transfer_bytes: Option<usize>,
+    /// Maximum bounded restarts after a transport/rebind failure.
+    pub usb_media_restart_max_attempts: u32,
+    /// First restart delay in milliseconds.
+    pub usb_media_restart_backoff_ms: u64,
+    /// Restart backoff ceiling in milliseconds.
+    pub usb_media_restart_max_backoff_ms: u64,
+    /// Reload the persisted overlay when a supervised restart rebuilds.
+    pub usb_media_restart_reload_overlay: bool,
     /// Add a UAC2 audio function (`--usb-uac2`).
     pub usb_uac2: bool,
     /// Add a FunctionFS vendor function (`--usb-vendor`).
@@ -1654,6 +1682,82 @@ impl NodeConfig {
         if self.usb_media_cdrom && self.usb_media.is_none() {
             return Err("--usb-media-cdrom requires --usb-media".to_owned());
         }
+        validate_path("--usb-media-export", self.usb_media_export.as_deref())?;
+        if let Some(path) = self.usb_media_export.as_deref() {
+            if !path.is_absolute() {
+                return Err(format!(
+                    "--usb-media-export {} must be an absolute path",
+                    path.display()
+                ));
+            }
+        }
+        let export_format = self.usb_media_export_format.trim().to_ascii_lowercase();
+        if !matches!(
+            export_format.as_str(),
+            "raw" | "nbd" | "fat32" | "vfat" | "iso" | "iso9660"
+        ) {
+            return Err(format!(
+                "--usb-media-export-format must be raw, fat32, or iso9660, got {:?}",
+                self.usb_media_export_format
+            ));
+        }
+        let format_is_read_only =
+            matches!(export_format.as_str(), "fat32" | "vfat" | "iso" | "iso9660");
+        if self.usb_media_export_read_write && format_is_read_only {
+            return Err(
+                "--usb-media-export-read-write is invalid for FAT32/ISO 9660 media".to_owned(),
+            );
+        }
+        if self.usb_media_export.is_some() && !self.usb_gadget {
+            return Err("--usb-media-export requires --usb-gadget".to_owned());
+        }
+        if self.usb_media_export.is_none() {
+            if self.usb_media_export_persist.is_some() {
+                return Err("--usb-media-export-persist requires --usb-media-export".to_owned());
+            }
+            if self.usb_media_export_reload {
+                return Err("--usb-media-export-reload requires --usb-media-export".to_owned());
+            }
+            if self.usb_media_export_timeout_ms.is_some()
+                || self.usb_media_export_max_transfer_bytes.is_some()
+            {
+                return Err(
+                    "--usb-media-export timeout/transfer bounds require --usb-media-export"
+                        .to_owned(),
+                );
+            }
+        }
+        if let Some(persist) = self.usb_media_export_persist.as_deref() {
+            if !persist.is_absolute() {
+                return Err(format!(
+                    "--usb-media-export-persist {} must be an absolute path",
+                    persist.display()
+                ));
+            }
+            if !self.usb_media_export_read_write {
+                return Err(
+                    "--usb-media-export-persist requires --usb-media-export-read-write".to_owned(),
+                );
+            }
+        }
+        if self.usb_media_export_reload
+            && (!self.usb_media_export_read_write || self.usb_media_export_persist.is_none())
+        {
+            return Err(
+                "--usb-media-export-reload requires --usb-media-export-read-write and \
+                 --usb-media-export-persist"
+                    .to_owned(),
+            );
+        }
+        let restart = MediaRestartPolicy {
+            max_attempts: self.usb_media_restart_max_attempts,
+            backoff_ms: self.usb_media_restart_backoff_ms,
+            max_backoff_ms: self.usb_media_restart_max_backoff_ms,
+            reload_overlay: self.usb_media_restart_reload_overlay,
+        };
+        restart
+            .validate()
+            .map_err(|error| format!("invalid --usb-media-restart policy: {error}"))?;
         if (self.usb_uac2 || self.usb_vendor) && !self.usb_gadget {
             return Err("--usb-uac2/--usb-vendor require --usb-gadget".to_owned());
         }
@@ -1977,6 +2081,19 @@ mod tests {
             usb_media: None,
             usb_media_ro: false,
             usb_media_cdrom: false,
+            usb_media_export: None,
+            usb_media_export_format: "raw".to_owned(),
+            usb_media_export_read_write: false,
+            usb_media_export_persist: None,
+            usb_media_export_persist_on_flush: true,
+            usb_media_export_persist_on_stop: true,
+            usb_media_export_reload: false,
+            usb_media_export_timeout_ms: None,
+            usb_media_export_max_transfer_bytes: None,
+            usb_media_restart_max_attempts: ozma_usb::USB_MEDIA_RESTART_DEFAULT_MAX_ATTEMPTS,
+            usb_media_restart_backoff_ms: ozma_usb::USB_MEDIA_RESTART_DEFAULT_BACKOFF_MS,
+            usb_media_restart_max_backoff_ms: ozma_usb::USB_MEDIA_RESTART_DEFAULT_MAX_BACKOFF_MS,
+            usb_media_restart_reload_overlay: true,
             usb_uac2: false,
             usb_vendor: false,
             usb_vendor_daemon: None,
@@ -2988,6 +3105,36 @@ mod tests {
 
         config.usb_media = Some(PathBuf::new());
         assert!(config.validate().is_err());
+
+        // The userspace auto-start export is separate and also opt-in.
+        let mut export = test_config(NodeProfile::Hardware);
+        export.usb_media_export = Some(PathBuf::from("/srv/export.img"));
+        assert!(export.validate().is_err());
+
+        export.usb_gadget = true;
+        export.usb_udc = Some("dummy_udc.0".into());
+        assert!(export.validate().is_ok());
+
+        export.usb_media_export_read_write = true;
+        export.usb_media_export_persist = Some(PathBuf::from("/srv/overlay.bin"));
+        assert!(export.validate().is_ok());
+
+        export.usb_media_export_reload = true;
+        assert!(export.validate().is_ok());
+
+        export.usb_media_export_format = "iso9660".into();
+        assert!(export.validate().is_err());
+        export.usb_media_export_format = "raw".into();
+        export.usb_media_export_reload = false;
+        export.usb_media_export_persist = Some(PathBuf::from("relative.bin"));
+        assert!(export.validate().is_err());
+        export.usb_media_export_persist = None;
+        export.usb_media_restart_max_attempts = 17;
+        assert!(export.validate().is_err());
+        export.usb_media_restart_max_attempts = 3;
+        export.usb_media_restart_backoff_ms = 500;
+        export.usb_media_restart_max_backoff_ms = 100;
+        assert!(export.validate().is_err());
 
         // The default root is always a usable, explicit path.
         assert_eq!(

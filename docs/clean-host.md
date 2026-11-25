@@ -129,10 +129,15 @@ Files live in `scripts/systemd/`:
   `ozma-node-%i.env`.
 - `ozma-node-vm@.service` — `%i` is a VM/node name (`--profile vm --name %i`).
 - `ozma-virtual-node.service` — discovery/supervisor process.
-- `env/*.env.example` — one example per profile plus the supervisor.
+- `ozma-multiseat.service` — desktop-seat supervisor; loads the persisted
+  `seats.json` and runs one `ozma-node --profile desktop` per X output.
+- `env/*.env.example` — one example per profile, the supervisor, and multiseat.
 - `verify-units.sh` — renders placeholders to a temporary directory and runs
   `systemd-analyze verify` for both the system units and least-privilege user
   units; no install required.
+
+`ozma-meeting-detect` has no unit: it is a per-session, on-demand IPC server that
+is not yet wired to the controller report path.
 
 Validate:
 
@@ -141,9 +146,11 @@ scripts/systemd/verify-units.sh
 # PASS  system ozma-node@.service
 # PASS  system ozma-node-vm@.service
 # PASS  system ozma-virtual-node.service
+# PASS  system ozma-multiseat.service
 # PASS  user ozma-node@.service
 # PASS  user ozma-node-vm@.service
 # PASS  user ozma-virtual-node.service
+# PASS  user ozma-multiseat.service
 
 scripts/systemd/verify-units.sh --system-only
 scripts/systemd/verify-units.sh --user-only
@@ -169,11 +176,20 @@ The user layout installs:
 ```text
 ~/.local/bin/ozma-node
 ~/.local/bin/ozma-virtual-node
+~/.local/bin/ozma-multiseat          # when built
+~/.local/bin/ozma-meeting-detect     # when built; on demand, no unit
 ~/.local/lib/systemd/user/ozma-node@.service
 ~/.local/lib/systemd/user/ozma-node-vm@.service
 ~/.local/lib/systemd/user/ozma-virtual-node.service
+~/.local/lib/systemd/user/ozma-multiseat.service   # when the binary is installed
 ~/.local/etc/ozma/*.env.example
 ```
+
+The optional binaries are installed only when present in the target directory;
+`--build` adds the `ozma-multiseat` package. `--no-multiseat` skips the
+`ozma-multiseat` binary, its unit, and its env example; `--no-meeting-detect`
+skips the meeting binary. Both flags compose with `--dry-run`, which prints the
+exact `install`/`write`/`copy` actions and writes nothing.
 
 It never enables or starts a unit and never deletes `softnode/`, `node/`,
 `agent/`, or any Python virtualenv. System layout is an explicit
@@ -196,6 +212,8 @@ can be staged before the binaries exist.
 | `ozma-node` system user/group plus existing `video`/`input`/`render`/`kvm`/`libvirt` groups | yes, as root | `install-system.sh` |
 | State/runtime/config dirs with least-privilege modes | yes, as root | `install-system.sh` |
 | Units, env examples, tmpfiles and modules-load snippets | yes | `install-system.sh` |
+| `ozma-multiseat.service` + env example | yes (unit/env only; binary via `install-rust.sh`) | `install-system.sh` |
+| `ozma-meeting-detect` | binary only, on demand — no unit | `install-rust.sh` |
 | udev rules for uinput, hidg, V4L2, render, optional gadget | yes, as root | `install-system.sh` |
 | AppArmor libvirt-qemu drop-in | yes, as root | `install-system.sh` |
 | libvirt `cgroup_device_acl` | **no** — copy-only snippet | merge into `qemu.conf` |
@@ -255,6 +273,8 @@ systemctl restart libvirtd
 systemctl enable --now ozma-node@hardware.service
 # or, on a hypervisor:
 systemctl enable --now ozma-virtual-node.service
+# or, for desktop seats (edit /etc/ozma/ozma-multiseat.env first):
+systemctl enable --now ozma-multiseat.service
 ```
 
 `install-rust.sh --system` installs the binaries, units, and env examples;
@@ -268,6 +288,7 @@ The rendered layout is:
 /usr/local/lib/systemd/system/ozma-node@.service
 /usr/local/lib/systemd/system/ozma-node-vm@.service
 /usr/local/lib/systemd/system/ozma-virtual-node.service
+/usr/local/lib/systemd/system/ozma-multiseat.service
 /usr/local/lib/systemd/system/ozma-node@.service.d/10-usb-gadget.conf  # opt-in
 /etc/ozma/*.env.example
 /etc/ozma/install-operator-commands.txt
@@ -362,12 +383,20 @@ A system `ozma-node@desktop.service` only works if the desktop session is grante
 explicitly and `ProtectHome`/`ReadWritePaths` are relaxed for the captured
 files; that is an operator decision, not an installer default.
 
+`ozma-multiseat.service` follows the same rule. It keeps `PrivateTmp=no` because
+it must reach `/tmp/.X11-unix`, and a system unit cannot read a user's
+`~/.Xauthority` under `ProtectHome=yes`. Use a `systemctl --user` unit for a live
+desktop session, or provide a readable `XAUTHORITY` (for example
+`/etc/ozma/Xauthority`) in `ozma-multiseat.env`. Seat ownership/routing/audio,
+private Xvfb/Xephyr displays, and input isolation stay opt-in through
+`OZMA_MULTISEAT_ARGS`; the unit never passes `--print-plan` or `--dry-run`.
+
 ### Verify the system surface
 
 ```bash
 scripts/verify-system-install.sh
 # ...
-# 77 passed, 0 failed, 1 skipped
+# 82 passed, 0 failed, 1 skipped
 # RESULT: PASS
 ```
 
@@ -377,11 +406,10 @@ world-writable paths, verifies profile groups, tmpfiles/runtime-dir agreement,
 the copy-only libvirt snippet, and the desktop user-unit caveat, verifies the
 rendered units, and runs `udevadm verify`; AppArmor syntax is checked when
 `apparmor_parser` exists and otherwise reported as SKIP. The count drops when a
-tool is absent (a minimal container reports 75 passed, 0 failed, 3 skipped for
-`udevadm`, `apparmor_parser`, and `systemd-analyze`). It never needs root and
-removes its temp roots unless `--keep` is set. Full host/container evidence and
-the root-only follow-up steps are in
-[`phase4-system-install-report.md`](phase4-system-install-report.md).
+tool is absent (`udevadm`, `apparmor_parser`, and `systemd-analyze` each turn
+their checks into SKIPs). It never needs root and removes its temp roots unless
+`--keep` is set. Full host/container evidence and the root-only follow-up steps
+are in [`phase4-system-install-report.md`](phase4-system-install-report.md).
 
 ### Rollback
 
@@ -390,7 +418,8 @@ systemctl disable --now ozma-node@hardware.service
 # repeat for any other enabled unit (ozma-node@vm, ozma-virtual-node, ...)
 rm -f /usr/local/lib/systemd/system/ozma-node@.service \
       /usr/local/lib/systemd/system/ozma-node-vm@.service \
-      /usr/local/lib/systemd/system/ozma-virtual-node.service
+      /usr/local/lib/systemd/system/ozma-virtual-node.service \
+      /usr/local/lib/systemd/system/ozma-multiseat.service
 rm -rf /usr/local/lib/systemd/system/ozma-node@.service.d
 rm -f /etc/udev/rules.d/70-ozma-node-*.rules
 rm -f /etc/apparmor.d/abstractions/libvirt-qemu.d/ozma
@@ -502,8 +531,8 @@ scripts/clean-host/run.sh --container --full   # workspace suite
 Independent checks that do not need the moving libraries still pass:
 
 ```bash
-scripts/systemd/verify-units.sh          # PASS (3 system + 3 user, systemd 262)
-scripts/verify-system-install.sh         # PASS (77 passed, 0 failed, 1 skipped)
+scripts/systemd/verify-units.sh          # PASS (4 system + 4 user, systemd 262)
+scripts/verify-system-install.sh         # PASS (82 passed, 0 failed, 1 skipped)
 scripts/clean-host/run.sh --check-deps   # PASS (host; shellcheck/apparmor SKIP)
 scripts/install-rust.sh --dry-run ...    # exit 0, no files written
 scripts/install-system.sh --dry-run ...  # exit 0, no files written

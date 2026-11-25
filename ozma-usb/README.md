@@ -54,6 +54,7 @@ automatic gadget creation on a hardware profile.
 | NBD model | `NbdExport`, `NbdExportDescriptor`, `NbdHandshake`, `NbdRequest`/`NbdReply` framing, newstyle option constants |
 | NBD server | `NbdServer`/`NbdServerHandle` over TCP or Unix sockets, `NbdExportCatalog`, `NbdExportSource` (`overlay_file`/`overlay_media`/`overlay_bytes`), `NbdMemoryImage`, `NbdFileImage`, `NbdOverlayBackend`/`NbdOverlayPolicy`/`NbdOverlayStatus`, injected `NbdTransport`/`NbdClock`, bounded read/write/flush/trim/disc, read-only exports, copy-on-write writable exports |
 | Write overlay | `WriteOverlay`, `OverlayConfig`, `OverlayWriteReport`; bounded copy-on-write over FAT32/raw base bytes, per-block allocation accounting, checksummed atomic persistence, typed `overlay-bounds`/`overlay-corrupt` failures; wired into writable NBD exports |
+| Media restart | `MediaRestartPolicy`, `MediaRestartTracker`, `MediaRestartAttempt`; capped attempts, capped exponential backoff, overlay-reload policy, and a success reset for the userspace SCSI export |
 | Capabilities/status | `UsbGadgetCapabilities`, `GadgetStatus`, `FunctionStatus` (`media`, `uac2`, `function_fs` details); `protocol_capability()` projects onto `ozma_protocol::UsbCapability` |
 
 ## Quick start
@@ -96,36 +97,58 @@ The node now selects the controller from configuration:
 ozma-node --usb-gadget --usb-udc dummy_udc.0 \
   --usb-configfs-root /sys/kernel/config/usb_gadget \
   --usb-media /srv/installer.iso --usb-media-cdrom \
+  --usb-media-export /srv/installer.iso \
+  --usb-media-export-format iso9660 \
   --usb-uac2 --usb-uac2-bridge \
   --usb-uac2-sink-device hw:0,0 --usb-uac2-source-device hw:0,1 \
   --usb-vendor --usb-vendor-daemon /usr/local/bin/ozma-ffs
 ```
 
+`--usb-media` creates the ConfigFS kernel mass-storage LUN; `--usb-media-export`
+is the separate opt-in userspace SCSI export. For a writable raw export add
+`--usb-media-export-read-write --usb-media-export-persist /var/lib/ozma/overlay.bin`
+and optionally `--usb-media-export-reload`. Restart recovery defaults to three
+attempts with 250 ms→4 s capped exponential backoff; override it with
+`--usb-media-restart-max-attempts`, `--usb-media-restart-backoff-ms`, and
+`--usb-media-restart-max-backoff-ms`.
+
 Equivalent environment variables are `OZMA_USB_GADGET`, `OZMA_USB_CONFIGFS_ROOT`,
 `OZMA_USB_UDC`, `OZMA_USB_MEDIA`, `OZMA_USB_MEDIA_RO`,
-`OZMA_USB_MEDIA_CDROM`, `OZMA_USB_UAC2`, `OZMA_USB_UAC2_BRIDGE`,
+`OZMA_USB_MEDIA_CDROM`, `OZMA_USB_MEDIA_EXPORT`,
+`OZMA_USB_MEDIA_EXPORT_FORMAT`, `OZMA_USB_MEDIA_EXPORT_READ_WRITE`,
+`OZMA_USB_MEDIA_EXPORT_PERSIST`, `OZMA_USB_UAC2`, `OZMA_USB_UAC2_BRIDGE`,
 `OZMA_USB_UAC2_SINK_DEVICE`, `OZMA_USB_UAC2_SOURCE_DEVICE`,
 `OZMA_USB_VENDOR`, and `OZMA_USB_VENDOR_DAEMON`. The node builds a HID
-keyboard + mouse gadget,
-optionally a mass-storage LUN, and opt-in UAC2/FunctionFS vendor functions, then
-optionally a mass-storage LUN, then creates and binds it only when a UDC is
-supplied and the root exists. A missing UDC/root/permission/media or a bind
-failure is logged with its typed `kind()`; the node keeps running, advertises no
-`usb` capability, and `GET /usb` answers a typed 503 rather than fabricating a
-gadget. Without `--usb-gadget`, `/usb` stays a typed 501 and no ConfigFS write
-occurs.
+keyboard + mouse gadget, optionally a ConfigFS mass-storage LUN, an opt-in
+userspace SCSI export, and opt-in UAC2/FunctionFS vendor functions, then
+creates and binds it only when a UDC is supplied and the root exists. A missing
+UDC/root/permission/media or a bind failure is logged with its typed `kind()`;
+the node keeps running, advertises no `usb` capability, and `GET /usb` answers a
+typed 503 rather than fabricating a gadget. Without `--usb-gadget`, `/usb` stays
+a typed 501 and no ConfigFS write occurs.
 
 When bound, `ozma-node` advertises `usb` in capabilities, TXT/registration, and
 `/api/v1/connection.usb`, and exposes:
 
 | Route | Behaviour |
 |---|---|
-| `GET /usb` | Bearer-guarded read-only gadget status, function list, capabilities, LUN media state, UAC2 descriptor/bridge status, and FunctionFS daemon readiness (no backing paths). |
+| `GET /usb` | Bearer-guarded read-only gadget status, function list, capabilities, LUN media state, UAC2 descriptor/bridge status, and FunctionFS daemon readiness (no backing paths). Nested `media_export` reports `not-configured`/`configured`/`running`/`failed`, `auto_start`, overlay state, counters, and bounded restart state. |
+| `GET /usb/media` | Userspace SCSI export state, capacity, overlay/persistence summary, counters, and typed `last_error`. |
+| `POST /usb/media/start` | Configure a userspace SCSI export from an existing image (`path`, `function`, `format`, `read_only`, `persist_path`, `persist_on_flush`, `persist_on_stop`, `reload`, `max_transfer_bytes`, `timeout_ms`). Never claims `running` before a transfer. |
+| `POST /usb/media/stop` | Stop the export and apply its overlay persistence policy. |
+| `GET /usb/hotplug` | Bounded poll view of `export_start`, `export_stop`, `attach`, `detach`, `unbind`, `restart`, and `rebind` events. Auto-start is recorded as `export_start` with state `auto-start`. |
 | `POST /usb/media/attach` | Attach an existing absolute regular file to a mass-storage instance; enforces read-only/CD-ROM. |
 | `POST /usb/media/detach` | Clear the LUN `file` attribute; the function/gadget stay in place. |
 | `GET /usb/nbd` | Running loopback NBD export summary and counters (`running`, URL, export, size, read-only, writable overlay status, stats). |
 | `POST /usb/nbd/start` | Serve one existing absolute FAT32/ISO/raw file over loopback NBD (`path`, optional `export`, `format`, `read_only`, `persist_path`, `persist_on_flush`, `persist_on_stop`). ISO/FAT32 are forced read-only; raw defaults to read-only; a second start is a typed 409. A writable raw export is copy-on-write. |
 | `POST /usb/nbd/stop` | Stop the opt-in NBD listener, persist any configured overlay, and return its final counters. |
+
+The userspace export auto-starts only when `--usb-media-export` is set. It is
+reported as `configured` (not `running`) and uses `IdleBulkTransport`; only a
+real command cycle over an attached transport can mark it running. A configured
+auto-start failure keeps the typed reason in `/usb` and `/usb/media` instead of
+failing node startup. On SIGINT/SIGTERM the export is stopped and its overlay is
+flushed according to `persist_on_stop`.
 
 Attach/detach write only ConfigFS `file`/`ro`/`cdrom` attributes. The NBD
 routes only bind a loopback TCP socket and read the backing file; they do not
@@ -426,6 +449,32 @@ FunctionFS loopback endpoints only.
 No test mounts FunctionFS, opens a real UDC endpoint, or claims a live host
 transfer. The node uses `IdleBulkTransport` for a configured-but-not-attached
 export, and only attaches a transport after the daemon enables its endpoints.
+
+#### Bounded media restart supervision
+
+`MediaRestartPolicy` bounds recovery of a failed export:
+
+```rust
+use ozma_usb::{MediaRestartPolicy, MediaRestartTracker};
+
+let policy = MediaRestartPolicy::new(3, 250, 4_000) // attempts, first delay, ceiling
+    .with_overlay_reload(true);
+let mut tracker = MediaRestartTracker::new();
+let attempt = tracker.record_failure(&policy).unwrap(); // Some(1, 250 ms)
+assert_eq!(attempt.backoff_ms, 250);
+tracker.record_success(); // a real CSW written clears the failure streak
+assert_eq!(tracker.attempts(), 0);
+# Ok::<(), ozma_usb::UsbError>(())
+```
+
+The policy is data-only: it sleeps nothing and touches no endpoint. Attempts
+are capped (0..=16), backoff is capped exponential, and a cap of `0` disables
+restart. When the cap is exhausted the export stays `failed` instead of
+retrying forever. The node applies it to bulk-transport errors and to an
+observed FunctionFS `bound → unbound` transition; counters and the typed last
+error stay visible across a rebuild. If `reload_overlay` is enabled and the
+export has a persistence path, the overlay is committed before the rebuild and
+reloaded afterwards, so a writable restart resumes from the persisted bytes.
 
 ### UAC2 audio functions
 
@@ -1134,14 +1183,17 @@ existing VM; the disposable QEMU is quit over QMP or killed on timeout.
   unbind/cleanup), but mounting in the default path still requires an injected
   mounter and caller privileges. The command mounter is untested against a real
   FunctionFS mount/UDC in the default suite; there is no persistent daemon
-  process, restart supervision, real UDC event loop, or vendor protocol. The
-  SCSI `MassStorageLoop` and node `/usb/media*` routes exist, but a live
-  FunctionFS transport is attached only by explicit code; the default node path
-  starts a configured export with `IdleBulkTransport` and never auto-attaches a
-  UDC endpoint. Blocking file-endpoint reads do not enforce the loop deadline
-  themselves, so the typed timeout contract is proven with fakes until a real
-  UDC test is added. `running` is deliberately only reachable after a real
-  command cycle; a mount, marker, UDC bind, or enable event never suffices.
+  process, real UDC event loop, or vendor protocol. The SCSI `MassStorageLoop`
+  and node `/usb/media*` routes exist, and `--usb-media-export` auto-starts a
+  configured export, but a live FunctionFS transport is still attached only by
+  explicit code; the default node path starts with `IdleBulkTransport` and never
+  opens a UDC endpoint. Blocking file-endpoint reads do not enforce the loop
+  deadline themselves, so the typed timeout contract is proven with fakes until
+  a real UDC test is added. `running` is deliberately only reachable after a
+  real command cycle; a mount, marker, UDC bind, or enable event never suffices.
+  Restart supervision is bounded by `MediaRestartPolicy` and exercised through
+  fake transports; there is no background endpoint driver, so a production
+  transport error/rebind is only retried when the node observes it again.
   Class/vendor control requests are rejected with typed errors until a protocol
   handler exists. Suspend and resume events are accepted but not acted on.
   UAC2 models descriptors/capabilities, writes
@@ -1155,9 +1207,11 @@ existing VM; the disposable QEMU is quit over QMP or killed on timeout.
   starting either backend; the lifecycle status is library-only for now.
 - Node media export routes (`GET/POST /usb/media`, `/usb/hotplug`) are backed by
   the userspace SCSI/overlay path and are independent of the ConfigFS
-  mass-storage LUN. They do not auto-start on boot, do not drive a real
-  FunctionFS endpoint, and record only transitions the node caused or observed;
-  there is no SSE stream or kernel hotplug monitor.
+  mass-storage LUN. `--usb-media-export` auto-starts that path at node startup;
+  it still does not drive a real FunctionFS endpoint, and hotplug records only
+  transitions the node caused or observed (no SSE stream or kernel hotplug
+  monitor). Shutdown stops the export and applies the overlay persistence
+  policy.
 - Node-side gadget teardown/recovery across restart, and hardware-profile
   validation. Mounting, block-device I/O, and real USB/IP transport remain
   deliberately outside this crate.

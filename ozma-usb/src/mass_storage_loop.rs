@@ -463,6 +463,15 @@ impl<T: MassStorageBulkTransport> MassStorageLoop<T> {
         &self.stats
     }
 
+    /// Replace the counters, for example when a supervised restart rebuilds
+    /// the device/transport but must keep the export's visible history.
+    ///
+    /// This does not change `running`: a rebuilt loop still reports
+    /// `running: false` until a real command cycle completes.
+    pub fn restore_stats(&mut self, stats: MassStorageLoopStats) {
+        self.stats = stats;
+    }
+
     /// Whether at least one command cycle completed after a transport attach.
     pub fn is_running(&self) -> bool {
         self.running

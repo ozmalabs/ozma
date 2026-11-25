@@ -1,0 +1,56 @@
+[Unit]
+Description=Ozma multi-seat supervisor (one ozma-node per X output)
+Documentation=https://github.com/ozmalabs/ozma/blob/main/docs/multiseat-rust.md
+After=network-online.target
+Wants=network-online.target
+# The CLI restarts individual seat children with bounded backoff. This limit
+# only stops a supervisor that cannot start at all from restart-looping.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# --print-plan and --dry-run are deliberately absent: they print and exit, and
+# systemd would restart-loop the unit instead of supervising seats.
+# DISPLAY (and, for a system unit, XAUTHORITY) comes from the env file; the
+# supervisor loads and atomically updates the persisted store while running.
+ExecStart=@BIN_DIR@/ozma-multiseat --node-bin @BIN_DIR@/ozma-node --seats-file @STATE_DIR@/seats.json --hotplug $OZMA_MULTISEAT_ARGS
+EnvironmentFile=-@ENV_DIR@/ozma-multiseat.env
+
+# Same account/group convention as the node units. A live desktop session is
+# usually better served by a systemd --user unit; see scripts/systemd/README.md.
+User=@OZMA_USER@
+Group=@OZMA_GROUP@
+SupplementaryGroups=video input render
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+# SIGTERM goes to the supervisor, which stops and reaps every seat child.
+# Anything left after TimeoutStopSec is killed with the rest of the cgroup.
+KillMode=mixed
+UMask=0027
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+# X11 sockets live in /tmp/.X11-unix, so a private /tmp would hide the display.
+PrivateTmp=no
+PrivateDevices=no
+DeviceAllow=/dev/video* rw
+DeviceAllow=/dev/uinput rw
+DeviceAllow=/dev/input/event* rw
+DeviceAllow=/dev/dri/renderD* rw
+ReadWritePaths=@STATE_DIR@ @RUNTIME_DIR@
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

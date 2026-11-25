@@ -87,6 +87,9 @@ class FontTemplate:
     width: int             # pixels per glyph
     height: int            # pixels per glyph
     glyphs: dict[int, np.ndarray] = field(default_factory=dict)  # code → (height, width) bool array
+    #: True for a real console/BIOS bitmap font, False for the Pillow
+    #: approximation generated when no system PSF font is available.
+    is_native: bool = True
 
     @classmethod
     def from_raw_bytes(cls, name: str, data: bytes, width: int = 8, height: int = 16, num_glyphs: int = 256) -> "FontTemplate":
@@ -138,8 +141,14 @@ class OCRResult:
     grid_height: int = 0            # Number of lines
     cell_width: int = 0             # Pixel width per character cell
     cell_height: int = 0            # Pixel height per character cell
-    confidence: float = 0.0         # Average match confidence (0-1)
+    confidence: float = 0.0         # Average best-match correlation (0-1)
     cells: list[list[dict]] = field(default_factory=list)  # Per-cell info
+    #: Average gap between the best and second-best glyph correlation over
+    #: non-blank cells.  Unlike raw cosine correlation this is discriminative:
+    #: arbitrary GUI pixels tend to match many glyphs almost equally well.
+    match_margin: float = 0.0
+    #: True when a real console font was used (not the Pillow approximation).
+    font_native: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -165,18 +174,38 @@ class TextCapture:
         self._load_system_fonts()
 
     def _load_system_fonts(self) -> None:
-        """Load available VGA fonts from the system."""
+        """Load available VGA/console fonts from the system."""
         from pathlib import Path
 
-        # Try system PSF fonts
-        psf_dirs = [Path("/usr/share/consolefonts"), Path("/usr/lib/kbd/consolefonts")]
-        preferred = ["Lat2-VGA16.psf", "default8x16.psf", "VGA-ROM.f16"]
+        # Debian/Ubuntu keep console fonts in /usr/share/consolefonts, while
+        # Arch/Fedora and the kbd package use /usr/share/kbd/consolefonts.
+        # Missing the latter made TextCapture fall back to an anti-aliased
+        # Pillow font, which cannot match a real VGA console.
+        psf_dirs = [
+            Path("/usr/share/consolefonts"),
+            Path("/usr/lib/kbd/consolefonts"),
+            Path("/usr/share/kbd/consolefonts"),
+            Path("/usr/local/share/consolefonts"),
+        ]
+        # Base names (no extension) of fonts that closely match the classic
+        # VGA 8x16/8x14 text-mode glyphs.
+        preferred = [
+            "Lat2-VGA16",
+            "default8x16",
+            "VGA-ROM",
+            "LatGrkCyr-8x16",
+            "UniCyr_8x16",
+            "Mik_8x16",
+            "cp850-8x16",
+            "Lat15-VGA16",
+        ]
+        suffixes = ["", ".psf", ".psfu", ".gz", ".psf.gz", ".psfu.gz", ".f16"]
 
         for psf_dir in psf_dirs:
             if not psf_dir.exists():
                 continue
             for name in preferred:
-                for suffix in ["", ".gz", ".psf.gz"]:
+                for suffix in suffixes:
                     path = psf_dir / (name + suffix)
                     if path.exists():
                         try:
@@ -188,7 +217,27 @@ class TextCapture:
                         except Exception as e:
                             log.debug("Failed to load %s: %s", path, e)
 
-        # Fallback: generate a minimal ASCII font from Pillow
+            # Last resort: try any PSF font in the directory.  Some distros
+            # only ship locale-specific names that are still valid VGA fonts.
+            for path in sorted(psf_dir.iterdir()):
+                if not path.is_file():
+                    continue
+                lname = path.name.lower()
+                if not (".psf" in lname or lname.endswith(".gz") or lname.endswith(".f16")):
+                    continue
+                try:
+                    font = FontTemplate.from_psf_file(str(path))
+                    if font.width in (8, 9) and font.height in (8, 14, 16):
+                        self._fonts.append(font)
+                        log.info("Loaded fallback font: %s (%dx%d, %d glyphs)",
+                                 font.name, font.width, font.height, len(font.glyphs))
+                        return
+                except Exception as e:
+                    log.debug("Failed to load %s: %s", path, e)
+
+        # Fallback: generate a minimal ASCII font from Pillow.  This is only an
+        # approximation, so callers must not treat its matches as high
+        # confidence (see OCRResult.font_native).
         if _PIL_AVAILABLE and not self._fonts:
             self._generate_pillow_font()
 
@@ -201,7 +250,7 @@ class TextCapture:
             font_obj = ImageFont.load_default()
 
         width, height = 8, 16
-        ft = FontTemplate(name="pillow-mono", width=width, height=height)
+        ft = FontTemplate(name="pillow-mono", width=width, height=height, is_native=False)
 
         for code in range(32, 127):
             img = Image.new("L", (width, height), 0)
@@ -240,7 +289,13 @@ class TextCapture:
                 x1, y1, x2, y2 = region
                 frame = frame[y1:y2, x1:x2]
             if len(frame.shape) == 3:
-                gray = np.mean(frame, axis=2).astype(np.float32) / 255.0
+                # Rec. 601 luminance, ignoring any alpha channel.  A plain
+                # channel mean shifts coloured/subpixel-antialiased console
+                # text and made the cell detector pick a half-size grid.
+                rgb = frame[:, :, :3].astype(np.float32)
+                gray = (0.299 * rgb[:, :, 0]
+                        + 0.587 * rgb[:, :, 1]
+                        + 0.114 * rgb[:, :, 2]) / 255.0
             else:
                 gray = frame.astype(np.float32) / 255.0
 
@@ -260,6 +315,7 @@ class TextCapture:
         # Match each cell
         lines = []
         all_confidences = []
+        text_margins = []
         cells = []
 
         for row in range(rows):
@@ -277,13 +333,19 @@ class TextCapture:
                 # Binarise: threshold at mean
                 threshold = cell.mean()
                 binary = (cell > threshold).astype(np.float32)
+                is_blank = binary.sum() < 0.05 * binary.size
 
                 # Match against all glyphs
-                best_code, best_conf = self._match_glyph(binary, font)
+                best_code, best_conf, margin = self._match_glyph(binary, font)
                 char = _CP437_MAP.get(best_code, chr(best_code) if best_code < 128 else "?")
                 line_chars.append(char)
                 all_confidences.append(best_conf)
-                row_cells.append({"char": char, "code": best_code, "conf": round(best_conf, 3)})
+                if not is_blank:
+                    text_margins.append(margin)
+                row_cells.append({
+                    "char": char, "code": best_code,
+                    "conf": round(best_conf, 3), "margin": round(margin, 3),
+                })
 
             lines.append("".join(line_chars).rstrip())
             cells.append(row_cells)
@@ -294,6 +356,7 @@ class TextCapture:
 
         text = "\n".join(lines)
         avg_conf = sum(all_confidences) / max(len(all_confidences), 1)
+        avg_margin = sum(text_margins) / len(text_margins) if text_margins else 0.0
 
         result = OCRResult(
             text=text,
@@ -304,6 +367,8 @@ class TextCapture:
             cell_height=cell_h,
             confidence=avg_conf,
             cells=cells,
+            match_margin=avg_margin,
+            font_native=getattr(font, "is_native", True),
         )
         self._last_result = result
         return result
@@ -342,18 +407,33 @@ class TextCapture:
     def _detect_cell_size(self, gray: np.ndarray, font: FontTemplate) -> tuple[int, int]:
         """Detect character cell size from the image.
 
-        First tries the font's native size, then common terminal sizes.
-        Uses column intensity autocorrelation to verify grid alignment.
+        A terminal font must tile the frame: the previous heuristic scored
+        only edge energy at candidate boundaries, which preferred large cells
+        (e.g. 12x24 on a 1280x800 console) because they crossed more glyph
+        strokes.  That wrong stride shifted every row/column and produced
+        garbage text.  Here each candidate is scored by actually matching a
+        sample of its cells against the font, with a penalty for a grid that
+        does not tile the frame.
         """
         h, w = gray.shape
 
-        # Try common cell sizes (most likely first)
+        # Try common cell sizes (font native first so ties win).
         candidates = [
             (font.width, font.height),
             (8, 16), (9, 16), (8, 14), (8, 8),
             (10, 18), (10, 20), (12, 24),  # larger terminal fonts
-            (7, 14), (6, 12),  # smaller fonts
+            (7, 14), (6, 12),              # smaller fonts
+            (16, 32), (16, 16),            # doubled / scaled consoles
         ]
+
+        # Pre-normalise glyph templates once for vectorised cell matching.
+        codes = list(font.glyphs.keys())
+        if not codes:
+            return (font.width, font.height)
+        glyph_matrix = np.stack(
+            [font.glyphs[c].reshape(-1) for c in codes]
+        ).astype(np.float32)
+        glyph_norms = np.linalg.norm(glyph_matrix, axis=1)
 
         best_size = (font.width, font.height)
         best_score = -1.0
@@ -366,15 +446,54 @@ class TextCapture:
             if cols < 10 or rows < 5:
                 continue
 
-            # Score: measure regularity of column boundaries
-            # Sum vertical edge energy at cell boundaries
-            edges = np.abs(np.diff(gray, axis=1))
-            score = 0.0
-            for c in range(1, cols):
-                x = c * cw
-                if x < edges.shape[1]:
-                    score += edges[:, x - 1].sum() + edges[:, min(x, edges.shape[1] - 1)].sum()
-            score /= cols
+            # Sample a bounded subset of cells: enough to measure glyph
+            # agreement without an O(frame) cost per candidate.
+            row_step = max(1, rows // 10)
+            col_step = max(1, cols // 20)
+            corrs: list[float] = []
+            margins: list[float] = []
+
+            for row in range(0, rows, row_step):
+                for col in range(0, cols, col_step):
+                    cell = gray[row * ch:row * ch + ch, col * cw:col * cw + cw]
+                    if cell.shape != (font.height, font.width):
+                        cell = self._resize(cell, font.width, font.height)
+                    binary = (cell > cell.mean()).astype(np.float32)
+                    if binary.sum() < 0.05 * binary.size:
+                        continue  # blank cell, uninformative
+                    vec = binary.reshape(-1)
+                    norm = float(np.linalg.norm(vec))
+                    if norm < 1e-9:
+                        continue
+                    sims = glyph_matrix @ vec / (glyph_norms * norm + 1e-10)
+                    if sims.size >= 2:
+                        top2 = np.argpartition(sims, -2)[-2:]
+                        pair = sorted((float(sims[i]) for i in top2), reverse=True)
+                        corrs.append(pair[0])
+                        margins.append(pair[0] - pair[1])
+                    else:
+                        corrs.append(float(sims.max()))
+                        margins.append(float(sims.max()))
+
+            if not corrs:
+                continue
+
+            mean_corr = sum(corrs) / len(corrs)
+            mean_margin = sum(margins) / len(margins)
+
+            # A real text grid tiles the frame.  Non-tiling candidates drift
+            # across glyphs and must not win on a marginal score.
+            rem_w = w % cw
+            rem_h = h % ch
+            if rem_w == 0 and rem_h == 0:
+                tile_score = 1.0
+            elif rem_w + rem_h <= 2:
+                tile_score = 0.85
+            else:
+                tile_score = 0.6
+
+            # Reward both a good match and a clear margin over the runner-up.
+            score = mean_corr * (1.0 + min(1.0, mean_margin / 0.15)) * tile_score
 
             if score > best_score:
                 best_score = score
@@ -382,14 +501,21 @@ class TextCapture:
 
         return best_size
 
-    def _match_glyph(self, cell: np.ndarray, font: FontTemplate) -> tuple[int, float]:
-        """Find the best matching glyph for a cell.  Returns (code, confidence)."""
+    def _match_glyph(self, cell: np.ndarray, font: FontTemplate) -> tuple[int, float, float]:
+        """Find the best matching glyph for a cell.
+
+        Returns (code, correlation, margin) where margin is the correlation
+        gap to the second-best glyph.  Raw correlation alone is not enough:
+        arbitrary pixels can correlate well with *some* glyph, but they match
+        many glyphs almost equally well, so the margin stays small.
+        """
         best_code = 32  # space
         best_corr = -1.0
+        second_corr = -1.0
 
         # Quick check: if cell is nearly empty, it's a space
         if cell.sum() < 0.05 * cell.size:
-            return (32, 0.95)
+            return (32, 0.95, 1.0)
 
         for code, glyph in font.glyphs.items():
             # Normalised correlation
@@ -397,10 +523,14 @@ class TextCapture:
                 max(np.sqrt(np.sum(cell ** 2) * np.sum(glyph ** 2)), 1e-10)
             )
             if corr > best_corr:
+                second_corr = best_corr
                 best_corr = corr
                 best_code = code
+            elif corr > second_corr:
+                second_corr = corr
 
-        return (best_code, float(best_corr))
+        margin = max(0.0, best_corr - second_corr) if second_corr > -1.0 else max(0.0, best_corr)
+        return (best_code, float(best_corr), float(margin))
 
     @staticmethod
     def _resize(arr: np.ndarray, target_w: int, target_h: int) -> np.ndarray:

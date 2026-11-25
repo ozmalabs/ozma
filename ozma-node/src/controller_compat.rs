@@ -27,7 +27,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -52,11 +52,12 @@ use ozma_usb::MediaFormat as UsbMediaFormat;
 use ozma_usb::{
     is_safe_identifier, BoxedMassStorageTransport, FunctionFsStatus, FunctionStatus, GadgetStatus,
     IdleBulkTransport, MassStorageDevice, MassStorageImage, MassStorageLoop, MassStorageLoopConfig,
-    MassStorageLoopStats, MassStorageOverlayStatus, MassStoragePersistPolicy, MediaState,
-    NbdExportCatalog, NbdExportSource, NbdOverlayPolicy, NbdServer, NbdServerConfig,
-    NbdServerHandle, NbdServerStats, OverlayConfig, Uac2Status, UsbError, UsbFunctionKind,
-    UsbGadgetCapabilities, UsbGadgetController, UsbMediaHotplugKind, UsbMediaHotplugLog,
-    VirtualMedia, MASS_STORAGE_DEFAULT_TIMEOUT_MS, SCSI_MAX_TRANSFER_BYTES, SCSI_SECTOR_BYTES,
+    MassStorageLoopStats, MassStorageOverlayStatus, MassStoragePersistPolicy, MediaRestartPolicy,
+    MediaRestartTracker, MediaState, NbdExportCatalog, NbdExportSource, NbdOverlayPolicy,
+    NbdServer, NbdServerConfig, NbdServerHandle, NbdServerStats, OverlayConfig, Uac2Status,
+    UsbError, UsbFunctionKind, UsbGadgetCapabilities, UsbGadgetController, UsbMediaHotplugKind,
+    UsbMediaHotplugLog, VirtualMedia, MASS_STORAGE_DEFAULT_TIMEOUT_MS, SCSI_MAX_TRANSFER_BYTES,
+    SCSI_SECTOR_BYTES,
 };
 #[cfg(test)]
 use ozma_usb::{MassStorageBulkTransport, MassStorageCommandOutcome};
@@ -1621,6 +1622,7 @@ pub struct UsbControl {
     error: Option<String>,
     nbd: Arc<Mutex<Option<NbdRuntime>>>,
     media: Arc<Mutex<Option<MassStorageMediaRuntime>>>,
+    media_auto: Arc<Mutex<MediaAutoStartState>>,
     hotplug: Arc<Mutex<UsbMediaHotplugState>>,
     uac2_bridge: Option<Uac2BridgeShared>,
 }
@@ -1659,11 +1661,316 @@ impl MassStorageMediaState {
     }
 }
 
+/// Why a media export is being supervised for restart.
+#[allow(dead_code)] // the live transport driver is not wired yet; tests exercise it
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaRestartReason {
+    /// A bulk endpoint read/write/flush failed.
+    TransportError,
+    /// The configured gadget was observed transitioning to unbound.
+    FunctionFsRebind,
+}
+
+impl MediaRestartReason {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::TransportError => "restart",
+            Self::FunctionFsRebind => "rebind",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::TransportError => "bulk transport failure triggered a bounded restart",
+            Self::FunctionFsRebind => "gadget unbind observed; FunctionFS rebind requested",
+        }
+    }
+
+    fn usb_error(self) -> UsbError {
+        UsbError::MassStorageTransport {
+            operation: self.operation(),
+            reason: self.description().to_owned(),
+        }
+    }
+
+    fn hotplug_kind(self) -> UsbMediaHotplugKind {
+        match self {
+            Self::TransportError => UsbMediaHotplugKind::Restart,
+            Self::FunctionFsRebind => UsbMediaHotplugKind::Rebind,
+        }
+    }
+}
+
+/// Result of one bounded restart request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MediaRestartOutcome {
+    /// No export is configured.
+    NotConfigured,
+    /// The last export was stopped; restart is not applicable.
+    Stopped,
+    /// The export was rebuilt within the attempt cap.
+    Restarted { attempt: u32, backoff_ms: u64 },
+    /// The attempt cap was reached; the export stays failed.
+    Exhausted { max_attempts: u32 },
+    /// The attempt was allowed but rebuilding the device failed.
+    Failed { attempt: u32, message: String },
+}
+
+/// Validated start options shared by the route and node auto-start.
+#[derive(Clone, Debug)]
+struct MediaExportSpec {
+    path: PathBuf,
+    format: UsbMediaFormat,
+    read_only: bool,
+    persist_path: Option<PathBuf>,
+    persist_on_flush: bool,
+    persist_on_stop: bool,
+    reload: bool,
+    max_transfer_bytes: Option<usize>,
+    timeout_ms: Option<u64>,
+    function: Option<String>,
+    restart: MediaRestartPolicy,
+}
+
+/// A typed request-validation failure that the route renders as JSON and the
+/// auto-start path stores as a section-less status error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MediaSpecError {
+    code: &'static str,
+    message: String,
+    remediation: &'static str,
+}
+
+impl MediaSpecError {
+    fn response(self) -> Response {
+        compat_error_with_remediation(
+            StatusCode::BAD_REQUEST,
+            self.code,
+            self.message,
+            Some(self.remediation),
+        )
+    }
+}
+
+impl MediaExportSpec {
+    /// Validate a route request exactly as the start route always has.
+    fn from_request(
+        request: &UsbMediaStartRequest,
+        restart: MediaRestartPolicy,
+    ) -> Result<Self, MediaSpecError> {
+        restart.validate().map_err(|error| MediaSpecError {
+            code: "usb-invalid-restart-policy",
+            message: error.to_string(),
+            remediation: "Use 0..=16 attempts with a backoff ceiling at or above the first delay.",
+        })?;
+
+        let path_text = request.path.trim();
+        if path_text.is_empty() || path_text.contains('\0') {
+            return Err(MediaSpecError {
+                code: "usb-invalid-media-path",
+                message: "media `path` must be a non-empty path without NUL bytes".to_owned(),
+                remediation: "Pass the absolute path of an existing raw/FAT32/ISO image.",
+            });
+        }
+        let path = PathBuf::from(path_text);
+        if !path.is_absolute() {
+            return Err(MediaSpecError {
+                code: "usb-invalid-media-path",
+                message: "media path must be absolute".to_owned(),
+                remediation:
+                    "Use an absolute path; relative paths are resolved differently by the kernel.",
+            });
+        }
+
+        let format = match request
+            .format
+            .as_deref()
+            .unwrap_or("raw")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "raw" | "nbd" => UsbMediaFormat::Raw,
+            "fat32" | "vfat" => UsbMediaFormat::Fat32,
+            "iso" | "iso9660" => UsbMediaFormat::Iso9660,
+            other => {
+                return Err(MediaSpecError {
+                    code: "usb-invalid-media-format",
+                    message: format!("unsupported media export format {other:?}"),
+                    remediation: "Use `raw`, `fat32`, or `iso9660`.",
+                });
+            }
+        };
+        let format_is_read_only = matches!(format, UsbMediaFormat::Fat32 | UsbMediaFormat::Iso9660);
+        if format_is_read_only && request.read_only == Some(false) {
+            return Err(MediaSpecError {
+                code: "usb-read-only-media",
+                message: "FAT32 and ISO 9660 media exports are always read-only".to_owned(),
+                remediation: "Omit read_only or set it to true.",
+            });
+        }
+        let read_only = request.read_only.unwrap_or(true) || format_is_read_only;
+
+        let mut persistence = None;
+        if !read_only {
+            if let Some(persist_text) = request.persist_path.as_deref() {
+                let persist_text = persist_text.trim();
+                if persist_text.is_empty() || persist_text.contains('\0') {
+                    return Err(MediaSpecError {
+                        code: "usb-invalid-overlay-path",
+                        message:
+                            "overlay `persist_path` must be a non-empty path without NUL bytes"
+                                .to_owned(),
+                        remediation:
+                            "Omit persist_path for an ephemeral overlay, or pass an absolute path.",
+                    });
+                }
+                let persist = PathBuf::from(persist_text);
+                if !persist.is_absolute() {
+                    return Err(MediaSpecError {
+                        code: "usb-invalid-overlay-path",
+                        message: "overlay `persist_path` must be absolute".to_owned(),
+                        remediation: "Use an absolute path outside the base image.",
+                    });
+                }
+                if persist == path {
+                    return Err(MediaSpecError {
+                        code: "usb-invalid-overlay-path",
+                        message: "overlay `persist_path` must not be the base image".to_owned(),
+                        remediation: "Choose a separate file; the base image is never written.",
+                    });
+                }
+                persistence = Some(persist);
+            }
+        }
+        if request.reload && (read_only || persistence.is_none()) {
+            return Err(MediaSpecError {
+                code: "usb-invalid-overlay-path",
+                message: "`reload` requires writable raw media with an explicit persist_path"
+                    .to_owned(),
+                remediation:
+                    "Set read_only=false and pass persist_path of an existing overlay file.",
+            });
+        }
+
+        Ok(Self {
+            path,
+            format,
+            read_only,
+            persist_path: persistence,
+            persist_on_flush: request.persist_on_flush.unwrap_or(true),
+            persist_on_stop: request.persist_on_stop.unwrap_or(true),
+            reload: request.reload,
+            max_transfer_bytes: request.max_transfer_bytes,
+            timeout_ms: request.timeout_ms,
+            function: request.function.clone(),
+            restart,
+        })
+    }
+}
+
+/// How an export was started, used for the bounded hotplug log label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaStartOrigin {
+    Route,
+    AutoStart,
+}
+
+impl MediaStartOrigin {
+    fn state(self) -> &'static str {
+        match self {
+            Self::Route => "configured",
+            Self::AutoStart => "auto-start",
+        }
+    }
+}
+
+/// Opt-in node startup configuration for the userspace SCSI export.
+///
+/// The fields mirror [`UsbMediaStartRequest`]; `main` builds this from the
+/// `--usb-media-export*` flags. It never implies a live transport: auto-start
+/// builds the same `configured` export a route start would, and `running`
+/// remains false until a command cycle completes.
+#[derive(Clone, Debug)]
+pub struct UsbMediaAutoStartConfig {
+    /// Existing absolute backing image.
+    pub path: PathBuf,
+    /// Raw, FAT32, or ISO 9660.
+    pub format: UsbMediaFormat,
+    /// Serve raw media read-only. FAT32/ISO are forced read-only.
+    pub read_only: bool,
+    /// Optional absolute overlay persistence file for writable raw media.
+    pub persist_path: Option<PathBuf>,
+    /// Commit the overlay on SCSI `SYNCHRONIZE CACHE(10)`.
+    pub persist_on_flush: bool,
+    /// Commit the overlay when the export stops.
+    pub persist_on_stop: bool,
+    /// Load an existing persistence file before serving.
+    pub reload: bool,
+    /// Optional per-transfer endpoint deadline.
+    pub timeout_ms: Option<u64>,
+    /// Optional smaller data-phase bound.
+    pub max_transfer_bytes: Option<usize>,
+    /// Bounded restart/backoff policy.
+    pub restart: MediaRestartPolicy,
+}
+
+impl UsbMediaAutoStartConfig {
+    fn spec(&self) -> MediaExportSpec {
+        MediaExportSpec {
+            path: self.path.clone(),
+            format: self.format,
+            read_only: self.read_only
+                || matches!(self.format, UsbMediaFormat::Fat32 | UsbMediaFormat::Iso9660),
+            persist_path: self.persist_path.clone(),
+            persist_on_flush: self.persist_on_flush,
+            persist_on_stop: self.persist_on_stop,
+            reload: self.reload,
+            max_transfer_bytes: self.max_transfer_bytes,
+            timeout_ms: self.timeout_ms,
+            function: None,
+            restart: self.restart,
+        }
+    }
+}
+
 /// One userspace SCSI export and its live counters.
 struct MassStorageMediaRuntime {
     runner: MassStorageLoop<BoxedMassStorageTransport>,
     state: MassStorageMediaState,
     function: String,
+    last_error: Option<MassStorageMediaError>,
+    source: MediaExportSpec,
+    restart: MediaRestartTracker,
+    pending_restart: Option<u64>,
+    auto_start: bool,
+}
+
+/// Counters and restart visibility carried across a supervised rebuild.
+struct MediaRestore {
+    stats: MassStorageLoopStats,
+    restart: MediaRestartTracker,
+    last_error: Option<MassStorageMediaError>,
+    pending_restart: Option<u64>,
+    auto_start: bool,
+}
+
+impl MediaRestore {
+    fn from_runtime(runtime: &MassStorageMediaRuntime) -> Self {
+        Self {
+            stats: runtime.runner.stats().clone(),
+            restart: runtime.restart.clone(),
+            last_error: runtime.last_error.clone(),
+            pending_restart: runtime.pending_restart,
+            auto_start: runtime.auto_start,
+        }
+    }
+}
+
+/// Startup/restart policy and the last typed auto-start failure.
+#[derive(Debug, Default)]
+struct MediaAutoStartState {
+    config: Option<UsbMediaAutoStartConfig>,
     last_error: Option<MassStorageMediaError>,
 }
 
@@ -1752,6 +2059,7 @@ impl MassStorageMediaRuntime {
                 self.state,
                 MassStorageMediaState::Configured | MassStorageMediaState::Running
             ),
+            "auto_start": self.auto_start,
             "function": self.function,
             "read_only": device.is_read_only(),
             "capacity": {
@@ -1762,7 +2070,20 @@ impl MassStorageMediaRuntime {
             "overlay": device.overlay_status().map(UsbMediaOverlayStatus::from_status),
             "stats": self.runner.stats(),
             "last_error": self.last_error,
+            "restart": {
+                "attempts": self.restart.attempts(),
+                "max_attempts": self.source.restart.max_attempts,
+                "exhausted": self.restart.is_exhausted(),
+                "pending_backoff_ms": self.pending_restart,
+                "reload_overlay": self.source.restart.reload_overlay,
+            },
         })
+    }
+
+    #[allow(dead_code)] // used by tests until a live transport driver calls it
+    fn note_transport_failure(&mut self, error: &UsbError) {
+        self.state = MassStorageMediaState::Failed;
+        self.last_error = Some(MassStorageMediaError::from_usb(error));
     }
 }
 
@@ -1784,6 +2105,7 @@ impl UsbControl {
             error: None,
             nbd: Arc::new(Mutex::new(None)),
             media: Arc::new(Mutex::new(None)),
+            media_auto: Arc::new(Mutex::new(MediaAutoStartState::default())),
             hotplug: Arc::new(Mutex::new(UsbMediaHotplugState::default())),
             uac2_bridge: None,
         }
@@ -1798,6 +2120,7 @@ impl UsbControl {
             error: Some(reason.into()),
             nbd: Arc::new(Mutex::new(None)),
             media: Arc::new(Mutex::new(None)),
+            media_auto: Arc::new(Mutex::new(MediaAutoStartState::default())),
             hotplug: Arc::new(Mutex::new(UsbMediaHotplugState::default())),
             uac2_bridge: None,
         }
@@ -1828,21 +2151,315 @@ impl UsbControl {
     /// Path-free status of the userspace SCSI media export.
     fn media_status_json(&self) -> Value {
         let slot = lock(&self.media);
+        let auto = lock(&self.media_auto);
+        let auto_enabled = auto.config.is_some();
         match slot.as_ref() {
             Some(runtime) => runtime.status_json(),
-            None => serde_json::json!({
-                "ok": true,
-                "state": "not-configured",
-                "running": false,
-                "configured": false,
-                "function": null,
-                "read_only": null,
-                "capacity": null,
-                "overlay": null,
-                "stats": MassStorageLoopStats::default(),
-                "last_error": null,
-            }),
+            None => {
+                let auto_failed = auto_enabled && auto.last_error.is_some();
+                serde_json::json!({
+                    "ok": true,
+                    "state": if auto_failed { "failed" } else { "not-configured" },
+                    "running": false,
+                    "configured": false,
+                    "auto_start": auto_enabled,
+                    "function": null,
+                    "read_only": null,
+                    "capacity": null,
+                    "overlay": null,
+                    "stats": MassStorageLoopStats::default(),
+                    "last_error": auto.last_error,
+                    "restart": null,
+                })
+            }
         }
+    }
+
+    /// Build one media export from validated options without installing it.
+    ///
+    /// `restore` carries counters/restart visibility across a supervised
+    /// restart; `reload` decides whether the persisted overlay is loaded.
+    fn build_media_runtime(
+        &self,
+        spec: &MediaExportSpec,
+        function: &str,
+        reload: bool,
+        restore: Option<MediaRestore>,
+    ) -> Result<MassStorageMediaRuntime, UsbError> {
+        let mut media = match spec.format {
+            UsbMediaFormat::Iso9660 => MassStorageImage::iso(&spec.path),
+            UsbMediaFormat::Fat32 => MassStorageImage::fat32(&spec.path),
+            _ => MassStorageImage::disk(&spec.path),
+        };
+        if spec.format == UsbMediaFormat::Raw {
+            media = media.with_read_only(spec.read_only)?;
+        }
+        media.validate_for_attach()?;
+
+        let policy = MassStoragePersistPolicy {
+            persist_on_flush: spec.persist_on_flush,
+            persist_on_stop: spec.persist_on_stop,
+        };
+        let persistence = spec.persist_path.as_ref().filter(|_| !spec.read_only);
+        let mut overlay_config = OverlayConfig::default();
+        if let Some(path) = persistence {
+            overlay_config = overlay_config.with_persistence(path);
+        }
+        let device = if reload && persistence.is_some() {
+            let persist = persistence.expect("persistence was just checked");
+            MassStorageDevice::load_writable_file(&spec.path, overlay_config, policy, persist)
+        } else {
+            MassStorageDevice::from_media(&media, overlay_config, policy)
+        }?;
+
+        let loop_config = MassStorageLoopConfig {
+            transfer_timeout_ms: spec.timeout_ms.unwrap_or(MASS_STORAGE_DEFAULT_TIMEOUT_MS),
+            max_transfer_bytes: spec.max_transfer_bytes.unwrap_or(SCSI_MAX_TRANSFER_BYTES),
+            max_commands: None,
+        };
+        let mut runner = MassStorageLoop::new(
+            device,
+            Box::new(IdleBulkTransport) as BoxedMassStorageTransport,
+            loop_config,
+        )?;
+        let (restart, last_error, pending_restart, auto_start) = match restore {
+            Some(restore) => {
+                runner.restore_stats(restore.stats);
+                (
+                    restore.restart,
+                    restore.last_error,
+                    restore.pending_restart,
+                    restore.auto_start,
+                )
+            }
+            None => (MediaRestartTracker::new(), None, None, false),
+        };
+
+        Ok(MassStorageMediaRuntime {
+            runner,
+            state: MassStorageMediaState::Configured,
+            function: function.to_owned(),
+            last_error,
+            source: spec.clone(),
+            restart,
+            pending_restart,
+            auto_start,
+        })
+    }
+
+    /// Install a built export, refusing to replace a live/configured one.
+    fn install_media_runtime(
+        &self,
+        runtime: MassStorageMediaRuntime,
+        origin: MediaStartOrigin,
+    ) -> Result<Value, Response> {
+        let mut slot = lock(&self.media);
+        if slot
+            .as_ref()
+            .is_some_and(|runtime| runtime.state != MassStorageMediaState::Stopped)
+        {
+            return Err(media_export_conflict());
+        }
+        let body = runtime.status_json();
+        let function = Some(runtime.function.clone());
+        *slot = Some(runtime);
+        drop(slot);
+        self.record_media_hotplug(
+            UsbMediaHotplugKind::ExportStart,
+            function,
+            Some(origin.state().to_owned()),
+        );
+        Ok(body)
+    }
+
+    /// Opt-in node startup: build and install the configured userspace export.
+    ///
+    /// The export is `configured`, never `running`; no transport is attached
+    /// and no transfer is claimed. A typed failure is retained and surfaced by
+    /// `/usb` and `/usb/media` instead of crashing the node.
+    pub fn auto_start_media_export(&self, config: &UsbMediaAutoStartConfig) {
+        {
+            let mut auto = lock(&self.media_auto);
+            auto.config = Some(config.clone());
+            auto.last_error = None;
+        }
+        if let Err(error) = config.restart.validate() {
+            let error = MassStorageMediaError::from_usb(&error);
+            lock(&self.media_auto).last_error = Some(error);
+            self.record_media_hotplug(
+                UsbMediaHotplugKind::ExportStart,
+                None,
+                Some("failed".to_owned()),
+            );
+            return;
+        }
+        let function = self
+            .media_export_function(None)
+            .unwrap_or_else(|_| crate::config::DEFAULT_USB_MASS_STORAGE_INSTANCE.to_owned());
+        let spec = config.spec();
+        match self.build_media_runtime(&spec, &function, spec.reload, None) {
+            Ok(mut runtime) => {
+                runtime.auto_start = true;
+                match self.install_media_runtime(runtime, MediaStartOrigin::AutoStart) {
+                    Ok(_) => {
+                        info!(
+                            function = function.as_str(),
+                            restart_max_attempts = config.restart.max_attempts,
+                            "userspace SCSI media export auto-started (configured, not running)"
+                        );
+                    }
+                    Err(_) => {
+                        let error = UsbError::InvalidConfig(
+                            "a userspace SCSI media export is already configured".to_owned(),
+                        );
+                        self.note_auto_start_failure(&error);
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(
+                    kind = error.kind(),
+                    "userspace SCSI media export auto-start failed; no export was installed"
+                );
+                self.note_auto_start_failure(&error);
+            }
+        }
+    }
+
+    fn note_auto_start_failure(&self, error: &UsbError) {
+        lock(&self.media_auto).last_error = Some(MassStorageMediaError::from_usb(error));
+        self.record_media_hotplug(
+            UsbMediaHotplugKind::ExportStart,
+            None,
+            Some("failed".to_owned()),
+        );
+    }
+
+    /// Apply one bounded restart to a failed export.
+    ///
+    /// Called after a transport failure or an observed FunctionFS unbind. The
+    /// attempt cap and backoff come from the export's
+    /// [`MediaRestartPolicy`]; exhausting the cap leaves the export `failed`
+    /// instead of retrying forever. Counters and the prior typed error stay
+    /// visible, and a writable overlay is committed before it is reloaded.
+    fn restart_media_export(&self, reason: MediaRestartReason) -> MediaRestartOutcome {
+        let mut slot = lock(&self.media);
+        let Some(runtime) = slot.as_mut() else {
+            return MediaRestartOutcome::NotConfigured;
+        };
+        if runtime.state == MassStorageMediaState::Stopped {
+            return MediaRestartOutcome::Stopped;
+        }
+        let policy = runtime.source.restart;
+        let Some(attempt) = runtime.restart.record_failure(&policy) else {
+            runtime.pending_restart = None;
+            runtime.state = MassStorageMediaState::Failed;
+            let error = reason.usb_error();
+            runtime.last_error = Some(MassStorageMediaError::from_usb(&error));
+            let function = Some(runtime.function.clone());
+            drop(slot);
+            self.record_media_hotplug(reason.hotplug_kind(), function, Some("failed".to_owned()));
+            return MediaRestartOutcome::Exhausted {
+                max_attempts: policy.max_attempts,
+            };
+        };
+
+        runtime.pending_restart = Some(attempt.backoff_ms);
+        runtime.state = MassStorageMediaState::Failed;
+        let error = reason.usb_error();
+        runtime.last_error = Some(MassStorageMediaError::from_usb(&error));
+
+        let source = runtime.source.clone();
+        let function = runtime.function.clone();
+        let reload = policy.reload_overlay && source.persist_path.is_some();
+        if reload {
+            if let Err(commit_error) = runtime.runner.device_mut().commit() {
+                runtime.pending_restart = None;
+                runtime.last_error = Some(MassStorageMediaError::from_usb(&commit_error));
+                let function = Some(function);
+                drop(slot);
+                self.record_media_hotplug(
+                    reason.hotplug_kind(),
+                    function,
+                    Some("failed".to_owned()),
+                );
+                return MediaRestartOutcome::Failed {
+                    attempt: attempt.attempt,
+                    message: commit_error.kind().to_owned(),
+                };
+            }
+        }
+
+        let restore = MediaRestore::from_runtime(runtime);
+        let rebuilt = self.build_media_runtime(&source, &function, reload, Some(restore));
+        match rebuilt {
+            Ok(mut runtime) => {
+                runtime.state = MassStorageMediaState::Configured;
+                runtime.pending_restart = None;
+                *slot = Some(runtime);
+                let function = slot.as_ref().map(|runtime| runtime.function.clone());
+                drop(slot);
+                self.record_media_hotplug(
+                    reason.hotplug_kind(),
+                    function,
+                    Some("configured".to_owned()),
+                );
+                MediaRestartOutcome::Restarted {
+                    attempt: attempt.attempt,
+                    backoff_ms: attempt.backoff_ms,
+                }
+            }
+            Err(rebuild_error) => {
+                runtime.state = MassStorageMediaState::Failed;
+                runtime.pending_restart = None;
+                runtime.last_error = Some(MassStorageMediaError::from_usb(&rebuild_error));
+                let function = Some(runtime.function.clone());
+                drop(slot);
+                self.record_media_hotplug(
+                    reason.hotplug_kind(),
+                    function,
+                    Some("failed".to_owned()),
+                );
+                MediaRestartOutcome::Failed {
+                    attempt: attempt.attempt,
+                    message: rebuild_error.kind().to_owned(),
+                }
+            }
+        }
+    }
+
+    /// Stop the export and apply its persistence policy during node shutdown.
+    pub fn shutdown_media_export(&self) -> Result<(), UsbError> {
+        let mut slot = lock(&self.media);
+        let Some(runtime) = slot.as_mut() else {
+            return Ok(());
+        };
+        if runtime.state == MassStorageMediaState::Stopped {
+            return Ok(());
+        }
+        let result = runtime.runner.stop();
+        match &result {
+            Ok(()) => {
+                runtime.state = MassStorageMediaState::Stopped;
+                runtime.last_error = None;
+            }
+            Err(error) => {
+                runtime.state = MassStorageMediaState::Failed;
+                runtime.last_error = Some(MassStorageMediaError::from_usb(error));
+            }
+        }
+        let function = Some(runtime.function.clone());
+        drop(slot);
+        self.record_media_hotplug(
+            UsbMediaHotplugKind::ExportStop,
+            function,
+            Some(if result.is_ok() {
+                "shutdown".to_owned()
+            } else {
+                "failed".to_owned()
+            }),
+        );
+        result
     }
 
     /// Record a media export/attachment transition.
@@ -1856,16 +2473,34 @@ impl UsbControl {
     }
 
     /// Record a gadget bind→unbind transition observed from ConfigFS.
+    ///
+    /// A live export is reloaded within its restart policy because the
+    /// FunctionFS endpoints are gone until the gadget rebinds.
     fn note_gadget_bound(&self, bound: bool) {
-        let mut hotplug = lock(&self.hotplug);
-        let previous = hotplug.last_bound;
-        hotplug.last_bound = Some(bound);
-        if previous == Some(true) && !bound {
-            hotplug.log.record(
-                UsbMediaHotplugKind::Unbind,
-                None,
-                Some("unbound".to_owned()),
-            );
+        let transitioned = {
+            let mut hotplug = lock(&self.hotplug);
+            let previous = hotplug.last_bound;
+            hotplug.last_bound = Some(bound);
+            if previous == Some(true) && !bound {
+                hotplug.log.record(
+                    UsbMediaHotplugKind::Unbind,
+                    None,
+                    Some("unbound".to_owned()),
+                );
+                true
+            } else {
+                false
+            }
+        };
+        if transitioned {
+            let has_export = {
+                let slot = lock(&self.media);
+                slot.as_ref()
+                    .is_some_and(|runtime| runtime.state != MassStorageMediaState::Stopped)
+            };
+            if has_export {
+                let _ = self.restart_media_export(MediaRestartReason::FunctionFsRebind);
+            }
         }
     }
 
@@ -2055,13 +2690,16 @@ impl UsbControl {
             Ok(outcome) => {
                 runtime.state = MassStorageMediaState::Running;
                 runtime.last_error = None;
+                runtime.restart.record_success();
+                runtime.pending_restart = None;
                 Ok(Some(outcome))
             }
             Err(error) => {
                 if error.kind() != "mass-storage-not-attached" {
-                    runtime.state = MassStorageMediaState::Failed;
+                    runtime.note_transport_failure(&error);
+                } else {
+                    runtime.last_error = Some(MassStorageMediaError::from_usb(&error));
                 }
-                runtime.last_error = Some(MassStorageMediaError::from_usb(&error));
                 Err(error)
             }
         }
@@ -3729,176 +4367,22 @@ async fn usb_media_start(
         return media_export_conflict();
     }
 
-    let function = match control.media_export_function(request.function.as_deref()) {
+    let spec = match MediaExportSpec::from_request(&request, MediaRestartPolicy::default()) {
+        Ok(spec) => spec,
+        Err(error) => return error.response(),
+    };
+    let function = match control.media_export_function(spec.function.as_deref()) {
         Ok(function) => function,
         Err(response) => return response,
     };
-
-    let path_text = request.path.trim();
-    if path_text.is_empty() || path_text.contains('\0') {
-        return compat_error_with_remediation(
-            StatusCode::BAD_REQUEST,
-            "usb-invalid-media-path",
-            "media `path` must be a non-empty path without NUL bytes",
-            Some("Pass the absolute path of an existing raw/FAT32/ISO image."),
-        );
-    }
-    let path = Path::new(path_text);
-    if !path.is_absolute() {
-        return compat_error_with_remediation(
-            StatusCode::BAD_REQUEST,
-            "usb-invalid-media-path",
-            "media path must be absolute",
-            Some("Use an absolute path; relative paths are resolved differently by the kernel."),
-        );
-    }
-
-    let format = match request
-        .format
-        .as_deref()
-        .unwrap_or("raw")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "raw" | "nbd" => UsbMediaFormat::Raw,
-        "fat32" | "vfat" => UsbMediaFormat::Fat32,
-        "iso" | "iso9660" => UsbMediaFormat::Iso9660,
-        other => {
-            return compat_error_with_remediation(
-                StatusCode::BAD_REQUEST,
-                "usb-invalid-media-format",
-                format!("unsupported media export format {other:?}"),
-                Some("Use `raw`, `fat32`, or `iso9660`."),
-            );
-        }
-    };
-    let format_is_read_only = matches!(format, UsbMediaFormat::Fat32 | UsbMediaFormat::Iso9660);
-    if format_is_read_only && request.read_only == Some(false) {
-        return compat_error_with_remediation(
-            StatusCode::BAD_REQUEST,
-            "usb-read-only-media",
-            "FAT32 and ISO 9660 media exports are always read-only",
-            Some("Omit read_only or set it to true."),
-        );
-    }
-    let read_only = request.read_only.unwrap_or(true) || format_is_read_only;
-
-    let mut media = match format {
-        UsbMediaFormat::Iso9660 => MassStorageImage::iso(path),
-        UsbMediaFormat::Fat32 => MassStorageImage::fat32(path),
-        _ => MassStorageImage::disk(path),
-    };
-    if format == UsbMediaFormat::Raw {
-        media = match media.with_read_only(read_only) {
-            Ok(media) => media,
-            Err(error) => return usb_error_response(error),
-        };
-    }
-    if let Err(error) = media.validate_for_attach() {
-        return usb_error_response(error);
-    }
-
-    let mut overlay_config = OverlayConfig::default();
-    let mut persistence = None;
-    if !read_only {
-        if let Some(persist_text) = request.persist_path.as_deref() {
-            let persist_text = persist_text.trim();
-            if persist_text.is_empty() || persist_text.contains('\0') {
-                return compat_error_with_remediation(
-                    StatusCode::BAD_REQUEST,
-                    "usb-invalid-overlay-path",
-                    "overlay `persist_path` must be a non-empty path without NUL bytes",
-                    Some("Omit persist_path for an ephemeral overlay, or pass an absolute path."),
-                );
-            }
-            let persist = Path::new(persist_text);
-            if !persist.is_absolute() {
-                return compat_error_with_remediation(
-                    StatusCode::BAD_REQUEST,
-                    "usb-invalid-overlay-path",
-                    "overlay `persist_path` must be absolute",
-                    Some("Use an absolute path outside the base image."),
-                );
-            }
-            if persist == path {
-                return compat_error_with_remediation(
-                    StatusCode::BAD_REQUEST,
-                    "usb-invalid-overlay-path",
-                    "overlay `persist_path` must not be the base image",
-                    Some("Choose a separate file; the base image is never written."),
-                );
-            }
-            persistence = Some(persist.to_path_buf());
-            overlay_config = overlay_config.with_persistence(persist);
-        }
-    }
-    if request.reload && (read_only || persistence.is_none()) {
-        return compat_error_with_remediation(
-            StatusCode::BAD_REQUEST,
-            "usb-invalid-overlay-path",
-            "`reload` requires writable raw media with an explicit persist_path",
-            Some("Set read_only=false and pass persist_path of an existing overlay file."),
-        );
-    }
-
-    let policy = MassStoragePersistPolicy {
-        persist_on_flush: request.persist_on_flush.unwrap_or(true),
-        persist_on_stop: request.persist_on_stop.unwrap_or(true),
-    };
-    let device = if request.reload {
-        let Some(persist) = persistence else {
-            unreachable!("reload was validated to require a persistence path");
-        };
-        MassStorageDevice::load_writable_file(&media.path, overlay_config, policy, persist)
-    } else {
-        MassStorageDevice::from_media(&media, overlay_config, policy)
-    };
-    let device = match device {
-        Ok(device) => device,
+    let runtime = match control.build_media_runtime(&spec, &function, spec.reload, None) {
+        Ok(runtime) => runtime,
         Err(error) => return usb_error_response(error),
     };
-
-    let loop_config = MassStorageLoopConfig {
-        transfer_timeout_ms: request
-            .timeout_ms
-            .unwrap_or(MASS_STORAGE_DEFAULT_TIMEOUT_MS),
-        max_transfer_bytes: request
-            .max_transfer_bytes
-            .unwrap_or(SCSI_MAX_TRANSFER_BYTES),
-        max_commands: None,
-    };
-    let runner = match MassStorageLoop::new(
-        device,
-        Box::new(IdleBulkTransport) as BoxedMassStorageTransport,
-        loop_config,
-    ) {
-        Ok(runner) => runner,
-        Err(error) => return usb_error_response(error),
-    };
-
-    let mut slot = lock(&control.media);
-    if slot
-        .as_ref()
-        .is_some_and(|runtime| runtime.state != MassStorageMediaState::Stopped)
-    {
-        return media_export_conflict();
+    match control.install_media_runtime(runtime, MediaStartOrigin::Route) {
+        Ok(body) => Json(body).into_response(),
+        Err(response) => response,
     }
-    let runtime = MassStorageMediaRuntime {
-        runner,
-        state: MassStorageMediaState::Configured,
-        function: function.clone(),
-        last_error: None,
-    };
-    let body = runtime.status_json();
-    *slot = Some(runtime);
-    drop(slot);
-    control.record_media_hotplug(
-        UsbMediaHotplugKind::ExportStart,
-        Some(function),
-        Some("configured".to_owned()),
-    );
-    Json(body).into_response()
 }
 
 /// `POST /usb/media/stop` — stop the export and apply its persistence policy.
@@ -11397,6 +11881,33 @@ mod tests {
         path
     }
 
+    fn auto_media_config(
+        path: &std::path::Path,
+        restart: MediaRestartPolicy,
+    ) -> UsbMediaAutoStartConfig {
+        auto_media_config_with(path, restart, false, None)
+    }
+
+    fn auto_media_config_with(
+        path: &std::path::Path,
+        restart: MediaRestartPolicy,
+        read_write: bool,
+        persist: Option<&std::path::Path>,
+    ) -> UsbMediaAutoStartConfig {
+        UsbMediaAutoStartConfig {
+            path: path.to_path_buf(),
+            format: UsbMediaFormat::Raw,
+            read_only: !read_write,
+            persist_path: persist.map(std::path::Path::to_path_buf),
+            persist_on_flush: true,
+            persist_on_stop: true,
+            reload: false,
+            timeout_ms: None,
+            max_transfer_bytes: None,
+            restart,
+        }
+    }
+
     fn usb_fake_state() -> (ConnectionState, Arc<FakeUsbGadgetController>) {
         let fake = Arc::new(FakeUsbGadgetController::new());
         let config = UsbGadgetConfig::new("ozma", "dummy_udc.0")
@@ -12296,6 +12807,356 @@ mod tests {
         assert_eq!(last["kind"], "unbind");
         assert_eq!(last["state"], "unbound");
 
+        std::fs::remove_file(image).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_media_auto_start_reports_not_configured_configured_and_no_fake_running() {
+        let (state, _fake) = usb_fake_state();
+        let control = state.usb.as_ref().unwrap().clone();
+        let app = usb_router(state);
+        let image = temp_file("media-auto-start", &vec![0u8; 4096]);
+
+        let (status, body) = get_json(&app, "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media_export"]["state"], "not-configured");
+        assert_eq!(body["media_export"]["auto_start"], false);
+        assert_eq!(body["media_export"]["running"], false);
+
+        control.auto_start_media_export(&auto_media_config(&image, MediaRestartPolicy::default()));
+
+        let (status, body) = get_json(&app, "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media_export"]["state"], "configured");
+        assert_eq!(body["media_export"]["configured"], true);
+        assert_eq!(body["media_export"]["auto_start"], true);
+        assert_eq!(
+            body["media_export"]["running"], false,
+            "auto-start must not claim running without a completed transfer"
+        );
+        assert_eq!(body["media_export"]["stats"]["commands"], 0);
+        assert_eq!(body["media_export"]["restart"]["max_attempts"], 3);
+        assert!(
+            !body.to_string().contains(image.to_string_lossy().as_ref()),
+            "auto-start status must not echo the backing path: {body}"
+        );
+
+        let (status, body) = get_json(&app, "/usb/hotplug").await;
+        assert_eq!(status, StatusCode::OK);
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "export_start");
+        assert_eq!(events[0]["state"], "auto-start");
+
+        control.shutdown_media_export().unwrap();
+        std::fs::remove_file(image).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_media_auto_start_failure_is_typed_and_not_running() {
+        let fake = Arc::new(FakeUsbGadgetController::new());
+        let config = UsbGadgetConfig::new("ozma", "dummy_udc.0")
+            .with_function(UsbFunction::mass_storage("usb0", None));
+        fake.create_gadget(&config).unwrap();
+        fake.bind("ozma", "dummy_udc.0").unwrap();
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_usb(Some(UsbControl::configured(fake, "ozma")));
+        let control = state.usb.as_ref().unwrap().clone();
+        let app = usb_router(state);
+        let missing = temp_path("media-auto-missing");
+
+        control
+            .auto_start_media_export(&auto_media_config(&missing, MediaRestartPolicy::default()));
+
+        let (status, body) = get_json(&app, "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media_export"]["state"], "failed");
+        assert_eq!(body["media_export"]["running"], false);
+        assert_eq!(body["media_export"]["configured"], false);
+        assert_eq!(body["media_export"]["auto_start"], true);
+        assert_eq!(
+            body["media_export"]["last_error"]["kind"],
+            "media-not-found"
+        );
+        assert!(
+            !body
+                .to_string()
+                .contains(missing.to_string_lossy().as_ref()),
+            "auto-start failure must not echo the backing path: {body}"
+        );
+
+        let (status, body) = get_json(&app, "/usb/media").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "failed");
+        assert_eq!(body["running"], false);
+    }
+
+    #[tokio::test]
+    async fn usb_media_transport_error_restarts_with_backoff_and_recovers() {
+        let (state, _fake) = usb_fake_state();
+        let control = state.usb.as_ref().unwrap().clone();
+        let app = usb_router(state);
+        let image = temp_file("media-restart-recover", &vec![0u8; 4096]);
+
+        control.auto_start_media_export(&auto_media_config(
+            &image,
+            MediaRestartPolicy::new(2, 25, 100),
+        ));
+
+        let mut fault = MemoryBulkTransport::new();
+        fault.set_read_fault(Some(BulkTransportFault::Timeout));
+        control.media_attach_test_transport(fault).unwrap();
+        assert!(control.media_step_test().is_err());
+
+        let (status, body) = get_json(&app, "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media_export"]["state"], "failed");
+        assert_eq!(body["media_export"]["running"], false);
+        assert_eq!(body["media_export"]["restart"]["attempts"], 0);
+        assert_eq!(
+            body["media_export"]["last_error"]["kind"],
+            "mass-storage-endpoint-timeout"
+        );
+        let transport_errors = body["media_export"]["stats"]["timeout_errors"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(transport_errors, 1);
+
+        assert_eq!(
+            control.restart_media_export(MediaRestartReason::TransportError),
+            MediaRestartOutcome::Restarted {
+                attempt: 1,
+                backoff_ms: 25
+            }
+        );
+
+        let (status, body) = get_json(&app, "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media_export"]["state"], "configured");
+        assert_eq!(body["media_export"]["running"], false);
+        assert_eq!(body["media_export"]["restart"]["attempts"], 1);
+        assert!(body["media_export"]["restart"]["pending_backoff_ms"].is_null());
+        assert_eq!(
+            body["media_export"]["stats"]["timeout_errors"], transport_errors,
+            "counters must survive the supervised restart"
+        );
+
+        let mut healthy = MemoryBulkTransport::new();
+        healthy.push_host_data(&media_test_unit_ready()).unwrap();
+        control.media_attach_test_transport(healthy).unwrap();
+        let outcome = control.media_step_test().unwrap().unwrap();
+        assert_eq!(outcome.status, ScsiStatus::Good);
+
+        let (status, body) = get_json(&app, "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media_export"]["state"], "running");
+        assert_eq!(body["media_export"]["running"], true);
+        assert_eq!(
+            body["media_export"]["restart"]["attempts"], 0,
+            "a real transfer resets the failure streak"
+        );
+
+        let (status, body) = get_json(&app, "/usb/hotplug").await;
+        assert_eq!(status, StatusCode::OK);
+        let events = body["events"].as_array().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event["kind"] == "restart" && event["state"] == "configured"));
+
+        control.shutdown_media_export().unwrap();
+        std::fs::remove_file(image).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_media_repeated_failures_hit_the_attempt_cap_and_stay_failed() {
+        let (state, _fake) = usb_fake_state();
+        let control = state.usb.as_ref().unwrap().clone();
+        let app = usb_router(state);
+        let image = temp_file("media-restart-cap", &vec![0u8; 4096]);
+        control.auto_start_media_export(&auto_media_config(
+            &image,
+            MediaRestartPolicy::new(2, 5, 20),
+        ));
+
+        for expected in 1..=2 {
+            let mut fault = MemoryBulkTransport::new();
+            fault.set_read_fault(Some(BulkTransportFault::Io));
+            control.media_attach_test_transport(fault).unwrap();
+            assert!(control.media_step_test().is_err());
+            assert_eq!(
+                control.restart_media_export(MediaRestartReason::TransportError),
+                MediaRestartOutcome::Restarted {
+                    attempt: expected,
+                    backoff_ms: 5 * u64::from(expected)
+                }
+            );
+        }
+
+        let mut fault = MemoryBulkTransport::new();
+        fault.set_read_fault(Some(BulkTransportFault::Io));
+        control.media_attach_test_transport(fault).unwrap();
+        assert!(control.media_step_test().is_err());
+        assert_eq!(
+            control.restart_media_export(MediaRestartReason::TransportError),
+            MediaRestartOutcome::Exhausted { max_attempts: 2 }
+        );
+
+        // A repeated request cannot exceed the cap or start a new crash loop.
+        assert_eq!(
+            control.restart_media_export(MediaRestartReason::TransportError),
+            MediaRestartOutcome::Exhausted { max_attempts: 2 }
+        );
+
+        let (status, body) = get_json(&app, "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media_export"]["state"], "failed");
+        assert_eq!(body["media_export"]["running"], false);
+        assert_eq!(body["media_export"]["restart"]["attempts"], 2);
+        assert_eq!(body["media_export"]["restart"]["exhausted"], true);
+        assert!(body["media_export"]["last_error"]["kind"]
+            .as_str()
+            .unwrap()
+            .starts_with("mass-storage"));
+
+        control.shutdown_media_export().unwrap();
+        std::fs::remove_file(image).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_media_overlay_survives_restart_and_shutdown_flush() {
+        let (state, _fake) = usb_fake_state();
+        let control = state.usb.as_ref().unwrap().clone();
+        let app = usb_router(state);
+        let base = temp_file("media-restart-overlay", &vec![0u8; 4096]);
+        let persistence = temp_path("media-restart-overlay-persist");
+        control.auto_start_media_export(&auto_media_config_with(
+            &base,
+            MediaRestartPolicy::default(),
+            true,
+            Some(&persistence),
+        ));
+
+        let mut payload = vec![0x5au8; SCSI_SECTOR_BYTES];
+        payload[3] = 0x42;
+        let mut transport = MemoryBulkTransport::new();
+        transport
+            .push_host_data(&media_write10(0, 1, &payload))
+            .unwrap();
+        transport.push_host_data(&payload).unwrap();
+        control.media_attach_test_transport(transport).unwrap();
+        assert_eq!(
+            control.media_step_test().unwrap().unwrap().status,
+            ScsiStatus::Good
+        );
+
+        let mut fault = MemoryBulkTransport::new();
+        fault.set_read_fault(Some(BulkTransportFault::Io));
+        control.media_attach_test_transport(fault).unwrap();
+        assert!(control.media_step_test().is_err());
+        assert!(matches!(
+            control.restart_media_export(MediaRestartReason::TransportError),
+            MediaRestartOutcome::Restarted { attempt: 1, .. }
+        ));
+
+        // The restart committed and reloaded the overlay, so the bytes survive.
+        let (status, body) = get_json(&app, "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media_export"]["state"], "configured");
+        assert_eq!(body["media_export"]["overlay"]["allocated_blocks"], 1);
+        assert_eq!(body["media_export"]["overlay"]["dirty"], false);
+
+        let mut reader = MemoryBulkTransport::new();
+        reader.push_host_data(&media_read10(0, 1)).unwrap();
+        control.media_attach_test_transport(reader).unwrap();
+        let read = control.media_step_test().unwrap().unwrap();
+        assert_eq!(read.status, ScsiStatus::Good);
+        assert_eq!(read.data_in_bytes, SCSI_SECTOR_BYTES);
+        let mut slot = lock(&control.media);
+        let runtime = slot.as_mut().unwrap();
+        let mut sector = vec![0u8; SCSI_SECTOR_BYTES];
+        runtime.runner.device_mut().read_at(0, &mut sector).unwrap();
+        assert_eq!(sector, payload);
+        drop(slot);
+
+        // A second unflushed write must be committed by shutdown.
+        let mut payload2 = vec![0xa5u8; SCSI_SECTOR_BYTES];
+        payload2[9] = 0x17;
+        let mut writer = MemoryBulkTransport::new();
+        writer
+            .push_host_data(&media_write10(0, 1, &payload2))
+            .unwrap();
+        writer.push_host_data(&payload2).unwrap();
+        control.media_attach_test_transport(writer).unwrap();
+        assert_eq!(
+            control.media_step_test().unwrap().unwrap().status,
+            ScsiStatus::Good
+        );
+
+        control.shutdown_media_export().unwrap();
+        assert!(persistence.is_file(), "shutdown must flush per policy");
+        assert_eq!(std::fs::read(&base).unwrap(), vec![0u8; 4096]);
+
+        let mut reloaded = MassStorageDevice::load_writable_file(
+            &base,
+            OverlayConfig::default().with_persistence(&persistence),
+            ozma_usb::MassStoragePersistPolicy::manual(),
+            &persistence,
+        )
+        .unwrap();
+        let mut sector = vec![0u8; SCSI_SECTOR_BYTES];
+        reloaded.read_at(0, &mut sector).unwrap();
+        assert_eq!(sector, payload2);
+
+        let (status, body) = get_json(&app, "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media_export"]["state"], "stopped");
+        assert_eq!(body["media_export"]["running"], false);
+
+        std::fs::remove_file(base).unwrap();
+        std::fs::remove_file(persistence).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_media_functionfs_unbind_reloads_and_is_logged() {
+        let (state, fake) = usb_fake_state();
+        let control = state.usb.as_ref().unwrap().clone();
+        let app = usb_router(state);
+        let image = temp_file("media-rebind", &vec![0u8; 4096]);
+        control.auto_start_media_export(&auto_media_config(&image, MediaRestartPolicy::default()));
+
+        fake.unbind("ozma").unwrap();
+        let (status, body) = get_json(&app, "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media_export"]["state"], "configured");
+        assert_eq!(body["media_export"]["running"], false);
+        assert_eq!(body["media_export"]["restart"]["attempts"], 1);
+
+        let (status, body) = get_json(&app, "/usb/hotplug").await;
+        assert_eq!(status, StatusCode::OK);
+        let events = body["events"].as_array().unwrap();
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"unbind"));
+        assert!(kinds.contains(&"rebind"));
+        let rebind = events
+            .iter()
+            .find(|event| event["kind"] == "rebind")
+            .unwrap();
+        assert_eq!(rebind["state"], "configured");
+
+        control.shutdown_media_export().unwrap();
         std::fs::remove_file(image).unwrap();
     }
 

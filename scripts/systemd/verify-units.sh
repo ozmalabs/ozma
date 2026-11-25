@@ -42,7 +42,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 # stand-ins so syntax verification needs neither an installed binary nor the
 # ozma-node service user.
 mkdir -p "$TMPDIR/bin"
-for exe in ozma-node ozma-virtual-node; do
+for exe in ozma-node ozma-virtual-node ozma-multiseat ozma-meeting-detect; do
     printf '#!/bin/sh\nexit 0\n' >"$TMPDIR/bin/$exe"
     chmod +x "$TMPDIR/bin/$exe"
 done
@@ -74,7 +74,7 @@ render_user() {
 }
 
 failed=0
-units="ozma-node@.service ozma-node-vm@.service ozma-virtual-node.service"
+units="ozma-node@.service ozma-node-vm@.service ozma-virtual-node.service ozma-multiseat.service"
 
 verify_one() {
     local label=$1 unit=$2 file=$3

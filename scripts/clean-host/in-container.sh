@@ -65,17 +65,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-run_step "cargo build -p ozma-node -p ozma-softnode --bins" \
-    cargo build --bins -p ozma-node -p ozma-softnode
+run_step "cargo build -p ozma-node -p ozma-softnode -p ozma-multiseat --bins" \
+    cargo build --bins -p ozma-node -p ozma-softnode -p ozma-multiseat
 
 NODE_BIN="$TARGET_DIR/debug/ozma-node"
 VNM_BIN="$TARGET_DIR/debug/ozma-virtual-node"
+MULTISEAT_BIN="$TARGET_DIR/debug/ozma-multiseat"
+MEETING_BIN="$TARGET_DIR/debug/ozma-meeting-detect"
 
 if [ ! -x "$NODE_BIN" ]; then
     fail "expected binary $NODE_BIN"
 fi
 if [ ! -x "$VNM_BIN" ]; then
     fail "expected binary $VNM_BIN"
+fi
+if [ ! -x "$MULTISEAT_BIN" ]; then
+    fail "expected binary $MULTISEAT_BIN"
+fi
+if [ ! -x "$MEETING_BIN" ]; then
+    fail "expected binary $MEETING_BIN"
 fi
 
 if [ "$FAILURES" -ne 0 ]; then
@@ -86,7 +94,7 @@ fi
 
 # ---------------------------------------------------------------------------
 section "Binary --help smoke"
-for pair in "$NODE_BIN:--profile" "$VNM_BIN:--node-bin"; do
+for pair in "$NODE_BIN:--profile" "$VNM_BIN:--node-bin" "$MULTISEAT_BIN:--seats-file"; do
     bin="${pair%%:*}"
     expected="${pair#*:}"
     if ! output=$("$bin" --help 2>&1); then
@@ -142,14 +150,33 @@ else
     skip "systemd-analyze is not installed in the test image"
 fi
 
-if scripts/install-rust.sh --dry-run --from-target "$TARGET_DIR/debug" --prefix "$TARGET_DIR/install-dry-run" >/dev/null 2>&1; then
+if scripts/install-rust.sh --dry-run --from-target "$TARGET_DIR/debug" --prefix "$TARGET_DIR/install-dry-run" >"$TARGET_DIR/install-dry-run.log" 2>&1; then
     if [ -e "$TARGET_DIR/install-dry-run" ]; then
         fail "install-rust.sh --dry-run wrote files"
+    elif ! grep -q 'DRY   write .*ozma-multiseat\.service' "$TARGET_DIR/install-dry-run.log" ||
+         ! grep -q 'DRY   install .*ozma-meeting-detect' "$TARGET_DIR/install-dry-run.log" ||
+         ! grep -q 'ozma-multiseat\.env\.example' "$TARGET_DIR/install-dry-run.log"; then
+        fail "install-rust.sh --dry-run omitted the multiseat or meeting-detect assets"
     else
-        pass "install-rust.sh --dry-run wrote nothing"
+        pass "install-rust.sh --dry-run wrote nothing and covered multiseat + meeting-detect"
     fi
 else
     fail "install-rust.sh --dry-run"
+fi
+
+if scripts/install-rust.sh --dry-run --no-multiseat --no-meeting-detect \
+        --from-target "$TARGET_DIR/debug" --prefix "$TARGET_DIR/install-dry-run-optout" \
+        >"$TARGET_DIR/install-dry-run-optout.log" 2>&1; then
+    if [ -e "$TARGET_DIR/install-dry-run-optout" ]; then
+        fail "install-rust.sh --dry-run opt-out wrote files"
+    elif grep -q 'DRY   write .*ozma-multiseat\.service' "$TARGET_DIR/install-dry-run-optout.log" ||
+         grep -q 'DRY   install .*ozma-meeting-detect' "$TARGET_DIR/install-dry-run-optout.log"; then
+        fail "install-rust.sh opt-out still planned the new assets"
+    else
+        pass "install-rust.sh --dry-run --no-multiseat --no-meeting-detect wrote nothing and skipped them"
+    fi
+else
+    fail "install-rust.sh --dry-run opt-out"
 fi
 
 # Rootless temp-prefix check for the system user/udev/AppArmor/libvirt surface.

@@ -9,7 +9,13 @@ one-release overlap.
 | `ozma-node@.service` | System template; `%i` is `hardware`, `vm`, or `desktop`. |
 | `ozma-node-vm@.service` | Per-VM template; `%i` is the VM/node name (`--name %i`). |
 | `ozma-virtual-node.service` | Hypervisor supervisor: discovers VMs and spawns one `ozma-node --profile vm` per VM. |
+| `ozma-multiseat.service` | Desktop-seat supervisor: loads the persisted `seats.json` and supervises one `ozma-node --profile desktop` per X output. |
 | `env/*.env.example` | Environment-file examples. Copy, do not edit in place. |
+
+`ozma-meeting-detect` is installed as a binary but has **no unit**. It is a
+per-session, on-demand IPC server (`$XDG_RUNTIME_DIR/ozma-meeting-detect.sock`,
+fallback `/tmp/ozma-meeting-detect.sock`) and is not yet wired to the controller
+report path; start it in the session that owns the calendar data.
 
 `@BIN_DIR@`, `@ENV_DIR@`, `@STATE_DIR@`, `@RUNTIME_DIR@`,
 `@SUPERVISOR_STATE_DIR@`, `@SUPERVISOR_RUNTIME_DIR@`, `@OZMA_USER@`, and
@@ -33,9 +39,12 @@ whitespace, so do not quote individual values. Keep them on one line.
 scripts/install-rust.sh --build --prefix "$HOME/.local"
 ```
 
-This installs `ozma-node`/`ozma-virtual-node` under `~/.local/bin`, lays out
-user units under `~/.local/lib/systemd/user`, and writes env examples under
-`~/.local/etc/ozma`. It never removes Python and never starts a unit. Then:
+This installs `ozma-node`/`ozma-virtual-node` (and `ozma-multiseat` plus
+`ozma-meeting-detect` when their binaries are built) under `~/.local/bin`, lays
+out user units under `~/.local/lib/systemd/user`, and writes env examples under
+`~/.local/etc/ozma`. Use `--no-multiseat`/`--no-meeting-detect` to skip the
+optional binaries and the multiseat unit. It never removes Python and never
+starts a unit. Then:
 
 ```bash
 systemctl --user daemon-reload
@@ -68,6 +77,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ozma-node@hardware.service
 # or, on a hypervisor:
 sudo systemctl enable --now ozma-virtual-node.service
+# or, for desktop seats (edit /etc/ozma/ozma-multiseat.env first):
+sudo systemctl enable --now ozma-multiseat.service
 ```
 
 The installer itself never uses sudo.
@@ -96,6 +107,14 @@ root, or records them in `/etc/ozma/install-operator-commands.txt` under
   user's PipeWire session. Prefer a user unit (`systemctl --user`) or grant the
   desktop session explicitly. `ProtectHome=yes` is correct for system units and
   should be relaxed only for a user unit that must capture files under `$HOME`.
+- `ozma-multiseat`: runs as the same account as the node units and spawns the
+  seat children, so it needs the same device/group access. It keeps
+  `PrivateTmp=no` because X11 sockets live in `/tmp/.X11-unix`. A system unit
+  cannot read a user's `~/.Xauthority` under `ProtectHome=yes`; either use a
+  user unit or point `XAUTHORITY` at a readable host path. Leave
+  `--print-plan`/`--dry-run` out of the unit (they print and exit). Seat
+  ownership/routing/audio/private-display/input-isolation modes stay opt-in
+  through `OZMA_MULTISEAT_ARGS`.
 - Keep `ProtectSystem=strict`, `NoNewPrivileges=yes`, and the restricted address
   families. Add only the `DeviceAllow=` entries the selected profile needs.
 - Put `OZMA_API_TOKEN`/`OZMA_NODE_API_TOKEN` in the env file with mode `0600`;
@@ -106,8 +125,13 @@ root, or records them in `/etc/ozma/install-operator-commands.txt` under
 ```bash
 systemd-analyze verify scripts/systemd/ozma-node@.service \
     scripts/systemd/ozma-node-vm@.service \
-    scripts/systemd/ozma-virtual-node.service
+    scripts/systemd/ozma-virtual-node.service \
+    scripts/systemd/ozma-multiseat.service
 ```
+
+`scripts/systemd/verify-units.sh` renders every unit (system and least-privilege
+user) to a temp directory first, so it needs neither installed binaries nor the
+service account.
 
 `systemd-analyze` is not required on the build host; absence is reported as a
 SKIP by `scripts/clean-host/check-deps.sh`.

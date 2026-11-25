@@ -3,7 +3,7 @@
 Status: **library + real subprocess supervisor + CLI + controller read-only
 grouping + persisted seats/hotplug reconciliation + opt-in
 input-routing/display-ownership/audio execution + opt-in privileged input
-isolation + opt-in per-seat X servers (2026-11-25).**
+isolation + opt-in per-seat X servers + packaged systemd unit (2026-11-25).**
 The crate enumerates display/input topology, plans one desktop seat per output,
 can spawn, health-check, restart, stop, and report one `ozma-node --profile
 desktop` child per seat, and models the opt-in resource layers: `xinput
@@ -952,6 +952,80 @@ The optional status listener is bound to `127.0.0.1` and exposes only
 `/health`, `/status`, `/metrics`, and `/api/v1/connection`. It carries no
 bearer tokens, node argv, environment, or operator secret.
 
+## Packaging and systemd
+
+`scripts/install-rust.sh` installs `ozma-multiseat` with the node binaries:
+
+```bash
+scripts/install-rust.sh --build --prefix "$HOME/.local"        # user layout
+scripts/install-rust.sh --from-target target/release --prefix /tmp/ozma-review
+scripts/install-rust.sh --dry-run --build                      # prints, writes nothing
+scripts/install-rust.sh --build --no-multiseat                 # skip the binary/unit/env
+```
+
+The bin name is read from `ozma-multiseat/Cargo.toml` (no `[[bin]]` there, so it
+resolves to the package name). When the binary is present in the target
+directory (or built), the same run also installs:
+
+```text
+<bin-dir>/ozma-multiseat
+<units-dir>/ozma-multiseat.service
+<env-dir>/ozma-multiseat.env.example
+```
+
+`<bin-dir>` is `~/.local/bin` or `/usr/local/bin`, `<units-dir>` is
+`~/.local/lib/systemd/user` or `/usr/local/lib/systemd/system`, and `<env-dir>`
+is `~/.local/etc/ozma` or `/etc/ozma`. `--no-multiseat` skips all three; a
+missing binary skips them with a note rather than failing the node install.
+`scripts/install-system.sh` renders the same unit and env example (it never
+installs binaries), including the operator enable/rollback commands under the
+`desktop` profile.
+
+The unit is a single-instance supervisor, not a template:
+
+- `ExecStart=<bin>/ozma-multiseat --node-bin <bin>/ozma-node --seats-file
+  @STATE_DIR@/seats.json --hotplug $OZMA_MULTISEAT_ARGS`. The persisted store is
+  the same `seats.json` a seat node can read with `--multiseat --seats-file`.
+- `--print-plan` and `--dry-run` are deliberately **not** used: both print and
+  exit, which would make systemd restart-loop the unit.
+- `Restart=on-failure`, `RestartSec=5s`, `StartLimitIntervalSec=300`,
+  `StartLimitBurst=5`, `TimeoutStopSec=30s`, and `KillMode=mixed`: the
+  supervisor gets SIGTERM and stops/reaps every seat child; leftover processes
+  are killed after the timeout. Per-child restarts keep the CLI's own bounded
+  backoff.
+- `User=@OZMA_USER@`, `Group=@OZMA_GROUP@`,
+  `SupplementaryGroups=video input render` match the node units. The user-unit
+  rendering strips those system-only directives and retargets
+  `WantedBy=default.target`.
+- `PrivateTmp=no` because X11 sockets live in `/tmp/.X11-unix`;
+  `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, and the
+  device allow-list mirror the desktop node.
+- `DISPLAY` (and, for a system unit, `XAUTHORITY`) comes from
+  `ozma-multiseat.env`. A system unit cannot read a user's `~/.Xauthority` under
+  `ProtectHome=yes`; prefer `systemctl --user` for a live session or provide a
+  readable host cookie path. Ownership/routing/audio/private-display/input
+  isolation stay opt-in through `OZMA_MULTISEAT_ARGS`.
+
+## Meeting detection packaging
+
+`ozma-meeting-detect` (the `[[bin]]` selected from `ozma-softnode/Cargo.toml` by
+its `meeting` name/path) is installed by `install-rust.sh` when built and can be
+skipped with `--no-meeting-detect`. It has **no unit**: its only mode is a
+foreground IPC server bound to `$XDG_RUNTIME_DIR/ozma-meeting-detect.sock`
+(fallback `/tmp/ozma-meeting-detect.sock`), with no socket-path flag, no
+system-service mode, and no controller report wiring yet. Run it on demand in the
+session that owns the calendar data:
+
+```bash
+ozma-meeting-detect --interval 5 --ics-path ~/calendar.ics
+```
+
+`scripts/systemd/verify-units.sh` covers `ozma-multiseat.service` in both the
+system and user renderings; `scripts/verify-system-install.sh` checks the
+persisted-store command, the absence of `--print-plan`/`--dry-run` in
+`ExecStart`, the account/restart settings, the env example, file modes, and the
+operator enable/rollback lines.
+
 ## Tests
 
 ```bash
@@ -1194,9 +1268,11 @@ local status surface. Still required for parity:
    `sandboxie`, namespaces, cgroups).
 8. **Per-seat streaming.** HLS/WebRTC endpoints, per-seat monitoring, and the
    controller seeing N independent registrations.
-9. **Supervisor hardening.** Process-group/subreaper teardown, log
-   capture/rotation, restart-count limits, readiness for non-HTTP nodes, child
-   resource limits, and integration with systemd/process supervision.
+9. **Supervisor hardening.** A packaged `ozma-multiseat.service` (restart limit,
+   mixed kill mode, least-privilege sandbox) now exists, but process-group/
+   subreaper teardown, log capture/rotation, restart-count limits beyond
+   systemd's, readiness for non-HTTP nodes, and child resource limits are still
+   missing.
 10. **Windows.** DXGI/SetupAPI display enumeration, IddCx virtual displays, DXGI
     Desktop Duplication per output, Raw Input routing, WASAPI endpoints, and
     XInput gamepad mapping are **not implemented or claimed**.

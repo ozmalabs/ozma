@@ -27,6 +27,10 @@ pub enum UsbMediaHotplugKind {
     Detach,
     /// The gadget was observed transitioning from bound to unbound.
     Unbind,
+    /// A failed media transport was rebuilt within the restart policy.
+    Restart,
+    /// A FunctionFS rebind was observed and the export was reloaded.
+    Rebind,
 }
 
 impl UsbMediaHotplugKind {
@@ -38,6 +42,8 @@ impl UsbMediaHotplugKind {
             Self::Attach => "attach",
             Self::Detach => "detach",
             Self::Unbind => "unbind",
+            Self::Restart => "restart",
+            Self::Rebind => "rebind",
         }
     }
 }

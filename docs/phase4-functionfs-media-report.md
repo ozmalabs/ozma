@@ -17,9 +17,17 @@ bounded command loop, then exposes it through node routes:
 - `GET/POST /usb/media`, `POST /usb/media/stop`, and `GET /usb/hotplug`
   start/stop a userspace export and report state, capacity, overlay status,
   counters, and bounded transitions.
+- `--usb-media-export` auto-starts the same export at node startup from the
+  `--usb-media-export*`/`--usb-media-restart*` options. The startup state is
+  typed `not-configured`/`configured`/`running`/`failed`; a failure never
+  crashes the node.
+- `MediaRestartPolicy` bounds recovery after a bulk-transport error or an
+  observed FunctionFS unbind, with capped attempts/backoff and typed last error.
+  Counters stay visible across a rebuild and the persisted overlay is reloaded
+  according to policy.
 - `running` is only reported after a real command cycle completed over an
-  attached transport. A configured export is `configured`; an unattached
-  export uses `IdleBulkTransport` and cannot claim a transfer.
+  attached transport. A configured or auto-started export is `configured`; an
+  unattached export uses `IdleBulkTransport` and cannot claim a transfer.
 
 ## 1. Bulk transport and event loop
 
@@ -103,6 +111,21 @@ Start request fields: `path`, optional `function`, `format`
 (`raw`/`fat32`/`iso9660`), `read_only`, `persist_path`, `persist_on_flush`,
 `persist_on_stop`, `reload`, `max_transfer_bytes`, `timeout_ms`.
 
+Node startup options mirror those fields:
+
+| Option | Purpose |
+|---|---|
+| `--usb-media-export PATH` | Opt in to the userspace SCSI export at startup (distinct from the ConfigFS `--usb-media` LUN). |
+| `--usb-media-export-format FORMAT` | `raw` (default), `fat32`, or `iso9660`. |
+| `--usb-media-export-read-write` | Use the bounded copy-on-write overlay for raw media. |
+| `--usb-media-export-persist PATH` | Absolute overlay persistence file. |
+| `--usb-media-export-no-persist-on-flush` / `-no-persist-on-stop` | Opt out of the default flush/stop commits. |
+| `--usb-media-export-reload` | Load the existing overlay before serving. |
+| `--usb-media-export-timeout-ms`, `--usb-media-export-max-transfer-bytes` | Endpoint/data-phase bounds. |
+| `--usb-media-restart-max-attempts` (default 3) | Bounded restart cap; `0` disables restart. |
+| `--usb-media-restart-backoff-ms` / `--usb-media-restart-max-backoff-ms` (250/4000) | Capped exponential backoff. |
+| `--usb-media-restart-no-overlay-reload` | Rebuild from the base image instead of the persisted overlay. |
+
 Semantics:
 
 - Raw media defaults to read-only. `read_only: false` opts into the bounded
@@ -111,19 +134,47 @@ Semantics:
   They are probed with `MassStorageImage::validate_for_attach` before serving.
 - `persist_path` must be absolute and distinct from the base. `reload: true`
   loads an existing checksummed overlay with `MassStorageDevice::load_writable_file`.
-- Media state is `configured` immediately after start. It becomes `running`
-  only after `MassStorageLoop::step()` writes a CSW. A transport failure marks
-  it `failed` with a path-free typed `last_error`; stop marks it `stopped`.
+- Media state is `configured` immediately after start or auto-start. It becomes
+  `running` only after `MassStorageLoop::step()` writes a CSW. A transport
+  failure marks it `failed` with a path-free typed `last_error`; stop marks it
+  `stopped`.
 - Overlay status is path-free: geometry, allocation, dirty flag, whether a
   persistence file exists, its size, and the flush/stop policy.
 - `GET /usb/hotplug?since=<sequence>&limit=<n>` is capped at 64 retained
   events and never synthesises kernel events. Attach/detach/export events are
-  recorded only after the corresponding operation succeeds. `unbind` is
-  recorded only when a live gadget snapshot transitions from bound to unbound.
-- No route auto-starts an export. The default node path never opens a UDC
-  endpoint or claims a live host transfer.
+  recorded only after the corresponding operation succeeds. Auto-start is
+  `export_start` state `auto-start`; restart/rebind attempts are `restart` or
+  `rebind` with `configured`/`failed`. `unbind` is recorded only when a live
+  gadget snapshot transitions from bound to unbound.
+- Auto-start is opt-in. Without `--usb-media-export`, `/usb` reports
+  `media_export.state: "not-configured"` and no userspace export is created.
+  A failed auto-start records the typed reason and leaves `running: false`.
+- On SIGINT/SIGTERM the export is stopped and its overlay is flushed according
+  to `persist_on_stop`.
 
-## 3. Tests
+## 3. Restart supervision
+
+`ozma-usb/src/media_restart.rs` defines the policy/tracker and
+`ozma-node/src/controller_compat.rs` applies it:
+
+- `MediaRestartPolicy` caps attempts at `0..=16` (default 3), computes capped
+  exponential backoff (default 250 ms → 4 s), and optionally reloads the
+  persisted overlay.
+- `MediaRestartTracker::record_failure` returns the next attempt/backoff or
+  `None` once the cap is exhausted; `record_success` resets the streak after a
+  real CSW. An exhausted export stays `failed`, so there is no infinite crash
+  loop.
+- A supervised rebuild preserves `MassStorageLoopStats` and the typed last
+  error. If `reload_overlay` is set and a persistence path exists, the device
+  commits the overlay before rebuilding and loads it afterwards; otherwise it
+  restarts from the base image.
+- The same path runs when `/usb` observes a gadget `bound → unbound`
+  transition, recording `unbind` then `rebind` before marking the export
+  `configured` (never `running`).
+- Shutdown calls `MassStorageLoop::stop`, which commits the overlay when
+  `persist_on_stop` is set, then records `export_stop` state `shutdown`.
+
+## 4. Tests
 
 New library suite: `ozma-usb/tests/mass_storage_loop.rs` (10 tests):
 
@@ -140,29 +191,43 @@ New library suite: `ozma-usb/tests/mass_storage_loop.rs` (10 tests):
 - `FunctionFsBulkTransport` drives the SCSI loop through enabled FunctionFS
   loopback endpoints and observes daemon bytes read/written.
 
-New node tests in `controller_compat::tests` (6 tests):
+New `ozma-usb` restart-policy tests in `media_restart::tests` (5 tests):
 
-- Not-configured, configured, running-after-transfer, and stopped states.
-- Writable overlay persistence and reload through the routes.
-- Bad path/format/read-only requests, duplicate start, and a typed endpoint
-  timeout surfaced as `failed` + `last_error`.
-- Bounded hotplug log with attach/detach/export events, `since`/`limit`, and an
-  observed unbind; no events are fabricated before an action.
-- Configured-but-failed gadget returns typed 503s for media and hotplug routes.
-- A userspace export starts on a gadget with no `mass_storage.*` kernel LUN; the
-  route falls back to the `usb0` instance label instead of requiring ConfigFS
-  mass storage.
+- Default policy validates and keeps overlay reload enabled.
+- Backoff doubles and clamps at the ceiling.
+- Attempts stop exactly at the cap and report exhaustion.
+- A zero cap never restarts; a successful transfer resets the streak.
+- Invalid attempt/backoff bounds return a typed error.
+
+New node tests in `controller_compat::tests` (11 media tests total; 5 added):
+
+- Auto-start not configured (`not-configured`) and configured (`configured`,
+  `auto_start: true`) with `running: false`, zero commands, and an
+  `export_start` hotplug event state `auto-start`.
+- Auto-start failure on a missing image is a typed `failed` state with
+  `media-not-found`, no path echoed, and `running: false`.
+- Transport timeout → `failed`, bounded restart attempt 1 with 25 ms backoff,
+  counters preserved, then a healthy transfer returns to `running` and clears
+  the failure streak.
+- Repeated failures hit the attempt cap, stay `failed`/`exhausted`, and a
+  further restart request does not start a new loop.
+- Writing through the overlay, restarting with reload, verifying the persisted
+  sector, then a second unflushed write is committed by shutdown; the base image
+  remains untouched.
+- FunctionFS unbind observed from `/usb` records `unbind`/`rebind`, reloads the
+  export, and leaves it `configured`, not `running`.
+- Existing configured/running/stopped, overlay persistence/reload, bad request,
+  duplicate start, hotplug bounds, type-503, and no-kernel-LUN tests still pass.
 
 Verification run:
 
 ```text
-cargo test -p ozma-usb -p ozma-node --lib          # 451 passed, 3 ignored
-cargo test -p ozma-usb --test mass_storage_loop   # 10 passed
+cargo test -p ozma-usb -p ozma-node --lib          # 504 passed, 3 ignored
 cargo check -p ozma-usb -p ozma-node --all-targets
 rustfmt --edition 2021 --check <touched rust files>
 ```
 
-## 4. Remaining real-UDC/kernel gaps
+## 5. Remaining real-UDC/kernel gaps
 
 - No default or CI test mounts FunctionFS, opens a real UDC, or transfers on a
   hardware endpoint. `FunctionFsBulkTransport` is proven only with loopback
@@ -171,13 +236,17 @@ rustfmt --edition 2021 --check <touched rust files>
   The typed timeout contract is implemented and tested with fakes; a live
   endpoint adapter needs a nonblocking/poll-based deadline (or a host/UDC
   timeout) before hardware timeouts are guaranteed.
-- There is no persistent daemon process, restart supervision, or automatic
-  transport attach after a FunctionFS `ENABLE` event. The node route configures
-  an export and leaves attachment to explicit code.
-- The node media route does not auto-start from `--usb-media`; the ConfigFS
-  kernel LUN path and the userspace SCSI path remain separate.
+- There is no persistent daemon process or live endpoint driver. Restart
+  supervision is bounded and tested through injected fake transports, but a
+  production transport error/rebind is only retried when the node observes it
+  (`/usb` snapshot, route call, or shutdown); automatic transport attach after a
+  FunctionFS `ENABLE` event remains explicit code.
+- `--usb-media-export` auto-starts the userspace SCSI export, but it is separate
+  from the `--usb-media` ConfigFS kernel LUN; the node does not reconcile or
+  switch between the two paths.
 - Hotplug is a bounded poll view, not SSE and not a kernel hotplug monitor. It
-  records only route-caused or observed transitions.
+  records only route-caused, auto-start, restart/rebind, shutdown, or observed
+  transitions.
 - Malformed CBWs are typed failures without a CSW; one LUN (LUN 0) and the
   existing SCSI command subset are supported. There is no multi-LUN, class
   control request handling, or `Bulk-Only Mass Storage Reset` route.

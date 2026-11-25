@@ -377,7 +377,8 @@ if [ "$DO_UNITS" -eq 1 ]; then
     say ""
     say "Installing systemd units"
     install_dir "$UNIT_DIR" 0755 root root
-    for unit in ozma-node@.service ozma-node-vm@.service ozma-virtual-node.service; do
+    for unit in ozma-node@.service ozma-node-vm@.service ozma-virtual-node.service \
+                ozma-multiseat.service; do
         install_rendered "$SCRIPT_DIR/systemd/$unit" "$UNIT_DIR/$unit" 0644 root root
         say "  $UNIT_DIR/$unit"
     done
@@ -554,14 +555,16 @@ if [ "$DRY_RUN" -eq 0 ]; then
         if want_profile desktop; then
             echo "# Desktop: prefer a systemd --user unit (see docs/clean-host.md)."
             echo "systemctl enable --now ozma-node@desktop.service    # only with explicit session access"
+            echo "systemctl enable --now ozma-multiseat.service       # one node per X output, after editing its env"
         fi
         echo ""
         echo "# Rollback:"
         for unit in ozma-node@hardware.service ozma-node@vm.service ozma-node@desktop.service \
-                    ozma-virtual-node.service 'ozma-node-vm@<vm-name>.service'; do
+                    ozma-virtual-node.service 'ozma-node-vm@<vm-name>.service' \
+                    ozma-multiseat.service; do
             echo "systemctl disable --now $unit    # if enabled"
         done
-        echo "rm -f $UNIT_DIR/ozma-node@.service $UNIT_DIR/ozma-node-vm@.service $UNIT_DIR/ozma-virtual-node.service"
+        echo "rm -f $UNIT_DIR/ozma-node@.service $UNIT_DIR/ozma-node-vm@.service $UNIT_DIR/ozma-virtual-node.service $UNIT_DIR/ozma-multiseat.service"
         echo "rm -rf $UNIT_DIR/ozma-node@.service.d"
         echo "rm -f $UDEV_DIR/70-ozma-node-*.rules"
         echo "rm -f $APPARMOR_PARENT/ozma"
@@ -603,6 +606,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
     if want_profile desktop; then
         say "  # Desktop: use a systemd --user unit where possible; a system unit"
         say "  # cannot see the logged-in user's PipeWire session by default."
+        say "  # systemctl enable --now ozma-multiseat.service   # one node per X output"
     fi
     if [ "$USB_GADGET" -eq 1 ]; then
         say "USB gadget is opt-in and needs a mounted ConfigFS root, a UDC, and"

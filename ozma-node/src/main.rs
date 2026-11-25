@@ -22,8 +22,8 @@ use ozma_protocol::NodeId;
 use ozma_qmp::SharedQmpClient;
 use ozma_thermal::ThermalStatus;
 use ozma_usb::{
-    ConfigFsUsbController, FunctionFsConfig, FunctionFsDaemonSpec, MassStorageImage, UsbError,
-    UsbFunction, UsbGadgetConfig, UsbGadgetController,
+    ConfigFsUsbController, FunctionFsConfig, FunctionFsDaemonSpec, MassStorageImage, MediaFormat,
+    MediaRestartPolicy, UsbError, UsbFunction, UsbGadgetConfig, UsbGadgetController,
 };
 use tracing::{error, info, warn};
 
@@ -463,6 +463,103 @@ pub struct Args {
     #[arg(long, env = "OZMA_USB_MEDIA_CDROM")]
     pub usb_media_cdrom: bool,
 
+    /// Auto-start the userspace SCSI export from an existing image.
+    ///
+    /// Separate from `--usb-media`, which creates the ConfigFS kernel LUN.
+    /// Auto-start builds a `configured` export and never claims `running`
+    /// until a real bulk command cycle completes.
+    #[arg(long, env = "OZMA_USB_MEDIA_EXPORT", value_name = "PATH")]
+    pub usb_media_export: Option<std::path::PathBuf>,
+
+    /// Auto-start export format: `raw`, `fat32`, or `iso9660`.
+    #[arg(
+        long = "usb-media-export-format",
+        env = "OZMA_USB_MEDIA_EXPORT_FORMAT",
+        default_value = "raw",
+        value_name = "FORMAT"
+    )]
+    pub usb_media_export_format: String,
+
+    /// Serve the auto-start raw export read-write through the bounded overlay.
+    #[arg(
+        long = "usb-media-export-read-write",
+        env = "OZMA_USB_MEDIA_EXPORT_READ_WRITE"
+    )]
+    pub usb_media_export_read_write: bool,
+
+    /// Absolute overlay persistence file for the auto-start export.
+    #[arg(
+        long = "usb-media-export-persist",
+        env = "OZMA_USB_MEDIA_EXPORT_PERSIST",
+        value_name = "PATH"
+    )]
+    pub usb_media_export_persist: Option<std::path::PathBuf>,
+
+    /// Do not commit the auto-start overlay on SCSI flush.
+    #[arg(
+        long = "usb-media-export-no-persist-on-flush",
+        env = "OZMA_USB_MEDIA_EXPORT_NO_PERSIST_ON_FLUSH"
+    )]
+    pub usb_media_export_no_persist_on_flush: bool,
+
+    /// Do not commit the auto-start overlay on stop/shutdown.
+    #[arg(
+        long = "usb-media-export-no-persist-on-stop",
+        env = "OZMA_USB_MEDIA_EXPORT_NO_PERSIST_ON_STOP"
+    )]
+    pub usb_media_export_no_persist_on_stop: bool,
+
+    /// Load the existing auto-start overlay before serving.
+    #[arg(long = "usb-media-export-reload", env = "OZMA_USB_MEDIA_EXPORT_RELOAD")]
+    pub usb_media_export_reload: bool,
+
+    /// Per-transfer deadline for the auto-start export.
+    #[arg(
+        long = "usb-media-export-timeout-ms",
+        env = "OZMA_USB_MEDIA_EXPORT_TIMEOUT_MS",
+        value_name = "MS"
+    )]
+    pub usb_media_export_timeout_ms: Option<u64>,
+
+    /// Data-phase byte bound for the auto-start export.
+    #[arg(
+        long = "usb-media-export-max-transfer-bytes",
+        env = "OZMA_USB_MEDIA_EXPORT_MAX_TRANSFER_BYTES",
+        value_name = "BYTES"
+    )]
+    pub usb_media_export_max_transfer_bytes: Option<usize>,
+
+    /// Maximum bounded restarts after a media transport/rebind failure.
+    #[arg(
+        long = "usb-media-restart-max-attempts",
+        env = "OZMA_USB_MEDIA_RESTART_MAX_ATTEMPTS",
+        default_value_t = ozma_usb::USB_MEDIA_RESTART_DEFAULT_MAX_ATTEMPTS
+    )]
+    pub usb_media_restart_max_attempts: u32,
+
+    /// First restart delay for a failed media export.
+    #[arg(
+        long = "usb-media-restart-backoff-ms",
+        env = "OZMA_USB_MEDIA_RESTART_BACKOFF_MS",
+        default_value_t = ozma_usb::USB_MEDIA_RESTART_DEFAULT_BACKOFF_MS
+    )]
+    pub usb_media_restart_backoff_ms: u64,
+
+    /// Restart backoff ceiling for a failed media export.
+    #[arg(
+        long = "usb-media-restart-max-backoff-ms",
+        env = "OZMA_USB_MEDIA_RESTART_MAX_BACKOFF_MS",
+        default_value_t = ozma_usb::USB_MEDIA_RESTART_DEFAULT_MAX_BACKOFF_MS
+    )]
+    pub usb_media_restart_max_backoff_ms: u64,
+
+    /// Rebuild from the base image instead of reloading the persisted overlay.
+    #[arg(
+        long = "usb-media-restart-no-overlay-reload",
+        env = "OZMA_USB_MEDIA_RESTART_NO_OVERLAY_RELOAD"
+    )]
+    pub usb_media_restart_no_overlay_reload: bool,
+
     /// Add a UAC2 audio function (descriptors only; no ALSA bridge).
     #[arg(long, env = "OZMA_USB_UAC2")]
     pub usb_uac2: bool,
@@ -807,15 +904,17 @@ pub struct Args {
     pub webrtc_fit_capture: bool,
 
     /// How long the fit probe waits for the capture size to stay unchanged
-    /// before accepting it (milliseconds, clamped to 0-5000; default 1500).
+    /// before accepting it (milliseconds, clamped to 0-5000; default 4000).
     ///
     /// Only used with `--webrtc-fit-capture` when the discovery geometry is
-    /// unknown. The whole probe is still bounded (about 8 s), so a source that
-    /// never settles falls back to its last observed size.
+    /// unknown. The window must outlast a guest's early boot text mode
+    /// (typically ~3 s) or the probe latches it; the whole probe is still
+    /// bounded (about 8 s), so a source that never settles falls back to its
+    /// last observed size.
     #[arg(
         long,
         env = "OZMA_WEBRTC_SETTLE_MS",
-        default_value_t = 1_500,
+        default_value_t = 4_000,
         value_name = "MS"
     )]
     pub webrtc_settle_ms: u64,
@@ -1182,6 +1281,19 @@ async fn run() -> std::process::ExitCode {
         usb_media: args.usb_media.clone(),
         usb_media_ro: args.usb_media_ro,
         usb_media_cdrom: args.usb_media_cdrom,
+        usb_media_export: args.usb_media_export.clone(),
+        usb_media_export_format: args.usb_media_export_format.clone(),
+        usb_media_export_read_write: args.usb_media_export_read_write,
+        usb_media_export_persist: args.usb_media_export_persist.clone(),
+        usb_media_export_persist_on_flush: !args.usb_media_export_no_persist_on_flush,
+        usb_media_export_persist_on_stop: !args.usb_media_export_no_persist_on_stop,
+        usb_media_export_reload: args.usb_media_export_reload,
+        usb_media_export_timeout_ms: args.usb_media_export_timeout_ms,
+        usb_media_export_max_transfer_bytes: args.usb_media_export_max_transfer_bytes,
+        usb_media_restart_max_attempts: args.usb_media_restart_max_attempts,
+        usb_media_restart_backoff_ms: args.usb_media_restart_backoff_ms,
+        usb_media_restart_max_backoff_ms: args.usb_media_restart_max_backoff_ms,
+        usb_media_restart_reload_overlay: !args.usb_media_restart_no_overlay_reload,
         usb_uac2: args.usb_uac2,
         usb_vendor: args.usb_vendor,
         usb_vendor_daemon: args.usb_vendor_daemon.clone(),
@@ -1963,6 +2075,21 @@ async fn run() -> std::process::ExitCode {
     // and /usb answers a typed 503. A node without --usb-gadget keeps the typed
     // 501 surface.
     let mut usb_control = build_usb_control(&config);
+    if let Some(control) = usb_control.as_mut() {
+        if let Some(auto) = usb_media_auto_start_config(&config) {
+            if control.is_available() {
+                control.auto_start_media_export(&auto);
+            } else {
+                warn!(
+                    error = control.error().unwrap_or("USB unavailable"),
+                    "userspace SCSI media auto-start was requested but the gadget is unavailable"
+                );
+            }
+        }
+    }
+    // Keep a cloned handle (shared `Arc`s) so shutdown can stop the media
+    // export and apply its persistence policy after the state is served.
+    let usb_media_shutdown = usb_control.clone();
     let mut uac2_alsa_runtime: Option<usb_uac2::Uac2BridgeRuntime> = None;
     if let Some(control) = usb_control.as_mut() {
         if !control.is_available() {
@@ -2870,6 +2997,18 @@ async fn run() -> std::process::ExitCode {
             warn!("display snapshot broker did not stop within its bound");
         }
     }
+    // Stop the userspace media export last so its overlay is flushed according
+    // to `persist_on_stop`. A failure is logged; shutdown still proceeds.
+    if let Some(control) = usb_media_shutdown.as_ref() {
+        match control.shutdown_media_export() {
+            Ok(()) => info!("userspace SCSI media export stopped; persistence policy applied"),
+            Err(error) => warn!(
+                kind = error.kind(),
+                error = %error,
+                "userspace SCSI media export did not stop cleanly during shutdown"
+            ),
+        }
+    }
 
     // Stop the API/QUIC/HID/heartbeat tasks. `stop_task` aborts after the
     // cooperative window, so a task that never yields cannot hold exit.
@@ -3027,6 +3166,45 @@ fn build_usb_control(config: &NodeConfig) -> Option<controller_compat::UsbContro
             )))
         }
     }
+}
+
+/// Build the opt-in userspace media auto-start configuration.
+///
+/// `None` when `--usb-media-export` was not supplied. This is separate from
+/// the ConfigFS kernel LUN built by [`usb_gadget_config`].
+fn usb_media_auto_start_config(
+    config: &NodeConfig,
+) -> Option<controller_compat::UsbMediaAutoStartConfig> {
+    let path = config.usb_media_export.clone()?;
+    let normalized = config.usb_media_export_format.trim().to_ascii_lowercase();
+    let format = match normalized.as_str() {
+        "fat32" | "vfat" => MediaFormat::Fat32,
+        "iso" | "iso9660" => MediaFormat::Iso9660,
+        _ => MediaFormat::Raw,
+    };
+    let read_only = !config.usb_media_export_read_write
+        || matches!(format, MediaFormat::Fat32 | MediaFormat::Iso9660);
+    Some(controller_compat::UsbMediaAutoStartConfig {
+        path,
+        format,
+        read_only,
+        persist_path: if read_only {
+            None
+        } else {
+            config.usb_media_export_persist.clone()
+        },
+        persist_on_flush: config.usb_media_export_persist_on_flush,
+        persist_on_stop: config.usb_media_export_persist_on_stop,
+        reload: config.usb_media_export_reload,
+        timeout_ms: config.usb_media_export_timeout_ms,
+        max_transfer_bytes: config.usb_media_export_max_transfer_bytes,
+        restart: MediaRestartPolicy {
+            max_attempts: config.usb_media_restart_max_attempts,
+            backoff_ms: config.usb_media_restart_backoff_ms,
+            max_backoff_ms: config.usb_media_restart_max_backoff_ms,
+            reload_overlay: config.usb_media_restart_reload_overlay,
+        },
+    })
 }
 
 /// Build the composite gadget description for `--usb-gadget`.
@@ -3858,6 +4036,13 @@ mod tests {
         assert!(defaults.usb_media.is_none());
         assert!(!defaults.usb_media_ro);
         assert!(!defaults.usb_media_cdrom);
+        assert!(defaults.usb_media_export.is_none());
+        assert_eq!(defaults.usb_media_export_format, "raw");
+        assert!(!defaults.usb_media_export_read_write);
+        assert_eq!(defaults.usb_media_restart_max_attempts, 3);
+        assert_eq!(defaults.usb_media_restart_backoff_ms, 250);
+        assert_eq!(defaults.usb_media_restart_max_backoff_ms, 4_000);
+        assert!(!defaults.usb_media_restart_no_overlay_reload);
         assert!(!defaults.usb_uac2);
         assert!(!defaults.usb_vendor);
         assert!(defaults.usb_vendor_daemon.is_none());

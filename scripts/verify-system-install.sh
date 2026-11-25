@@ -149,6 +149,7 @@ for rel in \
     usr/local/lib/systemd/system/ozma-node@.service \
     usr/local/lib/systemd/system/ozma-node-vm@.service \
     usr/local/lib/systemd/system/ozma-virtual-node.service \
+    usr/local/lib/systemd/system/ozma-multiseat.service \
     usr/local/lib/systemd/system/ozma-node@.service.d/10-usb-gadget.conf \
     etc/ozma/libvirt-qemu-cgroup_device_acl.conf \
     etc/ozma/install-operator-commands.txt \
@@ -165,10 +166,10 @@ for rel in \
 done
 
 env_count=$(find "$R/etc/ozma" -maxdepth 1 -name '*.env.example' -type f 2>/dev/null | wc -l)
-if [ "$env_count" -eq 4 ]; then
-    pass "all 4 env examples rendered"
+if [ "$env_count" -eq 5 ]; then
+    pass "all 5 env examples rendered"
 else
-    fail "expected 4 env examples, found $env_count"
+    fail "expected 5 env examples, found $env_count"
 fi
 
 if grep -RIn '@[A-Z_][A-Z_]*@' "$R" >/dev/null 2>&1; then
@@ -184,6 +185,25 @@ if grep -Fq "ExecStart=$R/usr/local/bin/ozma-node --profile %i" \
     pass "unit paths rendered to the system layout"
 else
     fail "unit paths were not rendered to the system layout"
+fi
+
+# The multiseat supervisor must use the persisted store and never invoke the
+# print-and-exit modes (systemd would restart-loop the unit).
+MS_UNIT="$R/usr/local/lib/systemd/system/ozma-multiseat.service"
+if grep -Fq -- "--seats-file $R/var/lib/ozma-node/seats.json" "$MS_UNIT" &&
+   ! grep -Eq '^ExecStart=.*(--print-plan|--dry-run)' "$MS_UNIT" &&
+   grep -q '^User=ozma-node$' "$MS_UNIT" &&
+   grep -q '^Group=ozma-node$' "$MS_UNIT" &&
+   grep -q '^Restart=on-failure$' "$MS_UNIT"; then
+    pass "multiseat unit uses the persisted seats file with real supervision"
+else
+    fail "multiseat unit is missing the seats file, account, or restart policy"
+fi
+if grep -q '^DISPLAY=' "$R/etc/ozma/ozma-multiseat.env.example" &&
+   grep -q 'OZMA_MULTISEAT_ARGS' "$R/etc/ozma/ozma-multiseat.env.example"; then
+    pass "multiseat env example documents DISPLAY and extra flags"
+else
+    fail "multiseat env example is missing DISPLAY or OZMA_MULTISEAT_ARGS"
 fi
 
 # ---------------------------------------------------------------------------
@@ -311,7 +331,8 @@ CA="$TMP/custom-account"
 if run_install "$TMP/install-custom-account.log" --root "$CA" --profile hardware \
         --user ozma-test --group ozma-test-grp; then
     account_ok=1
-    for unit in ozma-node@.service ozma-node-vm@.service ozma-virtual-node.service; do
+    for unit in ozma-node@.service ozma-node-vm@.service ozma-virtual-node.service \
+                ozma-multiseat.service; do
         if ! grep -q '^User=ozma-test$' "$CA/usr/local/lib/systemd/system/$unit" ||
            ! grep -q '^Group=ozma-test-grp$' "$CA/usr/local/lib/systemd/system/$unit"; then
             account_ok=0
@@ -382,6 +403,7 @@ check_mode "$R/etc/ozma" 750
 check_mode "$R/etc/ozma/ozma-node-hardware.env.example" 640
 check_mode "$R/etc/ozma/libvirt-qemu-cgroup_device_acl.conf" 640
 check_mode "$R/usr/local/lib/systemd/system/ozma-node@.service" 644
+check_mode "$R/usr/local/lib/systemd/system/ozma-multiseat.service" 644
 check_mode "$R/etc/udev/rules.d/70-ozma-node-uinput.rules" 644
 check_mode "$R/run/ozma-node" 750
 check_mode "$R/run/ozma" 755
@@ -407,6 +429,12 @@ if grep -q 'systemd --user' "$R/etc/ozma/install-operator-commands.txt" &&
     pass "desktop system-vs-user caveat is documented"
 else
     fail "desktop system-vs-user caveat is missing"
+fi
+if grep -q 'systemctl enable --now ozma-multiseat.service' "$R/etc/ozma/install-operator-commands.txt" &&
+   grep -q 'rm -f .*ozma-multiseat.service' "$R/etc/ozma/install-operator-commands.txt"; then
+    pass "operator commands cover the multiseat unit"
+else
+    fail "operator commands do not cover the multiseat unit"
 fi
 
 # ---------------------------------------------------------------------------

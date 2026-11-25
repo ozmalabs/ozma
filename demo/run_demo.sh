@@ -146,9 +146,10 @@ start_vm_node() {
         fi
         if [[ "$DEMO_WEBRTC" == "1" ]]; then
             # QMP capture geometry is only known at runtime; fit the helper to
-            # the real head instead of failing at the 640x480 default.
+            # the real head instead of failing at the 640x480 default. The guest
+            # can sit in a 720x400 text mode for ~3 s, so wait past it.
             webrtc_args=(--webrtc-helper python3 --webrtc-helper-script "$WEBRTC_SCRIPT" \
-                --webrtc-fit-capture)
+                --webrtc-fit-capture --webrtc-settle-ms 4000)
         fi
         "$RUST_NODE_BIN" \
             --name "$name" \

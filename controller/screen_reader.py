@@ -43,6 +43,31 @@ from typing import Any
 
 log = logging.getLogger("ozma.screen_reader")
 
+#: Frames at or above this size prefer a real OCR engine (Tesseract) over the
+#: bitmap font matcher, even when the frame is auto-detected as a terminal.
+#: Classic text modes (640x400, 720x400) stay below this and remain fast.
+_BITMAP_PREFER_MAX_PIXELS = 800 * 600
+
+#: Confidence below which bitmap output is reported as low-confidence rather
+#: than being presented as an authoritative transcript.
+_BITMAP_ACCEPT_CONFIDENCE = 0.60
+
+
+def _parse_confidence(value: Any) -> float:
+    """Parse Tesseract confidence (``int``/``float``/string) to 0..1.
+
+    Tesseract 5 emits TSV confidence as a float string (``"91.811768"``).
+    The old ``int()`` parse raised and silently discarded every word from the
+    CLI fallback path, so Tesseract never contributed any regions.
+    """
+    try:
+        conf = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if conf < 0:
+        return 0.0
+    return conf / 100.0
+
 
 @dataclass
 class TextRegion:
@@ -115,7 +140,11 @@ class ScreenState:
     description: str = ""
     raw_text: str = ""
     screen_type: str = ""  # "terminal", "gui_light", "gui_dark", "bios", "unknown"
-    ocr_method: str = ""   # "bitmap", "tesseract", "multi_pass"
+    ocr_method: str = ""   # "bitmap", "tesseract", "bitmap+tesseract", "unavailable"
+    ocr_confidence: float = 0.0
+    #: "ok" | "low_confidence" | "unavailable".  Consumers must check this
+    #: before treating raw_text as a trustworthy transcript.
+    ocr_status: str = ""
 
     def find_button(self, label: str) -> UIElement | None:
         """Find a button by its label text."""
@@ -153,6 +182,8 @@ class ScreenState:
             "raw_text": self.raw_text,
             "screen_type": self.screen_type,
             "ocr_method": self.ocr_method,
+            "ocr_confidence": round(self.ocr_confidence, 3),
+            "ocr_status": self.ocr_status,
         }
         return d
 
@@ -161,6 +192,12 @@ class ScreenState:
         parts = ["Current screen state:"]
         if self.screen_type:
             parts.append(f"  Screen type: {self.screen_type}")
+        if self.ocr_status and self.ocr_status != "ok":
+            parts.append(
+                f"  OCR status: {self.ocr_status} "
+                f"(method={self.ocr_method or 'none'}, "
+                f"confidence={self.ocr_confidence:.2f}) — text may be unreliable"
+            )
         if self.description:
             parts.append(f"  Description: {self.description}")
         if self.paragraphs:
@@ -235,42 +272,107 @@ class ScreenReader:
         # Auto-detect screen type
         state.screen_type = self._detect_screen_type(arr)
 
-        # Level 1: Try bitmap font OCR for terminal/BIOS
-        # Only use if explicitly requested OR if auto-detected AND high confidence
-        if level == "bitmap" or (level == "auto" and state.screen_type in ("terminal", "bios")):
-            regions = self._bitmap_ocr(arr, state)
-            # Only trust bitmap results if confidence is high and text looks valid
-            avg_conf = (sum(r.confidence for r in regions) / len(regions)) if regions else 0
-            printable_ratio = 0
-            if regions:
-                all_text = " ".join(r.text for r in regions)
-                printable = sum(1 for c in all_text if c.isalnum() or c in " .,:;!?-=+/\\()[]{}@#$%&*_")
-                printable_ratio = printable / max(len(all_text), 1)
+        w, h = img.size
+        large_frame = (w * h) >= _BITMAP_PREFER_MAX_PIXELS
+        bitmap_requested = level == "bitmap" or (
+            level == "auto" and state.screen_type in ("terminal", "bios")
+        )
 
-            if regions and avg_conf > 0.6 and printable_ratio > 0.5:
-                state.text_regions = regions
-                state.raw_text = " ".join(tr.text for tr in regions)
+        bitmap_regions: list[TextRegion] = []
+        bitmap_conf = 0.0
+        bitmap_status = "unavailable"
+        bitmap_tried = False
+
+        # Level 1: bitmap font OCR.  It is fast and exact on classic text
+        # modes, but Tesseract is preferred on large frames: a 1280x800 VGA
+        # console is anti-aliased and the bitmap matcher can hallucinate
+        # glyphs while still reporting a high correlation.
+        prefer_tesseract = bool(
+            self._tesseract_available
+            and (large_frame or level in ("tesseract", "elements"))
+        )
+        if bitmap_requested and not (level == "auto" and prefer_tesseract):
+            bitmap_tried = True
+            bitmap_regions, bitmap_conf, bitmap_status = self._bitmap_ocr_scored(arr, state)
+            if bitmap_status == "ok":
+                state.text_regions = bitmap_regions
+                state.raw_text = " ".join(tr.text for tr in bitmap_regions)
                 state.ocr_method = "bitmap"
+                state.ocr_confidence = bitmap_conf
+                state.ocr_status = "ok"
                 state.lines, state.paragraphs = self._group_text(state.text_regions)
                 if level == "bitmap":
                     return state
-            elif level == "auto":
-                # Bitmap results were garbage — force Tesseract
-                regions = []
-                state.screen_type = "gui_dark" if state.screen_type == "terminal" else state.screen_type
+            elif level == "bitmap":
+                # Explicit bitmap request: return it, but never as
+                # high-confidence when the glyph match is poor.
+                if bitmap_regions:
+                    state.text_regions = bitmap_regions
+                    state.raw_text = " ".join(tr.text for tr in bitmap_regions)
+                    state.ocr_method = "bitmap"
+                    state.ocr_confidence = bitmap_conf
+                    state.ocr_status = bitmap_status
+                    state.lines, state.paragraphs = self._group_text(state.text_regions)
+                else:
+                    state.ocr_method = "unavailable"
+                    state.ocr_status = "unavailable"
+                return state
 
         # Level 2: Multi-pass Tesseract OCR
-        if level in ("auto", "tesseract", "elements") and (
-            not state.text_regions or state.screen_type.startswith("gui")
+        if (
+            level in ("auto", "tesseract", "elements")
+            and self._tesseract_available
+            and (not state.text_regions or state.screen_type.startswith("gui"))
         ):
             regions = await self._advanced_ocr(img, arr, state.screen_type)
             if regions:
-                # Merge with any bitmap results (bitmap takes priority for overlaps)
+                # Merge with any high-confidence bitmap results.
                 if state.text_regions:
                     regions = self._merge_ocr_results(state.text_regions, regions)
+                    state.ocr_method = "bitmap+tesseract"
+                else:
+                    state.ocr_method = "tesseract"
+                # Tesseract/dedup returns regions in confidence order; restore
+                # reading order (top-to-bottom, left-to-right) for raw_text.
+                regions = sorted(regions, key=lambda r: (r.y, r.x))
                 state.text_regions = regions
                 state.raw_text = " ".join(tr.text for tr in regions)
-                state.ocr_method = "multi_pass" if state.ocr_method else "tesseract"
+                state.ocr_confidence = (
+                    sum(tr.confidence for tr in regions) / len(regions)
+                )
+                state.ocr_status = "ok"
+            state.lines, state.paragraphs = self._group_text(state.text_regions)
+
+        # If Tesseract was preferred but produced nothing, try the bitmap
+        # matcher once as a fallback.
+        if not state.text_regions and bitmap_requested and not bitmap_tried:
+            bitmap_tried = True
+            bitmap_regions, bitmap_conf, bitmap_status = self._bitmap_ocr_scored(arr, state)
+            if bitmap_status == "ok":
+                state.text_regions = bitmap_regions
+                state.raw_text = " ".join(tr.text for tr in bitmap_regions)
+                state.ocr_method = "bitmap"
+                state.ocr_confidence = bitmap_conf
+                state.ocr_status = "ok"
+                state.lines, state.paragraphs = self._group_text(state.text_regions)
+
+        # Nothing reliable was read.  A bitmap result with a weak glyph match
+        # is only surfaced (with an explicit low-confidence marker) when no
+        # real OCR engine is available; otherwise return typed *unavailable*
+        # instead of fabricating text.
+        if not state.text_regions:
+            if bitmap_tried and bitmap_regions and not self._tesseract_available:
+                state.text_regions = bitmap_regions
+                state.raw_text = " ".join(tr.text for tr in bitmap_regions)
+                state.ocr_method = "bitmap"
+                state.ocr_confidence = bitmap_conf
+                state.ocr_status = "low_confidence"
+            else:
+                state.text_regions = []
+                state.raw_text = ""
+                state.ocr_method = "unavailable"
+                state.ocr_confidence = 0.0
+                state.ocr_status = "unavailable"
             state.lines, state.paragraphs = self._group_text(state.text_regions)
 
         # Level 3: UI element detection
@@ -386,36 +488,122 @@ class ScreenReader:
     # ── Level 1: Bitmap font OCR ──────────────────────────────────────
 
     def _bitmap_ocr(self, arr: Any, state: ScreenState) -> list[TextRegion]:
-        """Try bitmap font matching (text_capture.py)."""
+        """Try bitmap font matching (text_capture.py).
+
+        Retained as a list-only wrapper for callers that do not need the
+        confidence signal.  New code should use ``_bitmap_ocr_scored``.
+        """
+        regions, _confidence, _status = self._bitmap_ocr_scored(arr, state)
+        return regions
+
+    def _bitmap_ocr_scored(self, arr: Any, state: ScreenState) -> tuple[list[TextRegion], float, str]:
+        """Run bitmap OCR and score how trustworthy its output is.
+
+        Returns ``(regions, confidence, status)`` where status is ``"ok"``,
+        ``"low_confidence"`` or ``"unavailable"``.  Region geometry is derived
+        from the detected cell grid, so a wrong grid would shift every region;
+        the cell detector now validates the grid against the font.
+        """
         if not self._text_capture:
-            return []
+            return [], 0.0, "unavailable"
         try:
             result = self._text_capture.recognise_frame(arr)
             if not result or not result.text.strip():
-                return []
+                return [], 0.0, "unavailable"
 
-            regions = []
+            cell_w = max(int(result.cell_width), 1)
+            cell_h = max(int(result.cell_height), 1)
+            regions: list[TextRegion] = []
+
             for line_idx, line in enumerate(result.lines):
                 if not line.strip():
                     continue
-                # Each character is at a known grid position
-                y = line_idx * result.cell_height
-                # Find first and last non-space char for the region bounds
-                stripped = line.rstrip()
-                leading = len(line) - len(line.lstrip())
-                x = leading * result.cell_width
-                width = len(stripped.strip()) * result.cell_width
+
+                # Prefer the per-cell grid: it preserves internal spaces and
+                # gives exact first/last non-space column bounds.
+                cells = result.cells[line_idx] if line_idx < len(result.cells) else []
+                non_space = [
+                    i for i, c in enumerate(cells)
+                    if not str(c.get("char", " ")).isspace()
+                ]
+                if non_space:
+                    first, last = non_space[0], non_space[-1]
+                    text = line[first:last + 1].strip()
+                    x = first * cell_w
+                    width = (last - first + 1) * cell_w
+                else:
+                    text = line.strip()
+                    leading = len(line) - len(line.lstrip())
+                    x = leading * cell_w
+                    width = len(text) * cell_w
+
+                if not text:
+                    continue
                 regions.append(TextRegion(
-                    text=stripped.strip(),
-                    x=x, y=y,
+                    text=text,
+                    x=x,
+                    y=line_idx * cell_h,
                     width=max(width, 1),
-                    height=result.cell_height,
-                    confidence=result.confidence,
+                    height=cell_h,
+                    confidence=float(result.confidence),
                 ))
-            return regions
+
+            confidence, status = self._score_bitmap_result(result, regions)
+            # Never expose the raw correlation as the region confidence: it is
+            # not discriminative (see TextCapture._match_glyph).
+            for region in regions:
+                region.confidence = confidence
+
+            return regions, confidence, status
         except Exception as e:
             log.debug("Bitmap OCR failed: %s", e)
-            return []
+            return [], 0.0, "unavailable"
+
+    @staticmethod
+    def _score_bitmap_result(result: Any, regions: list[TextRegion]) -> tuple[float, str]:
+        """Calibrate bitmap OCR output to a confidence and status.
+
+        The old path accepted any output whose average correlation exceeded
+        0.6.  Correlations are always high for the *best* glyph even when the
+        pixels are GUI noise, so this combines three signals:
+          - correlation of the best glyph,
+          - margin to the second-best glyph (discriminative match),
+          - printable/alphanumeric plausibility of the text,
+        and caps confidence when only the Pillow approximation font exists.
+        """
+        if not regions:
+            return 0.0, "unavailable"
+
+        text = " ".join(r.text for r in regions)
+        if not text.strip():
+            return 0.0, "unavailable"
+
+        printable = sum(
+            1 for c in text if c.isalnum() or c in " .,:;!?-=+/\\()[]{}@#$%&*_'\"<>|~`^"
+        )
+        printable_ratio = printable / max(len(text), 1)
+        alnum = sum(1 for c in text if c.isalnum())
+
+        corr = float(getattr(result, "confidence", 0.0))
+        margin = float(getattr(result, "match_margin", 0.0))
+        native = bool(getattr(result, "font_native", False))
+
+        correlation_score = max(0.0, min(1.0, (corr - 0.5) / 0.45))
+        margin_score = max(0.0, min(1.0, margin / 0.10))
+        confidence = correlation_score * margin_score * printable_ratio
+
+        # Without a real console font the templates are an approximation;
+        # never call that high-confidence.
+        if not native:
+            confidence = min(confidence, 0.35)
+
+        # Require enough real text to avoid "recognising" a couple of pixels.
+        if alnum < 3 or printable_ratio < 0.6:
+            confidence = min(confidence, 0.4)
+
+        confidence = round(max(0.0, min(1.0, confidence)), 3)
+        status = "ok" if confidence >= _BITMAP_ACCEPT_CONFIDENCE else "low_confidence"
+        return confidence, status
 
     # ── Level 2: Advanced Tesseract OCR ───────────────────────────────
 
@@ -487,15 +675,15 @@ class ScreenReader:
             n = len(data["text"])
             for i in range(n):
                 text = data["text"][i].strip()
-                conf = int(data["conf"][i]) if data["conf"][i] != "-1" else 0
-                if text and conf > 25:
+                conf = _parse_confidence(data["conf"][i])
+                if text and conf > 0.25:
                     regions.append(TextRegion(
                         text=text,
                         x=int(data["left"][i] / scale),
                         y=int(data["top"][i] / scale),
                         width=max(1, int(data["width"][i] / scale)),
                         height=max(1, int(data["height"][i] / scale)),
-                        confidence=conf / 100.0,
+                        confidence=conf,
                     ))
             return regions
         except ImportError:
@@ -522,20 +710,31 @@ class ScreenReader:
                 regions = []
                 for line in result.stdout.splitlines()[1:]:
                     parts = line.split("\t")
-                    if len(parts) >= 12:
-                        text = parts[11].strip()
-                        conf = int(parts[10]) if parts[10] != "-1" else 0
-                        if text and conf > 25:
-                            regions.append(TextRegion(
-                                text=text,
-                                x=int(int(parts[6]) / scale),
-                                y=int(int(parts[7]) / scale),
-                                width=max(1, int(int(parts[8]) / scale)),
-                                height=max(1, int(int(parts[9]) / scale)),
-                                confidence=conf / 100.0,
-                            ))
+                    if len(parts) < 12:
+                        continue
+                    text = parts[11].strip()
+                    # Tesseract 5 reports TSV confidence as a float string
+                    # ("91.811768"); int() raised and discarded every word.
+                    conf = _parse_confidence(parts[10])
+                    if text and conf > 0.25:
+                        try:
+                            left, top, width, height = (
+                                int(parts[6]), int(parts[7]),
+                                int(parts[8]), int(parts[9]),
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                        regions.append(TextRegion(
+                            text=text,
+                            x=int(left / scale),
+                            y=int(top / scale),
+                            width=max(1, int(width / scale)),
+                            height=max(1, int(height / scale)),
+                            confidence=conf,
+                        ))
                 return regions
-            except Exception:
+            except Exception as e:
+                log.debug("Tesseract CLI pass failed: %s", e)
                 return []
             finally:
                 Path(f.name).unlink(missing_ok=True)
@@ -576,15 +775,15 @@ class ScreenReader:
                         )
                         for i in range(len(data["text"])):
                             text = data["text"][i].strip()
-                            conf = int(data["conf"][i]) if data["conf"][i] != "-1" else 0
-                            if text and conf > 40 and len(text) > 1:
+                            conf = _parse_confidence(data["conf"][i])
+                            if text and conf > 0.40 and len(text) > 1:
                                 regions.append(TextRegion(
                                     text=text,
                                     x=int((bx + data["left"][i]) / scale),
                                     y=int((by + data["top"][i]) / scale),
                                     width=max(1, int(data["width"][i] / scale)),
                                     height=max(1, int(data["height"][i] / scale)),
-                                    confidence=conf / 100.0,
+                                    confidence=conf,
                                 ))
                     except Exception:
                         pass
