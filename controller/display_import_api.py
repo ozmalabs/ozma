@@ -12,7 +12,7 @@ import base64
 import binascii
 from typing import Any
 
-from fastapi import APIRouter, Body, HTTPException, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Response
 from fastapi.responses import JSONResponse
 
 try:  # controller modules are imported top-level in the app
@@ -61,15 +61,37 @@ def _decode_body(body: dict[str, Any], max_bytes: int) -> tuple[str, bytes, str 
     return name, data, str(fmt) if fmt else None
 
 
-def build_router(store: ImportStore) -> APIRouter:
-    """Build the private display-import router."""
+def build_router(store: ImportStore, *, enabled: bool = True) -> APIRouter:
+    """Build the private display-import router.
+
+    ``enabled`` mirrors ``display.importers.enabled``.  Reads and listings stay
+    available for imports stored while the feature was enabled, but new imports
+    fail with a typed ``display_disabled`` 503 when it is off.
+    """
     router = APIRouter(prefix="/api/v1/display", tags=["display-import"])
+
+    def _require_importers() -> None:
+        if not enabled:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "display_disabled",
+                    "message": "display importers are disabled",
+                },
+            )
 
     @router.get("/importers")
     def list_importers() -> dict[str, Any]:
-        return {"importers": importer_formats()}
+        return {
+            "enabled": enabled,
+            "importers": importer_formats() if enabled else [],
+        }
 
-    @router.post("/import", status_code=201)
+    @router.post(
+        "/import",
+        status_code=201,
+        dependencies=[Depends(_require_importers)],
+    )
     def import_source(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         if body.get("private") is False:
             raise HTTPException(

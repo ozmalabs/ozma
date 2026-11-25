@@ -14,8 +14,12 @@
  * All templates scale to any size — from 72x72 (Stream Deck key) to 4K.
  */
 
-const { createCanvas } = require('@napi-rs/canvas');
 const { irToRenderPlan, planToSvg } = require('./display_ir');
+const {
+  CanvasUnavailableError,
+  encodeCanvas,
+  loadCanvasFactory,
+} = require('./canvas_runtime');
 
 // ── Template registry ───────────────────────────────────────────────────────
 
@@ -29,8 +33,22 @@ function listTemplates() {
   return Object.keys(TEMPLATES);
 }
 
-async function renderTemplate(name, data, width, height, format = 'png') {
+/**
+ * Resolve a canvas factory from explicit options or the lazy runtime.
+ *
+ * `options` may be a canvas factory function or an object with a
+ * `createCanvas` property.  When neither is provided the optional native
+ * dependency is loaded on demand.
+ */
+function resolveCanvasFactory(options) {
+  if (typeof options === 'function') return options;
+  if (options && typeof options.createCanvas === 'function') return options.createCanvas;
+  return loadCanvasFactory();
+}
+
+async function renderTemplate(name, data, width, height, format = 'png', options = {}) {
   const fn = TEMPLATES[name] || TEMPLATES['text'];
+  const createCanvas = resolveCanvasFactory(options);
   const canvas = createCanvas(width, height);
   const ctx = canvas.getContext('2d');
 
@@ -40,10 +58,9 @@ async function renderTemplate(name, data, width, height, format = 'png') {
 
   await fn(ctx, data, width, height);
 
-  if (format === 'jpeg') {
-    return canvas.toBuffer('image/jpeg');
-  }
-  return canvas.toBuffer('image/png');
+  // Preserve the historical behaviour: any non-JPEG format renders PNG here.
+  if (format === 'jpeg') return encodeCanvas(canvas, 'jpeg');
+  return encodeCanvas(canvas, 'png');
 }
 
 // ── Helper functions ────────────────────────────────────────────────────────
@@ -542,23 +559,34 @@ function drawRenderPlan(ctx, plan) {
  * entry point used when a request supplies `{ir}` or `{layout}`.
  */
 async function renderIr(input, data, width, height, format = 'png', options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const { createCanvas: injectedCreateCanvas, ...planOptions } = opts;
   const plan = irToRenderPlan(input, {
-    ...(options || {}),
+    ...planOptions,
     data: data || {},
-    width: width || options.width,
-    height: height || options.height,
+    width: width || opts.width,
+    height: height || opts.height,
   });
+
+  // The SVG path is dependency-free and must not touch the optional canvas.
+  if (format === 'svg') return Buffer.from(planToSvg(plan), 'utf8');
+
+  const createCanvas = typeof injectedCreateCanvas === 'function'
+    ? injectedCreateCanvas
+    : loadCanvasFactory();
   const canvas = createCanvas(plan.width, plan.height);
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = plan.background || '#0a0a0f';
   ctx.fillRect(0, 0, plan.width, plan.height);
   drawRenderPlan(ctx, plan);
-  if (format === 'jpeg') return canvas.toBuffer('image/jpeg');
-  if (format === 'svg') return Buffer.from(planToSvg(plan), 'utf8');
-  return canvas.toBuffer('image/png');
+
+  // Preserve existing behaviour: unknown/non-JPEG formats render PNG here.
+  if (format === 'jpeg') return encodeCanvas(canvas, 'jpeg');
+  return encodeCanvas(canvas, 'png');
 }
 
 module.exports = {
+  CanvasUnavailableError,
   renderTemplate,
   renderIr,
   drawRenderPlan,

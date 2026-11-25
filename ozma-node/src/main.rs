@@ -726,6 +726,18 @@ pub struct Args {
     #[arg(long, default_value_t = 30)]
     pub heartbeat_interval: u64,
 
+    /// AIDA64 RemoteSensor-compatible listener port (0 disables it).
+    ///
+    /// Serves `/`, `/sse`, `/api`, `/sensors`, and an Ozma widget panel at
+    /// `/panel`. The listener is unauthenticated; enable it only on trusted
+    /// networks.
+    #[arg(long, env = "OZMA_AIDA64_PORT", default_value_t = 0)]
+    pub aida64_port: u16,
+
+    /// Bind address for the AIDA64 RemoteSensor listener.
+    #[arg(long, env = "OZMA_AIDA64_BIND", default_value = "0.0.0.0")]
+    pub aida64_bind: String,
+
     /// Thermal policy JSON (fan curves, zones, fan specs, safe limits).
     ///
     /// Without a policy the node exposes read-only temperatures and fan speeds.
@@ -2662,6 +2674,7 @@ async fn run() -> std::process::ExitCode {
         capture_provider,
         capabilities.capture.first(),
     );
+    let hardware_state = ozma_node::hardware::HardwareState::new();
     let desktop_controls = (config.profile == NodeProfile::Desktop).then(|| {
         let x11_display = config
             .x11_display
@@ -2694,6 +2707,7 @@ async fn run() -> std::process::ExitCode {
             .with_multi_console_hls(multi_console_hls.clone())
             .with_multi_console_webrtc(multi_console_webrtc.clone())
             .with_capture(capture_status)
+            .with_hardware(hardware_state.clone())
             .with_vnc_registration(vnc_registration)
             .with_desktop_controls(desktop_controls);
     // Control routes stay behind the bearer guard; the controller's read-only
@@ -2716,10 +2730,28 @@ async fn run() -> std::process::ExitCode {
     });
     let thermal_status = Arc::new(RwLock::new(ThermalStatus::default()));
     let thermal_router = ozma_node::thermal::router(thermal_status.clone(), thermal_policy);
-    let hardware_router = ozma_node::hardware::router(ozma_node::hardware::HardwareState::new());
+    let hardware_router = ozma_node::hardware::router(hardware_state.clone());
     let compat_router = controller_compat::compat_router(compat_state.clone())
         .merge(thermal_router)
         .merge(hardware_router);
+
+    if args.aida64_port != 0 {
+        let aida_bind = args.aida64_bind.clone();
+        let aida_port = args.aida64_port;
+        let aida_hardware = hardware_state.clone();
+        let aida_shutdown = shutdown.clone();
+        background.push((
+            "aida64",
+            tokio::spawn(async move {
+                if let Err(error) =
+                    ozma_node::aida64::serve(&aida_bind, aida_port, aida_hardware, aida_shutdown)
+                        .await
+                {
+                    error!(error = %error, "AIDA64 RemoteSensor listener exited");
+                }
+            }),
+        ));
+    }
 
     // Opt-in mesh service. It is merged into the guarded compatibility router,
     // so `/api/v1/connect/*` uses the same bearer-token guard as the other

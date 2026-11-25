@@ -119,24 +119,21 @@ M0 must land before B/C/D/E merge to avoid schema churn.
 |---|---|---|---|
 | M0 Contracts | **Done** | `ozma-display-ir` models/validation/canonical hash; `controller/display_ir.py` parity; six `schemas/display/*.schema.json`; golden fixtures; lossless capture arrays aligned across Rust/Python/importers | `WGT-004` cross-link in `docs/protocols.md` |
 | M1 Local repository | **Done** | `controller/asset_repository.py` index/cache/install/update/rollback, hashes, signatures, safe extraction, sync policy, API router; `retro-gauges` manifest migrated; `WidgetPack` preserves repository fields; signed Connect index sync interop tested | Operator deployment tuning only |
-| M2 Connect shared DB | **Done** | `connect/assets/` SQLAlchemy models + portable migration, object storage, deterministic signed index, search/entry/versions/categories/submit/stats/snapshot API, licence + attestation rules, 27 tests; controller→Connect sync tests | Production key management and a Connect deployment/UI |
-| M3 IR/translation core | **Mostly done** | IR→`ScreenLayout`/`DisplayDefinition`, compact `meta.ozma_ir`, validation, export-report helper; semantic adapters for gauge/bar/number/text/sparkline/status/icon/table/card; PNG render-plan + SVG preview; LVGL export with reports | Canvas-backed PNG end-to-end test (dependency missing here); per-target golden snapshots (`WGT-045`); AIDA64 panel output |
+| M2 Connect shared DB | **Done** | `connect/assets/` models + migration, object storage, deterministic signed index, full API, licence/attestation rules, environment bootstrap (`bootstrap.py`), controller→Connect sync tests | Production key management, review UI, marketplace surface |
+| M3 IR/translation core | **Done** | IR→`ScreenLayout`/`DisplayDefinition`, compact `meta.ozma_ir`, validation, export-report helper; adapters for gauge/bar/number/text/sparkline/status/icon/table/card; PNG render-plan/SVG, fake-canvas PNG/JPEG tests, LVGL export; browser/LVGL/Adaptive Cards goldens | Real raster run requires optional `@napi-rs/canvas`; per-target visual pixel snapshots |
 | M3b Vibe/shape/coherence | **Done** | `org.ozma.vibe/1` models/validation; SVG/CSS/property shape extraction; source/user/derived keyword separation; advisory coherence with dimensions/outliers/conflicts/overrides; Rust/Python parity; repository filter/related packs | Optional local vision tagging (`WGT-049a`, disabled by default) |
-| M4 Font subsystem | **Done** | `ozma-fonts` and `controller/font_translation.py` metadata, PANOSE/metrics/scripts/features, `fsType` licence gate, deterministic shape/intent matching, plan_export and reports; TTF/OTF subsetting, BDF, LVGL C, PIL previews; 30 Rust + 36 Python tests | WOFF2 write path requires optional `brotli`; expand CJK/Arabic/Indic shaping golden corpus (`WGT-056`) |
-| M5 Render adapters/themes | **Mostly done** | Browser theme loader; `core-dark`, `core-light`, `noc`, `audio`, `minimal` + hashed theme-pack manifest; SVG gauge/bar/dual/threshold and sparkline/history widgets with a11y; PNG render-plan integration; LVGL C/JSON; Adaptive Cards export | uPlot/gridstack editor; AIDA64 panel output; full browser/LVGL/AIDA64 golden parity |
-| M6 Importers | **Done** | AIDA64/SensorPanel (ZIP/XML/JSON/HTML, safe extraction), Rainmeter INI, Home Assistant YAML, MagicMirror non-evaluating JS reader, Grafana dashboards/panels, Adaptive Cards import/export; private import store + API; lossless capture and IR validation tests | Native AIDA64 `.rslcd` remains best-effort/opaque by design (`WGT-070` recon) |
-| M7 Hardening | **Partial** | `OZMA_DISPLAY_*` feature flags, licence/checksum/sandbox gate script, signed index and pack verification, operator/authoring/publishing/importing/font docs, 69 config/licence tests | CI wiring, fuzz targets, browser sandbox enforcement, performance budgets, release notes (`WGT-080`–`WGT-087`) |
+| M4 Font subsystem | **Done** | Rust + Python metadata, PANOSE/metrics/scripts/features, `fsType` gate, deterministic matching, reports; TTF/OTF subsetting, BDF, LVGL C, previews; Latin/CJK/Arabic/Indic/icon golden corpus | WOFF2 write path requires optional `brotli`; live shaping render comparison |
+| M5 Render adapters/themes | **Done** | Five original themes + hashed pack; gauge/bar/dual/threshold, VU ballistics (attack/release, dB/s falloff, peak hold, clip latch, RMS), and sparkline/history widgets; sandboxed third-party widgets; PNG render plans; LVGL C/JSON; Adaptive Cards; AIDA64 `/panel` generated from `WidgetIR` | Optional uPlot/gridstack editor; AIDA64 native Windows shared-memory/registry emulation |
+| M6 Importers | **Done** | AIDA64/SensorPanel, Rainmeter, Home Assistant, MagicMirror, Grafana, Adaptive Cards import/export; private import store + API; lossless capture and IR validation | Native AIDA64 `.rslcd` remains best-effort/opaque (`WGT-070`) |
+| M7 Hardening | **Done (except optional)** | Feature flags/runtime, licence/checksum/sandbox gate, Ed25519 trust + signing CLI, browser sandbox/CSP, migration tooling, perf benchmarks, targeted CI, Connect bootstrap, release notes | Fuzz regression (in progress); default-on rollout decision; marketplace/review UI |
 
 Known gaps for the next slice:
 
-1. Canvas-backed PNG rendering and AIDA64 panel output from IR (AIDA64 is
-   owned by a separate in-flight track).
-2. Golden visual parity snapshots across browser, PNG, LVGL, Adaptive Cards,
-   and any AIDA64 target.
-3. Full font shaping corpus (CJK, Arabic/Indic), WOFF2 writing with `brotli`,
-   and production Ed25519 key distribution.
-4. CI licence/fuzz/sandbox gates and performance budgets.
-5. Connect deployment, review UI, and public marketplace surface.
+1. Real raster PNG/JPEG runs on a host with `@napi-rs/canvas`; current tests
+   cover the canvas contract with an injected recording factory.
+2. Optional uPlot/gridstack editor and AIDA64 native Windows exporters.
+3. Default-on rollout after field validation; Connect review UI/marketplace.
+4. Live font shaping/render comparison and WOFF2 writing with `brotli`.
 
 ## 7. Task backlog
 

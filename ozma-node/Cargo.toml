@@ -55,6 +55,7 @@ ozma-thermal  = { path = "../ozma-thermal" }
 ozma-hardware = { path = "../ozma-hardware" }
 # Binary display envelopes (scene snapshots) for the reliable Display channel.
 ozma-display-protocol = { path = "../ozma-display-protocol" }
+ozma-display-ir = { path = "../ozma-display-ir" }
 # Browser camera/microphone reassembly is shared with the client side.
 ozma-client-core = { path = "../ozma-client-core" }
 # Opt-in userspace WireGuard mesh + mDNS peer identity (`--mesh`).
@@ -89,6 +90,8 @@ local-ip-address = "0.6"
 hostname         = "0.4"
 # Per-client zlib stream for the RFB ZRLE encoding.
 flate2           = "1"
+# AIDA64-compatible system metrics (CPU load, memory use, uptime, processes).
+sysinfo          = "0.29"
 # SSE stream construction for the AIDA64 RemoteSensor endpoint.
 futures-util     = "0.3"
 

@@ -327,6 +327,206 @@ def test_definition_wrapper_and_theme_tokens_are_accepted():
     assert result["metadata"]["translation_report"]["source_format"] == "ozma_display_definition"
 
 
+def _table():
+    return {
+        "type": "table",
+        "x": 10,
+        "y": 120,
+        "w": 200,
+        "h": 80,
+        "label": "Facts",
+        "rows": [["cpu", "42"], ["mem", "50"]],
+    }
+
+
+def test_theme_tokens_override_surface_arc_bar_and_colours():
+    result = export_lvgl(
+        _layout([_gauge(), _bar(), _text(), _table()]),
+        options={
+            "theme": {
+                "tokens": {
+                    "color": {
+                        "surface": {"$type": "color", "$value": "#112233"},
+                        "text": {"$type": "color", "$value": "#eeeeee"},
+                        "muted": {"$type": "color", "$value": "#aabbcc"},
+                        "accent": {"$type": "color", "$value": "#445566"},
+                        "warn": {"$type": "color", "$value": "#ffaa00"},
+                        "crit": {"$type": "color", "$value": "#ff0000"},
+                    },
+                    "metric": {
+                        "arc_width": {"$type": "dimension", "$value": "12px"},
+                        "bar_radius": {"$type": "dimension", "$value": "7px"},
+                    },
+                }
+            }
+        },
+    )
+    source = result["source"]
+    metadata = result["metadata"]
+    widgets = {widget["index"]: widget for widget in metadata["widgets"]}
+    gauge_id = widgets[0]["identifier"]
+    bar_id = widgets[1]["identifier"]
+    text_id = widgets[2]["identifier"]
+    table_id = widgets[3]["identifier"]
+
+    assert f"lv_obj_set_style_arc_width({gauge_id}, 12, LV_PART_MAIN);" in source
+    assert f"lv_obj_set_style_arc_width({gauge_id}, 12, LV_PART_INDICATOR);" in source
+    assert (
+        f"lv_obj_set_style_arc_color({gauge_id}, lv_color_hex(0x445566), "
+        "LV_PART_INDICATOR);"
+    ) in source
+    assert f"lv_obj_set_style_radius({bar_id}, 7, LV_PART_MAIN);" in source
+    assert (
+        f"lv_obj_set_style_bg_color({bar_id}, lv_color_hex(0x445566), "
+        "LV_PART_INDICATOR);"
+    ) in source
+    assert (
+        f"lv_obj_set_style_bg_color({table_id}, lv_color_hex(0x112233), "
+        "LV_PART_MAIN);"
+    ) in source
+    assert (
+        f"lv_obj_set_style_text_color({text_id}, lv_color_hex(0xeeeeee), "
+        "LV_PART_MAIN);"
+    ) in source
+    assert "lv_obj_set_style_text_color(row, lv_color_hex(0xaabbcc), LV_PART_MAIN);" in source
+    assert '{ 70.0f, "warning", lv_color_hex(0xffaa00) },' in source
+    assert '{ 90.0f, "critical", lv_color_hex(0xff0000) },' in source
+
+    assert widgets[0]["color"] == "#445566"
+    assert widgets[0]["arc_width"] == 12
+    assert widgets[1]["bar_radius"] == 7
+    assert widgets[1]["warn_color"] == "#ffaa00"
+    assert widgets[1]["crit_color"] == "#ff0000"
+    assert widgets[2]["text_color"] == "#eeeeee"
+    assert widgets[3]["surface"] == "#112233"
+    assert widgets[3]["muted_color"] == "#aabbcc"
+    assert not any(
+        "uses fallback" in item
+        for item in metadata["translation_report"]["approximated"]
+    )
+
+
+def test_theme_token_aliases_and_dtcg_colour_forms_are_supported():
+    result = export_lvgl(
+        _layout([_gauge(), _bar(), _table()]),
+        options={
+            "tokens": {
+                "accent": "rgb(1, 2, 3)",
+                "text": "rgba(4, 5, 6, 0.5)",
+                "surface": "#070809cc",
+                "warn": "#0a0b0c",
+                "crit": "#0d0e0f",
+                "metric": {
+                    "arc_width": {"$value": "14px"},
+                    "bar_radius": {"$value": "9px"},
+                },
+                "typography": {"size": {"$value": "18px"}},
+            }
+        },
+    )
+    source = result["source"]
+    metadata = result["metadata"]
+    widgets = {widget["index"]: widget for widget in metadata["widgets"]}
+
+    assert "lv_color_hex(0x010203)" in source
+    assert "lv_color_hex(0x040506)" in source
+    assert "lv_color_hex(0x070809)" in source
+    assert "lv_color_hex(0x0a0b0c)" in source
+    assert "lv_color_hex(0x0d0e0f)" in source
+    assert f"lv_obj_set_style_arc_width({widgets[0]['identifier']}, 14, LV_PART_MAIN);" in source
+    assert f"lv_obj_set_style_radius({widgets[1]['identifier']}, 9, LV_PART_MAIN);" in source
+    assert widgets[0]["arc_width"] == 14
+    assert widgets[1]["bar_radius"] == 9
+    assert widgets[2]["surface"] == "#070809"
+    assert widgets[0]["text_size"] == 18
+    assert any(
+        "text size 18px is retained in metadata" in item
+        for item in metadata["translation_report"]["approximated"]
+    )
+    assert not any(
+        "uses fallback" in item
+        for item in metadata["translation_report"]["approximated"]
+    )
+
+
+def test_invalid_and_oversized_style_tokens_fall_back_and_are_reported():
+    result = export_lvgl(
+        _layout([_gauge(), _bar(), _table()]),
+        options={
+            "theme": {
+                "tokens": {
+                    "metric": {
+                        "arc_width": {"$value": 9999},
+                        "bar_radius": {"$value": "fat"},
+                    },
+                    "color": {
+                        "surface": {"$value": "javascript:alert(1)"},
+                        "accent": {"$value": "#12345"},
+                    },
+                }
+            }
+        },
+    )
+    source = result["source"]
+    metadata = result["metadata"]
+    report = metadata["translation_report"]
+    widgets = {widget["index"]: widget for widget in metadata["widgets"]}
+
+    assert (
+        f"lv_obj_set_style_arc_width({widgets[0]['identifier']}, 10, "
+        "LV_PART_MAIN);"
+    ) in source
+    assert (
+        f"lv_obj_set_style_radius({widgets[1]['identifier']}, 4, "
+        "LV_PART_MAIN);"
+    ) in source
+    assert (
+        f"lv_obj_set_style_bg_color({widgets[2]['identifier']}, "
+        "lv_color_hex(0x111118), LV_PART_MAIN);"
+    ) in source
+    assert "lv_color_hex(0x5b6fff)" in source
+    for unsafe in ("9999", "fat", "javascript", "#12345"):
+        assert unsafe not in source
+
+    warnings = " ".join(report["warnings"])
+    assert "metric.arc_width" in warnings and "outside" in warnings
+    assert "metric.bar_radius" in warnings and "finite number" in warnings
+    assert "color.surface" in warnings and "valid colour" in warnings
+    assert "color.accent" in warnings and "valid colour" in warnings
+    approximated = " ".join(report["approximated"])
+    assert "gauge arc width uses fallback 10px" in approximated
+    assert "bar radius uses fallback 4px" in approximated
+    assert "surface colour uses fallback #111118" in approximated
+
+
+def test_default_style_output_remains_stable():
+    layout = _layout([_gauge(), _bar(), _text(), _table()])
+    result = export_lvgl(layout)
+    source = result["source"]
+    widgets = {widget["index"]: widget for widget in result["metadata"]["widgets"]}
+
+    assert (
+        f"lv_obj_set_style_arc_width({widgets[0]['identifier']}, 10, "
+        "LV_PART_MAIN);"
+    ) in source
+    assert (
+        f"lv_obj_set_style_radius({widgets[1]['identifier']}, 4, "
+        "LV_PART_MAIN);"
+    ) in source
+    assert (
+        f"lv_obj_set_style_bg_color({widgets[3]['identifier']}, "
+        "lv_color_hex(0x111118), LV_PART_MAIN);"
+    ) in source
+    assert "lv_color_hex(0x5b6fff)" in source
+    assert "lv_color_hex(0xe5e7eb)" in source
+    assert "lv_obj_set_style_text_color(row, lv_color_hex(0x8d9bb3), LV_PART_MAIN);" in source
+    assert widgets[0]["arc_width"] == 10
+    assert widgets[0]["surface"] == "#111118"
+    assert widgets[1]["bar_radius"] == 4
+    assert widgets[3]["surface"] == "#111118"
+    assert export_lvgl(layout) == result
+
+
 # ---------------------------------------------------------------------------
 # Determinism and malformed input
 # ---------------------------------------------------------------------------

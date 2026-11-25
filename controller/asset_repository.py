@@ -59,7 +59,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 log = logging.getLogger("ozma.asset_repository")
 
@@ -2127,9 +2127,28 @@ def _http_error(exc: AssetRepositoryError) -> HTTPException:
     )
 
 
-def build_router(manager: AssetRepository) -> APIRouter:
-    """Build the ``/api/v1/asset-db`` router around a repository instance."""
-    router = APIRouter(tags=["asset-db"])
+def build_router(manager: AssetRepository, *, enabled: bool = True) -> APIRouter:
+    """Build the ``/api/v1/asset-db`` router around a repository instance.
+
+    ``enabled`` mirrors ``display.asset_repository.enabled``.  When false the
+    routes stay mounted so callers receive a typed ``display_disabled`` 503
+    instead of a misleading 404.
+    """
+
+    def _require_enabled() -> None:
+        if not enabled:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "display_disabled",
+                    "message": "display asset repository is disabled",
+                },
+            )
+
+    router = APIRouter(
+        tags=["asset-db"],
+        dependencies=[Depends(_require_enabled)],
+    )
 
     @router.get("/api/v1/asset-db/search")
     def search_assets(

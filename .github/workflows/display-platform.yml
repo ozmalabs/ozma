@@ -1,0 +1,186 @@
+name: Display platform
+
+# Targeted hardening gate for the display platform (WGT-080/085/087).
+# This workflow is read-only: it needs no secrets, no network services beyond
+# the package registries used by the setup actions, and only contents:read.
+on:
+  pull_request:
+    paths:
+      - 'connect/assets/**'
+      - 'controller/asset_repository.py'
+      - 'controller/asset_trust.py'
+      - 'controller/display_config.py'
+      - 'controller/display_import_api.py'
+      - 'controller/display_import_store.py'
+      - 'controller/display_ir.py'
+      - 'controller/display_runtime.py'
+      - 'controller/font_export.py'
+      - 'controller/font_translation.py'
+      - 'controller/lvgl_export.py'
+      - 'controller/screen_widgets.py'
+      - 'controller/shape_extract.py'
+      - 'controller/widget_packs/**'
+      - 'controller/display_importers/**'
+      - 'scripts/check_display_licenses.py'
+      - 'scripts/display_benchmarks.py'
+      - 'scripts/display_keys.py'
+      - 'scripts/migrate_display_packs.py'
+      - 'tests/unit/connect/**'
+      - 'tests/unit/controller/test_*.py'
+      - 'schemas/display/**'
+      - 'ozma-display-ir/**'
+      - 'ozma-fonts/**'
+      - 'web/display/**'
+      - 'renderer/**'
+      - 'ozma-node/src/aida64.rs'
+      - 'ozma-node/tests/aida64.rs'
+      - 'docs/routing/aida64.md'
+      - 'docs/display-platform/**'
+      - 'docs/display-platform-execution-plan.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/display-platform.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'connect/assets/**'
+      - 'controller/asset_repository.py'
+      - 'controller/asset_trust.py'
+      - 'controller/display_config.py'
+      - 'controller/display_import_api.py'
+      - 'controller/display_import_store.py'
+      - 'controller/display_ir.py'
+      - 'controller/display_runtime.py'
+      - 'controller/font_export.py'
+      - 'controller/font_translation.py'
+      - 'controller/lvgl_export.py'
+      - 'controller/screen_widgets.py'
+      - 'controller/shape_extract.py'
+      - 'controller/widget_packs/**'
+      - 'controller/display_importers/**'
+      - 'scripts/check_display_licenses.py'
+      - 'scripts/display_benchmarks.py'
+      - 'scripts/display_keys.py'
+      - 'scripts/migrate_display_packs.py'
+      - 'tests/unit/connect/**'
+      - 'tests/unit/controller/test_*.py'
+      - 'schemas/display/**'
+      - 'ozma-display-ir/**'
+      - 'ozma-fonts/**'
+      - 'web/display/**'
+      - 'renderer/**'
+      - 'ozma-node/src/aida64.rs'
+      - 'ozma-node/tests/aida64.rs'
+      - 'docs/routing/aida64.md'
+      - 'docs/display-platform/**'
+      - 'docs/display-platform-execution-plan.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/display-platform.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python manifests, migration, and licence gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v4
+      - name: Install test tools
+        run: |
+          uv pip install --system pytest ruff fastapi httpx sqlalchemy pyyaml jsonschema \
+            fonttools pillow cryptography
+      - name: Display platform tests
+        run: |
+          python -m pytest \
+            tests/unit/controller/test_display_config.py \
+            tests/unit/controller/test_display_runtime.py \
+            tests/unit/controller/test_display_trust_runtime.py \
+            tests/unit/controller/test_asset_trust.py \
+            tests/unit/controller/test_asset_repository.py \
+            tests/unit/controller/test_display_ir.py \
+            tests/unit/controller/test_display_importers_core.py \
+            tests/unit/controller/test_display_importers_extended.py \
+            tests/unit/controller/test_display_import_api.py \
+            tests/unit/controller/test_font_translation.py \
+            tests/unit/controller/test_font_export.py \
+            tests/unit/controller/test_font_golden.py \
+            tests/unit/controller/test_shape_extract.py \
+            tests/unit/controller/test_lvgl_export.py \
+            tests/unit/controller/test_display_golden.py \
+            tests/unit/controller/test_display_perf.py \
+            tests/unit/controller/test_migrate_display_packs.py \
+            tests/unit/controller/test_display_license_gate.py \
+            tests/unit/connect/test_assets.py \
+            tests/unit/connect/test_asset_sync.py \
+            tests/unit/connect/test_asset_bootstrap.py -q
+      - name: Lint display Python
+        run: |
+          ruff check connect/assets controller/display_config.py \
+            controller/display_import_api.py controller/display_import_store.py \
+            controller/display_ir.py controller/display_runtime.py \
+            controller/asset_trust.py controller/asset_repository.py \
+            controller/font_*.py controller/shape_extract.py controller/lvgl_export.py \
+            scripts/check_display_licenses.py scripts/display_keys.py \
+            scripts/display_benchmarks.py scripts/migrate_display_packs.py \
+            tests/unit/connect tests/unit/controller/test_display_*.py \
+            tests/unit/controller/test_asset_trust.py \
+            tests/unit/controller/test_font_*.py \
+            tests/unit/controller/test_shape_extract.py \
+            tests/unit/controller/test_lvgl_export.py \
+            tests/unit/controller/test_migrate_display_packs.py
+      - name: Compile migration script
+        run: python -m py_compile scripts/migrate_display_packs.py
+      - name: Migration dry-run is clean
+        run: python scripts/migrate_display_packs.py --root controller/widget_packs --dry-run
+      - name: Licence gate (local first-party mode)
+        run: python scripts/check_display_licenses.py --root . --mode local
+      - name: Licence gate (published mode rejects first-party AGPL)
+        run: |
+          if python scripts/check_display_licenses.py \
+            --root . --mode published --json; then
+            echo "::error::published mode unexpectedly accepted a first-party AGPL pack"
+            exit 1
+          fi
+          echo "published mode correctly rejected the first-party AGPL pack"
+
+  rust:
+    name: Rust IR and font contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Test display IR and fonts
+        run: cargo test -p ozma-display-ir -p ozma-fonts
+      - name: Clippy (no dependencies)
+        run: |
+          cargo clippy -p ozma-display-ir -p ozma-fonts --all-targets \
+            --no-deps -- -D warnings
+      - name: Rustfmt
+        run: cargo fmt -p ozma-display-ir -p ozma-fonts -- --check
+
+  node:
+    name: Browser widgets and renderer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Node version
+        run: node --version
+      - name: Syntax check
+        run: |
+          find web/display renderer -name '*.js' \
+            -not -path '*/node_modules/*' -print0 \
+            | xargs -0 -n1 node --check
+      - name: Unit tests
+        run: |
+          node --test web/display/*.test.mjs \
+            web/display/widgets/*.test.mjs \
+            renderer/*.test.mjs

@@ -96,7 +96,9 @@ Connect routes (`/assets/search`, `/assets/entry/{id}`,
 `/assets/versions/{id}`, `/assets/categories`, `/assets/submit`,
 `/assets/stats`, `/assets/index/{channel}`) are served by `connect/assets/`.
 The controller verifies the signed index and replaces its cache only after
-canonical-JSON signature and ETag checks succeed.
+canonical-JSON signature and ETag checks succeed. See [connect.md](connect.md)
+for deploying that service: environment variables, storage layout, SQLite vs
+Postgres, key generation, TLS, and backup/restore.
 
 ## Configuration example
 
@@ -141,6 +143,32 @@ Local mode permits AGPL only for the configured first-party author. Published
 mode uses the community allowlist. The gate reads manifests, verifies hashes for
 files that exist, reports missing declared files, and rejects executable assets
 without a sandbox. It exits non-zero on errors and never executes pack code.
+
+## Migrating manifests for a release
+
+Older pack manifests can be upgraded in place with the migration script. It
+dry-runs by default, preserves unknown fields and option values, computes
+hashes only for files that exist, rejects symlinks and traversal, and refuses
+to overwrite a newer or invalid manifest without `--force`:
+
+```bash
+# Report what would change; writes nothing.
+python scripts/migrate_display_packs.py --root controller/widget_packs
+
+# Apply atomically, keeping a .manifest.json.bak beside each manifest.
+python scripts/migrate_display_packs.py \
+  --root controller/widget_packs --write --backup
+
+# Re-run to confirm the migration is idempotent (changed=0).
+python scripts/migrate_display_packs.py \
+  --root controller/widget_packs --dry-run
+```
+
+The JSON report is `{"checked", "changed", "skipped", "errors"}`. Manifests
+that already carry the extended lifecycle block are skipped byte-identically;
+use `--force` only to re-normalize them deliberately. See the
+[release notes](release-notes.md) for upgrade steps, rollback, feature flags,
+and known caveats, and [publishing](publishing.md) for the manifest contract.
 
 ## Troubleshooting
 

@@ -1,0 +1,23 @@
+{
+  "tokens": {
+    "color.bg": "#0b0d12",
+    "color.fg": "#f4f6fb",
+    "color.text": "#f4f6fb",
+    "color.muted": "#93a1b5",
+    "color.dim": "#65758b",
+    "color.accent": "#3ba7ff",
+    "color.ok": "#37d67a",
+    "color.warn": "#ffb020",
+    "color.crit": "#ff5c5c",
+    "color.track": "#1b2230",
+    "color.surface": "#141821",
+    "gauge.fill": "{color.accent}",
+    "gauge.track": "{color.track}",
+    "gauge.warn": "{color.warn}",
+    "gauge.crit": "{color.crit}",
+    "gauge.text": "{color.fg}",
+    "gauge.muted": "{color.muted}",
+    "bar.fill": "{color.accent}",
+    "bar.track": "{color.track}"
+  }
+}

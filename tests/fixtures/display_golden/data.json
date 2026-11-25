@@ -1,0 +1,9 @@
+{
+  "org.ozma/node.cpu_temp": 72.5,
+  "org.ozma/node.memory.percent": 63,
+  "cpu.usage": 42,
+  "node.name": "atlas-01",
+  "gpu.history": [18, 24, 31, 29, 42, 48, 55, 52, 61, 64],
+  "network.online": true,
+  "power.draw": 312
+}

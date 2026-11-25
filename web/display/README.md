@@ -117,6 +117,10 @@ http://localhost:8080/?autoconnect=0
 - `text` / `label`, `number`, `gauge`, `bar`, `vu_meter`, `icon`, `toggle`,
   `switch`, `scenario`, and `clock`-style cards. Unknown widget types render a
   readable fallback card.
+- `vu_meter` uses real meter ballistics when `widgets/vu.js` is present:
+  attack/release smoothing, dB-per-second falloff, peak hold/decay, clip latch,
+  RMS window, and mono/stereo channels. Add `input: "linear"` for 0..1 sources;
+  the default input is dBFS (`min`/`max` default to -60/0 dB).
 - Field bindings by numeric `field`/`field_id` or metric key
   (`metric`, `binding`, `data_key`, `metric_key`).
 - `{variable}` interpolation in labels/text using current field values.

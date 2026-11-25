@@ -50,7 +50,12 @@ app.post('/render', async (req, res) => {
     const type = fmt === 'jpeg' ? 'image/jpeg' : (fmt === 'svg' ? 'image/svg+xml' : 'image/png');
     res.type(type).send(buffer);
   } catch (err) {
-    res.status(err.code ? 400 : 500).json({ error: err.message, code: err.code });
+    // Canvas is optional.  Report a retryable service gap rather than a crash
+    // or a misleading 400 when PNG/JPEG was requested without @napi-rs/canvas.
+    const status = err.code === 'canvas_unavailable'
+      ? 503
+      : (err.code ? 400 : 500);
+    res.status(status).json({ error: err.message, code: err.code });
   }
 });
 
@@ -86,7 +91,7 @@ wss.on('connection', (ws) => {
         );
       ws.send(buffer);
     } catch (err) {
-      ws.send(JSON.stringify({ error: err.message }));
+      ws.send(JSON.stringify({ error: err.message, code: err.code }));
     }
   });
 });

@@ -41,6 +41,7 @@ const WIDGET_TYPES = new Set([
   'gauge',
   'bar',
   'vu_meter',
+  'vue_meter',
   'sparkline',
   'chart',
   'history',
@@ -56,7 +57,10 @@ const WIDGET_TYPES = new Set([
 const DEFAULT_THEME = 'core-dark';
 const GAUGE_MODULE_URL = './widgets/gauge.js';
 const SPARKLINE_MODULE_URL = './widgets/sparkline.js';
+const VU_MODULE_URL = './widgets/vu.js';
 const THEME_MODULE_URL = './theme.js';
+const SANDBOX_MODULE_URL = './sandbox.js';
+const SANDBOX_HOST_URL = './sandbox-host.html';
 export const DEFAULT_HISTORY_POINTS = 120;
 export const MAX_HISTORY_POINTS = 4096;
 
@@ -103,16 +107,22 @@ const state = {
   actionsByKey: new Map(),
   gaugeModule: null,
   sparklineModule: null,
+  vuModule: null,
   themeModule: null,
+  sandboxModule: null,
+  sandboxFrames: [],
   theme: null,
   themeTokens: {},
   themeCanvas: null,
   historyByField: new Map(),
+  vuStates: new Map(),
+  vuFlushers: new Set(),
 };
 
 let actionSequence = 0n;
 let gaugeSequence = 0;
 let sparklineSequence = 0;
+let vuSequence = 0;
 
 /* ------------------------------------------------------------------------- */
 /* Small utilities                                                            */
@@ -278,7 +288,7 @@ export function selectThemeSelection({
 export function gaugeModeForType(type) {
   const name = String(type || '').toLowerCase();
   if (name === 'gauge') return 'arc';
-  if (name === 'bar' || name === 'vu_meter') return 'bar';
+  if (name === 'bar' || name === 'vu_meter' || name === 'vue_meter') return 'bar';
   return null;
 }
 
@@ -298,6 +308,225 @@ export function sparklineModeForType(type, node = null) {
     return 'sparkline';
   }
   return null;
+}
+
+const VU_TYPES = new Set(['vu_meter', 'vue_meter']);
+
+/**
+ * Return the normalised VU widget type, or null for other widget types.
+ * `vue_meter` is accepted as a harmless spelling alias.
+ */
+export function vuTypeForNode(node) {
+  const type = String(typeof node === 'string' ? node : node?.type || '').toLowerCase();
+  return VU_TYPES.has(type) ? type : null;
+}
+
+/**
+ * Map a widget to the VU renderer.  The type mapping alone yields `'vu'`;
+ * pass `{ hasVuModule: false }` when callers need to model a missing optional
+ * module and fall back to the gauge bar renderer.
+ */
+export function vuRenderKind(node, { hasVuModule } = {}) {
+  if (!vuTypeForNode(node)) return null;
+  if (typeof hasVuModule === 'boolean') return hasVuModule ? 'vu' : null;
+  return 'vu';
+}
+
+function firstNodeValue(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  return undefined;
+}
+
+function vuNodeChannelMode(node) {
+  const right = firstNodeValue(
+    node?.right_metric,
+    node?.rightMetric,
+    node?.right_field,
+    node?.rightField,
+    node?.field_r,
+    node?.fieldR,
+  );
+  const raw = firstNodeValue(node?.channels, node?.channel_mode, node?.channelMode);
+  const numeric = Number(raw);
+  const stereo = right !== undefined
+    || (Number.isFinite(numeric) && numeric >= 2)
+    || /stereo|dual|lr|left.?right/i.test(String(raw || ''))
+    || Array.isArray(node?.levels);
+  return stereo ? 'stereo' : 'mono';
+}
+
+/**
+ * Serialise VU configuration from a definition node.  Snake_case and
+ * camelCase fields are accepted; unspecified values are left undefined so the
+ * VU module can apply its defaults.
+ */
+export function vuConfigForNode(node = {}, field = null, label = '') {
+  const source = node && typeof node === 'object' ? node : {};
+  const channels = vuNodeChannelMode(source);
+  let input = firstNodeValue(
+    source.input,
+    source.scale,
+    source.value_scale,
+    source.valueScale,
+  );
+  if (input === undefined && source.linear === true) input = 'linear';
+  if (input === undefined) {
+    const unit = String(firstNodeValue(source.unit, field?.unit, '') || '');
+    const min = Number(firstNodeValue(source.min, field?.min, Number.NaN));
+    const max = Number(firstNodeValue(source.max, field?.max, Number.NaN));
+    if (!/db/i.test(unit) && min === 0 && max === 1) input = 'linear';
+  }
+
+  return {
+    channels,
+    min: firstNodeValue(source.min, field?.min),
+    max: firstNodeValue(source.max, field?.max),
+    warn: firstNodeValue(source.warn, source.warn_at, source.warnAt),
+    crit: firstNodeValue(source.crit, source.critical, source.crit_at, source.critAt),
+    attackMs: firstNodeValue(source.attack_ms, source.attackMs),
+    releaseMs: firstNodeValue(source.release_ms, source.releaseMs),
+    falloffDbPerSec: firstNodeValue(
+      source.falloff_db_per_sec,
+      source.falloffDbPerSec,
+      source.falloff,
+    ),
+    peakHoldMs: firstNodeValue(source.peak_hold_ms, source.peakHoldMs),
+    peakFalloffDbPerSec: firstNodeValue(
+      source.peak_falloff_db_per_sec,
+      source.peakFalloffDbPerSec,
+    ),
+    rmsWindowMs: firstNodeValue(source.rms_window_ms, source.rmsWindowMs),
+    clipThresholdDb: firstNodeValue(
+      source.clip_db,
+      source.clipDb,
+      source.clip_threshold_db,
+      source.clipThresholdDb,
+    ),
+    clipAutoClearMs: firstNodeValue(
+      source.clip_auto_clear_ms,
+      source.clipAutoClearMs,
+      source.auto_clear_clip_ms,
+      source.autoClearMs,
+      source.auto_clear_ms,
+    ),
+    segments: firstNodeValue(source.segments, source.segment_count, source.segmentCount),
+    orientation: firstNodeValue(source.orientation, source.direction),
+    unit: firstNodeValue(source.unit, field?.unit),
+    label: firstNodeValue(label, source.label, source.title, source.name, ''),
+    decimals: firstNodeValue(source.decimals, source.precision),
+    width: firstNodeValue(source.width, source.w),
+    height: firstNodeValue(source.height, source.h),
+    padding: firstNodeValue(source.padding, source.inset),
+    gap: firstNodeValue(source.gap, source.row_gap, source.rowGap),
+    showValue: firstNodeValue(source.showValue, source.show_value),
+    showLabels: firstNodeValue(source.showLabels, source.show_labels),
+    showPeak: firstNodeValue(source.showPeak, source.show_peak),
+    showClip: firstNodeValue(source.showClip, source.show_clip),
+    animate: firstNodeValue(source.animate, source.animated),
+    reducedMotion: firstNodeValue(source.reducedMotion, source.reduced_motion),
+    leftLabel: firstNodeValue(source.left_label, source.leftLabel),
+    rightLabel: firstNodeValue(source.right_label, source.rightLabel),
+    input,
+  };
+}
+
+/**
+ * Extract a VU sample from a field value.  Arrays and `{ l, r }` objects pass
+ * through; stereo nodes pair the primary value with a second field value, and
+ * mono nodes keep the existing single-value binding shape.
+ */
+export function vuSampleForNode(node = {}, value, rightValue) {
+  const source = node && typeof node === 'object' ? node : {};
+
+  if (Array.isArray(value)) {
+    return value.length >= 2
+      ? { l: value[0], r: value[1] }
+      : value[0];
+  }
+
+  if (value && typeof value === 'object') {
+    if (Array.isArray(value.levels)) {
+      return { l: value.levels[0], r: value.levels[1] };
+    }
+    const left = firstNodeValue(
+      value.l,
+      value.left,
+      value.value,
+      value.level_l,
+      value.levelL,
+      value.db,
+      value.level,
+    );
+    const right = firstNodeValue(
+      value.r,
+      value.right,
+      value.value2,
+      value.second,
+      value.level_r,
+      value.levelR,
+      value.db2,
+      value.level2,
+    );
+    if (left !== undefined || right !== undefined) {
+      return { l: left ?? right, r: right ?? left };
+    }
+  }
+
+  if (
+    Array.isArray(source.levels)
+    && (value === undefined || value === null || value === '')
+    && (rightValue === undefined || rightValue === null)
+  ) {
+    return { l: source.levels[0], r: source.levels[1] };
+  }
+
+  if (vuNodeChannelMode(source) === 'stereo' || rightValue !== undefined) {
+    let right = rightValue;
+    if ((right === undefined || right === null) && Array.isArray(source.levels)) {
+      right = source.levels[1];
+    }
+    if (right === undefined || right === null) right = value;
+    return { l: value, r: right };
+  }
+
+  return value;
+}
+
+/**
+ * Pure monotonic delta helper.  Non-finite timestamps and clock regressions
+ * produce a zero delta; the caller keeps the previous timestamp.
+ */
+export function vuDeltaMs(nowMs, lastMs) {
+  const now = Number(nowMs);
+  if (!Number.isFinite(now)) return 0;
+  const last = Number(lastMs);
+  if (!Number.isFinite(last) || last < 0) return 0;
+  return Math.max(0, now - last);
+}
+
+/**
+ * Advance a VU record using an injected clock.  `step` is normally
+ * `vu.stepVuState`; keeping it injectable makes the client timing path pure
+ * and testable without a browser.
+ */
+export function vuStepForTimestamp(record, sample, config, nowMs, step = null) {
+  if (!record || typeof record !== 'object') return 0;
+  const dt = record.lastMs === undefined || record.lastMs === null
+    ? 0
+    : vuDeltaMs(nowMs, record.lastMs);
+  const now = Number(nowMs);
+  if (Number.isFinite(now)) {
+    const previous = Number(record.lastMs);
+    record.lastMs = Number.isFinite(previous) && previous >= 0
+      ? Math.max(previous, now)
+      : now;
+  }
+  if (record.state && typeof step === 'function') {
+    step(record.state, sample, config, dt);
+  }
+  return dt;
 }
 
 /**
@@ -325,13 +554,258 @@ export function historyCapacityForNode(node, fallback = DEFAULT_HISTORY_POINTS) 
 }
 
 /**
+ * Markers and fields that require a third-party widget to run in the iframe
+ * sandbox.  These are pure checks: no module or DOM is consulted.
+ */
+const SANDBOX_RENDERER_MARKERS = new Set([
+  'third_party',
+  'third-party',
+  'thirdparty',
+  'sandbox',
+  'sandboxed',
+  'iframe',
+  'webview',
+]);
+const SANDBOX_TYPE_MARKERS = new Set(['iframe_widget', 'iframe-widget', 'webview']);
+const SANDBOX_EXECUTABLE_FIELDS = ['script', 'scripts', 'code', 'js', 'javascript'];
+const SCRIPTISH_HTML_RE =
+  /<\s*(?:script|iframe|object|embed|foreignobject)\b|\bon[a-z]+\s*=|javascript\s*:|data\s*:\s*text\/html|srcdoc\s*=/i;
+const SVG_UNSAFE_RE =
+  /<\s*(?:script|style|foreignobject|iframe|object|embed|image|use|animate|set|audio|video|feimage)\b|\bon[a-z]+\s*=|(?:xlink:)?href\s*=|javascript\s*:|<!entity\b|url\(\s*['"]?(?!#)/i;
+
+function sandboxExecutableValue(value) {
+  if (value === undefined || value === null || value === false) return false;
+  if (typeof value === 'string') return value.trim() !== '';
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === 'object') return Object.keys(value).length > 0;
+  return true;
+}
+
+function sandboxRendererMarker(node) {
+  const markers = [];
+  for (const key of ['renderer', 'renderer_type', 'rendererType']) {
+    const raw = node?.[key];
+    if (typeof raw === 'string' && raw.trim()) markers.push(raw.trim().toLowerCase());
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      const nested = raw.type ?? raw.kind ?? raw.mode ?? raw.name;
+      if (typeof nested === 'string' && nested.trim()) {
+        markers.push(nested.trim().toLowerCase());
+      }
+    }
+  }
+  return markers;
+}
+
+function isSandboxRendererMarker(marker) {
+  if (!marker) return false;
+  if (SANDBOX_RENDERER_MARKERS.has(marker)) return true;
+  return /^third[_-]?party(?:[_-]|$)/.test(marker)
+    || marker.startsWith('sandbox')
+    || marker.endsWith('_iframe')
+    || marker.endsWith('-iframe');
+}
+
+function hasSandboxRendererMarker(node) {
+  return sandboxRendererMarker(node).some(isSandboxRendererMarker);
+}
+
+/**
+ * True when a definition node carries executable third-party code or explicitly
+ * declares the iframe sandbox.  Declarative HTML without executable markers is
+ * not sandboxed.
+ *
+ * @param {object|null|undefined} node
+ * @returns {boolean}
+ */
+export function shouldSandboxWidget(node) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return false;
+
+  if (node.executable === true) return true;
+
+  if (typeof node.sandbox === 'string' && node.sandbox.trim().toLowerCase() === 'iframe') {
+    return true;
+  }
+
+  if (hasSandboxRendererMarker(node)) return true;
+
+  if (typeof node.type === 'string' && SANDBOX_TYPE_MARKERS.has(node.type.trim().toLowerCase())) {
+    return true;
+  }
+
+  for (const field of SANDBOX_EXECUTABLE_FIELDS) {
+    if (sandboxExecutableValue(node[field])) return true;
+  }
+
+  if (typeof node.html === 'string' && SCRIPTISH_HTML_RE.test(node.html)) return true;
+
+  return false;
+}
+
+function sandboxActionRequested(actionValue) {
+  if (actionValue === true) return true;
+  if (typeof actionValue === 'string') {
+    const text = actionValue.trim().toLowerCase();
+    return Boolean(text) && text !== 'none' && text !== 'false' && text !== '0';
+  }
+  if (Array.isArray(actionValue)) return actionValue.length > 0;
+  if (actionValue && typeof actionValue === 'object') return Object.keys(actionValue).length > 0;
+  return false;
+}
+
+/**
+ * Capabilities for a sandboxed widget.  Rendering is always requested; the
+ * `actions` capability is only added when the node asks for it.
+ */
+export function sandboxCapabilitiesForNode(node) {
+  return sandboxActionRequested(node?.actions) ? ['render', 'actions'] : ['render'];
+}
+
+/**
+ * Decide how a widget should be rendered.  A sandboxed widget never falls
+ * through to the gauge, sparkline, or legacy card renderers, even when the
+ * sandbox module failed to load.
+ */
+export function sandboxRenderPlan(node, { hasSandboxModule = false } = {}) {
+  if (!shouldSandboxWidget(node)) return { kind: 'builtin' };
+  if (!hasSandboxModule) {
+    return {
+      kind: 'error',
+      code: 'SANDBOX_MODULE_UNAVAILABLE',
+      message: 'Sandboxed widget unavailable',
+    };
+  }
+  return { kind: 'sandbox' };
+}
+
+function sandboxPlainString(value, maxLength = 256) {
+  if (typeof value !== 'string') return '';
+  return value
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function firstSandboxString(...values) {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return '';
+}
+
+function sandboxToken(value, fallback = 'widget') {
+  if (typeof value !== 'string' && typeof value !== 'number') return fallback;
+  const token = String(value)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+  return token || fallback;
+}
+
+function sandboxThreshold(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+/**
+ * Normal/warn/crit severity for a sandboxed widget.  Non-numeric values are
+ * always normal so a string or boolean metric cannot trip a threshold.
+ */
+export function sandboxSeverity(node, value) {
+  if (typeof value === 'boolean' || value === undefined || value === null) return 'normal';
+  const number = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(number)) return 'normal';
+
+  const crit = sandboxThreshold(
+    node?.crit ?? node?.critical ?? node?.crit_at ?? node?.critAt,
+  );
+  const warn = sandboxThreshold(
+    node?.warn ?? node?.warn_at ?? node?.warnAt,
+  );
+  if (crit !== null && number >= crit) return 'crit';
+  if (warn !== null && number >= warn) return 'warn';
+  return 'normal';
+}
+
+/**
+ * Conservative client-side SVG allowlist.  The sandbox host sanitises the
+ * string again; this check keeps external references and scriptable content
+ * out of the mount payload in the first place.
+ *
+ * @returns {string|null} original SVG string when allowed
+ */
+export function allowlistedSandboxSvg(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text || text.length > 64 * 1024) return null;
+  if (!/^<svg\b/i.test(text) || !/<\/svg>\s*$/i.test(text)) return null;
+  if (SVG_UNSAFE_RE.test(text)) return null;
+  return text;
+}
+
+function formatSandboxValue(value, field, node) {
+  const raw = value === undefined ? node?.value : value;
+  if (raw === undefined || raw === null) return '—';
+  if (typeof raw === 'function' || typeof raw === 'symbol') return '—';
+  const safeNode = node && typeof node === 'object' ? { ...node, unit: '' } : {};
+  const safeField = field && typeof field === 'object' ? { ...field, unit: '' } : null;
+  let text;
+  try {
+    text = formatWidgetValue(raw, safeField, safeNode);
+  } catch {
+    text = formatValue(raw);
+  }
+  return sandboxPlainString(String(text), 4096) || '—';
+}
+
+/**
+ * Build the declarative mount payload for a sandboxed widget.
+ *
+ * Only the widget kind, label/title, formatted value, unit, severity, and an
+ * optional allowlisted SVG are copied.  Scripts, code, URLs, HTML, and every
+ * other arbitrary node field are ignored.
+ *
+ * @param {object} node
+ * @param {object|null} [field]
+ * @param {*} [value]
+ * @returns {{kind: string, label: string, value: string, unit: string,
+ *   severity: string, svg?: string}}
+ */
+export function sandboxMountPayload(node, field = null, value = undefined) {
+  const payload = {
+    kind: sandboxToken(
+      node?.kind ?? node?.widget_kind ?? node?.widgetKind ?? node?.type,
+      'widget',
+    ),
+    label: sandboxPlainString(
+      firstSandboxString(node?.label, node?.title, node?.name, field?.key),
+      256,
+    ),
+    value: formatSandboxValue(value, field, node),
+    unit: sandboxPlainString(
+      firstSandboxString(node?.unit, field?.unit),
+      64,
+    ),
+    severity: sandboxSeverity(node, value === undefined ? node?.value : value),
+  };
+
+  const svg = allowlistedSandboxSvg(node?.svg ?? node?.svgString ?? node?.svg_string);
+  if (svg) payload.svg = svg;
+  return payload;
+}
+
+/**
  * Choose between the SVG sparkline/gauge renderers and the legacy fallback.
  */
 export function widgetRenderKind(
   node,
-  { hasGaugeModule = false, hasSparklineModule = false } = {},
+  { hasGaugeModule = false, hasSparklineModule = false, hasVuModule = false } = {},
 ) {
   const type = typeof node === 'string' ? node : node?.type;
+  if (shouldSandboxWidget(typeof node === 'string' ? null : node)) return 'sandbox';
+  if (hasVuModule && vuRenderKind(node, { hasVuModule: true })) return 'vu';
   if (hasSparklineModule && sparklineModeForType(type, typeof node === 'string' ? null : node)) {
     return 'sparkline';
   }
@@ -647,6 +1121,7 @@ function normaliseActions(value) {
 }
 
 function renderDefinition(definition) {
+  teardownSandboxFrames('definition');
   const documentData = definition.definition || {};
   state.definition = definition;
   state.document = documentData;
@@ -656,6 +1131,8 @@ function renderDefinition(definition) {
   state.values.clear();
   state.valuesByKey.clear();
   state.historyByField.clear();
+  state.vuStates.clear();
+  state.vuFlushers.clear();
   state.bindings = [];
   state.textBindings = [];
   state.fieldRows.clear();
@@ -717,7 +1194,7 @@ function renderNode(node) {
     : Array.isArray(node.widgets)
       ? node.widgets
       : null;
-  const container = children !== null && (
+  const container = !shouldSandboxWidget(node) && children !== null && (
     CONTAINER_TYPES.has(type) || !WIDGET_TYPES.has(type)
   );
 
@@ -748,10 +1225,30 @@ function renderWidget(node) {
   const type = String(node.type || 'widget').toLowerCase();
   const field = resolveField(node);
   const action = resolveAction(node);
+
+  const sandboxPlan = sandboxRenderPlan(node, {
+    hasSandboxModule: Boolean(
+      state.sandboxModule && typeof state.sandboxModule.createSandboxFrame === 'function',
+    ),
+  });
+  if (sandboxPlan.kind === 'error') {
+    return renderSandboxUnavailable(node, type, sandboxPlan);
+  }
+  if (sandboxPlan.kind === 'sandbox') {
+    return renderSandboxWidget(node, field, action, type);
+  }
+
+  const hasVuModule = Boolean(
+    state.vuModule && typeof state.vuModule.renderVu === 'function',
+  );
   const renderKind = widgetRenderKind(node, {
     hasGaugeModule: Boolean(state.gaugeModule),
     hasSparklineModule: Boolean(state.sparklineModule),
+    hasVuModule,
   });
+  const vuMode = renderKind === 'vu'
+    ? vuRenderKind(node, { hasVuModule })
+    : null;
   const sparklineMode = renderKind === 'sparkline' ? sparklineModeForType(type, node) : null;
   const gaugeMode = renderKind === 'gauge' ? gaugeModeForType(type) : null;
 
@@ -765,6 +1262,21 @@ function renderWidget(node) {
     heading.className = 'widget-label';
     heading.textContent = headingText;
     card.append(heading);
+  }
+
+  if (vuMode) {
+    const host = document.createElement('div');
+    host.className = 'vu-host';
+    host.dataset.vu = vuMode;
+    try {
+      mountVu(host, node, field, headingText);
+      card.classList.add('widget-meter', 'widget-vu-svg');
+      card.append(host);
+      if (action) attachAction(card, action, node);
+      return card;
+    } catch {
+      // Fall through to the gauge bar or legacy card/meter renderer.
+    }
   }
 
   if (sparklineMode) {
@@ -804,7 +1316,7 @@ function renderWidget(node) {
   let track = null;
   let fill = null;
 
-  if (type === 'gauge' || type === 'bar' || type === 'vu_meter' || type === 'sparkline') {
+  if (type === 'gauge' || type === 'bar' || type === 'vu_meter' || type === 'vue_meter' || type === 'sparkline') {
     card.classList.add('widget-meter');
     track = document.createElement('div');
     track.className = 'meter-track';
@@ -843,6 +1355,271 @@ function renderWidget(node) {
 
   if (action) attachAction(card, action, node);
   return card;
+}
+
+function sandboxHostMountPayload(node, field, value, heading) {
+  const payload = sandboxMountPayload(node, field, value);
+  const nodes = [
+    {
+      type: 'text',
+      x: 0,
+      y: 0,
+      text: payload.label || heading || payload.kind,
+      dataKey: 'label',
+      size: 13,
+      color: '#9ca3af',
+    },
+    {
+      type: 'text',
+      x: 0,
+      y: 20,
+      text: payload.value,
+      dataKey: 'value',
+      size: 28,
+      weight: 600,
+      color: '#e5e7eb',
+    },
+  ];
+
+  if (payload.unit) {
+    nodes.push({
+      type: 'text',
+      x: 0,
+      y: 56,
+      text: payload.unit,
+      dataKey: 'unit',
+      size: 14,
+      color: '#9ca3af',
+    });
+  }
+
+  if (payload.severity !== 'normal') {
+    nodes.push({
+      type: 'text',
+      x: 0,
+      y: 78,
+      text: payload.severity,
+      dataKey: 'severity',
+      size: 12,
+      weight: 600,
+      color: payload.severity === 'crit' ? '#f26464' : '#f0b94a',
+    });
+  }
+
+  if (payload.svg) {
+    nodes.push({
+      type: 'svg',
+      x: 0,
+      y: 64,
+      width: 120,
+      height: 120,
+      svg: payload.svg,
+    });
+  }
+
+  return { ...payload, nodes };
+}
+
+function sandboxDataPayload(node, field, value) {
+  const payload = sandboxMountPayload(node, field, value);
+  delete payload.svg;
+  return payload;
+}
+
+function renderSandboxUnavailable(node, type, plan = {}) {
+  const headingText = widgetHeading(node, type, null);
+  const card = document.createElement('article');
+  card.className = `widget widget-${cssToken(type)} widget-sandbox widget-sandbox-error`;
+  card.dataset.widgetType = type;
+  card.dataset.sandbox = 'unavailable';
+  card.setAttribute('role', 'alert');
+  card.setAttribute('aria-label', headingText || 'Sandboxed widget unavailable');
+
+  if (headingText) {
+    const heading = document.createElement('div');
+    heading.className = 'widget-label';
+    heading.textContent = headingText;
+    card.append(heading);
+  }
+
+  const message = document.createElement('p');
+  message.className = 'widget-value';
+  message.textContent = 'Sandboxed widget unavailable';
+  card.append(message);
+
+  const detail = document.createElement('p');
+  detail.className = 'muted small';
+  detail.textContent = 'Third-party code was not executed.';
+  card.append(detail);
+
+  log(
+    `Sandboxed widget unavailable (${plan.code || 'SANDBOX_UNAVAILABLE'}): third-party code was not executed`,
+    'warn',
+  );
+  return card;
+}
+
+function sandboxHostFailure(entry, error) {
+  if (entry.failed) return;
+  entry.failed = true;
+  entry.ready = false;
+
+  try {
+    if (entry.bridge && !entry.bridge.destroyed) {
+      entry.bridge.teardown('mount-failure', { notify: false });
+    }
+  } catch {
+    // The bridge may already be gone.
+  }
+
+  if (entry.host) {
+    entry.host.replaceChildren();
+    entry.host.setAttribute('role', 'alert');
+    const message = document.createElement('p');
+    message.className = 'widget-value';
+    message.textContent = 'Sandboxed widget unavailable';
+    const detail = document.createElement('p');
+    detail.className = 'muted small';
+    detail.textContent = 'Third-party code was not executed.';
+    entry.host.append(message, detail);
+  }
+  if (entry.card) {
+    entry.card.classList.add('widget-sandbox-error');
+    entry.card.dataset.sandbox = 'unavailable';
+  }
+
+  log(
+    `Sandboxed widget unavailable: ${error?.message || error || 'bridge failed'}`,
+    'warn',
+  );
+}
+
+function renderSandboxWidget(node, field, action, type) {
+  const sandbox = state.sandboxModule;
+  if (!sandbox || typeof sandbox.createSandboxFrame !== 'function') {
+    return renderSandboxUnavailable(node, type, {
+      code: 'SANDBOX_MODULE_UNAVAILABLE',
+      message: 'Sandboxed widget unavailable',
+    });
+  }
+
+  const headingText = widgetHeading(node, type, field);
+  const card = document.createElement('article');
+  card.className = `widget widget-${cssToken(type)} widget-sandbox`;
+  card.dataset.widgetType = type;
+  card.dataset.sandbox = 'iframe';
+  if (headingText) {
+    const heading = document.createElement('div');
+    heading.className = 'widget-label';
+    heading.textContent = headingText;
+    card.append(heading);
+  }
+
+  const host = document.createElement('div');
+  host.className = 'sandbox-host';
+  host.style.position = 'relative';
+  host.style.width = '100%';
+  host.style.height = '96px';
+  host.style.minHeight = '96px';
+  host.style.overflow = 'hidden';
+  if (headingText) host.setAttribute('aria-label', headingText);
+  card.append(host);
+
+  let frame;
+  try {
+    frame = sandbox.createSandboxFrame({
+      src: SANDBOX_HOST_URL,
+      title: String(headingText || `Sandboxed ${type}`).slice(0, 256),
+      capabilities: sandboxCapabilitiesForNode(node),
+      document,
+      container: host,
+      onMessage(message) {
+        if (message.type === 'error') {
+          log(
+            `Sandboxed widget error: ${message.payload?.message || message.payload?.code || 'remote error'}`,
+            'warn',
+          );
+        }
+      },
+    });
+  } catch (error) {
+    log(`Sandboxed widget unavailable: ${error?.message || error}`, 'warn');
+    return renderSandboxUnavailable(node, type, {
+      code: error?.code || 'SANDBOX_CREATE',
+      message: 'Sandboxed widget unavailable',
+    });
+  }
+
+  const bridge = frame?.sandboxBridge;
+  if (!bridge || typeof bridge.mount !== 'function') {
+    log('Sandboxed widget unavailable: sandbox bridge missing', 'warn');
+    return renderSandboxUnavailable(node, type, {
+      code: 'SANDBOX_BRIDGE',
+      message: 'Sandboxed widget unavailable',
+    });
+  }
+
+  const entry = {
+    frame,
+    bridge,
+    host,
+    card,
+    node,
+    field,
+    ready: false,
+    failed: false,
+    latestValue: field ? (state.values.get(field.id) ?? node.value) : node.value,
+  };
+  state.sandboxFrames.push(entry);
+
+  bridge.readyPromise
+    .then(() => {
+      if (bridge.destroyed || entry.failed) return;
+      entry.ready = true;
+      try {
+        bridge.mount(sandboxHostMountPayload(node, field, entry.latestValue, headingText));
+      } catch (error) {
+        sandboxHostFailure(entry, error);
+      }
+    })
+    .catch((error) => {
+      if (error?.code === 'SANDBOX_TEARDOWN') return;
+      sandboxHostFailure(entry, error);
+    });
+
+  if (field && field.id !== undefined && field.id !== null) {
+    state.bindings.push({
+      fieldId: field.id,
+      apply(value) {
+        entry.latestValue = value;
+        if (!entry.ready || entry.failed || bridge.destroyed) return;
+        try {
+          bridge.data(sandboxDataPayload(node, field, value));
+        } catch (error) {
+          sandboxHostFailure(entry, error);
+        }
+      },
+    });
+  }
+
+  if (action) attachAction(card, action, node);
+  return card;
+}
+
+function teardownSandboxFrames(reason = 'definition') {
+  const frames = state.sandboxFrames;
+  state.sandboxFrames = [];
+  for (const entry of frames) {
+    try {
+      if (entry.bridge && typeof entry.bridge.teardown === 'function') {
+        entry.bridge.teardown(reason);
+      } else if (entry.frame && typeof entry.frame.teardown === 'function') {
+        entry.frame.teardown(reason);
+      }
+    } catch {
+      // A frame that already failed must not break definition reload.
+    }
+  }
 }
 
 function gaugeConfigForNode(node, field, mode, label) {
@@ -935,6 +1712,104 @@ function updateGauge(host, config, value, tokens, options) {
     const severityWord = severity === 'crit' ? 'critical' : severity === 'warn' ? 'warning' : 'normal';
     desc.textContent = `${geometry.label || 'Gauge'} reading ${reading}; range ${gauge.formatGaugeValue(geometry.min, geometry)} to ${gauge.formatGaugeValue(geometry.max, geometry)}${unit ? ` ${unit}` : ''}; ${severityWord}.`;
   }
+}
+
+function resolveVuRightField(node) {
+  const candidate = firstNodeValue(
+    node?.right_metric,
+    node?.rightMetric,
+    node?.right_field,
+    node?.rightField,
+    node?.field_r,
+    node?.fieldR,
+  );
+  if (candidate === undefined) return null;
+  return resolveField({ field: candidate });
+}
+
+function vuClockNow() {
+  if (
+    typeof globalThis.performance === 'object'
+    && globalThis.performance
+    && typeof globalThis.performance.now === 'function'
+  ) {
+    return globalThis.performance.now();
+  }
+  return Date.now();
+}
+
+function mountVu(host, node, field, label) {
+  const vu = state.vuModule;
+  if (
+    !vu
+    || typeof vu.renderVu !== 'function'
+    || typeof vu.createVuState !== 'function'
+    || typeof vu.stepVuState !== 'function'
+  ) {
+    throw new Error('vu module unavailable');
+  }
+
+  const config = vuConfigForNode(node, field, label);
+  const tokens = state.themeTokens || {};
+  const rightField = resolveVuRightField(node);
+  vuSequence += 1;
+  const options = { id: node.id || node.key || `vu-${vuSequence}` };
+  const initialLeft = field ? state.values.get(field.id) : node.value;
+  const initialRight = rightField ? state.values.get(rightField.id) : undefined;
+  const record = {
+    state: vu.createVuState(config),
+    config,
+    lastMs: null,
+    leftValue: initialLeft,
+    rightValue: initialRight,
+    dirty: false,
+  };
+  const key = `${node.id || node.key || field?.id || 'vu'}:${vuSequence}`;
+  state.vuStates.set(key, record);
+
+  vu.renderVu(host, config, record.state, tokens, options);
+
+  const render = () => {
+    if (typeof vu.updateVu === 'function') {
+      vu.updateVu(host, record.state, config, tokens, options);
+    } else {
+      vu.renderVu(host, config, record.state, tokens, options);
+    }
+  };
+
+  const flush = () => {
+    if (!record.dirty) return;
+    record.dirty = false;
+    const sample = vuSampleForNode(node, record.leftValue, record.rightValue);
+    vuStepForTimestamp(record, sample, config, vuClockNow(), vu.stepVuState);
+    render();
+  };
+  state.vuFlushers.add(flush);
+
+  if (field && field.id !== undefined && field.id !== null) {
+    state.bindings.push({
+      fieldId: field.id,
+      apply(value) {
+        record.leftValue = value;
+        record.dirty = true;
+      },
+    });
+  }
+  if (rightField && rightField.id !== undefined && rightField.id !== null) {
+    state.bindings.push({
+      fieldId: rightField.id,
+      apply(value) {
+        record.rightValue = value;
+        record.dirty = true;
+      },
+    });
+  }
+
+  if (initialLeft !== undefined || initialRight !== undefined) {
+    record.dirty = true;
+    flush();
+  }
+  return record;
 }
 
 function historySample(value) {
@@ -1254,6 +2129,10 @@ function applyDataUpdate(update) {
     }
   }
 
+  for (const flush of state.vuFlushers) {
+    flush();
+  }
+
   updateTextBindings();
   state.lastUpdate = new Date();
 }
@@ -1385,13 +2264,17 @@ async function applySelectedTheme(themeModule) {
 }
 
 async function bootstrapOptionalModules() {
-  const [themeModule, gaugeModule, sparklineModule] = await Promise.all([
+  const [themeModule, gaugeModule, sparklineModule, sandboxModule, vuModule] = await Promise.all([
     loadThemeModule(),
     importOptional(GAUGE_MODULE_URL),
     importOptional(SPARKLINE_MODULE_URL),
+    importOptional(SANDBOX_MODULE_URL),
+    importOptional(VU_MODULE_URL),
   ]);
   if (gaugeModule) state.gaugeModule = gaugeModule;
   if (sparklineModule) state.sparklineModule = sparklineModule;
+  if (sandboxModule) state.sandboxModule = sandboxModule;
+  if (vuModule) state.vuModule = vuModule;
   if (themeModule) {
     state.themeModule = themeModule;
     await applySelectedTheme(themeModule);
@@ -1420,6 +2303,7 @@ function bootAdapter() {
   });
   window.addEventListener('beforeunload', () => {
     state.manualClose = true;
+    teardownSandboxFrames('unload');
     clearReconnect();
     if (state.ws) {
       try {

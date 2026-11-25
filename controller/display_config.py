@@ -43,6 +43,8 @@ _ENV_TO_FIELD = {
     "OZMA_DISPLAY_ASSET_INDEX_URL": "asset_index_url",
     "OZMA_DISPLAY_CACHE_DIR": "cache_dir",
     "OZMA_DISPLAY_ALLOW_UNSIGNED_PACKS": "allow_unsigned_packs",
+    "OZMA_DISPLAY_SIGNATURE_REQUIRED": "signature_required",
+    "OZMA_DISPLAY_TRUSTED_KEYS": "trusted_keys",
     "OZMA_DISPLAY_MAX_PACK_BYTES": "max_pack_bytes",
     "OZMA_DISPLAY_MAX_IMPORT_BYTES": "max_import_bytes",
 }
@@ -55,11 +57,12 @@ _BOOL_FIELDS = (
     "fonts_translation_enabled",
     "importers_enabled",
     "allow_unsigned_packs",
+    "signature_required",
 )
 
 _SIZE_FIELDS = ("max_pack_bytes", "max_import_bytes")
 
-_STRING_FIELDS = ("asset_index_url", "cache_dir")
+_STRING_FIELDS = ("asset_index_url", "cache_dir", "trusted_keys")
 
 
 class DisplayConfigError(ValueError):
@@ -156,6 +159,10 @@ class DisplayConfig:
     asset_index_url: str = ""
     cache_dir: str = ""
     allow_unsigned_packs: bool = False
+    signature_required: bool = False
+    #: Raw JSON string of trusted public keys.  Kept opaque here so runtimes can
+    #: choose their own verifier format without this module parsing secrets.
+    trusted_keys: str = ""
     max_pack_bytes: int = DEFAULT_MAX_PACK_BYTES
     max_import_bytes: int = DEFAULT_MAX_IMPORT_BYTES
 
@@ -251,6 +258,16 @@ class DisplayConfig:
                     defaults.allow_unsigned_packs,
                 ),
                 "OZMA_DISPLAY_ALLOW_UNSIGNED_PACKS",
+            ),
+            signature_required=_parse_bool(
+                resolved.get(
+                    "signature_required",
+                    defaults.signature_required,
+                ),
+                "OZMA_DISPLAY_SIGNATURE_REQUIRED",
+            ),
+            trusted_keys=_parse_text(
+                resolved.get("trusted_keys", defaults.trusted_keys)
             ),
             max_pack_bytes=_parse_size(
                 resolved.get("max_pack_bytes", defaults.max_pack_bytes),

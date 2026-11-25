@@ -1,0 +1,208 @@
+{
+  "id": "org.ozma.layout.golden_cockpit",
+  "name": "Golden Cockpit",
+  "width": 1280,
+  "height": 720,
+  "background": "#0b0d12",
+  "theme": "core-dark",
+  "fields": [
+    {"id": 1, "key": "org.ozma/node.cpu_temp", "type": "real", "unit": "celsius", "scale": 100},
+    {"id": 2, "key": "org.ozma/node.memory.percent", "type": "real", "unit": "percent"},
+    {"id": 3, "key": "cpu.usage", "type": "real", "unit": "percent"},
+    {"id": 4, "key": "node.name", "type": "string"},
+    {"id": 5, "key": "gpu.history", "type": "real", "unit": "percent"},
+    {"id": 6, "key": "network.online", "type": "bool"},
+    {"id": 7, "key": "power.draw", "type": "real", "unit": "watt"}
+  ],
+  "widgets": [
+    {
+      "id": "cpu_temp",
+      "type": "gauge",
+      "ir_kind": "gauge",
+      "x": 24,
+      "y": 24,
+      "w": 240,
+      "h": 240,
+      "metric": "org.ozma/node.cpu_temp",
+      "label": "CPU Temperature",
+      "unit": "celsius",
+      "decimals": 1,
+      "min": 0,
+      "max": 100,
+      "value": 72.5,
+      "font_size": 22,
+      "tick_count": 5,
+      "arc_start_deg": 135,
+      "arc_end_deg": 405,
+      "domain": {
+        "min": 0,
+        "max": 100,
+        "nominal": 45,
+        "thresholds": [
+          {"at": 75, "severity": "warning", "label": "Warm", "color": "#f0b94a"},
+          {"at": 90, "severity": "critical", "label": "Hot", "color": "#f26464"}
+        ],
+        "severity_bands": [
+          {"min": 0, "max": 74, "severity": "ok", "label": "Nominal"}
+        ]
+      }
+    },
+    {
+      "id": "memory",
+      "type": "bar",
+      "ir_kind": "bar",
+      "x": 288,
+      "y": 24,
+      "w": 320,
+      "h": 44,
+      "metric": "org.ozma/node.memory.percent",
+      "label": "Memory",
+      "unit": "percent",
+      "decimals": 0,
+      "min": 0,
+      "max": 100,
+      "value": 63,
+      "radius": 6,
+      "font_size": 13,
+      "domain": {
+        "min": 0,
+        "max": 100,
+        "thresholds": [
+          {"at": 80, "severity": "warning", "label": "High", "color": "#f0b94a"},
+          {"at": 95, "severity": "critical", "label": "Exhausted", "color": "#f26464"}
+        ]
+      }
+    },
+    {
+      "id": "cpu_load",
+      "type": "number",
+      "ir_kind": "number",
+      "x": 640,
+      "y": 24,
+      "w": 220,
+      "h": 100,
+      "metric": "cpu.usage",
+      "label": "CPU Load",
+      "unit": "percent",
+      "decimals": 0,
+      "min": 0,
+      "max": 100,
+      "value": 42,
+      "font_size": 44,
+      "domain": {
+        "min": 0,
+        "max": 100,
+        "thresholds": [
+          {"at": 85, "severity": "warning", "label": "Busy", "color": "#f0b94a"},
+          {"at": 95, "severity": "critical", "label": "Saturated", "color": "#f26464"}
+        ]
+      }
+    },
+    {
+      "id": "node_label",
+      "type": "text",
+      "ir_kind": "text",
+      "x": 24,
+      "y": 296,
+      "w": 420,
+      "h": 32,
+      "metric": "node.name",
+      "label": "Node",
+      "text": "Node {node.name} / load {cpu.usage}%",
+      "font_size": 18,
+      "align": "left"
+    },
+    {
+      "id": "gpu_history",
+      "type": "sparkline",
+      "ir_kind": "sparkline",
+      "x": 24,
+      "y": 352,
+      "w": 480,
+      "h": 140,
+      "metric": "gpu.history",
+      "label": "GPU History",
+      "unit": "percent",
+      "decimals": 0,
+      "min": 0,
+      "max": 100,
+      "values": [18, 24, 31, 29, 42, 48, 55, 52, 61, 64],
+      "line_width": 2,
+      "font_size": 12,
+      "domain": {
+        "min": 0,
+        "max": 100,
+        "thresholds": [
+          {"at": 80, "severity": "warning", "label": "Hot", "color": "#f0b94a"}
+        ]
+      }
+    },
+    {
+      "id": "network_status",
+      "type": "status",
+      "ir_kind": "status",
+      "x": 520,
+      "y": 352,
+      "w": 240,
+      "h": 44,
+      "metric": "network.online",
+      "label": "Network online",
+      "text": "Network online",
+      "font_size": 14
+    },
+    {
+      "id": "cooling",
+      "type": "icon",
+      "ir_kind": "icon",
+      "x": 1064,
+      "y": 24,
+      "w": 96,
+      "h": 96,
+      "icon": "fan",
+      "label": "Cooling"
+    },
+    {
+      "id": "quick_stats",
+      "type": "table",
+      "ir_kind": "table",
+      "x": 520,
+      "y": 412,
+      "w": 336,
+      "h": 150,
+      "label": "Quick Stats",
+      "font_size": 12,
+      "rows": [
+        ["Metric", "Value"],
+        ["CPU", "42%"],
+        ["Memory", "63%"],
+        ["GPU", "64%"]
+      ]
+    },
+    {
+      "id": "power_draw",
+      "type": "card",
+      "ir_kind": "card",
+      "x": 884,
+      "y": 24,
+      "w": 372,
+      "h": 200,
+      "metric": "power.draw",
+      "label": "Power Draw",
+      "unit": "watt",
+      "decimals": 0,
+      "min": 0,
+      "max": 500,
+      "value": 312,
+      "font_size": 18,
+      "radius": 10,
+      "domain": {
+        "min": 0,
+        "max": 500,
+        "thresholds": [
+          {"at": 350, "severity": "warning", "label": "Elevated", "color": "#f0b94a"},
+          {"at": 450, "severity": "critical", "label": "Over budget", "color": "#f26464"}
+        ]
+      }
+    }
+  ]
+}

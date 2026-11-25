@@ -689,3 +689,9 @@ def test_router_accepts_a_bare_manifest_body(service):
         assert response.status_code == 200
         assert response.json()["private"] is False
         assert client.get("/assets/search").json()["total"] == 1
+
+# Do not leave the repository ``connect`` namespace cached for later controller
+# tests, which expect controller/connect.py (OzmaConnect).
+for _name in list(sys.modules):
+    if _name == "connect" or _name.startswith("connect."):
+        sys.modules.pop(_name, None)

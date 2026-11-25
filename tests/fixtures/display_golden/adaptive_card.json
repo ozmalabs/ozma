@@ -1,0 +1,87 @@
+{
+  "card": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "body": [
+      {
+        "text": "CPU Temperature",
+        "type": "TextBlock",
+        "wrap": true
+      },
+      {
+        "text": "Memory",
+        "type": "TextBlock",
+        "wrap": true
+      },
+      {
+        "text": "CPU Load",
+        "type": "TextBlock",
+        "wrap": true
+      },
+      {
+        "text": "Node",
+        "type": "TextBlock",
+        "wrap": true
+      },
+      {
+        "text": "GPU History",
+        "type": "TextBlock",
+        "wrap": true
+      },
+      {
+        "text": "Network online",
+        "type": "TextBlock",
+        "wrap": true
+      },
+      {
+        "text": "Cooling",
+        "type": "TextBlock",
+        "wrap": true
+      },
+      {
+        "text": "Quick Stats",
+        "type": "TextBlock",
+        "wrap": true
+      },
+      {
+        "items": [
+          {
+            "text": "Power Draw",
+            "type": "TextBlock",
+            "wrap": true
+          }
+        ],
+        "type": "Container"
+      }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+  },
+  "translation_report": {
+    "approximated": [
+      "cpu_temp: gauge exported as TextBlock",
+      "memory: bar exported as TextBlock",
+      "cpu_load: numeric value exported as TextBlock",
+      "gpu_history: sparkline exported as TextBlock",
+      "cooling: icon exported as TextBlock",
+      "quick_stats: table exported as TextBlock"
+    ],
+    "converted": [
+      "node_label",
+      "network_status",
+      "power_draw"
+    ],
+    "direction": "export",
+    "dropped": [
+      "cpu_temp: gauge chart/gauge semantics",
+      "memory: bar chart/gauge semantics",
+      "gpu_history: sparkline chart/gauge semantics",
+      "cooling: image source"
+    ],
+    "fidelity": "approximate",
+    "source_format": "org.ozma.widget-ir/1",
+    "target_format": "adaptive_card",
+    "translator": "controller.display_importers.adaptive_cards",
+    "translator_version": "1.0.0",
+    "warnings": []
+  }
+}

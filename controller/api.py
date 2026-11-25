@@ -245,7 +245,7 @@ class DirectRegisterRequest(BaseModel):
     seat_id: str = ""
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None, local_proxy: Any | None = None, file_sharing: Any | None = None, zfs: Any | None = None, failover: Any | None = None, ups_monitor: Any | None = None, ddns: Any | None = None, speedtest: Any | None = None, dns_verifier: Any | None = None, node_api_token: str = "", webrtc_ice_servers: list[dict] | None = None, supervisor_status_url: str = "", supervisor_status_token: str = "") -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None, local_proxy: Any | None = None, file_sharing: Any | None = None, zfs: Any | None = None, failover: Any | None = None, ups_monitor: Any | None = None, ddns: Any | None = None, speedtest: Any | None = None, dns_verifier: Any | None = None, node_api_token: str = "", webrtc_ice_servers: list[dict] | None = None, supervisor_status_url: str = "", supervisor_status_token: str = "", display_config: Any | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -11852,16 +11852,40 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     software_inventory = SoftwareInventoryManager()
     app.include_router(_software_router(software_inventory))
 
+    # Display platform: one runtime, three routers.  The runtime owns the
+    # asset repository and import store; routers stay mounted when a feature
+    # is off so callers get a typed 503 instead of a misleading 404.
+    from display_config import DisplayConfig as _DisplayConfig
+    from display_runtime import (
+        build_config_router as _display_config_router,
+        build_runtime as _build_display_runtime,
+    )
+
+    _resolved_display_config = (
+        display_config
+        if display_config is not None
+        else _DisplayConfig.from_env()
+    )
+    display_runtime = _build_display_runtime(_resolved_display_config)
+    app.include_router(_display_config_router(display_runtime))
+
     # Display asset repository (widgets/themes/fonts; local cache + sync)
-    from asset_repository import AssetRepository, build_router as _asset_router
-    asset_repository = AssetRepository()
-    app.include_router(_asset_router(asset_repository))
+    from asset_repository import build_router as _asset_router
+    app.include_router(
+        _asset_router(
+            display_runtime.asset_repository,
+            enabled=display_runtime.config.asset_repository_enabled,
+        )
+    )
 
     # Private display imports (lossless source capture, never auto-published)
     from display_import_api import build_router as _import_router
-    from display_import_store import ImportStore
-    display_import_store = ImportStore()
-    app.include_router(_import_router(display_import_store))
+    app.include_router(
+        _import_router(
+            display_runtime.import_store,
+            enabled=display_runtime.config.importers_enabled,
+        )
+    )
 
     # GraphQL API (optional — requires strawberry-graphql)
     if _GRAPHQL_AVAILABLE and _gql_create_router is not None:

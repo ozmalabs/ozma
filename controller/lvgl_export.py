@@ -266,13 +266,16 @@ def _flatten_theme(source: Mapping[str, Any]) -> dict[str, Any]:
     return {key: _resolve_token(value, flat) for key, value in flat.items()}
 
 
-def _parse_color(value: Any, fallback: int, tokens: Mapping[str, Any] | None = None) -> int:
+def _parse_color_value(
+    value: Any, tokens: Mapping[str, Any] | None = None
+) -> int | None:
+    """Parse a validated colour without a fallback; ``None`` means invalid."""
     value = _resolve_token(value, tokens or {})
     if not isinstance(value, str):
-        return fallback
+        return None
     text = value.strip()
     if not text:
-        return fallback
+        return None
     lowered = text.lower()
     if lowered in _NAMED_COLORS:
         return _NAMED_COLORS[lowered]
@@ -284,22 +287,199 @@ def _parse_color(value: Any, fallback: int, tokens: Mapping[str, Any] | None = N
         elif len(digits) in (6, 8):
             digits = digits[:6]
         else:
-            return fallback
+            return None
         try:
             return int(digits, 16)
         except ValueError:
-            return fallback
+            return None
     match = _RGB_RE.match(text)
     if match:
         red, green, blue = (int(match.group(i)) for i in (1, 2, 3))
-        if max(red, green, blue, 255) > 255:
-            return fallback
+        if any(component > 255 for component in (red, green, blue)):
+            return None
         return (red << 16) | (green << 8) | blue
-    return fallback
+    return None
+
+
+def _parse_color(value: Any, fallback: int, tokens: Mapping[str, Any] | None = None) -> int:
+    parsed = _parse_color_value(value, tokens)
+    return fallback if parsed is None else parsed
 
 
 def _color_hex(value: int) -> str:
     return f"#{value & 0xFFFFFF:06x}"
+
+
+_NUMBER_TOKEN_RE = re.compile(
+    r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(?:px)?$"
+)
+
+
+def _token_number(value: Any, tokens: Mapping[str, Any]) -> float | None:
+    """Resolve a finite numeric token; supports unitless numbers and ``Npx``."""
+    value = _resolve_token(value, tokens)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        match = _NUMBER_TOKEN_RE.match(value.strip())
+        if not match:
+            return None
+        try:
+            number = float(match.group(1))
+        except ValueError:
+            return None
+    else:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _scope(index: int | None) -> str:
+    return "canvas" if index is None else f"widget[{index}]"
+
+
+def _colour_from_tokens(
+    tokens: Mapping[str, Any],
+    keys: Sequence[str],
+    fallback: int,
+    warnings: list[str],
+    index: int | None,
+    label: str,
+) -> tuple[int, bool]:
+    """Return ``(colour, used_valid_token)`` with warnings on invalid tokens."""
+    for key in keys:
+        if key not in tokens:
+            continue
+        parsed = _parse_color_value(tokens[key], tokens)
+        if parsed is None:
+            warnings.append(
+                f"{_scope(index)} token `{key}` for {label} is not a valid colour; "
+                f"using fallback {_color_hex(fallback)}"
+            )
+            return fallback, False
+        return parsed, True
+    return fallback, False
+
+
+def _explicit_colour(
+    value: Any,
+    tokens: Mapping[str, Any],
+    fallback: int,
+    warnings: list[str],
+    index: int,
+    field: str,
+) -> tuple[int | None, bool]:
+    """Return ``(colour_or_none, valid)`` for an explicit widget colour."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, False
+    parsed = _parse_color_value(value, tokens)
+    if parsed is None:
+        warnings.append(
+            f"widget[{index}] `{field}` is not a valid colour; "
+            f"using fallback {_color_hex(fallback)}"
+        )
+        return fallback, False
+    return parsed, True
+
+
+def _widget_or_token_colour(
+    value: Any,
+    tokens: Mapping[str, Any],
+    keys: Sequence[str],
+    fallback: int,
+    warnings: list[str],
+    index: int,
+    field: str,
+    label: str,
+) -> int:
+    explicit, _valid = _explicit_colour(
+        value, tokens, fallback, warnings, index, field
+    )
+    if explicit is not None:
+        return explicit
+    parsed, _used = _colour_from_tokens(
+        tokens, keys, fallback, warnings, index, label
+    )
+    return parsed
+
+
+def _style_int(
+    tokens: Mapping[str, Any],
+    keys: Sequence[str],
+    fallback: int,
+    minimum: int,
+    maximum: int,
+    warnings: list[str],
+    index: int,
+    label: str,
+) -> tuple[int, bool]:
+    """Resolve a bounded integer style token; return ``(value, used_token)``."""
+    for key in keys:
+        if key not in tokens:
+            continue
+        number = _token_number(tokens[key], tokens)
+        if number is None:
+            warnings.append(
+                f"widget[{index}] token `{key}` for {label} is not a finite "
+                f"number; using fallback {fallback}"
+            )
+            return fallback, False
+        rounded = int(_round(number, 0))
+        if rounded < minimum or rounded > maximum:
+            warnings.append(
+                f"widget[{index}] token `{key}` for {label}="
+                f"{_format_number(number)} is outside {minimum}..{maximum}; "
+                f"using fallback {fallback}"
+            )
+            return fallback, False
+        return rounded, True
+    return fallback, False
+
+
+_TEXT_SIZE_TOKENS = (
+    "typography.size",
+    "typography.size_px",
+    "font.size",
+    "font.size_px",
+    "text.size",
+)
+
+
+def _text_size(
+    widget: Mapping[str, Any],
+    tokens: Mapping[str, Any],
+    warnings: list[str],
+    index: int,
+) -> tuple[int | None, bool]:
+    """Resolve a text size from widget typography or theme tokens."""
+    candidates: list[tuple[str, Any]] = []
+    typography = widget.get("typography")
+    if isinstance(typography, Mapping) and typography.get("size_px") is not None:
+        candidates.append(("typography.size_px", typography["size_px"]))
+    if widget.get("font_size") is not None:
+        candidates.append(("font_size", widget["font_size"]))
+    for key in _TEXT_SIZE_TOKENS:
+        if key in tokens:
+            candidates.append((f"token `{key}`", tokens[key]))
+
+    for source, value in candidates:
+        number = _token_number(value, tokens)
+        if number is None:
+            warnings.append(
+                f"widget[{index}] {source} text size is not a finite number; "
+                "ignoring it"
+            )
+            return None, False
+        rounded = int(_round(number, 0))
+        if rounded < 4 or rounded > 512:
+            warnings.append(
+                f"widget[{index}] {source} text size="
+                f"{_format_number(number)} is outside 4..512; ignoring it"
+            )
+            return None, False
+        return rounded, True
+    return None, False
 
 
 def _unit_suffix(unit: str) -> str:
@@ -561,42 +741,159 @@ def _normalise_widget(
 
     min_value, max_value = _resolve_widget_min_max(widget, warnings, index)
 
-    def token_colour(keys: Sequence[str], fallback: int) -> int:
-        for key in keys:
-            if key in tokens:
-                return _parse_color(tokens[key], fallback, tokens)
-        return fallback
+    arc_limit = max(1, int(min(width, height) // 2))
+    arc_default = min(10, arc_limit)
+    arc_width = arc_default
+    arc_from_token = False
+    if kind == "gauge":
+        arc_width, arc_from_token = _style_int(
+            tokens,
+            ("metric.arc_width", "gauge.arc_width"),
+            arc_default,
+            1,
+            arc_limit,
+            warnings,
+            index,
+            "arc width",
+        )
+    radius_limit = max(0, int(min(width, height) // 2))
+    radius_default = min(4, radius_limit)
+    bar_radius = radius_default
+    bar_radius_from_token = False
+    if kind == "bar":
+        bar_radius, bar_radius_from_token = _style_int(
+            tokens,
+            ("metric.bar_radius", "radius.md"),
+            radius_default,
+            0,
+            radius_limit,
+            warnings,
+            index,
+            "bar radius",
+        )
+    text_size, _text_size_supplied = (
+        _text_size(widget, tokens, warnings, index)
+        if kind != "image"
+        else (None, False)
+    )
+
+    surface = DEFAULT_COLORS["surface"]
+    surface_supplied = False
+    if kind in ("table", "card", "custom"):
+        explicit_surface, explicit_surface_valid = _explicit_colour(
+            widget.get("surface", widget.get("background", widget.get("bg"))),
+            tokens,
+            DEFAULT_COLORS["surface"],
+            warnings,
+            index,
+            "surface",
+        )
+        if explicit_surface is not None:
+            surface = explicit_surface
+            surface_supplied = explicit_surface_valid
+        else:
+            surface, surface_token = _colour_from_tokens(
+                tokens,
+                ("color.surface", "color.background", "canvas.background", "surface"),
+                DEFAULT_COLORS["surface"],
+                warnings,
+                index,
+                "surface colour",
+            )
+            surface_supplied = surface_token
+
+    style_notes: list[str] = []
+    if kind == "gauge" and not arc_from_token:
+        style_notes.append(
+            f"widget[{index}] gauge arc width uses fallback {arc_width}px "
+            "(set metric.arc_width or gauge.arc_width)"
+        )
+    if kind == "bar" and not bar_radius_from_token:
+        style_notes.append(
+            f"widget[{index}] bar radius uses fallback {bar_radius}px "
+            "(set metric.bar_radius or radius.md)"
+        )
+    if kind in ("table", "card", "custom") and not surface_supplied:
+        style_notes.append(
+            f"widget[{index}] surface colour uses fallback {_color_hex(surface)} "
+            "(set color.surface, color.background, or canvas.background)"
+        )
+    if text_size is not None:
+        style_notes.append(
+            f"widget[{index}] text size {text_size}px is retained in metadata; "
+            "LVGL C uses the active font"
+        )
 
     palette = {
-        "accent": _parse_color(
+        "accent": _widget_or_token_colour(
             widget.get("color"),
-            token_colour(("gauge.fill", "bar.fill", "color.accent"), DEFAULT_COLORS["accent"]),
             tokens,
+            ("gauge.fill", "bar.fill", "color.accent", "accent"),
+            DEFAULT_COLORS["accent"],
+            warnings,
+            index,
+            "color",
+            "accent colour",
         ),
-        "track": _parse_color(
+        "track": _widget_or_token_colour(
             widget.get("track", widget.get("track_color")),
-            token_colour(("gauge.track", "bar.track", "color.track"), DEFAULT_COLORS["track"]),
             tokens,
+            ("gauge.track", "bar.track", "color.track", "track"),
+            DEFAULT_COLORS["track"],
+            warnings,
+            index,
+            "track",
+            "track colour",
         ),
-        "text": _parse_color(
+        "text": _widget_or_token_colour(
             widget.get("text_color"),
-            token_colour(("gauge.text", "color.fg", "color.text"), DEFAULT_COLORS["fg"]),
             tokens,
+            ("gauge.text", "color.fg", "color.text", "text"),
+            DEFAULT_COLORS["fg"],
+            warnings,
+            index,
+            "text_color",
+            "text colour",
         ),
-        "warn": _parse_color(
+        "warn": _widget_or_token_colour(
             widget.get("warn_color"),
-            token_colour(("gauge.warn", "color.warn"), DEFAULT_COLORS["warn"]),
             tokens,
+            ("gauge.warn", "color.warn", "warn"),
+            DEFAULT_COLORS["warn"],
+            warnings,
+            index,
+            "warn_color",
+            "warning colour",
         ),
-        "crit": _parse_color(
+        "crit": _widget_or_token_colour(
             widget.get("crit_color"),
-            token_colour(("gauge.crit", "color.crit", "color.error"), DEFAULT_COLORS["crit"]),
             tokens,
+            ("gauge.crit", "color.crit", "color.error", "crit"),
+            DEFAULT_COLORS["crit"],
+            warnings,
+            index,
+            "crit_color",
+            "critical colour",
         ),
-        "ok": _parse_color(
+        "ok": _widget_or_token_colour(
             widget.get("ok_color"),
-            token_colour(("color.ok",), DEFAULT_COLORS["ok"]),
             tokens,
+            ("color.ok", "ok"),
+            DEFAULT_COLORS["ok"],
+            warnings,
+            index,
+            "ok_color",
+            "ok colour",
+        ),
+        "muted": _widget_or_token_colour(
+            widget.get("muted_color"),
+            tokens,
+            ("gauge.muted", "color.muted", "color.dim", "muted"),
+            DEFAULT_COLORS["muted"],
+            warnings,
+            index,
+            "muted_color",
+            "muted colour",
         ),
     }
     thresholds = _threshold_list(widget, index, palette, tokens, warnings)
@@ -647,10 +944,15 @@ def _normalise_widget(
         "color": palette["accent"],
         "track": palette["track"],
         "text_color": palette["text"],
-        "muted": DEFAULT_COLORS["muted"],
+        "muted": palette["muted"],
         "warn": palette["warn"],
         "crit": palette["crit"],
         "ok": palette["ok"],
+        "surface": surface,
+        "arc_width": arc_width,
+        "bar_radius": bar_radius,
+        "text_size": text_size,
+        "style_notes": style_notes,
         "source_widget": widget,
     }
 
@@ -741,6 +1043,8 @@ def _c_widget_creation(record: Mapping[str, Any]) -> list[str]:
     lines: list[str] = []
     x, y = _format_number(record["x"]), _format_number(record["y"])
     w, h = _format_number(record["w"]), _format_number(record["h"])
+    arc_width = _format_number(record["arc_width"])
+    bar_radius = _format_number(record["bar_radius"])
 
     if kind == "gauge":
         lines.extend(
@@ -751,8 +1055,8 @@ def _c_widget_creation(record: Mapping[str, Any]) -> list[str]:
                 f"    lv_arc_set_range({ident}, (int32_t){_c_float(record['min'])}, (int32_t){_c_float(record['max'])});",
                 f"    lv_arc_set_bg_angles({ident}, 135, 45);",
                 f"    lv_arc_set_value({ident}, (int32_t){_c_float(record['value'])});",
-                f"    lv_obj_set_style_arc_width({ident}, 10, LV_PART_MAIN);",
-                f"    lv_obj_set_style_arc_width({ident}, 10, LV_PART_INDICATOR);",
+                f"    lv_obj_set_style_arc_width({ident}, {arc_width}, LV_PART_MAIN);",
+                f"    lv_obj_set_style_arc_width({ident}, {arc_width}, LV_PART_INDICATOR);",
                 f"    lv_obj_set_style_arc_color({ident}, {_c_color(record['track'])}, LV_PART_MAIN);",
                 f"    lv_obj_set_style_arc_color({ident}, {_c_color(record['color'])}, LV_PART_INDICATOR);",
                 f"    lv_obj_set_style_bg_opa({ident}, LV_OPA_TRANSP, LV_PART_MAIN);",
@@ -772,7 +1076,7 @@ def _c_widget_creation(record: Mapping[str, Any]) -> list[str]:
                 f"    lv_bar_set_value({ident}, (int32_t){_c_float(record['value'])}, LV_ANIM_OFF);",
                 f"    lv_obj_set_style_bg_color({ident}, {_c_color(record['track'])}, LV_PART_MAIN);",
                 f"    lv_obj_set_style_bg_color({ident}, {_c_color(record['color'])}, LV_PART_INDICATOR);",
-                f"    lv_obj_set_style_radius({ident}, 4, LV_PART_MAIN);",
+                f"    lv_obj_set_style_radius({ident}, {bar_radius}, LV_PART_MAIN);",
                 f"    {ident}_label = lv_label_create(root);",
                 f"    lv_label_set_text({ident}_label, {_c_string(_format_decimal(record['value'], record['decimals'], record['unit']))});",
                 f"    lv_obj_set_pos({ident}_label, {x}, {y});",
@@ -860,7 +1164,7 @@ def _c_widget_creation(record: Mapping[str, Any]) -> list[str]:
                 f"    {ident} = lv_obj_create(root);",
                 f"    lv_obj_set_pos({ident}, {x}, {y});",
                 f"    lv_obj_set_size({ident}, {w}, {h});",
-                f"    lv_obj_set_style_bg_color({ident}, {_c_color(DEFAULT_COLORS['surface'])}, LV_PART_MAIN);",
+                f"    lv_obj_set_style_bg_color({ident}, {_c_color(record['surface'])}, LV_PART_MAIN);",
                 f"    lv_obj_set_style_radius({ident}, 4, LV_PART_MAIN);",
             ]
         )
@@ -1049,6 +1353,7 @@ def _collect_notes(
     approximations: list[str] = []
     dropped: list[str] = []
     for record in records:
+        approximations.extend(record.get("style_notes", []))
         kind = record["kind"]
         if kind == "gauge":
             approximations.append(
@@ -1109,17 +1414,38 @@ def _build_export(
 
     theme_source = options.get("tokens") or options.get("theme") or {}
     tokens = _flatten_theme(theme_source) if isinstance(theme_source, Mapping) else {}
-    background = _parse_color(
-        options.get("background", layout.get("background")),
-        DEFAULT_COLORS["bg"],
-        tokens,
-    )
+    warnings: list[str] = []
+    canvas_notes: list[str] = []
+    background_value = options.get("background", layout.get("background"))
+    if background_value is not None:
+        parsed_background = _parse_color_value(background_value, tokens)
+        if parsed_background is None:
+            warnings.append(
+                "canvas background is not a valid colour; "
+                f"using fallback {_color_hex(DEFAULT_COLORS['bg'])}"
+            )
+            background = DEFAULT_COLORS["bg"]
+        else:
+            background = parsed_background
+    else:
+        background, background_from_token = _colour_from_tokens(
+            tokens,
+            ("canvas.background", "color.background", "color.surface", "background"),
+            DEFAULT_COLORS["bg"],
+            warnings,
+            None,
+            "canvas background",
+        )
+        if not background_from_token:
+            canvas_notes.append(
+                f"canvas background uses fallback {_color_hex(background)} "
+                "(set canvas.background, color.background, or color.surface)"
+            )
     prefix_raw = options.get("function_prefix", "ozma_lvgl")
     prefix = _IDENTIFIER_RE.sub("_", str(prefix_raw)).strip("_")[:32] or "ozma_lvgl"
     if prefix[0].isdigit():
         prefix = f"ozma_{prefix}"
 
-    warnings: list[str] = []
     records = [
         _normalise_widget(widget, index, tokens, warnings, prefix)
         for index, widget in enumerate(widgets)
@@ -1136,6 +1462,7 @@ def _build_export(
         warnings,
         background_note=rgba_seen,
     )
+    approximations = [*canvas_notes, *approximations]
 
     source_hash = _canonical_hash(widgets_or_layout)
     metadata_widgets = []
@@ -1160,8 +1487,14 @@ def _build_export(
                 "unit": record["unit"],
                 "color": _color_hex(record["color"]),
                 "track_color": _color_hex(record["track"]),
+                "text_color": _color_hex(record["text_color"]),
+                "muted_color": _color_hex(record["muted"]),
+                "surface": _color_hex(record["surface"]),
                 "warn_color": _color_hex(record["warn"]),
                 "crit_color": _color_hex(record["crit"]),
+                "arc_width": record["arc_width"],
+                "bar_radius": record["bar_radius"],
+                "text_size": record["text_size"],
                 "thresholds": [
                     {
                         "at": item["at"],

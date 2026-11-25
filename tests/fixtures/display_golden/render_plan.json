@@ -1,0 +1,1023 @@
+{
+  "schema": "org.ozma.render-plan/1",
+  "version": 1,
+  "width": 1280,
+  "height": 720,
+  "background": "#0b0d12",
+  "sourceFormat": "ozma_screen_layout",
+  "ops": [
+    {
+      "op": "group",
+      "id": "w0",
+      "x": 24,
+      "y": 24,
+      "w": 240,
+      "h": 240,
+      "clip": {
+        "x": 24,
+        "y": 24,
+        "w": 240,
+        "h": 240
+      },
+      "children": [
+        {
+          "op": "arc",
+          "id": "cpu_temp.track",
+          "cx": 144,
+          "cy": 144,
+          "r": 94.8,
+          "startAngle": 135,
+          "endAngle": 405,
+          "stroke": "#1b2230",
+          "lineWidth": 21.6,
+          "cap": "round"
+        },
+        {
+          "op": "arc",
+          "id": "cpu_temp.value",
+          "cx": 144,
+          "cy": 144,
+          "r": 94.8,
+          "startAngle": 135,
+          "endAngle": 330.75,
+          "stroke": "#37d67a",
+          "lineWidth": 21.6,
+          "cap": "round",
+          "binding": {
+            "metric": "org.ozma/node.cpu_temp",
+            "decimals": 1,
+            "unit": "celsius",
+            "format": "",
+            "mode": "number",
+            "min": 0,
+            "max": 100,
+            "thresholds": [
+              {
+                "at": 0,
+                "severity": "ok",
+                "color": "#37d67a",
+                "label": "Nominal"
+              },
+              {
+                "at": 75,
+                "severity": "warning",
+                "color": "#f0b94a",
+                "label": "Warm"
+              },
+              {
+                "at": 90,
+                "severity": "critical",
+                "color": "#f26464",
+                "label": "Hot"
+              }
+            ],
+            "colors": {
+              "accent": "#3ba7ff",
+              "warn": "#ffb020",
+              "crit": "#ff5c5c",
+              "ok": "#37d67a",
+              "text": "#f4f6fb"
+            }
+          },
+          "role": "gauge-value",
+          "angleStart": 135,
+          "angleSweep": 270,
+          "thresholds": [
+            {
+              "at": 0,
+              "severity": "ok",
+              "color": "#37d67a",
+              "label": "Nominal"
+            },
+            {
+              "at": 75,
+              "severity": "warning",
+              "color": "#f0b94a",
+              "label": "Warm"
+            },
+            {
+              "at": 90,
+              "severity": "critical",
+              "color": "#f26464",
+              "label": "Hot"
+            }
+          ],
+          "colors": {
+            "accent": "#3ba7ff",
+            "warn": "#ffb020",
+            "crit": "#ff5c5c",
+            "ok": "#37d67a"
+          },
+          "value": 72.5
+        },
+        {
+          "op": "line",
+          "id": "cpu_temp.tick0",
+          "x1": 84.603,
+          "y1": 203.397,
+          "x2": 69.33,
+          "y2": 218.67,
+          "stroke": "#93a1b5",
+          "lineWidth": 1.728,
+          "cap": "butt"
+        },
+        {
+          "op": "line",
+          "id": "cpu_temp.tick1",
+          "x1": 66.394,
+          "y1": 111.855,
+          "x2": 46.438,
+          "y2": 103.589,
+          "stroke": "#93a1b5",
+          "lineWidth": 1.728,
+          "cap": "butt"
+        },
+        {
+          "op": "line",
+          "id": "cpu_temp.tick2",
+          "x1": 144,
+          "y1": 60,
+          "x2": 144,
+          "y2": 38.4,
+          "stroke": "#93a1b5",
+          "lineWidth": 1.728,
+          "cap": "butt"
+        },
+        {
+          "op": "line",
+          "id": "cpu_temp.tick3",
+          "x1": 221.606,
+          "y1": 111.855,
+          "x2": 241.562,
+          "y2": 103.589,
+          "stroke": "#93a1b5",
+          "lineWidth": 1.728,
+          "cap": "butt"
+        },
+        {
+          "op": "line",
+          "id": "cpu_temp.tick4",
+          "x1": 203.397,
+          "y1": 203.397,
+          "x2": 218.67,
+          "y2": 218.67,
+          "stroke": "#93a1b5",
+          "lineWidth": 1.728,
+          "cap": "butt"
+        },
+        {
+          "op": "text",
+          "id": "cpu_temp.value-text",
+          "x": 144,
+          "y": 146.64,
+          "text": "72.5°C",
+          "fill": "#37d67a",
+          "fontSize": 22,
+          "fontFamily": "sans-serif",
+          "fontWeight": "bold",
+          "align": "center",
+          "baseline": "middle",
+          "binding": {
+            "metric": "org.ozma/node.cpu_temp",
+            "decimals": 1,
+            "unit": "celsius",
+            "format": "",
+            "mode": "number",
+            "min": 0,
+            "max": 100,
+            "thresholds": [
+              {
+                "at": 0,
+                "severity": "ok",
+                "color": "#37d67a",
+                "label": "Nominal"
+              },
+              {
+                "at": 75,
+                "severity": "warning",
+                "color": "#f0b94a",
+                "label": "Warm"
+              },
+              {
+                "at": 90,
+                "severity": "critical",
+                "color": "#f26464",
+                "label": "Hot"
+              }
+            ],
+            "colors": {
+              "accent": "#3ba7ff",
+              "warn": "#ffb020",
+              "crit": "#ff5c5c",
+              "ok": "#37d67a",
+              "text": "#f4f6fb"
+            }
+          },
+          "role": "value-text"
+        },
+        {
+          "op": "text",
+          "id": "cpu_temp.label",
+          "x": 144,
+          "y": 202.776,
+          "text": "CPU Temperature",
+          "fill": "#93a1b5",
+          "fontSize": 7,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "center",
+          "baseline": "middle"
+        }
+      ]
+    },
+    {
+      "op": "group",
+      "id": "w1",
+      "x": 288,
+      "y": 24,
+      "w": 320,
+      "h": 44,
+      "clip": {
+        "x": 288,
+        "y": 24,
+        "w": 320,
+        "h": 44
+      },
+      "children": [
+        {
+          "op": "bar",
+          "id": "memory",
+          "x": 288,
+          "y": 24,
+          "w": 320,
+          "h": 44,
+          "value": 63,
+          "min": 0,
+          "max": 100,
+          "orientation": "horizontal",
+          "track": "#1b2230",
+          "fill": "#3ba7ff",
+          "radius": 6,
+          "role": "bar",
+          "binding": {
+            "metric": "org.ozma/node.memory.percent",
+            "decimals": 0,
+            "unit": "percent",
+            "format": "",
+            "mode": "number",
+            "min": 0,
+            "max": 100,
+            "thresholds": [
+              {
+                "at": 80,
+                "severity": "warning",
+                "color": "#f0b94a",
+                "label": "High"
+              },
+              {
+                "at": 95,
+                "severity": "critical",
+                "color": "#f26464",
+                "label": "Exhausted"
+              }
+            ],
+            "colors": {
+              "accent": "#3ba7ff",
+              "warn": "#ffb020",
+              "crit": "#ff5c5c",
+              "ok": "#37d67a",
+              "text": "#f4f6fb"
+            }
+          },
+          "thresholds": [
+            {
+              "at": 80,
+              "severity": "warning",
+              "color": "#f0b94a",
+              "label": "High"
+            },
+            {
+              "at": 95,
+              "severity": "critical",
+              "color": "#f26464",
+              "label": "Exhausted"
+            }
+          ],
+          "colors": {
+            "accent": "#3ba7ff",
+            "warn": "#ffb020",
+            "crit": "#ff5c5c",
+            "ok": "#37d67a"
+          }
+        },
+        {
+          "op": "text",
+          "id": "memory.label",
+          "x": 290,
+          "y": 35.7,
+          "text": "Memory",
+          "fill": "#93a1b5",
+          "fontSize": 13,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "middle"
+        },
+        {
+          "op": "text",
+          "id": "memory.value-text",
+          "x": 606,
+          "y": 35.7,
+          "text": "63%",
+          "fill": "#f4f6fb",
+          "fontSize": 13,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "right",
+          "baseline": "middle",
+          "binding": {
+            "metric": "org.ozma/node.memory.percent",
+            "decimals": 0,
+            "unit": "percent",
+            "format": "",
+            "mode": "number",
+            "min": 0,
+            "max": 100,
+            "thresholds": [
+              {
+                "at": 80,
+                "severity": "warning",
+                "color": "#f0b94a",
+                "label": "High"
+              },
+              {
+                "at": 95,
+                "severity": "critical",
+                "color": "#f26464",
+                "label": "Exhausted"
+              }
+            ],
+            "colors": {
+              "accent": "#3ba7ff",
+              "warn": "#ffb020",
+              "crit": "#ff5c5c",
+              "ok": "#37d67a",
+              "text": "#f4f6fb"
+            }
+          },
+          "role": "value-text"
+        }
+      ]
+    },
+    {
+      "op": "group",
+      "id": "w2",
+      "x": 640,
+      "y": 24,
+      "w": 220,
+      "h": 100,
+      "clip": {
+        "x": 640,
+        "y": 24,
+        "w": 220,
+        "h": 100
+      },
+      "children": [
+        {
+          "op": "text",
+          "id": "cpu_load.value-text",
+          "x": 750,
+          "y": 74,
+          "text": "42%",
+          "fill": "#3ba7ff",
+          "fontSize": 44,
+          "fontFamily": "sans-serif",
+          "fontWeight": "bold",
+          "align": "center",
+          "baseline": "middle",
+          "binding": {
+            "metric": "cpu.usage",
+            "decimals": 0,
+            "unit": "percent",
+            "format": "",
+            "mode": "number",
+            "min": 0,
+            "max": 100,
+            "thresholds": [
+              {
+                "at": 85,
+                "severity": "warning",
+                "color": "#f0b94a",
+                "label": "Busy"
+              },
+              {
+                "at": 95,
+                "severity": "critical",
+                "color": "#f26464",
+                "label": "Saturated"
+              }
+            ],
+            "colors": {
+              "accent": "#3ba7ff",
+              "warn": "#ffb020",
+              "crit": "#ff5c5c",
+              "ok": "#37d67a",
+              "text": "#f4f6fb"
+            }
+          },
+          "role": "value-text"
+        },
+        {
+          "op": "text",
+          "id": "cpu_load.label",
+          "x": 750,
+          "y": 106,
+          "text": "CPU Load",
+          "fill": "#93a1b5",
+          "fontSize": 14,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "center",
+          "baseline": "middle"
+        }
+      ]
+    },
+    {
+      "op": "group",
+      "id": "w3",
+      "x": 24,
+      "y": 296,
+      "w": 420,
+      "h": 32,
+      "clip": {
+        "x": 24,
+        "y": 296,
+        "w": 420,
+        "h": 32
+      },
+      "children": [
+        {
+          "op": "text",
+          "id": "node_label.text",
+          "x": 26,
+          "y": 312,
+          "text": "Node atlas-01 / load 42.0%",
+          "fill": "#f4f6fb",
+          "fontSize": 18,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "middle",
+          "maxWidth": 420,
+          "binding": {
+            "metric": "node.name",
+            "decimals": 1,
+            "unit": "",
+            "format": "",
+            "mode": "text",
+            "min": 0,
+            "max": 100,
+            "thresholds": [],
+            "colors": {
+              "accent": "#3ba7ff",
+              "warn": "#ffb020",
+              "crit": "#ff5c5c",
+              "ok": "#37d67a",
+              "text": "#f4f6fb"
+            },
+            "template": "Node {node.name} / load {cpu.usage}%"
+          },
+          "role": "template-text"
+        }
+      ]
+    },
+    {
+      "op": "group",
+      "id": "w4",
+      "x": 24,
+      "y": 352,
+      "w": 480,
+      "h": 140,
+      "clip": {
+        "x": 24,
+        "y": 352,
+        "w": 480,
+        "h": 140
+      },
+      "children": [
+        {
+          "op": "rect",
+          "id": "gpu_history.surface",
+          "x": 24,
+          "y": 352,
+          "w": 480,
+          "h": 140,
+          "fill": "#141821",
+          "radius": 2,
+          "opacity": 0.6
+        },
+        {
+          "op": "polyline",
+          "id": "gpu_history.line",
+          "points": [
+            [
+              24,
+              466.8
+            ],
+            [
+              77.333,
+              458.4
+            ],
+            [
+              130.667,
+              448.6
+            ],
+            [
+              184,
+              451.4
+            ],
+            [
+              237.333,
+              433.2
+            ],
+            [
+              290.667,
+              424.8
+            ],
+            [
+              344,
+              415
+            ],
+            [
+              397.333,
+              419.2
+            ],
+            [
+              450.667,
+              406.6
+            ],
+            [
+              504,
+              402.4
+            ]
+          ],
+          "stroke": "#3ba7ff",
+          "lineWidth": 2,
+          "close": false,
+          "binding": {
+            "metric": "gpu.history",
+            "decimals": 0,
+            "unit": "percent",
+            "format": "",
+            "mode": "number",
+            "min": 0,
+            "max": 100,
+            "thresholds": [
+              {
+                "at": 80,
+                "severity": "warning",
+                "color": "#f0b94a",
+                "label": "Hot"
+              }
+            ],
+            "colors": {
+              "accent": "#3ba7ff",
+              "warn": "#ffb020",
+              "crit": "#ff5c5c",
+              "ok": "#37d67a",
+              "text": "#f4f6fb"
+            }
+          },
+          "role": "sparkline",
+          "geometry": {
+            "x": 24,
+            "y": 352,
+            "w": 480,
+            "h": 140,
+            "min": 0,
+            "max": 100,
+            "fill": false,
+            "close": false
+          }
+        },
+        {
+          "op": "text",
+          "id": "gpu_history.label",
+          "x": 26,
+          "y": 480,
+          "text": "GPU History",
+          "fill": "#93a1b5",
+          "fontSize": 12,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "bottom"
+        },
+        {
+          "op": "text",
+          "id": "gpu_history.value-text",
+          "x": 502,
+          "y": 480,
+          "text": "64%",
+          "fill": "#3ba7ff",
+          "fontSize": 12,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "right",
+          "baseline": "bottom",
+          "binding": {
+            "metric": "gpu.history",
+            "decimals": 0,
+            "unit": "percent",
+            "format": "",
+            "mode": "number",
+            "min": 0,
+            "max": 100,
+            "thresholds": [
+              {
+                "at": 80,
+                "severity": "warning",
+                "color": "#f0b94a",
+                "label": "Hot"
+              }
+            ],
+            "colors": {
+              "accent": "#3ba7ff",
+              "warn": "#ffb020",
+              "crit": "#ff5c5c",
+              "ok": "#37d67a",
+              "text": "#f4f6fb"
+            }
+          },
+          "role": "value-text"
+        }
+      ]
+    },
+    {
+      "op": "group",
+      "id": "w5",
+      "x": 520,
+      "y": 352,
+      "w": 240,
+      "h": 44,
+      "clip": {
+        "x": 520,
+        "y": 352,
+        "w": 240,
+        "h": 44
+      },
+      "children": [
+        {
+          "op": "arc",
+          "id": "network_status.dot",
+          "cx": 529.92,
+          "cy": 374,
+          "r": 7.92,
+          "startAngle": 0,
+          "endAngle": 360,
+          "fill": "#37d67a",
+          "lineWidth": 0,
+          "binding": {
+            "metric": "network.online",
+            "decimals": 1,
+            "unit": "",
+            "format": "",
+            "mode": "status",
+            "min": 0,
+            "max": 100,
+            "thresholds": [],
+            "colors": {
+              "accent": "#3ba7ff",
+              "warn": "#ffb020",
+              "crit": "#ff5c5c",
+              "ok": "#37d67a",
+              "text": "#f4f6fb"
+            }
+          },
+          "role": "status-dot",
+          "colors": {
+            "accent": "#3ba7ff",
+            "warn": "#ffb020",
+            "crit": "#ff5c5c",
+            "ok": "#37d67a",
+            "muted": "#93a1b5"
+          }
+        },
+        {
+          "op": "text",
+          "id": "network_status.text",
+          "x": 543.84,
+          "y": 374,
+          "text": "Network online",
+          "fill": "#f4f6fb",
+          "fontSize": 14,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "middle",
+          "binding": {
+            "metric": "network.online",
+            "decimals": 1,
+            "unit": "",
+            "format": "",
+            "mode": "status",
+            "min": 0,
+            "max": 100,
+            "thresholds": [],
+            "colors": {
+              "accent": "#3ba7ff",
+              "warn": "#ffb020",
+              "crit": "#ff5c5c",
+              "ok": "#37d67a",
+              "text": "#f4f6fb"
+            },
+            "offlineText": "Offline",
+            "onlineText": "Network online"
+          },
+          "role": "status-text"
+        }
+      ]
+    },
+    {
+      "op": "group",
+      "id": "w6",
+      "x": 1064,
+      "y": 24,
+      "w": 96,
+      "h": 96,
+      "clip": {
+        "x": 1064,
+        "y": 24,
+        "w": 96,
+        "h": 96
+      },
+      "children": [
+        {
+          "op": "rect",
+          "id": "cooling.surface",
+          "x": 1064,
+          "y": 24,
+          "w": 96,
+          "h": 96,
+          "fill": "#141821",
+          "stroke": "#1b2230",
+          "lineWidth": 1,
+          "radius": 13.44
+        },
+        {
+          "op": "icon",
+          "id": "cooling.glyph",
+          "x": 1064,
+          "y": 24,
+          "w": 96,
+          "h": 96,
+          "name": "fan",
+          "color": "#3ba7ff",
+          "label": "Cooling"
+        },
+        {
+          "op": "text",
+          "id": "cooling.label",
+          "x": 1112,
+          "y": 108.48,
+          "text": "Cooling",
+          "fill": "#93a1b5",
+          "fontSize": 13,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "center",
+          "baseline": "middle"
+        }
+      ]
+    },
+    {
+      "op": "group",
+      "id": "w7",
+      "x": 520,
+      "y": 412,
+      "w": 336,
+      "h": 150,
+      "clip": {
+        "x": 520,
+        "y": 412,
+        "w": 336,
+        "h": 150
+      },
+      "children": [
+        {
+          "op": "rect",
+          "id": "quick_stats.surface",
+          "x": 520,
+          "y": 412,
+          "w": 336,
+          "h": 150,
+          "fill": "#141821",
+          "radius": 2
+        },
+        {
+          "op": "text",
+          "id": "quick_stats.header",
+          "x": 524,
+          "y": 430,
+          "text": "Quick Stats",
+          "fill": "#f4f6fb",
+          "fontSize": 12,
+          "fontFamily": "sans-serif",
+          "fontWeight": "bold",
+          "align": "left",
+          "baseline": "middle"
+        },
+        {
+          "op": "text",
+          "id": "quick_stats.r0.c0",
+          "x": 524,
+          "y": 460,
+          "text": "Metric",
+          "fill": "#f4f6fb",
+          "fontSize": 12,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "middle"
+        },
+        {
+          "op": "text",
+          "id": "quick_stats.r0.c1",
+          "x": 692,
+          "y": 460,
+          "text": "Value",
+          "fill": "#f4f6fb",
+          "fontSize": 12,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "middle"
+        },
+        {
+          "op": "text",
+          "id": "quick_stats.r1.c0",
+          "x": 524,
+          "y": 490,
+          "text": "CPU",
+          "fill": "#f4f6fb",
+          "fontSize": 12,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "middle"
+        },
+        {
+          "op": "text",
+          "id": "quick_stats.r1.c1",
+          "x": 692,
+          "y": 490,
+          "text": "42%",
+          "fill": "#f4f6fb",
+          "fontSize": 12,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "middle"
+        },
+        {
+          "op": "text",
+          "id": "quick_stats.r2.c0",
+          "x": 524,
+          "y": 520,
+          "text": "Memory",
+          "fill": "#f4f6fb",
+          "fontSize": 12,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "middle"
+        },
+        {
+          "op": "text",
+          "id": "quick_stats.r2.c1",
+          "x": 692,
+          "y": 520,
+          "text": "63%",
+          "fill": "#f4f6fb",
+          "fontSize": 12,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "middle"
+        },
+        {
+          "op": "text",
+          "id": "quick_stats.r3.c0",
+          "x": 524,
+          "y": 550,
+          "text": "GPU",
+          "fill": "#f4f6fb",
+          "fontSize": 12,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "middle"
+        },
+        {
+          "op": "text",
+          "id": "quick_stats.r3.c1",
+          "x": 692,
+          "y": 550,
+          "text": "64%",
+          "fill": "#f4f6fb",
+          "fontSize": 12,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "middle"
+        }
+      ]
+    },
+    {
+      "op": "group",
+      "id": "w8",
+      "x": 884,
+      "y": 24,
+      "w": 372,
+      "h": 200,
+      "clip": {
+        "x": 884,
+        "y": 24,
+        "w": 372,
+        "h": 200
+      },
+      "children": [
+        {
+          "op": "rect",
+          "id": "power_draw.surface",
+          "x": 884,
+          "y": 24,
+          "w": 372,
+          "h": 200,
+          "fill": "#141821",
+          "stroke": "#1b2230",
+          "lineWidth": 1,
+          "radius": 10
+        },
+        {
+          "op": "text",
+          "id": "power_draw.label",
+          "x": 892,
+          "y": 46,
+          "text": "Power Draw",
+          "fill": "#93a1b5",
+          "fontSize": 10,
+          "fontFamily": "sans-serif",
+          "fontWeight": "normal",
+          "align": "left",
+          "baseline": "middle"
+        },
+        {
+          "op": "text",
+          "id": "power_draw.value-text",
+          "x": 1070,
+          "y": 140,
+          "text": "312 watt",
+          "fill": "#3ba7ff",
+          "fontSize": 68,
+          "fontFamily": "sans-serif",
+          "fontWeight": "bold",
+          "align": "center",
+          "baseline": "middle",
+          "binding": {
+            "metric": "power.draw",
+            "decimals": 0,
+            "unit": "watt",
+            "format": "",
+            "mode": "number",
+            "min": 0,
+            "max": 500,
+            "thresholds": [
+              {
+                "at": 350,
+                "severity": "warning",
+                "color": "#f0b94a",
+                "label": "Elevated"
+              },
+              {
+                "at": 450,
+                "severity": "critical",
+                "color": "#f26464",
+                "label": "Over budget"
+              }
+            ],
+            "colors": {
+              "accent": "#3ba7ff",
+              "warn": "#ffb020",
+              "crit": "#ff5c5c",
+              "ok": "#37d67a",
+              "text": "#f4f6fb"
+            }
+          },
+          "role": "value-text"
+        }
+      ]
+    }
+  ],
+  "warnings": []
+}

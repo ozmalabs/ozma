@@ -126,6 +126,8 @@ keeps Connect/importers opt-in permanently per deployment.
   substitution reports, and export targets.
 - [Operations](operations.md): sync modes, offline cache, install/update/
   rollback, asset-db endpoints, and troubleshooting.
+- [Release notes](release-notes.md): M0–M7 status, feature flags, migration
+  and upgrade steps, verification commands, and known caveats.
 
 ## Security posture
 

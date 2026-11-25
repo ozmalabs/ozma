@@ -886,6 +886,7 @@ def plan_and_export(
             result["format"] = metadata.format
         elif report.action == "subset":
             subset_flavour = flavour or _flavour_for_target(target_profile, output)
+            requested = codepoints_from_glyphs(selected_glyphs or ())
             subset_font(
                 metadata,
                 selected_glyphs or (),
@@ -893,6 +894,15 @@ def plan_and_export(
                 flavour=subset_flavour,
             )
             result["format"] = subset_flavour
+            # A subset silently omits glyphs the source does not contain.
+            # Surface those codepoints in the report rather than losing them.
+            missing = {
+                f"U+{codepoint:04X}"
+                for codepoint in requested - metadata.codepoint_set()
+            }
+            result["dropped_glyphs"] = sorted(
+                set(result.get("dropped_glyphs", [])) | missing
+            )
         elif report.action == "substituted":
             if selected_glyphs:
                 subset_flavour = flavour or _flavour_for_target(target_profile, output)

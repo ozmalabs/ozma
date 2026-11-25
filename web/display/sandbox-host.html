@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'"
+  >
+  <title>Ozma Sandboxed Widget</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; padding: 0; overflow: hidden; background: transparent; }
+    #ozma-sandbox-root {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      font: 14px/1.35 system-ui, sans-serif;
+      color: #e5e7eb;
+      contain: layout paint size;
+    }
+    #ozma-sandbox-root * { box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <div id="ozma-sandbox-root" role="img" aria-label="Sandboxed widget"></div>
+  <script>
+    // SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+    //
+    // Minimal host shim for a sandboxed third-party widget.  It renders only
+    // declarative text/rect/SVG nodes from a mount payload.  It does not run
+    // widget-supplied code, does not navigate, and cannot reach the network.
+    // The unguessable channel id in the URL fragment is the capability.
+    (() => {
+      'use strict';
+
+      const PROTOCOL_VERSION = 1;
+      const MAX_NODES = 512;
+      const MAX_TEXT = 4096;
+      const MAX_SVG = 64 * 1024;
+      const MAX_PAYLOAD = 256 * 1024;
+      const MAX_SVG_DEPTH = 24;
+      const MAX_CANVAS = 16384;
+      const SVG_NS = 'http://www.w3.org/2000/svg';
+      const SVG_TAGS = new Set([
+        'svg', 'g', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon',
+        'path', 'text', 'tspan', 'defs', 'lineargradient', 'radialgradient',
+        'stop', 'title', 'desc', 'clippath', 'mask',
+      ]);
+      const SVG_TAG_CASE = {
+        lineargradient: 'linearGradient',
+        radialgradient: 'radialGradient',
+        clippath: 'clipPath',
+      };
+      const SVG_ATTR_CASE = {
+        viewbox: 'viewBox',
+        preserveaspectratio: 'preserveAspectRatio',
+        gradientunits: 'gradientUnits',
+        gradienttransform: 'gradientTransform',
+        patternunits: 'patternUnits',
+        clippathunits: 'clipPathUnits',
+        maskunits: 'maskUnits',
+        textlength: 'textLength',
+        lengthadjust: 'lengthAdjust',
+        stopcolor: 'stop-color',
+        stopopacity: 'stop-opacity',
+        fillcolor: 'fill',
+        strokewidth: 'stroke-width',
+        strokelinecap: 'stroke-linecap',
+        strokelinejoin: 'stroke-linejoin',
+        strokedasharray: 'stroke-dasharray',
+        fontsize: 'font-size',
+        fontfamily: 'font-family',
+        fontweight: 'font-weight',
+        textanchor: 'text-anchor',
+        dominantbaseline: 'dominant-baseline',
+      };
+      const SVG_ATTRS = new Set([
+        'x', 'y', 'x1', 'y1', 'x2', 'y2', 'width', 'height', 'rx', 'ry',
+        'cx', 'cy', 'r', 'd', 'points', 'transform', 'fill', 'stroke',
+        'stroke-width', 'stroke-linecap', 'stroke-linejoin', 'stroke-dasharray',
+        'opacity', 'fill-opacity', 'stroke-opacity', 'viewbox',
+        'preserveaspectratio', 'font-size', 'font-family', 'font-weight',
+        'text-anchor', 'dominant-baseline', 'stop-color', 'stop-opacity',
+        'offset', 'gradientunits', 'gradienttransform', 'id', 'class',
+        'clippathunits', 'maskunits', 'textlength', 'lengthadjust',
+      ]);
+      const NUMERIC_ATTRS = new Set([
+        'x', 'y', 'x1', 'y1', 'x2', 'y2', 'width', 'height', 'rx', 'ry',
+        'cx', 'cy', 'r', 'stroke-width', 'opacity', 'fill-opacity',
+        'stroke-opacity', 'font-size', 'font-weight', 'stop-opacity', 'offset',
+      ]);
+      const PAINT_ATTRS = new Set(['fill', 'stroke', 'stop-color']);
+      const COLOR_RE = /^(?:#[0-9a-f]{3,8}|(?:rgb|rgba|hsl|hsla)\([0-9%.,\s/+-]+\)|none|transparent|currentcolor)$/i;
+      const URL_PAINT_RE = /^url\(#[A-Za-z][A-Za-z0-9_-]{0,63}\)$/;
+      const NUMBER_RE = /^-?(?:\d+|\d*\.\d+)(?:%|px)?$/;
+      const PATH_RE = /^[0-9eE+\-.,\sMmZzLlHhVvCcSsQqTtAa]*$/;
+      const TRANSFORM_RE = /^[0-9eE+\-.,\s()A-Za-z]*$/;
+      const ID_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+      const CLASS_RE = /^[A-Za-z0-9 _-]{0,128}$/;
+
+      const root = document.getElementById('ozma-sandbox-root');
+      const channel = new URLSearchParams(location.hash.replace(/^#/, '')).get('ozma-channel');
+      if (!root || !channel) return;
+
+      let lastMount = null;
+      let lastData = {};
+
+      function send(type, id, payload) {
+        try {
+          parent.postMessage({
+            v: PROTOCOL_VERSION,
+            channel,
+            type,
+            id: id === undefined ? null : id,
+            payload: payload === undefined ? null : payload,
+          }, '*');
+        } catch {
+          // The parent has gone away.
+        }
+      }
+
+      function number(value, fallback, min, max) {
+        if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+        return Math.min(max, Math.max(min, value));
+      }
+
+      function safeColor(value) {
+        return typeof value === 'string' && COLOR_RE.test(value.trim()) ? value.trim() : null;
+      }
+
+      function safeText(value) {
+        return typeof value === 'string' ? value.slice(0, MAX_TEXT) : '';
+      }
+
+      function payloadObject(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+        try {
+          if (JSON.stringify(value).length > MAX_PAYLOAD) return null;
+        } catch {
+          return null;
+        }
+        return value;
+      }
+
+      function position(element, node) {
+        element.style.position = 'absolute';
+        element.style.left = `${number(node.x, 0, -MAX_CANVAS, MAX_CANVAS)}px`;
+        element.style.top = `${number(node.y, 0, -MAX_CANVAS, MAX_CANVAS)}px`;
+        if (node.width !== undefined) {
+          element.style.width = `${number(node.width, 0, 0, MAX_CANVAS)}px`;
+        }
+        if (node.height !== undefined) {
+          element.style.height = `${number(node.height, 0, 0, MAX_CANVAS)}px`;
+        }
+        const opacity = number(node.opacity, 1, 0, 1);
+        if (opacity !== 1) element.style.opacity = String(opacity);
+      }
+
+      function resolveText(node) {
+        if (typeof node.dataKey === 'string' && node.dataKey.length <= 128) {
+          const value = lastData[node.dataKey];
+          if (typeof value === 'string' || typeof value === 'number') {
+            return safeText(String(value));
+          }
+        }
+        return safeText(node.text);
+      }
+
+      function renderText(node) {
+        const element = document.createElement('div');
+        position(element, node);
+        element.textContent = resolveText(node);
+        element.style.whiteSpace = 'pre-wrap';
+        element.style.overflowWrap = 'anywhere';
+        const color = safeColor(node.color);
+        if (color) element.style.color = color;
+        element.style.fontSize = `${number(node.size, 14, 1, 512)}px`;
+        element.style.fontWeight = String(number(node.weight, 400, 100, 900));
+        const align = node.align === 'center' || node.align === 'right' ? node.align : 'left';
+        element.style.textAlign = align;
+        return element;
+      }
+
+      function renderRect(node) {
+        const element = document.createElement('div');
+        position(element, node);
+        const background = safeColor(node.color) || safeColor(node.fill);
+        if (background) element.style.background = background;
+        const border = safeColor(node.borderColor);
+        if (border) {
+          element.style.border = `${number(node.borderWidth, 1, 0, 64)}px solid ${border}`;
+        }
+        element.style.borderRadius = `${number(node.radius, 0, 0, 4096)}px`;
+        return element;
+      }
+
+      function sanitiseAttribute(name, value) {
+        if (typeof value !== 'string' || value.length > 4096) return null;
+        const lower = name.toLowerCase();
+        if (lower.startsWith('on')) return null;
+        if (NUMERIC_ATTRS.has(lower)) return NUMBER_RE.test(value) ? value : null;
+        if (PAINT_ATTRS.has(lower)) {
+          return safeColor(value) || (URL_PAINT_RE.test(value) ? value : null);
+        }
+        if (lower === 'd') return PATH_RE.test(value) ? value : null;
+        if (lower === 'points') return PATH_RE.test(value) ? value : null;
+        if (lower === 'transform') {
+          return TRANSFORM_RE.test(value) && !/url/i.test(value) ? value : null;
+        }
+        if (lower === 'id') return ID_RE.test(value) ? value : null;
+        if (lower === 'class') return CLASS_RE.test(value) ? value : null;
+        if (lower === 'viewbox') {
+          return /^-?\d+(?:\.\d+)?(?:\s+-?\d+(?:\.\d+)?){3}$/.test(value) ? value : null;
+        }
+        if (lower === 'preserveaspectratio') {
+          return /^[A-Za-z]{1,32}$/.test(value) ? value : null;
+        }
+        if (lower === 'font-family') {
+          return /^[A-Za-z0-9 ,_-]{1,128}$/.test(value) ? value : null;
+        }
+        if (lower === 'stroke-dasharray') return PATH_RE.test(value) ? value : null;
+        if (lower === 'text-anchor' || lower === 'dominant-baseline') {
+          return /^[A-Za-z-]{1,32}$/.test(value) ? value : null;
+        }
+        if (lower === 'stroke-linecap' || lower === 'stroke-linejoin'
+          || lower === 'lengthadjust') {
+          return /^[A-Za-z]{1,32}$/.test(value) ? value : null;
+        }
+        if (lower === 'gradientunits' || lower === 'clippathunits'
+          || lower === 'maskunits') {
+          return /^[A-Za-z]{1,32}$/.test(value) ? value : null;
+        }
+        if (lower === 'gradienttransform') {
+          return TRANSFORM_RE.test(value) && !/url/i.test(value) ? value : null;
+        }
+        return null;
+      }
+
+      function rebuildSvg(source, depth) {
+        if (depth > MAX_SVG_DEPTH) return null;
+        const tag = source.localName ? source.localName.toLowerCase() : '';
+        if (!SVG_TAGS.has(tag)) return null;
+        const element = document.createElementNS(SVG_NS, SVG_TAG_CASE[tag] || tag);
+        if (source.attributes) {
+          for (const attribute of Array.from(source.attributes)) {
+            const lower = attribute.name.toLowerCase();
+            if (lower.startsWith('on') || !SVG_ATTRS.has(lower)) continue;
+            const safe = sanitiseAttribute(lower, attribute.value);
+            if (safe === null) continue;
+            try {
+              element.setAttribute(SVG_ATTR_CASE[lower] || lower, safe);
+            } catch {
+              // Ignore an attribute the SVG implementation rejects.
+            }
+          }
+        }
+        for (const child of Array.from(source.childNodes || [])) {
+          if (child.nodeType === 3) {
+            element.appendChild(document.createTextNode(safeText(child.nodeValue)));
+          } else if (child.nodeType === 1) {
+            const rebuilt = rebuildSvg(child, depth + 1);
+            if (rebuilt) element.appendChild(rebuilt);
+          }
+        }
+        return element;
+      }
+
+      function sanitiseSvg(source) {
+        if (typeof source !== 'string' || source.length > MAX_SVG) return null;
+        let parsed;
+        try {
+          parsed = new DOMParser().parseFromString(source, 'image/svg+xml');
+        } catch {
+          return null;
+        }
+        if (!parsed || parsed.getElementsByTagName('parsererror').length > 0) return null;
+        const documentElement = parsed.documentElement;
+        if (!documentElement || documentElement.localName.toLowerCase() !== 'svg') return null;
+        return rebuildSvg(documentElement, 0);
+      }
+
+      function renderSvg(node) {
+        const svg = sanitiseSvg(node.svg);
+        if (!svg) return null;
+        const wrapper = document.createElement('div');
+        position(wrapper, node);
+        svg.setAttribute('width', '100%');
+        svg.setAttribute('height', '100%');
+        wrapper.appendChild(svg);
+        return wrapper;
+      }
+
+      function render(payload, id) {
+        const nodes = Array.isArray(payload.nodes) ? payload.nodes.slice(0, MAX_NODES) : [];
+        const background = safeColor(payload.background);
+        root.style.background = background || 'transparent';
+        root.replaceChildren();
+
+        for (const node of nodes) {
+          if (!node || typeof node !== 'object') continue;
+          let element = null;
+          if (node.type === 'text') element = renderText(node);
+          else if (node.type === 'rect') element = renderRect(node);
+          else if (node.type === 'svg') element = renderSvg(node);
+          if (element) root.appendChild(element);
+        }
+
+        send('resize', id, {
+          width: Math.max(1, Math.min(MAX_CANVAS, root.scrollWidth || root.clientWidth || 1)),
+          height: Math.max(1, Math.min(MAX_CANVAS, root.scrollHeight || root.clientHeight || 1)),
+        });
+      }
+
+      window.addEventListener('message', (event) => {
+        if (event.source !== window.parent) return;
+        const message = event.data;
+        if (!message || typeof message !== 'object' || Array.isArray(message)) return;
+        if (message.v !== PROTOCOL_VERSION || message.channel !== channel) return;
+
+        const id = typeof message.id === 'string' || Number.isInteger(message.id)
+          ? message.id
+          : null;
+
+        if (message.type === 'mount') {
+          const payload = payloadObject(message.payload);
+          if (!payload) {
+            send('error', id, { code: 'SANDBOX_PAYLOAD', message: 'Invalid mount payload' });
+            return;
+          }
+          lastMount = payload;
+          try {
+            render(lastMount, id);
+          } catch {
+            send('error', id, { code: 'SANDBOX_RENDER', message: 'Failed to render payload' });
+          }
+        } else if (message.type === 'data') {
+          const payload = payloadObject(message.payload);
+          if (!payload) {
+            send('error', id, { code: 'SANDBOX_PAYLOAD', message: 'Invalid data payload' });
+            return;
+          }
+          lastData = { ...lastData, ...payload };
+          if (lastMount) {
+            try {
+              render(lastMount, id);
+            } catch {
+              send('error', id, { code: 'SANDBOX_RENDER', message: 'Failed to render data' });
+            }
+          }
+        } else if (message.type === 'teardown') {
+          root.replaceChildren();
+          lastMount = null;
+          lastData = {};
+        }
+      });
+
+      send('ready', null, { capabilities: ['render'] });
+    })();
+  </script>
+</body>
+</html>

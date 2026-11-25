@@ -3,6 +3,7 @@
 //! registration, API, and audio bridge used by the binary and tests.
 
 pub mod agent_metrics;
+pub mod aida64;
 pub mod api;
 pub mod audio_runtime;
 pub mod backend;
