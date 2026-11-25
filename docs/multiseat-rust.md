@@ -4,8 +4,9 @@ Status: **library + real subprocess supervisor + CLI + controller read-only
 grouping + persisted seats/hotplug reconciliation + opt-in
 input-routing/display-ownership/audio execution + opt-in privileged input
 isolation + private-display input targeting + opt-in per-seat X servers +
-opt-in headless Weston Wayland compositor + opt-in DRM lease-only handoff +
-packaged systemd unit (2026-11-25).**
+opt-in headless Weston/sway Wayland compositor + opt-in per-seat Wayland
+virtual keyboard/pointer injection + opt-in DRM lease-only handoff +
+packaged systemd unit (2026-11-26).**
 The crate enumerates display/input topology, plans one desktop seat per output,
 can spawn, health-check, restart, stop, and report one `ozma-node --profile
 desktop` child per seat, and models the opt-in resource layers: `xinput
@@ -552,6 +553,7 @@ The display backend is selected per supervisor run, not per seat:
 | `xephyr` | Start `Xephyr :N -screen WxHx24` with `DISPLAY` set to the shared display, so the private X root is a window inside the operator's desktop. If `Xephyr` is unavailable the start fails with a typed `Unsupported` error. |
 | `xorg` | Start a real `Xorg :N -config <file> -logfile <file> -nolisten tcp -noreset -novtswitch -sharevts -keeptty -auth <Xauthority>` per seat. Geometry, dummy/video, and libinput devices come from the config. Without `xorg_config` the start is a typed `Unsupported` error instead of a host GPU probe. |
 | `weston` | Start a throwaway headless Weston compositor per seat: `weston --backend=headless --renderer=pixman --socket=ozma-weston-N --idle-time=0 --config=<generated> --width=W --height=H`, with a private `XDG_RUNTIME_DIR`. Export `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` instead of `DISPLAY`. No DRM device, GPU mode-setting, or existing X/Wayland session is used. |
+| `sway` | Start a throwaway headless sway (wlroots) compositor per seat with `WLR_BACKENDS=headless`, `WLR_RENDERER=pixman`, `WLR_LIBINPUT_NO_DEVICES=1`, a private `XDG_RUNTIME_DIR`, and a generated minimal config. Sway creates its own `wayland-N` socket; the launcher creates an `ozma-sway-N` symlink in the private runtime dir and exports that stable `WAYLAND_DISPLAY`. It exposes `zwp_virtual_keyboard_manager_v1` and `zwlr_virtual_pointer_manager_v1`. No DRM/GPU/operator session is used. |
 
 `SeatDisplayOptions` carries `backend`, `size` (default `1280x800`), the display
 number range (default `90..=199`), readiness timeout/poll, an optional shared
@@ -621,13 +623,77 @@ Lifecycle and honesty rules:
   `input_targeting_unavailable` note, leaves `input_targeting_applied=false`,
   and never runs `xinput` or claims display input isolation. The privileged
   helper may still own the physical devices, but its uinput nodes are not
-  attached to this compositor.
+  attached to this compositor. Weston does not implement
+  `zwlr_virtual_pointer_manager_v1`, so `--seat-input wayland` requires the
+  `sway` backend.
+- **Sway synthetic input.** `--seat-input wayland` connects a virtual keyboard
+  and pointer only to the seat's own `WAYLAND_DISPLAY` socket (see
+  [Per-seat synthetic Wayland input](#per-seat-synthetic-wayland-input---seat-input-wayland)).
+  It is not physical isolation: the headless compositor still has no libinput
+  seat, and helper uinput devices are not attached to it. The status keeps
+  `input_targeting_applied=false` and reports the separate
+  `input_injection_available`/`input_injection_applied` flags.
 - **Status.** Each seat carries `display_backend`, `display`, `display_pid`,
   `display_ready`, `display_notes`, and a typed `display_error`
   (`missing_binary`, `number_exhausted`, `startup_timeout`, `crashed`,
-  `unsupported`). For Weston, `display` is the `WAYLAND_DISPLAY` name rather
-  than an X display. All display fields are omitted for the default `shared`
-  backend, so existing status JSON is unchanged.
+  `unsupported`). For Weston/Sway, `display` is the `WAYLAND_DISPLAY` name
+  rather than an X display. All display fields are omitted for the default
+  `shared` backend, so existing status JSON is unchanged.
+
+## Per-seat synthetic Wayland input (`--seat-input wayland`)
+
+This is an opt-in automation/test path, not physical input isolation. It
+creates a virtual keyboard and pointer through the compositor's own protocols;
+it never opens `/dev/uinput`, creates a global device, or sends an event to a
+different compositor.
+
+Module: `ozma-multiseat/src/seat_input.rs`.
+
+| Type | Purpose |
+|---|---|
+| `SeatInputMode` | `off` (default) or `wayland`; parsed from `--seat-input`. |
+| `SeatInputInjector` | The injectable seam. `connect`, `inject_key`, `inject_text`, `pointer_motion`, `pointer_button`, `disconnect`, `connected_seats`, `events_sent`. |
+| `WaylandSeatInputInjector` | Real implementation. Connects only to the supplied `SeatWaylandEnv.socket`; binds `wl_seat`, `zwp_virtual_keyboard_manager_v1`, and `zwlr_virtual_pointer_manager_v1`; creates both virtual devices. |
+| `SeatInputCapabilities` | Per-seat keyboard/pointer availability and protocol names. |
+| `SeatInputError` | Typed `protocol_unavailable`, `compositor_refused`, `disconnected`, `not_connected`, `unsupported_key`, `io`, `unsupported`. |
+| `FakeSeatInputInjector` | Test fake (`crate::fake`) that records keys/text/motion/buttons by seat and never opens a socket. |
+
+Protocol details:
+
+- The keyboard is created with `zwp_virtual_keyboard_manager_v1::create_virtual_keyboard`
+  and seeded with the compiled-in US XKB keymap from
+  `ozma-multiseat/data/wayland-us.xkb` (`WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1`).
+  `inject_text("a")` sends XKB keycode `38` press/release; `"b"` is `56`.
+- The pointer is created with `zwlr_virtual_pointer_manager_v1::create_virtual_pointer`
+  and sends relative `motion`/`button` requests (plus `frame` when the object
+  is version 2).
+- `ascii_key` maps the US layout; unsupported characters are a typed
+  `UnsupportedKey` error instead of a silent no-op.
+- A missing protocol global is `ProtocolUnavailable`. A compositor that aborts
+  the handshake is `CompositorRefused`; a closed socket is `Disconnected`.
+
+Supervisor integration:
+
+- `SupervisorOptions::seat_input` defaults to `Off`. `ProcessSeatSupervisor::new`
+  installs the real injector for `Wayland`; the CLI (which uses `with_parts`)
+  installs it explicitly; tests inject `FakeSeatInputInjector`.
+- After the private display is ready, the injector connects to that seat's
+  `SeatWaylandEnv` only. `resources.input_injection_available` is true only
+  when both globals were bound; `resources.input_injection_applied` is true
+  only when the keyboard (and connection) exists. A failure records a typed
+  `seat_input` resource error plus an `input_injection_unavailable` display
+  note and leaves both flags false. It never sets the physical
+  `input_isolation_applied` or `input_targeting_applied` flags.
+- Stop, display crash, rollback, and `Drop` disconnect the injector before the
+  compositor is removed, set `input_injection_released`, and retain the last
+  event count.
+- `--seat-input wayland` with a non-Wayland display is a typed validation
+  error. With `weston` it is also rejected because Weston lacks the wlroots
+  virtual-pointer global; `sway` is the supported backend today.
+- Documented test/automation API: build a `SeatInputRequest { seat_id, wayland }`
+  from the seat's `SeatWaylandEnv`, call `connect`, then `inject_text` /
+  `pointer_motion` / `pointer_button`. The live test does exactly this against
+  two real headless sway seats.
 
 ## DRM leases (`--seat-drm-lease`)
 
@@ -1083,6 +1149,12 @@ ozma-multiseat --display :0 --input-isolation helper \
 # alternative (`--seat-display xephyr`).
 ozma-multiseat --display :0 --seat-display xvfb --seat-display-size 1280x800
 
+# Give each seat a private headless sway compositor and connect a per-seat
+# virtual keyboard/pointer to that seat's own WAYLAND_DISPLAY socket. This is
+# synthetic input automation, not physical uinput isolation.
+ozma-multiseat --display :0 --seat-display sway --seat-input wayland \
+  --seat-display-size 1280x800
+
 # Opt in to a lease-only DRM handoff for one seat. `auto` selects only a vkms
 # card; name an explicit /dev/dri/cardN for a real output. The fd is exported in
 # OZMA_DRM_FD; this does not create scanout or compositor isolation.
@@ -1128,8 +1200,9 @@ Configuration:
 | `--input-isolation xinput\|helper` | Input path. `xinput` is the default; `helper` uses privileged `EVIOCGRAB`/uinput isolation. |
 | `--input-helper PATH` | Helper binary for `--input-isolation helper` (default `ozma-seat-input`). |
 | `--input-targeting off\|warn\|strict` | Restrict a private display to the seat's helper uinput devices. `warn` is the default; `strict` prevents the spawn on failure; `off` skips `xinput`. |
-| `--seat-display shared\|xvfb\|xephyr\|xorg\|weston` | Per-seat display backend. `shared` is the default; `xvfb`/`xephyr`/`xorg` start and stop a private X server per seat; `weston` starts a throwaway headless Wayland compositor with a private runtime dir/socket. |
-| `--seat-display-size WxH` | Private screen size for Xvfb/Xephyr/Weston (default `1280x800`). |
+| `--seat-display shared\|xvfb\|xephyr\|xorg\|weston\|sway` | Per-seat display backend. `shared` is the default; `xvfb`/`xephyr`/`xorg` start and stop a private X server per seat; `weston` starts a throwaway headless Wayland compositor; `sway` starts a throwaway headless wlroots compositor with virtual-input protocols. |
+| `--seat-display-size WxH` | Private screen size for Xvfb/Xephyr/Weston/Sway (default `1280x800`). |
+| `--seat-input off\|wayland` | Connect a virtual keyboard/pointer only to the seat's private Wayland socket (default `off`). Requires `--seat-display sway`; creates no uinput device. |
 | `--seat-drm-lease [SEAT=]CARD:CONNECTOR[@CRTC]` | Opt-in lease-only handoff. Repeat once per seat, or prefix every value with a seat id/index. `auto`/`vkms` selects only a virtual vkms card; real outputs must be named explicitly. |
 | `--seats-file PATH` | Load/reuse and atomically update persisted seat identities. Never written by `--print-plan`/`--dry-run`. |
 | `--hotplug` | Poll read-only sysfs DRM/input snapshots, debounce, and start/stop/restart seats. |
@@ -1180,17 +1253,29 @@ Targeting is never applied on the default shared display. The headless
 `input_targeting_unavailable` note and leaves targeting unapplied regardless of
 this flag.
 
-With `--seat-display xvfb`, `xephyr`, `xorg`, or `weston`, the supervisor starts
-a private display before each seat. A missing `Xvfb`/`Xephyr`/`Xorg`/`weston` is
-a typed `display_error`; a server/compositor that never completes its handshake
-is a typed `startup_timeout` and is never claimed; an exhausted `:90..=199`
-range is `number_exhausted`; a server that exits is `crashed`. Display numbers
-are reused after stop or rollback. For X backends the child receives `DISPLAY`
-(and `XAUTHORITY`); for `weston` it receives `WAYLAND_DISPLAY` and
+With `--seat-display xvfb`, `xephyr`, `xorg`, `weston`, or `sway`, the
+supervisor starts a private display before each seat. A missing
+`Xvfb`/`Xephyr`/`Xorg`/`weston`/`sway` is a typed `display_error`; a
+server/compositor that never completes its handshake is a typed
+`startup_timeout` and is never claimed; an exhausted `:90..=199` range is
+`number_exhausted`; a server that exits is `crashed`. Display numbers are
+reused after stop or rollback. For X backends the child receives `DISPLAY`
+(and `XAUTHORITY`); for `weston`/`sway` it receives `WAYLAND_DISPLAY` and
 `XDG_RUNTIME_DIR` and inherited `DISPLAY`/`XAUTHORITY` are removed. Output lists
 `display(<backend> <display> pid=... ready=...)`; JSON carries the same fields.
 On shutdown all child processes are stopped before their servers, and the
 sockets/processes/runtime directories are gone when `stop_all` returns.
+
+`--seat-input wayland` is only valid with `--seat-display sway`. After the
+private compositor is ready, the supervisor connects the real
+`WaylandSeatInputInjector` to that seat's `WAYLAND_DISPLAY` socket and creates
+a virtual keyboard/pointer. Status reports `resources.input_injection_available`
+(protocols present), `resources.input_injection_applied` (connection and
+keyboard created), and `resources.input_injection_events`. A missing protocol,
+refused compositor, or absent injector records a typed `seat_input` resource
+error and an `input_injection_unavailable` note, keeps both flags false, and
+does not claim any physical isolation. Stop/crash/shutdown disconnect the
+injector before the compositor is removed.
 
 `--seat-drm-lease [SEAT=]CARD:CONNECTOR[@CRTC]` adds a lease-only handoff before
 the node spawn. Without a seat prefix the flag must be repeated exactly once per
@@ -1392,6 +1477,12 @@ The default suite covers:
   typed failures, auto-virtual refusal of real cards, supervisor start/stop
   fd export and revoke, later-seat rollback, missing-backend failure, dry-run
   no-acquire, and status JSON (`drm_lease` plus `resources.drm_lease_*`).
+- Synthetic Wayland input (`tests/sway_input_supervisor.rs`): per-seat socket
+  targeting with two fake sway displays, `input_injection_available/applied`
+  status, stop disconnect/released state, typed missing-protocol failure with
+  no false claim, shared-display refusal, and fake per-seat key/text/pointer
+  isolation. `seat_input` unit tests cover mode parsing, US keycode mapping,
+  typed error kinds, and the compiled-in keymap.
 
 Controller-side grouping is covered by Python tests with fake nodes:
 
@@ -1525,6 +1616,23 @@ each, proves a client using seat A's runtime cannot reach seat B's socket, then
 stops both and checks the sockets, runtime dirs, and pids are gone. It never
 opens DRM or touches the operator's real Wayland/X session. Live evidence is in
 `phase4-wayland-seat-report.md`.
+
+The live per-seat synthetic-input proof is separately gated and needs `sway`:
+
+```bash
+OZMA_MULTISEAT_REAL_SWAY=1 \
+  cargo test -p ozma-multiseat --test live_sway_input_smoke \
+  -- --ignored --nocapture
+```
+
+It starts two throwaway headless sway compositors (private runtime dirs,
+`ozma-sway-N` symlinked sockets), maps one minimal Wayland keyboard probe in
+each, connects the real `WaylandSeatInputInjector` to each socket, types `a`
+into seat A and `b` into seat B, and requires seat A's probe to see keycode 38
+only and seat B's to see keycode 56 only. It also sends a pointer motion/button
+on seat A to prove the virtual pointer object works. No DRM, uinput, physical
+device, or operator session is touched. Evidence and any protocol blocker are
+recorded in `phase4-wayland-input-report.md`.
 
 The real `xinput` targeting path has its own throwaway-display smoke:
 

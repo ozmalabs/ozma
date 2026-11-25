@@ -1040,6 +1040,40 @@ pub struct Args {
     )]
     pub bluetooth_program: Option<std::path::PathBuf>,
 
+    /// Opt in to bounded application control for pids listed by `/apps`
+    /// (`/apps/{pid}/terminate`, `/signal`, `/suspend`, `/resume`).
+    ///
+    /// Off by default: without this flag every control route returns a typed
+    /// `503 apps.control-disabled` and the node never signals another process.
+    /// When enabled, pid 1, this node and its process tree, kernel threads,
+    /// zombies, and (by default) processes owned by another user are refused.
+    /// `SIGKILL` requires explicit confirmation and every signal is preceded by
+    /// an exact pid/start-time re-check.
+    #[arg(long, env = "OZMA_APP_CONTROL")]
+    pub app_control: bool,
+
+    /// Seconds to wait after `SIGTERM` before the bounded `SIGKILL` escalation
+    /// used by `POST /apps/{pid}/terminate` (clamped to 1–30 seconds).
+    #[arg(
+        long,
+        env = "OZMA_APP_CONTROL_KILL_AFTER_SECONDS",
+        value_name = "SECONDS",
+        default_value_t = 2
+    )]
+    pub app_control_kill_after_seconds: u64,
+
+    /// Allow application control of processes owned by another user.
+    ///
+    /// Off by default. This is a deliberate administrative widening; exact pid,
+    /// start-time, process-tree, kernel-thread, and confirmation checks still
+    /// apply.
+    #[arg(
+        long,
+        env = "OZMA_APP_CONTROL_ALLOW_OTHER_USERS",
+        requires = "app_control"
+    )]
+    pub app_control_allow_other_users: bool,
+
     /// Enable the local HLS pipeline: capture → ffmpeg → `/stream/*`.
     ///
     /// Requires a video capture source and an ffmpeg binary. WebRTC is not
@@ -2982,6 +3016,22 @@ async fn run() -> std::process::ExitCode {
         },
     };
     set_capability(&mut args, &mut config, "bluetooth", bluetooth_available);
+    // Opt-in application control. Nothing is signalled unless this flag is
+    // present; without it the routes stay mounted and return a typed 503.
+    let app_control = args.app_control.then(|| {
+        let control =
+            ozma_node::app_control::AppControl::new(ozma_node::app_control::AppControlConfig::new(
+                Duration::from_secs(args.app_control_kill_after_seconds),
+                args.app_control_allow_other_users,
+            ));
+        let policy = control.config();
+        info!(
+            kill_after_seconds = policy.kill_after.as_secs(),
+            allow_other_users = policy.allow_other_users,
+            "application control enabled; /apps/<pid> control routes are guarded"
+        );
+        control
+    });
     // Keep a handle for shutdown: a clipboard selection owner or persistent
     // wallpaper daemon must not outlive the node.
     let desktop_controls_shutdown = desktop_controls.clone();
@@ -3045,7 +3095,8 @@ async fn run() -> std::process::ExitCode {
             .with_vnc_registration(vnc_registration)
             .with_desktop_controls(desktop_controls)
             .with_backup(backup_service)
-            .with_bluetooth(bluetooth_service);
+            .with_bluetooth(bluetooth_service)
+            .with_app_control(app_control);
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with
     // `--api-token`. See `controller_compat::{compat_router, public_router}`.
@@ -4639,6 +4690,30 @@ mod tests {
         assert_eq!(
             probe_failure_detail(&"exit status: 1", ""),
             "exit status: 1"
+        );
+    }
+
+    #[test]
+    fn app_control_is_off_by_default_and_requires_app_control_for_other_users() {
+        let defaults = Args::parse_from(["ozma-node"]);
+        assert!(!defaults.app_control, "application control must be opt-in");
+        assert_eq!(defaults.app_control_kill_after_seconds, 2);
+        assert!(!defaults.app_control_allow_other_users);
+
+        let enabled = Args::parse_from([
+            "ozma-node",
+            "--app-control",
+            "--app-control-kill-after-seconds",
+            "7",
+            "--app-control-allow-other-users",
+        ]);
+        assert!(enabled.app_control);
+        assert_eq!(enabled.app_control_kill_after_seconds, 7);
+        assert!(enabled.app_control_allow_other_users);
+
+        assert!(
+            Args::try_parse_from(["ozma-node", "--app-control-allow-other-users"]).is_err(),
+            "widening the ownership policy requires --app-control"
         );
     }
 

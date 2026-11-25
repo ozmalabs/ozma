@@ -58,6 +58,7 @@ fn options(dry_run: bool, leases: BTreeMap<String, DrmLeaseRequest>) -> Supervis
         input_isolation: false,
         input_targeting: Default::default(),
         seat_display: Default::default(),
+        seat_input: Default::default(),
         drm_leases: leases,
     }
 }

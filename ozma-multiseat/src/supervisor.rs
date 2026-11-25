@@ -39,8 +39,11 @@ use crate::seat::{
     ResourceAction, ResourceKind, SeatPlan, SeatResourceStatus, SeatRuntimeStatus, SeatState,
 };
 use crate::seat_display::{
-    SeatDisplayError, SeatDisplayHandle, SeatDisplayLauncher, SeatDisplayNote, SeatDisplayNoteKind,
-    SeatDisplayOptions, SeatDisplayRequest, SeatDisplayStatus, SeatWaylandEnv,
+    SeatDisplayBackend, SeatDisplayError, SeatDisplayHandle, SeatDisplayLauncher, SeatDisplayNote,
+    SeatDisplayNoteKind, SeatDisplayOptions, SeatDisplayRequest, SeatDisplayStatus, SeatWaylandEnv,
+};
+use crate::seat_input::{
+    SeatInputInjector, SeatInputMode, SeatInputRequest, WaylandSeatInputInjector,
 };
 
 /// Default node binary used by the planner and the process launcher.
@@ -380,8 +383,12 @@ pub struct SupervisorOptions {
     pub input_targeting: InputTargetingMode,
     /// Opt-in per-seat X server strategy. `Shared` (the default) starts
     /// nothing; `Xvfb`/`Xephyr`/`Xorg` start a private display before the node and stop
-    /// it after the node.
+    /// it after the node. `Weston`/`Sway` start a private Wayland compositor.
     pub seat_display: SeatDisplayOptions,
+    /// Opt-in synthetic input strategy. `Off` (the default) creates no
+    /// injector; `Wayland` connects a virtual keyboard/pointer to the seat's
+    /// own private Wayland socket. It never creates a global uinput device.
+    pub seat_input: SeatInputMode,
     /// Opt-in DRM leases keyed by seat id. Empty by default. A lease hands the
     /// named connector/CRTC object IDs to the seat's inherited fd; it does not
     /// create scanout or compositor isolation.
@@ -403,6 +410,7 @@ impl Default for SupervisorOptions {
             input_isolation: false,
             input_targeting: InputTargetingMode::Warn,
             seat_display: SeatDisplayOptions::default(),
+            seat_input: SeatInputMode::Off,
             drm_leases: BTreeMap::new(),
         }
     }
@@ -515,6 +523,7 @@ pub struct ProcessSeatSupervisor {
     evdev_routing: Option<Box<dyn InputRouter>>,
     input_helper: Option<Box<dyn SeatInputHelper>>,
     input_targeter: Option<Box<dyn SeatInputTargeter>>,
+    input_injector: Option<Box<dyn SeatInputInjector>>,
     audio: Option<Box<dyn SeatAudioRouter>>,
     display_launcher: Option<Box<dyn SeatDisplayLauncher>>,
     drm_lease_backend: Option<Box<dyn DrmLeaseBackend>>,
@@ -537,6 +546,9 @@ impl ProcessSeatSupervisor {
             Arc::new(HttpHealthProbe::default()),
         )
         .with_optional_display_launcher(display_launcher);
+        if supervisor.options.seat_input.is_wayland() {
+            supervisor.input_injector = Some(Box::new(WaylandSeatInputInjector::new()));
+        }
         #[cfg(target_os = "linux")]
         if wants_lease {
             supervisor.drm_lease_backend =
@@ -560,6 +572,7 @@ impl ProcessSeatSupervisor {
             evdev_routing: None,
             input_helper: None,
             input_targeter: None,
+            input_injector: None,
             audio: None,
             display_launcher: None,
             drm_lease_backend: None,
@@ -645,6 +658,18 @@ impl ProcessSeatSupervisor {
         self
     }
 
+    /// Install the per-seat synthetic Wayland input injector used by
+    /// [`SupervisorOptions::seat_input`].
+    ///
+    /// [`Self::new`] installs [`WaylandSeatInputInjector`] when the mode is
+    /// `wayland`. Tests should inject [`crate::fake::FakeSeatInputInjector`].
+    /// Without an injector a requested mode records an honest
+    /// `input_injection_unavailable` note and never claims the resource.
+    pub fn with_seat_input_injector(mut self, injector: Box<dyn SeatInputInjector>) -> Self {
+        self.input_injector = Some(injector);
+        self
+    }
+
     /// Install the per-seat audio sink router used by `--audio-router`.
     ///
     /// With a router installed, start ensures the seat's null sink (and its
@@ -712,6 +737,10 @@ impl ProcessSeatSupervisor {
             if let Some(seat) = self.seats.get_mut(seat_id) {
                 seat.display_status = SeatDisplayStatus::shared();
             }
+            // Synthetic input needs a private Wayland socket; on a shared X
+            // display this records the honest unavailable note instead of
+            // claiming an injector.
+            self.apply_seat_input(seat_id)?;
             return Ok(());
         }
 
@@ -788,13 +817,16 @@ impl ProcessSeatSupervisor {
             ));
         }
         if backend.is_wayland() {
+            let detail = if backend == SeatDisplayBackend::Sway {
+                "synthetic virtual input is available only when --seat-input wayland is enabled; \
+                 physical libinput/uinput device targeting is not"
+            } else {
+                "this compositor exposes no libinput seat and no wlroots virtual-pointer global; \
+                 physical libinput/uinput device targeting is not"
+            };
             status.push_note(SeatDisplayNote::new(
                 SeatDisplayNoteKind::InputTargetingUnavailable,
-                format!(
-                    "seat {seat_id} uses a headless Weston compositor with no libinput seat; \
-                     physical inputs and helper uinput devices cannot be targeted at this \
-                     compositor, so display input isolation is not claimed"
-                ),
+                format!("seat {seat_id} uses a headless {backend} compositor; {detail} claimed"),
             ));
         }
 
@@ -809,6 +841,7 @@ impl ProcessSeatSupervisor {
         }
         seat.display = Some(handle);
         seat.display_status = status;
+        self.apply_seat_input(seat_id)?;
         Ok(())
     }
 
@@ -1217,6 +1250,129 @@ impl ProcessSeatSupervisor {
         Ok(())
     }
 
+    /// Connect the seat's synthetic Wayland keyboard/pointer to its own
+    /// compositor socket.
+    ///
+    /// Availability is only reported after [`SeatInputInjector::connect`]
+    /// returns both protocol globals. A missing protocol, refused compositor,
+    /// or missing injector records a typed error and an
+    /// `input_injection_unavailable` display note; it never sets
+    /// `input_injection_applied` or any physical-isolation flag.
+    fn apply_seat_input(&mut self, seat_id: &str) -> Result<(), MultiseatError> {
+        if !self.options.seat_input.is_wayland() {
+            return Ok(());
+        }
+        let Some((seat_display, wayland)) = self.seats.get(seat_id).and_then(|seat| {
+            let display = seat.display_status.display.clone()?;
+            let wayland = seat.display.as_ref()?.wayland()?.clone();
+            Some((display, wayland))
+        }) else {
+            let message = format!(
+                "seat {seat_id} requested Wayland synthetic input but has no ready private \
+                 Wayland display"
+            );
+            self.record_resource_error(
+                seat_id,
+                ResourceKind::SeatInput,
+                ResourceAction::Apply,
+                &format!("unsupported: {message}"),
+            );
+            self.seat_input_failure(seat_id, &message);
+            return Ok(());
+        };
+
+        let Some(injector) = self.input_injector.as_mut() else {
+            let message = format!(
+                "seat {seat_id} requested Wayland synthetic input but no injector is configured"
+            );
+            self.record_resource_error(
+                seat_id,
+                ResourceKind::SeatInput,
+                ResourceAction::Apply,
+                &format!("unsupported: {message}"),
+            );
+            self.seat_input_failure(seat_id, &message);
+            return Ok(());
+        };
+
+        let request = SeatInputRequest {
+            seat_id: seat_id.to_owned(),
+            wayland,
+        };
+        match injector.connect(&request) {
+            Ok(capabilities) => {
+                let available = capabilities.is_complete();
+                if let Some(seat) = self.seats.get_mut(seat_id) {
+                    seat.resources.input_injection_available = available;
+                    seat.resources.input_injection_applied = capabilities.supports_text();
+                    seat.resources.input_injection_released = false;
+                    seat.resources.input_injection_events = 0;
+                }
+                if !capabilities.pointer {
+                    self.push_display_note(
+                        seat_id,
+                        SeatDisplayNote::new(
+                            SeatDisplayNoteKind::InputInjectionUnavailable,
+                            format!(
+                                "seat {seat_id} compositor did not expose \
+                                 zwlr_virtual_pointer_manager_v1; keyboard text injection is \
+                                 available but pointer injection is not claimed"
+                            ),
+                        ),
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.record_resource_error(
+                    seat_id,
+                    ResourceKind::SeatInput,
+                    ResourceAction::Apply,
+                    &format!("{}: {error}", error.kind()),
+                );
+                let message = format!(
+                    "seat {seat_id} on display {seat_display} cannot accept synthetic Wayland \
+                     input: {error}"
+                );
+                self.seat_input_failure(seat_id, &message);
+                Ok(())
+            }
+        }
+    }
+
+    fn seat_input_failure(&mut self, seat_id: &str, message: &str) {
+        if let Some(seat) = self.seats.get_mut(seat_id) {
+            seat.resources.input_injection_available = false;
+            seat.resources.input_injection_applied = false;
+        }
+        self.push_display_note(
+            seat_id,
+            SeatDisplayNote::new(
+                SeatDisplayNoteKind::InputInjectionUnavailable,
+                message.to_owned(),
+            ),
+        );
+    }
+
+    /// Disconnect synthetic input without claiming availability. Used before a
+    /// display is stopped or replaced.
+    fn clear_seat_input(&mut self, seat_id: &str) {
+        if let Some(injector) = self.input_injector.as_mut() {
+            let events = injector.events_sent(seat_id);
+            injector.disconnect(seat_id);
+            if let Some(seat) = self.seats.get_mut(seat_id) {
+                seat.resources.input_injection_events = events;
+            }
+        }
+        if let Some(seat) = self.seats.get_mut(seat_id) {
+            if seat.resources.input_injection_applied {
+                seat.resources.input_injection_released = true;
+            }
+            seat.resources.input_injection_applied = false;
+            seat.resources.input_injection_available = false;
+        }
+    }
+
     /// Ask the helper to grab the seat's complete device set.
     ///
     /// The applied flag is only set from the helper's confirmed response. If a
@@ -1587,7 +1743,12 @@ impl ProcessSeatSupervisor {
         };
 
         // Display targeting is released before the helper grab (reverse of
-        // apply order). Re-enabling the other seats' devices while the private
+        // apply order). Synthetic Wayland input is closed first: it belongs to
+        // the display socket and must never outlive/reconnect to a replacement
+        // compositor.
+        self.clear_seat_input(seat_id);
+
+        // Re-enabling the other seats' devices while the private
         // server still exists keeps the shared XInput state honest. A failure
         // leaves the applied flag set for a later retry.
         if targeting_applied {
@@ -1862,6 +2023,7 @@ impl ProcessSeatSupervisor {
                 // restart re-applies it to the replacement display instead of
                 // trusting a stale `input_targeting_applied` flag.
                 self.clear_input_targeting(&seat_id);
+                self.clear_seat_input(&seat_id);
                 let seat = self.seats.get_mut(&seat_id).expect("tracked seat");
                 let mut cleanup_failure = None;
                 let mut display_released = false;
@@ -2326,6 +2488,7 @@ impl ProcessSeatSupervisor {
                 && !seat.resources.routing_applied
                 && !seat.resources.input_isolation_applied
                 && !seat.resources.input_targeting_applied
+                && !seat.resources.input_injection_applied
                 && !seat.resources.drm_lease_applied
             {
                 seat.resources = SeatResourceStatus::default();
@@ -2376,6 +2539,12 @@ impl ProcessSeatSupervisor {
                             self.options.input_targeting
                         ));
                     }
+                }
+                if self.options.seat_input.is_wayland() {
+                    message.push_str(
+                        "; would connect a per-seat Wayland virtual keyboard/pointer to the \
+                         private compositor socket",
+                    );
                 }
                 if let Some(request) = self.options.drm_leases.get(&seat_id) {
                     message.push_str(&format!(

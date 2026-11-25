@@ -264,12 +264,32 @@ impl DrmCard {
     }
 }
 
+/// A writeback connector discovered on a DRM card.
+///
+/// Writeback connectors are hidden unless the client enables
+/// `DRM_CLIENT_CAP_WRITEBACK_CONNECTORS`. They are sinks, not displays, so they
+/// are reported separately from [`DrmCard::connectors`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrmWritebackConnector {
+    /// Kernel connector name, for example `Writeback-2`.
+    pub name: String,
+    /// Connector object id.
+    pub object_id: u32,
+    /// CRTC object ids this writeback connector can drive.
+    #[serde(default)]
+    pub possible_crtcs: Vec<u32>,
+}
+
 /// A validated lease request.
 ///
 /// The CLI form is `[SEAT=]CARD:CONNECTOR[@CRTC][:PLANE]`, for example
 /// `/dev/dri/card3:Virtual-1`, `auto:Virtual-1@31`, or
 /// `/dev/dri/card3:Virtual-1@31:44`. A plane is validated against the selected
 /// CRTC before the lease ioctl and is reported alongside the connector/CRTC.
+///
+/// An optional writeback connector can also be named. It is normally discovered
+/// from the card and then added by the opt-in scanout verification path; it is
+/// not part of the CLI lease selector.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrmLeaseRequest {
     /// Card selector.
@@ -281,6 +301,9 @@ pub struct DrmLeaseRequest {
     /// Optional explicit plane selector.
     #[serde(default)]
     pub plane: DrmPlaneSelector,
+    /// Optional writeback connector object id to include in the lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writeback_connector: Option<u32>,
 }
 
 impl DrmLeaseRequest {
@@ -291,6 +314,7 @@ impl DrmLeaseRequest {
             connector: connector.into(),
             crtc: DrmCrtcSelector::Auto,
             plane: DrmPlaneSelector::Auto,
+            writeback_connector: None,
         }
     }
 
@@ -306,9 +330,24 @@ impl DrmLeaseRequest {
         self
     }
 
+    /// Include a specific writeback connector object id in the lease.
+    ///
+    /// The opt-in scanout verification path discovers the connector and then
+    /// adds it here, so it is validated and leased exactly like the display
+    /// connector.
+    pub fn with_writeback_connector(mut self, connector: u32) -> Self {
+        self.writeback_connector = Some(connector);
+        self
+    }
+
     /// The explicit plane object id, if one was requested.
     pub fn plane_id(&self) -> Option<u32> {
         self.plane.id()
+    }
+
+    /// The explicit writeback connector object id, if one was requested.
+    pub fn writeback_connector_id(&self) -> Option<u32> {
+        self.writeback_connector
     }
 }
 
@@ -343,6 +382,7 @@ impl FromStr for DrmLeaseRequest {
             connector: connector.to_owned(),
             crtc,
             plane,
+            writeback_connector: None,
         })
     }
 }
@@ -379,6 +419,10 @@ pub trait DrmLeaseHandle: Send {
     fn crtc_id(&self) -> u32;
     /// Explicitly requested plane object id, when the request named one.
     fn plane_id(&self) -> Option<u32> {
+        None
+    }
+    /// Explicitly requested writeback connector object id, when any.
+    fn writeback_connector_id(&self) -> Option<u32> {
         None
     }
     /// Leased plane object ids, when the kernel reports them.
@@ -420,6 +464,19 @@ pub trait DrmLeaseBackend: Send + Sync {
 
     /// List kernel lessee ids for a card.
     fn list_lease_ids(&self, card: &DrmCardSelector) -> Result<Vec<u32>, DrmLeaseError>;
+
+    /// Discover writeback connectors exposed by the card.
+    ///
+    /// The default is empty, which keeps lease-only fakes and unusual backends
+    /// honest: no writeback capability is claimed unless a backend implements
+    /// it. The real backend enables `DRM_CLIENT_CAP_WRITEBACK_CONNECTORS` on a
+    /// short-lived lessor fd before listing connectors.
+    fn writeback_connectors(
+        &self,
+        _card: &DrmCardSelector,
+    ) -> Result<Vec<DrmWritebackConnector>, DrmLeaseError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Typed DRM lease failures.
@@ -504,6 +561,17 @@ pub enum DrmLeaseError {
         crtc: u32,
     },
 
+    /// The requested writeback connector cannot drive the selected CRTC.
+    #[error("DRM writeback connector {connector} on {card} is not compatible with CRTC {crtc}")]
+    IncompatibleWriteback {
+        /// Card path or name.
+        card: String,
+        /// Writeback connector object id.
+        connector: u32,
+        /// CRTC object id.
+        crtc: u32,
+    },
+
     /// The caller is not DRM master or lacks the capability required to lease.
     #[error("DRM leasing on {card} requires DRM master/CAP_SYS_ADMIN: {reason}")]
     CapabilityRequired {
@@ -558,6 +626,7 @@ impl DrmLeaseError {
             Self::UnknownConnector { .. } => "unknown_object",
             Self::AlreadyLeased { .. } => "already_leased",
             Self::IncompatiblePlane { .. } => "incompatible_plane",
+            Self::IncompatibleWriteback { .. } => "incompatible_writeback",
             Self::CapabilityRequired { .. } => "capability_required",
             Self::UnknownCard(_) => "unknown_card",
             Self::InvalidRequest(_, _) => "invalid_request",
@@ -973,6 +1042,7 @@ fn register_lease(
     connector_id: u32,
     crtc_id: u32,
     plane_id: Option<u32>,
+    writeback_connector_id: Option<u32>,
     lessee_id: u32,
 ) {
     let mut registry = lease_registry().lock().expect("DRM lease registry lock");
@@ -990,14 +1060,37 @@ fn register_lease(
             lessee_id,
         );
     }
+    if let Some(writeback_connector_id) = writeback_connector_id {
+        registry.insert(
+            (
+                card.to_path_buf(),
+                DrmObjectKind::Connector,
+                writeback_connector_id,
+            ),
+            lessee_id,
+        );
+    }
 }
 
-fn unregister_lease(card: &Path, connector_id: u32, crtc_id: u32, plane_id: Option<u32>) {
+fn unregister_lease(
+    card: &Path,
+    connector_id: u32,
+    crtc_id: u32,
+    plane_id: Option<u32>,
+    writeback_connector_id: Option<u32>,
+) {
     let mut registry = lease_registry().lock().expect("DRM lease registry lock");
     registry.remove(&(card.to_path_buf(), DrmObjectKind::Connector, connector_id));
     registry.remove(&(card.to_path_buf(), DrmObjectKind::Crtc, crtc_id));
     if let Some(plane_id) = plane_id {
         registry.remove(&(card.to_path_buf(), DrmObjectKind::Plane, plane_id));
+    }
+    if let Some(writeback_connector_id) = writeback_connector_id {
+        registry.remove(&(
+            card.to_path_buf(),
+            DrmObjectKind::Connector,
+            writeback_connector_id,
+        ));
     }
 }
 
@@ -1015,7 +1108,7 @@ mod real {
         enumerate_at, is_vkms_card, map_io, register_lease, registry_conflict, unregister_lease,
         DrmCard, DrmCardSelector, DrmCrtcSelector, DrmLeaseBackend, DrmLeaseConnector,
         DrmLeaseError, DrmLeaseHandle, DrmLeaseObjects, DrmLeaseRequest, DrmObjectKind,
-        DEFAULT_DRM_DEV_ROOT, DEFAULT_DRM_ROOT,
+        DrmWritebackConnector, DEFAULT_DRM_DEV_ROOT, DEFAULT_DRM_ROOT,
     };
 
     /// Production DRM lease backend backed by the maintained `drm` crate.
@@ -1156,6 +1249,48 @@ mod real {
             self.inspect_card(card)
         }
 
+        fn writeback_connectors(
+            &self,
+            selector: &DrmCardSelector,
+        ) -> Result<Vec<DrmWritebackConnector>, DrmLeaseError> {
+            let card_info = self.card_for_selector(selector)?;
+            let card = self.open_card(&card_info)?;
+            enable_writeback_capability(&card, &card_info.path)?;
+            let handles = card
+                .resource_handles()
+                .map_err(|error| map_control_error(&card_info.path, error))?;
+            let mut writeback = Vec::new();
+            for handle in handles.connectors() {
+                let info = match card.get_connector(*handle, false) {
+                    Ok(info) => info,
+                    Err(error) => return Err(map_control_error(&card_info.path, error)),
+                };
+                if info.interface() != connector::Interface::Writeback {
+                    continue;
+                }
+                let mut possible_crtcs = Vec::new();
+                for encoder in info.encoders() {
+                    let Ok(encoder_info) = card.get_encoder(*encoder) else {
+                        continue;
+                    };
+                    for crtc in handles.filter_crtcs(encoder_info.possible_crtcs()) {
+                        let id = u32::from(crtc);
+                        if !possible_crtcs.contains(&id) {
+                            possible_crtcs.push(id);
+                        }
+                    }
+                }
+                possible_crtcs.sort_unstable();
+                writeback.push(DrmWritebackConnector {
+                    name: info.to_string(),
+                    object_id: u32::from(*handle),
+                    possible_crtcs,
+                });
+            }
+            writeback.sort_by_key(|connector| connector.object_id);
+            Ok(writeback)
+        }
+
         fn acquire(
             &self,
             request: &DrmLeaseRequest,
@@ -1167,6 +1302,12 @@ mod real {
                 });
             }
             let card = self.open_card(&card_info)?;
+            // Writeback connectors are hidden unless the lessor enables the
+            // capability. Enable it before resource enumeration so the
+            // requested object can be validated and inserted into the lease.
+            if request.writeback_connector.is_some() {
+                enable_writeback_capability(&card, &card_info.path)?;
+            }
             let handles = card
                 .resource_handles()
                 .map_err(|error| map_control_error(&card_info.path, error))?;
@@ -1252,6 +1393,54 @@ mod real {
                 }
             };
 
+            // A writeback connector has to be exposed with the writeback client
+            // capability, exist on this card, be a writeback connector, and be
+            // able to drive the selected CRTC. Validate all of that before the
+            // lease ioctl so a bad request is a typed error.
+            let writeback_connector_id = match request.writeback_connector {
+                Some(id) => {
+                    let handle = handles
+                        .connectors()
+                        .iter()
+                        .find(|handle| u32::from(**handle) == id)
+                        .copied()
+                        .ok_or_else(|| DrmLeaseError::UnknownObject {
+                            card: card_info.path.display().to_string(),
+                            kind: DrmObjectKind::Connector,
+                            id,
+                        })?;
+                    let info = card
+                        .get_connector(handle, false)
+                        .map_err(|error| map_control_error(&card_info.path, error))?;
+                    if info.interface() != connector::Interface::Writeback {
+                        return Err(DrmLeaseError::LeaseFailed {
+                            card: card_info.path.display().to_string(),
+                            message: format!(
+                                "connector {id} is {:?}, not a writeback connector",
+                                info.interface()
+                            ),
+                        });
+                    }
+                    let compatible = info.encoders().iter().any(|encoder| {
+                        card.get_encoder(*encoder).is_ok_and(|encoder| {
+                            handles
+                                .filter_crtcs(encoder.possible_crtcs())
+                                .iter()
+                                .any(|crtc| u32::from(*crtc) == crtc_id)
+                        })
+                    });
+                    if !compatible {
+                        return Err(DrmLeaseError::IncompatibleWriteback {
+                            card: card_info.path.display().to_string(),
+                            connector: id,
+                            crtc: crtc_id,
+                        });
+                    }
+                    Some(id)
+                }
+                None => None,
+            };
+
             // Reject a same-process duplicate against our own active leases
             // before attempting SET_MASTER. Cross-process duplicates are still
             // reported by the kernel as EBUSY.
@@ -1276,6 +1465,21 @@ mod real {
                         card: card_info.path.display().to_string(),
                         kind: DrmObjectKind::Plane,
                         id: plane_id,
+                    });
+                }
+            }
+            if let Some(writeback_connector_id) = writeback_connector_id {
+                if registry_conflict(
+                    &card_info.path,
+                    DrmObjectKind::Connector,
+                    writeback_connector_id,
+                )
+                .is_some()
+                {
+                    return Err(DrmLeaseError::AlreadyLeased {
+                        card: card_info.path.display().to_string(),
+                        kind: DrmObjectKind::Connector,
+                        id: writeback_connector_id,
                     });
                 }
             }
@@ -1333,6 +1537,19 @@ mod real {
                     lease_objects.push(raw);
                 }
             }
+            if let Some(writeback_connector_id) = writeback_connector_id {
+                let writeback_object =
+                    NonZeroU32::new(writeback_connector_id).ok_or_else(|| {
+                        DrmLeaseError::LeaseFailed {
+                            card: card_info.path.display().to_string(),
+                            message: "writeback connector object id was zero".to_owned(),
+                        }
+                    })?;
+                let raw = RawResourceHandle::from(writeback_object);
+                if !lease_objects.contains(&raw) {
+                    lease_objects.push(raw);
+                }
+            }
 
             let (lessee_id, fd) = card.create_lease(&lease_objects, 0).map_err(|error| {
                 map_lease_error(&card_info.path, connector_id, crtc_id, plane_id, error)
@@ -1359,6 +1576,7 @@ mod real {
                 connector_id,
                 crtc_id,
                 plane_id,
+                writeback_connector_id,
                 lessee_id.get(),
             );
 
@@ -1370,6 +1588,7 @@ mod real {
                 connector_id,
                 crtc_id,
                 plane_id,
+                writeback_connector_id,
                 plane_ids,
                 fd: Some(fd),
                 active: true,
@@ -1429,6 +1648,34 @@ mod real {
                 card: card_info.path.display().to_string(),
                 kind: DrmObjectKind::Crtc,
                 id: 0,
+            })
+    }
+
+    /// Enable the client capabilities required to see and lease writeback
+    /// connectors. The kernel requires atomic mode setting first.
+    fn enable_writeback_capability(card: &Card, card_path: &Path) -> Result<(), DrmLeaseError> {
+        drm::Device::set_client_capability(card, drm::ClientCapability::Atomic, true).map_err(
+            |error| match error.raw_os_error() {
+                Some(libc::EINVAL)
+                | Some(libc::EOPNOTSUPP)
+                | Some(libc::ENOSYS)
+                | Some(libc::ENOTTY) => DrmLeaseError::Unsupported {
+                    card: card_path.display().to_string(),
+                    reason: format!("atomic KMS is required for writeback capture: {error}"),
+                },
+                _ => map_control_error(card_path, error),
+            },
+        )?;
+        drm::Device::set_client_capability(card, drm::ClientCapability::WritebackConnectors, true)
+            .map_err(|error| match error.raw_os_error() {
+                Some(libc::EINVAL)
+                | Some(libc::EOPNOTSUPP)
+                | Some(libc::ENOSYS)
+                | Some(libc::ENOTTY) => DrmLeaseError::Unsupported {
+                    card: card_path.display().to_string(),
+                    reason: format!("writeback connector capability is unsupported: {error}"),
+                },
+                _ => map_control_error(card_path, error),
             })
     }
 
@@ -1555,6 +1802,7 @@ mod real {
         connector_id: u32,
         crtc_id: u32,
         plane_id: Option<u32>,
+        writeback_connector_id: Option<u32>,
         plane_ids: Vec<u32>,
         fd: Option<OwnedFd>,
         active: bool,
@@ -1583,6 +1831,10 @@ mod real {
 
         fn plane_id(&self) -> Option<u32> {
             self.plane_id
+        }
+
+        fn writeback_connector_id(&self) -> Option<u32> {
+            self.writeback_connector_id
         }
 
         fn plane_ids(&self) -> &[u32] {
@@ -1683,6 +1935,7 @@ mod real {
                         self.connector_id,
                         self.crtc_id,
                         self.plane_id,
+                        self.writeback_connector_id,
                     );
                     self.active = false;
                     self.fd = None;
@@ -1711,6 +1964,7 @@ mod real {
                 self.connector_id,
                 self.crtc_id,
                 self.plane_id,
+                self.writeback_connector_id,
             );
         }
     }

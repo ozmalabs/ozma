@@ -197,6 +197,12 @@ pub enum MultiseatError {
     #[error("seat input isolation error: {0}")]
     InputIsolation(String),
 
+    /// A per-seat synthetic Wayland input injector could not find the
+    /// compositor's virtual-input protocols, was refused, or disconnected.
+    /// Injection is never reported as available after this error.
+    #[error("seat synthetic input error: {0}")]
+    SeatInput(String),
+
     /// A private X display could not be restricted to the seat's uinput
     /// devices through `xinput`. The helper grab may still be applied, but full
     /// display isolation is never claimed after this error.
@@ -309,6 +315,7 @@ impl MultiseatError {
             Self::Hotplug(_) => "hotplug",
             Self::InputIsolation(_) => "input_isolation",
             Self::InputTargeting(_) => "input_targeting",
+            Self::SeatInput(_) => "seat_input",
             Self::SeatDisplayTool { .. } => "seat_display_tool",
             Self::SeatDisplayNumberExhausted { .. } => "seat_display_number_exhausted",
             Self::SeatDisplayStartupTimeout { .. } => "seat_display_startup_timeout",

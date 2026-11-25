@@ -19,6 +19,9 @@
 //!   is visible, and a restart count only when the supervisor explicitly
 //!   exports `OZMA_RESTART_COUNT`. Absent facts are `null`, never invented.
 //!
+//! Opt-in exact-pid process control is a separate service in
+//! [`crate::app_control`]; it never changes the `/apps` document.
+//!
 //! All filesystem reads are capped, all lists are bounded, and an unreadable
 //! procfs/source is a typed `503` instead of an empty success. The routes are
 //! mounted in the guarded controller-compatibility router next to `/hardware`;

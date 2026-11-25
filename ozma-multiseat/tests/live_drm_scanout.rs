@@ -18,7 +18,8 @@ use drm::ClientCapability;
 use drm::Device as _;
 use ozma_multiseat::{
     enumerate_drm_cards, DrmCardSelector, DrmLeaseBackend, DrmLeaseRequest, DrmScanoutBackend,
-    DrmScanoutCommit, DrmScanoutRequest, RealDrmLeaseBackend, RealDrmScanoutBackend,
+    DrmScanoutCommit, DrmScanoutRequest, DrmScanoutVerifyMode, RealDrmLeaseBackend,
+    RealDrmScanoutBackend,
 };
 
 struct ReadCard(std::fs::File);
@@ -519,4 +520,201 @@ fn vkms_scanout_frame_loop_has_real_flip_completions_and_clean_teardown() {
     replacement.teardown().expect("second frame-loop teardown");
     assert!(replacement.status().released);
     eprintln!("second frame loop completed and released");
+}
+
+fn live_vkms_card() -> ozma_multiseat::DrmCard {
+    let cards = enumerate_drm_cards().expect("enumerate DRM cards");
+    let requested_card = std::env::var("OZMA_DRM_CARD").ok();
+    let vkms = cards
+        .into_iter()
+        .find(|card| match requested_card.as_deref() {
+            Some(path) => card.path == Path::new(path),
+            None => card.is_vkms(),
+        })
+        .expect(
+            "no vkms card found; run `sudo modprobe vkms` (or create a configfs instance) and \
+             check /sys/class/drm/card*/device/driver",
+        );
+    assert!(
+        vkms.is_vkms() || matches!(vkms.driver.as_str(), "vkms" | "faux_driver"),
+        "live test refuses non-vkms card {} ({})",
+        vkms.path.display(),
+        vkms.driver
+    );
+    vkms
+}
+
+#[test]
+#[ignore = "opt-in live vkms writeback capture: set OZMA_DRM_LIVE=1 and load vkms"]
+fn vkms_scanout_writeback_capture_matches_pattern_and_tears_down() {
+    if std::env::var("OZMA_DRM_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipping: set OZMA_DRM_LIVE=1 to run the live vkms writeback test");
+        return;
+    }
+    let vkms = live_vkms_card();
+    let lease_backend = RealDrmLeaseBackend::new();
+    let inspected = lease_backend
+        .inspect(&vkms)
+        .expect("open/inspect the vkms card");
+    let connector = inspected
+        .connectors
+        .iter()
+        .find(|connector| {
+            connector.object_id.is_some()
+                && !matches!(connector.status, ozma_multiseat::DrmStatus::Disconnected)
+        })
+        .expect("vkms connector with object id");
+    let crtc_id = connector
+        .crtc_id
+        .unwrap_or_else(|| *inspected.crtcs.first().expect("vkms CRTC"));
+    let plane_id = discover_primary_plane(&vkms.path, crtc_id);
+    let writeback = lease_backend
+        .writeback_connectors(&DrmCardSelector::Explicit(vkms.path.clone()))
+        .expect("discover writeback connectors");
+    eprintln!(
+        "vkms writeback evidence: card={} driver={} connector={} crtc={crtc_id} plane={plane_id:?} \
+         writeback={writeback:?}",
+        vkms.path.display(),
+        vkms.driver,
+        connector.name
+    );
+
+    let mut request = DrmScanoutRequest::new(
+        DrmLeaseRequest::new(
+            DrmCardSelector::Explicit(vkms.path.clone()),
+            connector.name.clone(),
+        )
+        .with_crtc(crtc_id),
+    )
+    .with_frames(3)
+    .with_interval_ms(16)
+    .with_verify(DrmScanoutVerifyMode::Writeback)
+    .with_writeback_timeout_ms(2000);
+    if let Some(plane) = plane_id {
+        request = request.with_plane(plane);
+    }
+    let backend = RealDrmScanoutBackend::new();
+
+    if writeback.is_empty() {
+        let mut handle = backend
+            .start(&request)
+            .expect("scanout must still start without a writeback connector");
+        let status = handle.status().clone();
+        let blocker = status
+            .verification_blocker
+            .clone()
+            .expect("typed kms-verification-unavailable blocker");
+        eprintln!("writeback blocker evidence: {blocker:#?}");
+        assert_eq!(blocker.kind, "kms-verification-unavailable");
+        assert_eq!(blocker.mechanism, "writeback");
+        assert!(status.capture.is_none(), "no capture may be invented");
+        let error = handle.verify().expect_err("verify must report the blocker");
+        assert_eq!(error.code(), "kms-verification-unavailable");
+        handle.teardown().expect("teardown");
+        return;
+    }
+
+    let mut handle = backend.start(&request).expect("live writeback scanout");
+    let status = handle.status().clone();
+    eprintln!("live writeback status: {status:#?}");
+    assert_eq!(status.verification_mode, DrmScanoutVerifyMode::Writeback);
+    assert!(status.verification_blocker.is_none());
+    assert!(status.writeback_connector_id.is_some());
+    let capture = status.capture.clone().expect("capture accounting");
+    assert_eq!(
+        (capture.width, capture.height),
+        (status.width, status.height)
+    );
+    assert_eq!(capture.format, "XR24");
+
+    let stats = handle
+        .run_frames(request.frame_plan())
+        .expect("live writeback frame loop");
+    assert_eq!(stats.completed, 3);
+    let capture = handle.status().capture.clone().expect("capture accounting");
+    eprintln!("live writeback capture: {capture:#?}");
+    assert!(capture.captured_frames >= 3);
+    assert_eq!(capture.mismatches, 0);
+    assert_eq!(capture.timeouts, 0);
+    assert!(capture.checksums.len() >= 3);
+    assert_eq!(capture.checksums, capture.expected_checksums);
+
+    let verification = handle.verify().expect("live writeback verification");
+    eprintln!("live writeback verification: {verification:#?}");
+    assert!(verification.ok);
+    let verified_capture = verification.capture.expect("verification capture");
+    assert_eq!(verified_capture.mismatches, 0);
+    assert!(verified_capture.checksums.len() >= 3);
+
+    let lessee_fd = status.lessee_fd.expect("lessee fd recorded");
+    handle.teardown().expect("live writeback teardown");
+    let released = handle.status().clone();
+    assert!(released.released);
+    assert!(!released.applied);
+    assert_eq!(released.lessee_fd, None);
+    assert!(
+        !Path::new(&format!("/proc/self/fd/{lessee_fd}")).exists(),
+        "lessee fd {lessee_fd} must be closed after teardown"
+    );
+
+    // Reuse the same objects to prove writeback state, capture buffers, and the
+    // lease were released cleanly.
+    let mut replacement = backend
+        .start(&request)
+        .expect("the same vkms objects must be usable for a second writeback cycle");
+    replacement.verify().expect("second writeback verification");
+    replacement.teardown().expect("second writeback teardown");
+    assert!(replacement.status().released);
+}
+
+#[test]
+#[ignore = "opt-in live vkms CRC blocker: set OZMA_DRM_LIVE=1 and load vkms"]
+fn vkms_scanout_crc_records_precise_typed_blocker() {
+    if std::env::var("OZMA_DRM_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipping: set OZMA_DRM_LIVE=1 to run the live vkms CRC blocker test");
+        return;
+    }
+    let vkms = live_vkms_card();
+    let lease_backend = RealDrmLeaseBackend::new();
+    let inspected = lease_backend
+        .inspect(&vkms)
+        .expect("open/inspect the vkms card");
+    let connector = inspected
+        .connectors
+        .iter()
+        .find(|connector| connector.object_id.is_some())
+        .expect("vkms connector");
+    let crtc_id = connector
+        .crtc_id
+        .unwrap_or_else(|| *inspected.crtcs.first().expect("vkms CRTC"));
+    let plane_id = discover_primary_plane(&vkms.path, crtc_id);
+    let mut request = DrmScanoutRequest::new(
+        DrmLeaseRequest::new(
+            DrmCardSelector::Explicit(vkms.path.clone()),
+            connector.name.clone(),
+        )
+        .with_crtc(crtc_id),
+    )
+    .with_verify(DrmScanoutVerifyMode::Crc);
+    if let Some(plane) = plane_id {
+        request = request.with_plane(plane);
+    }
+    let backend = RealDrmScanoutBackend::new();
+    let mut handle = backend.start(&request).expect("crc scanout start");
+    let status = handle.status().clone();
+    let blocker = status
+        .verification_blocker
+        .clone()
+        .expect("typed kms-verification-unavailable blocker");
+    eprintln!("crc blocker evidence: {blocker:#?}");
+    assert_eq!(blocker.kind, "kms-verification-unavailable");
+    assert_eq!(blocker.mechanism, "crc");
+    assert!(status.capture.is_none(), "no CRC capture may be invented");
+    assert!(blocker
+        .kernel_evidence
+        .iter()
+        .any(|line| line.contains("CRC")));
+    let error = handle.verify().expect_err("crc verify blocker");
+    assert_eq!(error.code(), "kms-verification-unavailable");
+    handle.teardown().expect("crc teardown");
 }

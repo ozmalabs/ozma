@@ -136,6 +136,7 @@ fn live_supervisor_applies_and_releases_ownership_and_routing() {
             input_isolation: false,
             input_targeting: Default::default(),
             seat_display: Default::default(),
+            seat_input: Default::default(),
             drm_leases: Default::default(),
         },
         std::sync::Arc::new(ProcessLauncher),

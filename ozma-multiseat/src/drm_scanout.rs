@@ -52,6 +52,22 @@ pub const SCANOUT_DEFAULT_FRAMES: u32 = 1;
 pub const SCANOUT_MAX_FRAMES: u32 = 300;
 /// Default bounded wait for one page-flip completion event.
 pub const SCANOUT_FLIP_TIMEOUT_MS: u64 = 1000;
+/// Default bounded wait for one writeback capture job.
+pub const SCANOUT_WRITEBACK_TIMEOUT_MS: u64 = 1000;
+/// Upper bound on a writeback capture wait. A larger request is a typed
+/// validation failure rather than an unbounded wait.
+pub const SCANOUT_MAX_WRITEBACK_TIMEOUT_MS: u64 = 60_000;
+/// Default number of retries for a transient writeback commit failure.
+pub const SCANOUT_WRITEBACK_RETRIES: u32 = 1;
+/// Upper bound on writeback commit retries.
+pub const SCANOUT_MAX_WRITEBACK_RETRIES: u32 = 3;
+/// Upper bound on a verification capture buffer. The scanout buffer is bounded
+/// by the connector mode; this keeps verification from allocating an
+/// unexpectedly large extra buffer.
+pub const SCANOUT_MAX_VERIFY_BYTES: u64 = 64 * 1024 * 1024;
+/// Upper bound on checksum samples retained in status. The frame loop itself is
+/// separately bounded by [`SCANOUT_MAX_FRAMES`].
+pub const SCANOUT_MAX_CAPTURE_SAMPLES: usize = SCANOUT_MAX_FRAMES as usize;
 /// Pixel format used by the proof.
 pub const SCANOUT_FOURCC: &str = "XR24";
 /// Dumb-buffer bits per pixel.
@@ -87,6 +103,55 @@ impl DrmScanoutCommit {
     }
 }
 
+/// Opt-in pixel verification mechanism for the KMS proof.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrmScanoutVerifyMode {
+    /// No pixel capture. The proof still re-reads KMS state in `verify`.
+    #[default]
+    None,
+    /// Capture the composed CRTC output through a leased writeback connector
+    /// and compare a deterministic checksum for each captured frame.
+    Writeback,
+    /// Capture CRTC CRC values. This kernel/vkms supports CRC, but the safe
+    /// `drm` crate surface used by this crate has no CRC ioctl wrapper and the
+    /// crate forbids unsafe code, so the real backend reports the typed
+    /// `kms-verification-unavailable` blocker instead of pretending to capture.
+    Crc,
+}
+
+impl DrmScanoutVerifyMode {
+    /// Stable wire/status name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Writeback => "writeback",
+            Self::Crc => "crc",
+        }
+    }
+
+    /// Whether this mode asks for pixel capture.
+    pub fn is_capture(self) -> bool {
+        matches!(self, Self::Writeback | Self::Crc)
+    }
+}
+
+impl FromStr for DrmScanoutVerifyMode {
+    type Err = DrmScanoutError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "writeback" => Ok(Self::Writeback),
+            "crc" => Ok(Self::Crc),
+            other => Err(DrmScanoutError::InvalidRequest(
+                other.to_owned(),
+                "verification mode must be writeback, crc, or none".to_owned(),
+            )),
+        }
+    }
+}
+
 /// A validated scanout request.
 ///
 /// The CLI form is the same `[SEAT=]CARD:CONNECTOR[@CRTC][:PLANE]` selector as
@@ -117,6 +182,22 @@ pub struct DrmScanoutRequest {
         skip_serializing_if = "is_default_flip_timeout"
     )]
     pub flip_timeout_ms: u64,
+    /// Opt-in pixel verification mechanism. Defaults to `none`; writeback
+    /// capture is the implemented mechanism on this kernel.
+    #[serde(default, skip_serializing_if = "is_verify_none")]
+    pub verify: DrmScanoutVerifyMode,
+    /// Bounded wait for one writeback capture job.
+    #[serde(
+        default = "default_writeback_timeout_ms",
+        skip_serializing_if = "is_default_writeback_timeout"
+    )]
+    pub writeback_timeout_ms: u64,
+    /// Bounded retries for a transient writeback commit failure (EBUSY/EAGAIN).
+    #[serde(
+        default = "default_writeback_retries",
+        skip_serializing_if = "is_default_writeback_retries"
+    )]
+    pub writeback_retries: u32,
 }
 
 impl DrmScanoutRequest {
@@ -129,6 +210,9 @@ impl DrmScanoutRequest {
             frames: SCANOUT_DEFAULT_FRAMES,
             interval_ms: None,
             flip_timeout_ms: SCANOUT_FLIP_TIMEOUT_MS,
+            verify: DrmScanoutVerifyMode::None,
+            writeback_timeout_ms: SCANOUT_WRITEBACK_TIMEOUT_MS,
+            writeback_retries: SCANOUT_WRITEBACK_RETRIES,
         }
     }
 
@@ -168,6 +252,24 @@ impl DrmScanoutRequest {
         self
     }
 
+    /// Request an opt-in pixel verification mechanism.
+    pub fn with_verify(mut self, verify: DrmScanoutVerifyMode) -> Self {
+        self.verify = verify;
+        self
+    }
+
+    /// Bounded wait for one writeback capture job.
+    pub fn with_writeback_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.writeback_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Bounded retries for a transient writeback commit failure.
+    pub fn with_writeback_retries(mut self, retries: u32) -> Self {
+        self.writeback_retries = retries;
+        self
+    }
+
     /// Validate frame count and timeout bounds before touching a device.
     pub fn validate(&self) -> Result<(), DrmScanoutError> {
         if self.frames == 0 || self.frames > SCANOUT_MAX_FRAMES {
@@ -181,6 +283,20 @@ impl DrmScanoutRequest {
             return Err(DrmScanoutError::InvalidRequest(
                 self.lease.connector.clone(),
                 "flip timeout must be greater than zero".to_owned(),
+            ));
+        }
+        if self.writeback_timeout_ms == 0
+            || self.writeback_timeout_ms > SCANOUT_MAX_WRITEBACK_TIMEOUT_MS
+        {
+            return Err(DrmScanoutError::InvalidRequest(
+                self.lease.connector.clone(),
+                format!("writeback timeout must be 1..={SCANOUT_MAX_WRITEBACK_TIMEOUT_MS}ms"),
+            ));
+        }
+        if self.writeback_retries > SCANOUT_MAX_WRITEBACK_RETRIES {
+            return Err(DrmScanoutError::InvalidRequest(
+                self.lease.connector.clone(),
+                format!("writeback retries must be 0..={SCANOUT_MAX_WRITEBACK_RETRIES}"),
             ));
         }
         Ok(())
@@ -311,6 +427,10 @@ pub enum DrmScanoutNoteKind {
     PlaneLeased,
     /// A bounded page-flip loop presented more than the static proof frame.
     FrameLoop,
+    /// Writeback capture is configured for the leased CRTC.
+    WritebackCapture,
+    /// The requested pixel verification mechanism is unavailable.
+    VerificationUnavailable,
 }
 
 impl DrmScanoutNoteKind {
@@ -325,6 +445,8 @@ impl DrmScanoutNoteKind {
             Self::LegacyCommitForced => "legacy_commit_forced",
             Self::PlaneLeased => "plane_leased",
             Self::FrameLoop => "frame_loop",
+            Self::WritebackCapture => "writeback_capture",
+            Self::VerificationUnavailable => "verification_unavailable",
         }
     }
 }
@@ -363,6 +485,121 @@ impl DrmScanoutErrorStatus {
         Self {
             kind: error.code().to_owned(),
             message: error.to_string(),
+        }
+    }
+}
+
+/// Bounded pixel-capture accounting for one scanout proof.
+///
+/// Checksums are FNV-1a over the visible pixels only (`width * 4` bytes per
+/// row, pitch padding excluded) with the alpha byte masked to zero. This makes
+/// the value independent of the driver's alpha normalisation and of dumb-buffer
+/// row padding while still proving every visible RGB pixel.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrmScanoutCapture {
+    /// Writeback connector object id used for capture.
+    pub writeback_connector_id: u32,
+    /// Capture buffer width.
+    pub width: u32,
+    /// Capture buffer height.
+    pub height: u32,
+    /// Capture buffer pitch.
+    pub pitch: u32,
+    /// Capture framebuffer format name.
+    pub format: String,
+    /// Frames captured so far.
+    #[serde(default)]
+    pub captured_frames: u32,
+    /// Captured visible-RGB checksums, bounded by
+    /// [`SCANOUT_MAX_CAPTURE_SAMPLES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checksums: Vec<u32>,
+    /// Expected visible-RGB checksums for the corresponding captures.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_checksums: Vec<u32>,
+    /// Captures whose checksum differed from the scanout buffer.
+    #[serde(default)]
+    pub mismatches: u32,
+    /// Capture jobs that timed out.
+    #[serde(default)]
+    pub timeouts: u32,
+    /// Transient commit retries actually performed.
+    #[serde(default)]
+    pub job_retries: u32,
+    /// First mismatch detail, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mismatch: Option<String>,
+}
+
+impl DrmScanoutCapture {
+    /// Initial empty capture accounting for a configured writeback connector.
+    pub fn new(writeback_connector_id: u32, width: u32, height: u32, pitch: u32) -> Self {
+        Self {
+            writeback_connector_id,
+            width,
+            height,
+            pitch,
+            format: SCANOUT_FOURCC.to_owned(),
+            captured_frames: 0,
+            checksums: Vec::new(),
+            expected_checksums: Vec::new(),
+            mismatches: 0,
+            timeouts: 0,
+            job_retries: 0,
+            last_mismatch: None,
+        }
+    }
+
+    /// Record one completed capture and return whether it matched.
+    pub fn record(&mut self, captured: u32, expected: u32, frame: u32) -> bool {
+        self.captured_frames = self.captured_frames.saturating_add(1);
+        if self.checksums.len() < SCANOUT_MAX_CAPTURE_SAMPLES {
+            self.checksums.push(captured);
+            self.expected_checksums.push(expected);
+        }
+        if captured == expected {
+            true
+        } else {
+            self.mismatches = self.mismatches.saturating_add(1);
+            self.last_mismatch = Some(format!(
+                "writeback frame {frame}: captured visible-RGB checksum {captured:#010x} does not \
+                 match scanout checksum {expected:#010x}"
+            ));
+            false
+        }
+    }
+}
+
+/// A precise reason why the requested pixel verification could not run.
+///
+/// This is evidence, not a simulated capture: the scanout proof can still have
+/// programmed the leased objects, but `verify` will return the typed
+/// `kms-verification-unavailable` error and no captured checksum is invented.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrmScanoutVerificationBlocker {
+    /// Stable blocker kind: always `kms-verification-unavailable`.
+    pub kind: String,
+    /// Requested mechanism (`writeback` or `crc`).
+    pub mechanism: String,
+    /// Why it could not run.
+    pub reason: String,
+    /// Kernel/card evidence collected while deciding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kernel_evidence: Vec<String>,
+}
+
+impl DrmScanoutVerificationBlocker {
+    /// Build a `kms-verification-unavailable` blocker.
+    pub fn new(
+        mechanism: impl Into<String>,
+        reason: impl Into<String>,
+        kernel_evidence: Vec<String>,
+    ) -> Self {
+        Self {
+            kind: "kms-verification-unavailable".to_owned(),
+            mechanism: mechanism.into(),
+            reason: reason.into(),
+            kernel_evidence,
         }
     }
 }
@@ -415,7 +652,17 @@ pub struct DrmScanoutVerification {
     pub buffer_handle: u32,
     /// FNV-1a checksum of the pattern written into the mapping.
     pub pattern_checksum: u32,
-    /// Whether every checked field matched the request.
+    /// Pixel verification mechanism used by this verification.
+    #[serde(default)]
+    pub verification_mode: DrmScanoutVerifyMode,
+    /// Writeback capture accounting, when capture ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<DrmScanoutCapture>,
+    /// Typed blocker when the requested mechanism could not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_blocker: Option<DrmScanoutVerificationBlocker>,
+    /// Whether every checked field matched the request and every capture
+    /// matched its expected checksum.
     pub ok: bool,
     /// First mismatch, when `ok` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -479,6 +726,21 @@ pub struct DrmScanoutStatus {
     /// Whether a page flip was accepted after the modeset.
     #[serde(default)]
     pub page_flipped: bool,
+    /// Requested pixel verification mechanism.
+    #[serde(default)]
+    pub verification_mode: DrmScanoutVerifyMode,
+    /// Leased writeback connector, when capture is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writeback_connector_id: Option<u32>,
+    /// Writeback connector name, when capture is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writeback_connector: Option<String>,
+    /// Capture accounting (frames, checksums, mismatches, timeouts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<DrmScanoutCapture>,
+    /// Typed blocker when the requested capture mechanism could not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_blocker: Option<DrmScanoutVerificationBlocker>,
     /// Verification evidence, when `verify` ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<DrmScanoutVerification>,
@@ -516,6 +778,11 @@ impl DrmScanoutStatus {
             && self.pattern_checksum.is_none()
             && self.frames.is_none()
             && !self.page_flipped
+            && self.verification_mode == DrmScanoutVerifyMode::None
+            && self.writeback_connector_id.is_none()
+            && self.writeback_connector.is_none()
+            && self.capture.is_none()
+            && self.verification_blocker.is_none()
             && self.verification.is_none()
             && !self.applied
             && !self.released
@@ -531,6 +798,7 @@ impl DrmScanoutStatus {
             plane_id: request.lease.plane_id(),
             mode: request.mode.clone().unwrap_or_default(),
             pattern: SCANOUT_PATTERN.to_owned(),
+            verification_mode: request.verify,
             ..Self::default()
         }
     }
@@ -818,6 +1086,40 @@ pub enum DrmScanoutError {
         message: String,
     },
 
+    /// The requested pixel verification mechanism could not run. No capture is
+    /// invented; the kernel evidence is in status.
+    #[error("KMS {mechanism} verification is unavailable on {card}: {reason}")]
+    VerificationUnavailable {
+        /// Card path or name.
+        card: String,
+        /// Requested mechanism (`writeback` or `crc`).
+        mechanism: String,
+        /// Why it is unavailable.
+        reason: String,
+    },
+
+    /// A writeback capture job did not complete inside the bounded wait.
+    #[error("timed out waiting for writeback frame {frame} on {card} after {timeout_ms}ms")]
+    WritebackTimeout {
+        /// Card path or name.
+        card: String,
+        /// Zero-based capture frame index.
+        frame: u32,
+        /// Bounded wait.
+        timeout_ms: u64,
+    },
+
+    /// A writeback job could not be committed or prepared.
+    #[error("writeback capture for frame {frame} failed on {card}: {reason}")]
+    WritebackFailed {
+        /// Card path or name.
+        card: String,
+        /// Zero-based capture frame index.
+        frame: u32,
+        /// Kernel/driver detail.
+        reason: String,
+    },
+
     /// The proof was already torn down.
     #[error("scanout proof on {0} is no longer active")]
     Released(String),
@@ -864,6 +1166,9 @@ impl DrmScanoutError {
             Self::FlipUnsupported { .. } => "flip_unsupported",
             Self::FlipFailed { .. } => "flip_failed",
             Self::VerificationFailed { .. } => "verification_failed",
+            Self::VerificationUnavailable { .. } => "kms-verification-unavailable",
+            Self::WritebackTimeout { .. } => "writeback_timeout",
+            Self::WritebackFailed { .. } => "writeback_failed",
             Self::Released(_) => "released",
             Self::InvalidRequest(_, _) => "invalid_request",
             Self::Lease(error) => error.code(),
@@ -911,6 +1216,7 @@ fn drm_status_name(state: drm::control::connector::State) -> String {
 #[cfg(target_os = "linux")]
 mod real {
     use std::collections::BTreeMap;
+    use std::fs;
     use std::num::NonZeroU32;
     use std::os::fd::{AsFd, BorrowedFd};
     use std::path::Path;
@@ -928,14 +1234,16 @@ mod real {
 
     use super::{
         apply_frame_damage, drm_status_name, ensure_scanout_card, fill_pattern, frame_buffer_count,
-        pattern_checksum, DrmScanoutBackend, DrmScanoutCommit, DrmScanoutError,
-        DrmScanoutFramePlan, DrmScanoutFrameStats, DrmScanoutHandle, DrmScanoutNote,
-        DrmScanoutNoteKind, DrmScanoutRequest, DrmScanoutStatus, DrmScanoutVerification, BORDER_PX,
+        pattern_checksum, visible_rgb_checksum, DrmScanoutBackend, DrmScanoutCapture,
+        DrmScanoutCommit, DrmScanoutError, DrmScanoutFramePlan, DrmScanoutFrameStats,
+        DrmScanoutHandle, DrmScanoutNote, DrmScanoutNoteKind, DrmScanoutRequest, DrmScanoutStatus,
+        DrmScanoutVerification, DrmScanoutVerificationBlocker, DrmScanoutVerifyMode, BORDER_PX,
         DIAGONAL_PX, MAX_ATOMIC_PROPERTIES, SCANOUT_BPP, SCANOUT_DAMAGE_PATTERN, SCANOUT_DEPTH,
-        SCANOUT_FOURCC, SCANOUT_MAX_FRAMES, SCANOUT_PATTERN,
+        SCANOUT_FOURCC, SCANOUT_MAX_FRAMES, SCANOUT_MAX_VERIFY_BYTES, SCANOUT_PATTERN,
     };
     use crate::drm_lease::{
-        DrmCard, DrmCardSelector, DrmLeaseBackend, DrmLeaseHandle, RealDrmLeaseBackend,
+        DrmCard, DrmCardSelector, DrmCrtcSelector, DrmLeaseBackend, DrmLeaseHandle,
+        DrmLeaseRequest, DrmWritebackConnector, RealDrmLeaseBackend,
     };
 
     /// Production scanout proof over [`RealDrmLeaseBackend`].
@@ -986,6 +1294,87 @@ mod real {
                     }),
             }
         }
+
+        /// Resolve the CRTC before leasing when writeback verification needs to
+        /// add a writeback connector to the same lease. Pinning the CRTC makes
+        /// the writeback connector selection deterministic.
+        fn resolve_crtc(
+            &self,
+            card: &DrmCard,
+            request: &DrmLeaseRequest,
+        ) -> Result<u32, DrmScanoutError> {
+            if let DrmCrtcSelector::Id(id) = request.crtc {
+                return Ok(id);
+            }
+            let inspected = self.lease.inspect(card)?;
+            if let Some(connector) = inspected
+                .connectors
+                .iter()
+                .find(|connector| connector.name == request.connector)
+            {
+                if let Some(crtc_id) = connector.crtc_id {
+                    return Ok(crtc_id);
+                }
+            }
+            inspected
+                .crtcs
+                .first()
+                .copied()
+                .ok_or_else(|| DrmScanoutError::UnsupportedConnector {
+                    card: card.path.display().to_string(),
+                    connector: request.connector.clone(),
+                    reason: "the card reports no CRTC".to_owned(),
+                })
+        }
+    }
+
+    fn kernel_evidence(card: &DrmCard) -> Vec<String> {
+        let mut evidence = vec![format!(
+            "card {} driver {}",
+            card.path.display(),
+            card.driver
+        )];
+        if let Ok(release) = fs::read_to_string("/proc/sys/kernel/osrelease") {
+            evidence.push(format!("kernel {}", release.trim()));
+        }
+        for (label, path) in [
+            (
+                "vkms enable_writeback",
+                "/sys/module/vkms/parameters/enable_writeback",
+            ),
+            (
+                "vkms create_default_dev",
+                "/sys/module/vkms/parameters/create_default_dev",
+            ),
+        ] {
+            if let Ok(value) = fs::read_to_string(path) {
+                evidence.push(format!("{label}={}", value.trim()));
+            }
+        }
+        evidence
+    }
+
+    fn crc_blocker(card: &DrmCard) -> DrmScanoutVerificationBlocker {
+        let mut evidence = kernel_evidence(card);
+        evidence.push(
+            "vkms implements CRTC CRC callbacks (vkms_get_crc_sources/vkms_set_crc_source)"
+                .to_owned(),
+        );
+        evidence.push(
+            "userspace CRC needs DRM_IOCTL_CRTC_GET_SEQUENCE, DRM_IOCTL_CRTC_SET_CRC_SOURCE, and \
+             DRM_IOCTL_CRTC_GET_CRC"
+                .to_owned(),
+        );
+        evidence.push(
+            "drm 0.15.0 exposes no safe CRC wrapper and this crate forbids unsafe code; writeback \
+             capture is the implemented strongest mechanism"
+                .to_owned(),
+        );
+        DrmScanoutVerificationBlocker::new(
+            "crc",
+            "CRTC CRC capture is not exposed by the safe DRM API used by ozma-multiseat",
+            evidence,
+        )
     }
 
     impl DrmScanoutBackend for RealDrmScanoutBackend {
@@ -997,7 +1386,76 @@ mod real {
             let card = self.resolve_card(&request.lease.card)?;
             ensure_scanout_card(&card, &request.lease.card)?;
 
-            let lease = self.lease.acquire(&request.lease)?;
+            // Resolve the CRTC before leasing only when capture has to add a
+            // writeback connector to the same lease. The hint never changes the
+            // normal scanout lease shape when verification is off.
+            let crtc_hint =
+                if request.verify == DrmScanoutVerifyMode::Writeback && !request.force_legacy {
+                    Some(self.resolve_crtc(&card, &request.lease)?)
+                } else {
+                    None
+                };
+            let mut lease_request = request.lease.clone();
+            let mut writeback: Option<DrmWritebackConnector> = None;
+            let mut verification_blocker = None;
+            match request.verify {
+                DrmScanoutVerifyMode::None => {}
+                DrmScanoutVerifyMode::Crc => {
+                    verification_blocker = Some(crc_blocker(&card));
+                }
+                DrmScanoutVerifyMode::Writeback if request.force_legacy => {
+                    verification_blocker = Some(DrmScanoutVerificationBlocker::new(
+                        "writeback",
+                        "writeback capture requires atomic KMS, but the request forced the legacy \
+                         commit path",
+                        kernel_evidence(&card),
+                    ));
+                }
+                DrmScanoutVerifyMode::Writeback => {
+                    let crtc_hint = crtc_hint.unwrap_or(0);
+                    match self.lease.writeback_connectors(&request.lease.card) {
+                        Ok(connectors) => {
+                            let compatible = connectors
+                                .into_iter()
+                                .find(|connector| connector.possible_crtcs.contains(&crtc_hint));
+                            match compatible {
+                                Some(connector) => {
+                                    lease_request = lease_request
+                                        .with_crtc(crtc_hint)
+                                        .with_writeback_connector(connector.object_id);
+                                    writeback = Some(connector);
+                                }
+                                None => {
+                                    let mut evidence = kernel_evidence(&card);
+                                    evidence.push(format!(
+                                        "no writeback connector compatible with CRTC {crtc_hint} \
+                                         was reported by the lessor"
+                                    ));
+                                    verification_blocker =
+                                        Some(DrmScanoutVerificationBlocker::new(
+                                            "writeback",
+                                            format!(
+                                                "no writeback connector can drive CRTC {crtc_hint}"
+                                            ),
+                                            evidence,
+                                        ));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let mut evidence = kernel_evidence(&card);
+                            evidence.push(format!("writeback connector discovery failed: {error}"));
+                            verification_blocker = Some(DrmScanoutVerificationBlocker::new(
+                                "writeback",
+                                format!("cannot discover writeback connectors: {error}"),
+                                evidence,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let lease = self.lease.acquire(&lease_request)?;
             let connector_id = lease.connector_id();
             let crtc_id = lease.crtc_id();
             let Some(fd) = lease.as_fd() else {
@@ -1008,11 +1466,11 @@ mod real {
             };
             let device = LeaseDevice { fd };
 
-            let connector_handle = connector_handle(connector_id, &card.path)?;
+            let display_connector = connector_handle(connector_id, &card.path)?;
             let crtc_handle = crtc_handle(crtc_id, &card.path)?;
 
             let connector_info = device
-                .get_connector(connector_handle, false)
+                .get_connector(display_connector, false)
                 .map_err(|error| map_io(&card.path, error))?;
             if !matches!(connector_info.state(), connector::State::Connected) {
                 return Err(DrmScanoutError::UnsupportedConnector {
@@ -1052,14 +1510,16 @@ mod real {
                         reason: error.to_string(),
                     })?;
                 let pitch = buffer.pitch();
-                let checksum = {
+                let (checksum, visible_checksum) = {
                     let mut mapping = device.map_dumb_buffer(&mut buffer).map_err(|error| {
                         DrmScanoutError::BufferFailed {
                             card: card.path.display().to_string(),
                             reason: error.to_string(),
                         }
                     })?;
-                    fill_pattern(&mut mapping, width, height, pitch)
+                    let checksum = fill_pattern(&mut mapping, width, height, pitch);
+                    let visible = visible_rgb_checksum(&mapping, width, height, pitch);
+                    (checksum, visible)
                 };
                 let framebuffer = device
                     .add_framebuffer(&buffer, SCANOUT_DEPTH, SCANOUT_BPP)
@@ -1071,6 +1531,7 @@ mod real {
                     buffer,
                     framebuffer,
                     checksum,
+                    visible_checksum,
                 });
             }
             let pitch = slots[0].buffer.pitch();
@@ -1089,7 +1550,7 @@ mod real {
                     &card.path,
                     &request.lease.connector,
                     crtc_handle,
-                    connector_handle,
+                    display_connector,
                     initial_framebuffer,
                     mode,
                     &mode_name,
@@ -1117,7 +1578,7 @@ mod real {
                     &device,
                     &card.path,
                     &request.lease.connector,
-                    connector_handle,
+                    display_connector,
                     connector_id,
                     crtc_handle,
                     crtc_id,
@@ -1141,7 +1602,7 @@ mod real {
                             &card.path,
                             &request.lease.connector,
                             crtc_handle,
-                            connector_handle,
+                            display_connector,
                             initial_framebuffer,
                             mode,
                             &mode_name,
@@ -1172,6 +1633,161 @@ mod real {
                 }
             };
 
+            // Configure writeback capture only after the scanout commit chose
+            // its final commit path. A writeback connector is useless if the
+            // proof had to fall back to legacy KMS.
+            let mut capture: Option<CaptureSlot> = None;
+            if let Some(writeback) = writeback.as_ref() {
+                if commit == DrmScanoutCommit::Legacy {
+                    verification_blocker = Some(DrmScanoutVerificationBlocker::new(
+                        "writeback",
+                        "writeback capture requires atomic KMS, but scanout fell back to the \
+                         legacy commit path",
+                        kernel_evidence(&card),
+                    ));
+                } else if let Err(error) =
+                    device.set_client_capability(ClientCapability::WritebackConnectors, true)
+                {
+                    let mut evidence = kernel_evidence(&card);
+                    evidence.push(format!(
+                        "DRM_CLIENT_CAP_WRITEBACK_CONNECTORS on the lessee failed: {error}"
+                    ));
+                    verification_blocker = Some(DrmScanoutVerificationBlocker::new(
+                        "writeback",
+                        format!("the lessee cannot use writeback connectors: {error}"),
+                        evidence,
+                    ));
+                } else {
+                    let writeback_handle = connector_handle(writeback.object_id, &card.path)?;
+                    match AtomicProperties::read(
+                        &device,
+                        writeback_handle,
+                        &card.path,
+                        "connector",
+                        writeback.object_id,
+                    ) {
+                        Ok(properties) => {
+                            let has_crtc = properties
+                                .require(&card.path, "connector", writeback.object_id, "CRTC_ID")
+                                .is_ok();
+                            let has_fb = properties
+                                .require(
+                                    &card.path,
+                                    "connector",
+                                    writeback.object_id,
+                                    "WRITEBACK_FB_ID",
+                                )
+                                .is_ok();
+                            let formats = properties
+                                .blob(&device, &card.path, "WRITEBACK_PIXEL_FORMATS")
+                                .unwrap_or(None);
+                            let xrgb = DrmFourcc::Xrgb8888 as u32;
+                            let supports_xrgb = formats.as_ref().is_some_and(|blob| {
+                                blob.chunks_exact(4).any(|chunk| {
+                                    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                                        == xrgb
+                                })
+                            });
+                            let capture_bytes = u64::from(pitch) * u64::from(height);
+                            if !has_crtc || !has_fb {
+                                let mut evidence = kernel_evidence(&card);
+                                evidence.push(format!(
+                                    "writeback connector {} lacks CRTC_ID or WRITEBACK_FB_ID",
+                                    writeback.object_id
+                                ));
+                                verification_blocker = Some(DrmScanoutVerificationBlocker::new(
+                                    "writeback",
+                                    "the writeback connector lacks the atomic properties \
+                                         required to queue a job",
+                                    evidence,
+                                ));
+                            } else if !supports_xrgb {
+                                let mut evidence = kernel_evidence(&card);
+                                evidence.push(format!(
+                                    "WRITEBACK_PIXEL_FORMATS={:?}",
+                                    formats.as_ref().map(|blob| blob
+                                        .chunks_exact(4)
+                                        .map(|chunk| u32::from_le_bytes([
+                                            chunk[0], chunk[1], chunk[2], chunk[3]
+                                        ]))
+                                        .collect::<Vec<_>>())
+                                ));
+                                verification_blocker =
+                                    Some(DrmScanoutVerificationBlocker::new(
+                                        "writeback",
+                                        format!(
+                                            "writeback connector {} does not advertise {SCANOUT_FOURCC}",
+                                            writeback.object_id
+                                        ),
+                                        evidence,
+                                    ));
+                            } else if capture_bytes > SCANOUT_MAX_VERIFY_BYTES {
+                                let mut evidence = kernel_evidence(&card);
+                                evidence.push(format!(
+                                    "capture buffer would be {capture_bytes} bytes; bound is \
+                                     {SCANOUT_MAX_VERIFY_BYTES}"
+                                ));
+                                verification_blocker = Some(DrmScanoutVerificationBlocker::new(
+                                    "writeback",
+                                    "the capture buffer exceeds the verification size bound",
+                                    evidence,
+                                ));
+                            } else {
+                                let buffer = match device.create_dumb_buffer(
+                                    (width, height),
+                                    DrmFourcc::Xrgb8888,
+                                    SCANOUT_BPP,
+                                ) {
+                                    Ok(buffer) => buffer,
+                                    Err(error) => {
+                                        let _ = destroy_slots(&device, &card.path, &mut slots);
+                                        return Err(DrmScanoutError::BufferFailed {
+                                            card: card.path.display().to_string(),
+                                            reason: format!("writeback capture buffer: {error}"),
+                                        });
+                                    }
+                                };
+                                let framebuffer = match device.add_framebuffer(
+                                    &buffer,
+                                    SCANOUT_DEPTH,
+                                    SCANOUT_BPP,
+                                ) {
+                                    Ok(framebuffer) => framebuffer,
+                                    Err(error) => {
+                                        let _ = device.destroy_dumb_buffer(buffer);
+                                        let _ = destroy_slots(&device, &card.path, &mut slots);
+                                        return Err(DrmScanoutError::FramebufferFailed {
+                                            card: card.path.display().to_string(),
+                                            reason: format!(
+                                                "writeback capture framebuffer: {error}"
+                                            ),
+                                        });
+                                    }
+                                };
+                                capture = Some(CaptureSlot {
+                                    buffer,
+                                    framebuffer,
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            let mut evidence = kernel_evidence(&card);
+                            evidence.push(format!(
+                                "reading writeback connector properties failed: {error}"
+                            ));
+                            verification_blocker = Some(DrmScanoutVerificationBlocker::new(
+                                "writeback",
+                                format!(
+                                    "cannot read writeback connector {} properties: {error}",
+                                    writeback.object_id
+                                ),
+                                evidence,
+                            ));
+                        }
+                    }
+                }
+            }
+
             let stats =
                 DrmScanoutFrameStats::initial(request.frames, buffer_count, initial_checksum);
             let mut status = DrmScanoutStatus {
@@ -1193,6 +1809,21 @@ mod real {
                 pattern_checksum: Some(initial_checksum),
                 frames: Some(stats),
                 page_flipped,
+                verification_mode: request.verify,
+                writeback_connector_id: writeback.as_ref().map(|writeback| writeback.object_id),
+                writeback_connector: writeback.as_ref().map(|writeback| writeback.name.clone()),
+                capture: capture.as_ref().map(|_| {
+                    DrmScanoutCapture::new(
+                        writeback
+                            .as_ref()
+                            .map(|writeback| writeback.object_id)
+                            .unwrap_or(0),
+                        width,
+                        height,
+                        pitch,
+                    )
+                }),
+                verification_blocker: verification_blocker.clone(),
                 verification: None,
                 applied: true,
                 released: false,
@@ -1264,6 +1895,31 @@ mod real {
                     ),
                 ));
             }
+            if capture.is_some() {
+                status.push_note(DrmScanoutNote::new(
+                    DrmScanoutNoteKind::WritebackCapture,
+                    format!(
+                        "writeback connector {} captures the CRTC into an XRGB8888 dumb buffer; \
+                         visible-RGB checksum, {}ms timeout, {} retries, max {} bytes",
+                        writeback
+                            .as_ref()
+                            .map(|writeback| writeback.object_id)
+                            .unwrap_or(0),
+                        request.writeback_timeout_ms,
+                        request.writeback_retries,
+                        SCANOUT_MAX_VERIFY_BYTES
+                    ),
+                ));
+            }
+            if let Some(blocker) = status.verification_blocker.as_ref() {
+                status.push_note(DrmScanoutNote::new(
+                    DrmScanoutNoteKind::VerificationUnavailable,
+                    format!(
+                        "{} capture unavailable: {} (no capture claimed)",
+                        blocker.mechanism, blocker.reason
+                    ),
+                ));
+            }
 
             Ok(Box::new(RealDrmScanout {
                 lease: Some(lease),
@@ -1272,6 +1928,10 @@ mod real {
                 connector_id,
                 crtc_id,
                 plane_id,
+                writeback_connector_id: writeback.as_ref().map(|writeback| writeback.object_id),
+                capture,
+                capture_timeout: std::time::Duration::from_millis(request.writeback_timeout_ms),
+                capture_retries: request.writeback_retries,
                 status,
                 buffers: slots,
                 current: 0,
@@ -1284,6 +1944,7 @@ mod real {
         buffer: drm::control::dumbbuffer::DumbBuffer,
         framebuffer: framebuffer::Handle,
         checksum: u32,
+        visible_checksum: u32,
     }
 
     impl ScanoutSlot {
@@ -1294,6 +1955,41 @@ mod real {
         fn framebuffer_id(&self) -> u32 {
             u32::from(self.framebuffer)
         }
+    }
+
+    struct CaptureSlot {
+        buffer: drm::control::dumbbuffer::DumbBuffer,
+        framebuffer: framebuffer::Handle,
+    }
+
+    impl CaptureSlot {
+        fn framebuffer_id(&self) -> u32 {
+            u32::from(self.framebuffer)
+        }
+    }
+
+    fn destroy_capture(
+        device: &LeaseDevice<'_>,
+        card: &Path,
+        capture: CaptureSlot,
+    ) -> Option<DrmScanoutError> {
+        let mut first_error = None;
+        if let Err(error) = device.destroy_framebuffer(capture.framebuffer) {
+            first_error.get_or_insert(DrmScanoutError::FramebufferFailed {
+                card: card.display().to_string(),
+                reason: format!(
+                    "destroying writeback framebuffer {:?}: {error}",
+                    capture.framebuffer
+                ),
+            });
+        }
+        if let Err(error) = device.destroy_dumb_buffer(capture.buffer) {
+            first_error.get_or_insert(DrmScanoutError::BufferFailed {
+                card: card.display().to_string(),
+                reason: format!("destroying writeback dumb buffer: {error}"),
+            });
+        }
+        first_error
     }
 
     fn destroy_slots(
@@ -1326,6 +2022,10 @@ mod real {
         connector_id: u32,
         crtc_id: u32,
         plane_id: Option<u32>,
+        writeback_connector_id: Option<u32>,
+        capture: Option<CaptureSlot>,
+        capture_timeout: Duration,
+        capture_retries: u32,
         status: DrmScanoutStatus,
         buffers: Vec<ScanoutSlot>,
         current: usize,
@@ -1418,6 +2118,34 @@ mod real {
                     return Err(error);
                 }
             }
+            if self.capture.is_some() {
+                if let Some(writeback_id) = self.writeback_connector_id {
+                    let expected = self
+                        .buffers
+                        .get(self.current)
+                        .map(|slot| slot.visible_checksum)
+                        .unwrap_or(0);
+                    if let Err(error) = capture_scanout_frame(
+                        &device,
+                        &card,
+                        crtc,
+                        self.crtc_id,
+                        writeback_id,
+                        &mut self.capture,
+                        &mut self.status.capture,
+                        expected,
+                        width,
+                        height,
+                        self.capture_timeout,
+                        self.capture_retries,
+                        0,
+                    ) {
+                        self.status.frames = Some(stats.clone());
+                        self.status.mark_error(&error);
+                        return Err(error);
+                    }
+                }
+            }
 
             for index in 1..plan.frames {
                 if let (Some(interval), Some(last)) = (plan.interval, completions.last().copied()) {
@@ -1429,7 +2157,7 @@ mod real {
                 }
 
                 let slot_index = index as usize % buffer_count;
-                let checksum = {
+                let (checksum, visible_checksum) = {
                     let slot = &mut self.buffers[slot_index];
                     let handle = slot.buffer_handle();
                     let mut mapping =
@@ -1441,9 +2169,12 @@ mod real {
                                 ),
                             }
                         })?;
-                    apply_frame_damage(&mut mapping, width, height, pitch, index)
+                    let checksum = apply_frame_damage(&mut mapping, width, height, pitch, index);
+                    let visible = visible_rgb_checksum(&mapping, width, height, pitch);
+                    (checksum, visible)
                 };
                 self.buffers[slot_index].checksum = checksum;
+                self.buffers[slot_index].visible_checksum = visible_checksum;
                 stats.damage_updates += 1;
                 let framebuffer = self.buffers[slot_index].framebuffer;
 
@@ -1481,6 +2212,30 @@ mod real {
                             Some(self.buffers[slot_index].framebuffer_id());
                         self.status.buffer_handle = Some(self.buffers[slot_index].buffer_handle());
                         self.status.pattern_checksum = Some(checksum);
+                        if self.capture.is_some() {
+                            if let Some(writeback_id) = self.writeback_connector_id {
+                                let expected = self.buffers[slot_index].visible_checksum;
+                                if let Err(error) = capture_scanout_frame(
+                                    &device,
+                                    &card,
+                                    crtc,
+                                    self.crtc_id,
+                                    writeback_id,
+                                    &mut self.capture,
+                                    &mut self.status.capture,
+                                    expected,
+                                    width,
+                                    height,
+                                    self.capture_timeout,
+                                    self.capture_retries,
+                                    index,
+                                ) {
+                                    self.status.frames = Some(stats.clone());
+                                    self.status.mark_error(&error);
+                                    return Err(error);
+                                }
+                            }
+                        }
                     }
                     Err(error) => {
                         stats.dropped += 1;
@@ -1643,6 +2398,62 @@ mod real {
                 }
             }
 
+            // GETFB returns a *new* GEM handle in this file for the framebuffer
+            // object (drm_gem_fb_create_handle). Close it before any capture
+            // return path so repeated verify calls do not accumulate handles.
+            if let Some(handle) = framebuffer_info.buffer() {
+                let _ = device.close_buffer(handle);
+            }
+
+            if mismatch.is_none()
+                && self.status.verification_blocker.is_none()
+                && self.status.verification_mode == DrmScanoutVerifyMode::Writeback
+            {
+                if let Some(writeback_id) = self.writeback_connector_id {
+                    if self.capture.is_some() {
+                        let expected = self
+                            .buffers
+                            .get(self.current)
+                            .map(|slot| slot.visible_checksum)
+                            .unwrap_or(0);
+                        let capture_frame = self
+                            .status
+                            .capture
+                            .as_ref()
+                            .map(|capture| capture.captured_frames)
+                            .unwrap_or(0);
+                        if let Err(error) = capture_scanout_frame(
+                            &device,
+                            &self.card,
+                            crtc_handle,
+                            self.crtc_id,
+                            writeback_id,
+                            &mut self.capture,
+                            &mut self.status.capture,
+                            expected,
+                            self.status.width,
+                            self.status.height,
+                            self.capture_timeout,
+                            self.capture_retries,
+                            capture_frame,
+                        ) {
+                            self.status_error(&error);
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            if let Some(capture) = self.status.capture.as_ref() {
+                if capture.mismatches > 0 && mismatch.is_none() {
+                    mismatch = capture
+                        .last_mismatch
+                        .clone()
+                        .or_else(|| Some("writeback capture checksum mismatch".to_owned()));
+                }
+            }
+
+            let blocker = self.status.verification_blocker.clone();
+            let capture = self.status.capture.clone();
             let verification = DrmScanoutVerification {
                 crtc_id: self.crtc_id,
                 crtc_mode,
@@ -1663,15 +2474,21 @@ mod real {
                 buffer_pitch: pitch,
                 buffer_handle,
                 pattern_checksum: actual_checksum,
-                ok: mismatch.is_none(),
+                verification_mode: self.status.verification_mode,
+                capture,
+                verification_blocker: blocker.clone(),
+                ok: mismatch.is_none() && blocker.is_none(),
                 mismatch: mismatch.clone(),
             };
             self.status.verification = Some(verification.clone());
-            // GETFB returns a *new* GEM handle in this file for the framebuffer
-            // object (drm_gem_fb_create_handle). Close it so repeated verify
-            // calls do not accumulate handles.
-            if let Some(handle) = framebuffer_info.buffer() {
-                let _ = device.close_buffer(handle);
+            if let Some(blocker) = blocker {
+                let error = DrmScanoutError::VerificationUnavailable {
+                    card: self.card.display().to_string(),
+                    mechanism: blocker.mechanism.clone(),
+                    reason: blocker.reason.clone(),
+                };
+                self.status_error(&error);
+                return Err(error);
             }
             if let Some(mismatch) = mismatch {
                 let error = DrmScanoutError::VerificationFailed {
@@ -1695,6 +2512,29 @@ mod real {
             if let Some(lease) = self.lease.as_ref() {
                 if let Some(fd) = lease.as_fd() {
                     let device = LeaseDevice { fd };
+                    // Clear the writeback job/detach the connector before the
+                    // CRTC/plane state changes. Waiting for the capture event
+                    // and retrying here covers the kernel's deferred job
+                    // cleanup window.
+                    if let Some(writeback_id) = self.writeback_connector_id {
+                        match connector_handle(writeback_id, &card) {
+                            Ok(writeback_handle) => {
+                                if let Err(error) =
+                                    clear_writeback(&device, &card, writeback_handle, writeback_id)
+                                {
+                                    first_error.get_or_insert(error);
+                                }
+                            }
+                            Err(error) => {
+                                first_error.get_or_insert(error);
+                            }
+                        }
+                    }
+                    if let Some(capture) = self.capture.take() {
+                        if let Some(error) = destroy_capture(&device, &card, capture) {
+                            first_error.get_or_insert(error);
+                        }
+                    }
                     let clear = match crtc_handle(self.crtc_id, &card) {
                         Ok(crtc_handle) => {
                             if self.status.commit == DrmScanoutCommit::Atomic {
@@ -1892,6 +2732,27 @@ mod real {
             Ok(value
                 .as_enum()
                 .map(|value| value.name().to_string_lossy().into_owned()))
+        }
+
+        fn blob(
+            &self,
+            device: &LeaseDevice<'_>,
+            card: &Path,
+            property: &str,
+        ) -> Result<Option<Vec<u8>>, DrmScanoutError> {
+            let Some((handle, raw)) = self.values.get(property) else {
+                return Ok(None);
+            };
+            let info = device
+                .get_property(*handle)
+                .map_err(|error| map_io(card, error))?;
+            match info.value_type().convert_value(*raw) {
+                property::Value::Blob(id) if id != 0 => device
+                    .get_property_blob(id)
+                    .map(Some)
+                    .map_err(|error| map_io(card, error)),
+                _ => Ok(None),
+            }
         }
     }
 
@@ -2340,6 +3201,273 @@ mod real {
         }
     }
 
+    struct CaptureOutcome {
+        checksum: u32,
+        retries: u32,
+    }
+
+    fn has_visible_data(bytes: &[u8], width: u32, height: u32, pitch: u32) -> bool {
+        let row_bytes = (width as usize).saturating_mul(4);
+        let pitch = pitch as usize;
+        for y in 0..height as usize {
+            let row_start = y.saturating_mul(pitch);
+            let row_end = row_start.saturating_add(row_bytes);
+            if row_end > bytes.len() {
+                return false;
+            }
+            for pixel in bytes[row_start..row_end].chunks_exact(4) {
+                let value =
+                    u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]) & 0x00ff_ffff;
+                if value != 0x00a5_a5a5 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Queue one writeback job for the scanout CRTC, wait for its completion
+    /// event, then wait (bounded) for the capture buffer to leave the sentinel
+    /// pattern. No out-fence pointer is passed: the safe `drm` crate surface
+    /// cannot own the returned fd, and the proof already waits for the page-flip
+    /// event before reading the buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_writeback_frame(
+        device: &LeaseDevice<'_>,
+        card: &Path,
+        crtc: crtc::Handle,
+        crtc_id: u32,
+        writeback_handle: connector::Handle,
+        writeback_id: u32,
+        capture: &mut CaptureSlot,
+        width: u32,
+        height: u32,
+        timeout: Duration,
+        retries: u32,
+        frame: u32,
+    ) -> Result<CaptureOutcome, DrmScanoutError> {
+        let pitch = capture.buffer.pitch();
+        {
+            let mut mapping = device
+                .map_dumb_buffer(&mut capture.buffer)
+                .map_err(|error| DrmScanoutError::BufferFailed {
+                    card: card.display().to_string(),
+                    reason: format!("mapping the writeback capture buffer: {error}"),
+                })?;
+            mapping.fill(0xA5);
+        }
+
+        let properties =
+            AtomicProperties::read(device, writeback_handle, card, "connector", writeback_id)?;
+        let writeback_raw = RawResourceHandle::from(writeback_handle);
+        let mut retries_used = 0;
+        loop {
+            let mut request = AtomicModeReq::new();
+            request.add_raw_property(
+                writeback_raw,
+                properties.require(card, "connector", writeback_id, "CRTC_ID")?,
+                u64::from(crtc_id),
+            );
+            request.add_raw_property(
+                writeback_raw,
+                properties.require(card, "connector", writeback_id, "WRITEBACK_FB_ID")?,
+                u64::from(capture.framebuffer_id()),
+            );
+            match device.atomic_commit(
+                AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::PAGE_FLIP_EVENT,
+                request,
+            ) {
+                Ok(()) => break,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::EBUSY) | Some(libc::EAGAIN))
+                        && retries_used < retries =>
+                {
+                    retries_used += 1;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => {
+                    return Err(DrmScanoutError::WritebackFailed {
+                        card: card.display().to_string(),
+                        frame,
+                        reason: format!("atomic writeback commit: {error}"),
+                    })
+                }
+            }
+        }
+
+        wait_for_flip(device, crtc, card, frame, timeout).map_err(|error| match error {
+            DrmScanoutError::FlipTimeout { .. } => DrmScanoutError::WritebackTimeout {
+                card: card.display().to_string(),
+                frame,
+                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            },
+            other => other,
+        })?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (ready, checksum) = {
+                let mapping = device
+                    .map_dumb_buffer(&mut capture.buffer)
+                    .map_err(|error| DrmScanoutError::BufferFailed {
+                        card: card.display().to_string(),
+                        reason: format!("re-mapping the writeback capture buffer: {error}"),
+                    })?;
+                (
+                    has_visible_data(&mapping, width, height, pitch),
+                    visible_rgb_checksum(&mapping, width, height, pitch),
+                )
+            };
+            if ready {
+                return Ok(CaptureOutcome {
+                    checksum,
+                    retries: retries_used,
+                });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(DrmScanoutError::WritebackTimeout {
+                    card: card.display().to_string(),
+                    frame,
+                    timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(2)));
+        }
+    }
+
+    /// Run one writeback capture and record it. A checksum mismatch is kept in
+    /// status but does not abort the frame loop; `verify` turns any recorded
+    /// mismatch into a typed `verification_failed`. Timeouts and commit
+    /// failures are returned immediately because no pixel evidence exists.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_scanout_frame(
+        device: &LeaseDevice<'_>,
+        card: &Path,
+        crtc: crtc::Handle,
+        crtc_id: u32,
+        writeback_id: u32,
+        slot: &mut Option<CaptureSlot>,
+        status_capture: &mut Option<DrmScanoutCapture>,
+        expected: u32,
+        width: u32,
+        height: u32,
+        timeout: Duration,
+        retries: u32,
+        frame: u32,
+    ) -> Result<(), DrmScanoutError> {
+        let Some(capture) = slot.as_mut() else {
+            return Ok(());
+        };
+        let writeback = connector_handle(writeback_id, card)?;
+        match capture_writeback_frame(
+            device,
+            card,
+            crtc,
+            crtc_id,
+            writeback,
+            writeback_id,
+            capture,
+            width,
+            height,
+            timeout,
+            retries,
+            frame,
+        ) {
+            Ok(outcome) => {
+                if let Some(capture) = status_capture.as_mut() {
+                    capture.job_retries = capture.job_retries.saturating_add(outcome.retries);
+                    capture.record(outcome.checksum, expected, frame);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(capture) = status_capture.as_mut() {
+                    if matches!(error, DrmScanoutError::WritebackTimeout { .. }) {
+                        capture.timeouts = capture.timeouts.saturating_add(1);
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Clear the writeback job and detach the writeback connector. The kernel
+    /// defers job cleanup after signalling, so a bounded retry absorbs the
+    /// short window in which a commit can still return EINVAL/EBUSY.
+    fn clear_writeback(
+        device: &LeaseDevice<'_>,
+        card: &Path,
+        writeback_handle: connector::Handle,
+        writeback_id: u32,
+    ) -> Result<(), DrmScanoutError> {
+        let properties =
+            AtomicProperties::read(device, writeback_handle, card, "connector", writeback_id)?;
+        let writeback_raw = RawResourceHandle::from(writeback_handle);
+        let mut first_error = None;
+        for (property, value, flags, label) in [
+            (
+                "WRITEBACK_FB_ID",
+                0,
+                AtomicCommitFlags::empty(),
+                "clearing WRITEBACK_FB_ID",
+            ),
+            (
+                "CRTC_ID",
+                0,
+                AtomicCommitFlags::ALLOW_MODESET,
+                "detaching the writeback connector",
+            ),
+        ] {
+            let property_handle =
+                match properties.require(card, "connector", writeback_id, property) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                };
+            let mut cleared = false;
+            for _ in 0..250 {
+                let mut request = AtomicModeReq::new();
+                request.add_raw_property(writeback_raw, property_handle, value);
+                match device.atomic_commit(flags, request) {
+                    Ok(()) => {
+                        cleared = true;
+                        break;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EINVAL) | Some(libc::EBUSY) | Some(libc::EAGAIN)
+                        ) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(DrmScanoutError::WritebackFailed {
+                            card: card.display().to_string(),
+                            frame: 0,
+                            reason: format!("{label}: {error}"),
+                        });
+                        break;
+                    }
+                }
+            }
+            if !cleared && first_error.is_none() {
+                first_error.get_or_insert(DrmScanoutError::WritebackFailed {
+                    card: card.display().to_string(),
+                    frame: 0,
+                    reason: format!("{label} timed out"),
+                });
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Wait for one page-flip completion event for `crtc` with a bounded poll.
     ///
     /// Returns the kernel's vblank sequence when it reports one. Other event
@@ -2474,6 +3602,26 @@ fn is_default_flip_timeout(timeout: &u64) -> bool {
     *timeout == SCANOUT_FLIP_TIMEOUT_MS
 }
 
+fn is_verify_none(mode: &DrmScanoutVerifyMode) -> bool {
+    *mode == DrmScanoutVerifyMode::None
+}
+
+fn default_writeback_timeout_ms() -> u64 {
+    SCANOUT_WRITEBACK_TIMEOUT_MS
+}
+
+fn is_default_writeback_timeout(timeout: &u64) -> bool {
+    *timeout == SCANOUT_WRITEBACK_TIMEOUT_MS
+}
+
+fn default_writeback_retries() -> u32 {
+    SCANOUT_WRITEBACK_RETRIES
+}
+
+fn is_default_writeback_retries(retries: &u32) -> bool {
+    *retries == SCANOUT_WRITEBACK_RETRIES
+}
+
 /// Deterministic moving damage rectangle for `frame`: `(x, y, width, height)`.
 ///
 /// The rectangle visits a 3x3 grid (or a single position on very small modes)
@@ -2564,6 +3712,36 @@ pub fn pattern_checksum(bytes: &[u8]) -> u32 {
     for byte in bytes {
         hash ^= u32::from(*byte);
         hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// FNV-1a checksum of only the visible pixels, independent of row padding and
+/// alpha normalisation.
+///
+/// Each XRGB8888 pixel is masked to `0x00ff_ffff` before hashing. Drivers may
+/// write `0xff` into the unused X byte on capture, and dumb buffers normally
+/// have pitch padding that the hardware never writes; neither is part of the
+/// proof. This is the checksum used to compare a writeback capture with the
+/// scanout buffer that produced it.
+pub fn visible_rgb_checksum(bytes: &[u8], width: u32, height: u32, pitch: u32) -> u32 {
+    let row_bytes = (width as usize).saturating_mul(4);
+    let pitch = pitch as usize;
+    let height = height as usize;
+    let mut hash = 0x811c_9dc5u32;
+    for y in 0..height {
+        let row_start = y.saturating_mul(pitch);
+        let row_end = row_start.saturating_add(row_bytes);
+        if row_end > bytes.len() {
+            break;
+        }
+        for pixel in bytes[row_start..row_end].chunks_exact(4) {
+            let value = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]) & 0x00ff_ffff;
+            for byte in value.to_le_bytes() {
+                hash ^= u32::from(byte);
+                hash = hash.wrapping_mul(0x0100_0193);
+            }
+        }
     }
     hash
 }

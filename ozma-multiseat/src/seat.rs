@@ -412,6 +412,8 @@ pub enum ResourceKind {
     InputIsolation,
     /// Restricting a private X display to the seat's helper uinput devices.
     InputTargeting,
+    /// Synthetic per-seat Wayland keyboard/pointer injection.
+    SeatInput,
     /// Per-seat PipeWire/PulseAudio null sink.
     Audio,
     /// Per-seat DRM lease (connector/CRTC object handoff only).
@@ -426,6 +428,7 @@ impl ResourceKind {
             Self::Routing => "routing",
             Self::InputIsolation => "input_isolation",
             Self::InputTargeting => "input_targeting",
+            Self::SeatInput => "seat_input",
             Self::Audio => "audio",
             Self::DrmLease => "drm_lease",
         }
@@ -488,6 +491,15 @@ pub struct SeatResourceStatus {
     /// and that restriction has not been released.
     #[serde(default)]
     pub input_targeting_applied: bool,
+    /// A per-seat Wayland virtual keyboard/pointer connection is open.
+    #[serde(default)]
+    pub input_injection_applied: bool,
+    /// The compositor advertised the virtual-input protocol globals.
+    #[serde(default)]
+    pub input_injection_available: bool,
+    /// Synthetic input events successfully queued for this seat.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub input_injection_events: u64,
     /// A DRM lease was acquired for this seat and has not been released.
     #[serde(default)]
     pub drm_lease_applied: bool,
@@ -507,6 +519,9 @@ pub struct SeatResourceStatus {
     /// Private-display input targeting was released after being applied.
     #[serde(default)]
     pub input_targeting_released: bool,
+    /// Synthetic Wayland input was disconnected after being applied.
+    #[serde(default)]
+    pub input_injection_released: bool,
     /// A DRM lease was released after being applied.
     #[serde(default)]
     pub drm_lease_released: bool,
@@ -536,14 +551,18 @@ impl SeatResourceStatus {
             && !self.audio_applied
             && !self.input_isolation_applied
             && !self.input_targeting_applied
+            && !self.input_injection_applied
+            && !self.input_injection_available
             && !self.drm_lease_applied
             && !self.ownership_released
             && !self.routing_released
             && !self.audio_released
             && !self.input_isolation_released
             && !self.input_targeting_released
+            && !self.input_injection_released
             && !self.drm_lease_released
             && self.grabbed_device_count == 0
+            && self.input_injection_events == 0
             && self.uinput_devices.is_empty()
             && self.targeted_devices.is_empty()
             && self.disabled_devices.is_empty()
@@ -566,6 +585,10 @@ impl SeatResourceStatus {
 }
 
 fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 

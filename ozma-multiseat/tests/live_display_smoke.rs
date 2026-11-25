@@ -159,6 +159,7 @@ fn two_private_displays_start_with_distinct_display_strings_and_stop_cleanly() {
         input_isolation: false,
         input_targeting: Default::default(),
         seat_display: display_options.clone(),
+        seat_input: Default::default(),
         drm_leases: Default::default(),
     };
     let mut supervisor = ProcessSeatSupervisor::with_parts(

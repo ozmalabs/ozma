@@ -18,6 +18,10 @@ tokio = { workspace = true }
 evdev = "0.12"
 libc = { workspace = true }
 nix = { version = "0.30", features = ["signal", "poll"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [dev-dependencies]
 tempfile = "3"

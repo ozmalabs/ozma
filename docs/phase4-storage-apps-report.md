@@ -1,12 +1,17 @@
 # Phase 4 — storage, application, and self-management surfaces
 
-Status: **read-only observability implemented; privileged storage
-administration and process enforcement remain out of scope.**
+Status: **read-only observability implemented; opt-in exact-pid application
+control is available with `--app-control`. Privileged storage administration
+and policy-based process enforcement remain out of scope.**
 
 `ozma-node` now serves bounded, honest host facts that the deleted Python
 agent exposed through `agent/storage_manager.py`, `agent/app_monitor.py`, and
-`node/self_management.py`. The routes are deliberately observational: they do
-not mount, format, scrub, kill, or reconfigure anything.
+`node/self_management.py`. The routes are observational by default: they do not
+mount, format, scrub, kill, or reconfigure anything.
+
+Opt-in process control is layered beside the read-only `/apps` list and is
+documented in [`phase4-app-control-report.md`](phase4-app-control-report.md).
+It is off unless the node starts with `--app-control`.
 
 Read-only SMART and mdraid visibility lives next to these routes and is
 documented in [`phase4-storage-health-report.md`](phase4-storage-health-report.md).
@@ -19,6 +24,9 @@ documented in [`phase4-storage-health-report.md`](phase4-storage-health-report.m
 | `GET /storage/health` (alias `GET /api/v1/storage/health`) | node bearer guard | `/sys/block`, `smartctl -j -H -A`, `/proc/mdstat`, optional `mdadm --detail --scan` | 32 devices, 32 arrays, 64 members/array |
 | `GET /storage/smart?device=/dev/nvme0n1` (alias `GET /api/v1/storage/smart`) | node bearer guard | `/sys/block` + one bounded `smartctl -j -H -A` | one device |
 | `GET /apps?limit=N` (alias `GET /api/v1/apps`) | node bearer guard | numeric `/proc/<pid>/{comm,stat,status}`, `/proc/uptime`, `/etc/passwd` | `limit` 1–100, default 20 |
+| `POST /apps/{pid}/terminate` (alias `POST /api/v1/apps/{pid}/terminate`) | node bearer guard + `--app-control` | exact `/proc/<pid>/{stat,status}` + `kill(2)` | one pid; `SIGTERM` then one bounded `SIGKILL` |
+| `POST /apps/{pid}/signal` (alias `POST /api/v1/apps/{pid}/signal`) | node bearer guard + `--app-control` | exact `/proc/<pid>/{stat,status}` + `kill(2)` | one pid; `TERM`/`KILL`/`STOP`/`CONT` only |
+| `POST /apps/{pid}/suspend` / `resume` | node bearer guard + `--app-control` | exact `/proc/<pid>/{stat,status}` + `kill(2)` | one pid; `SIGSTOP` / `SIGCONT` |
 | `GET /self` (alias `GET /api/v1/self`) | node bearer guard | `/proc/self/{stat,statm,cgroup}`, `/proc/uptime`, crate metadata | fixed document |
 
 The routes are mounted in `controller_compat::compat_router` next to
@@ -152,6 +160,32 @@ process count, distinct users, and total RSS.
 Unreadable procfs is a typed `503` (`apps.proc-unavailable`). Individual
 processes that disappear mid-scan are skipped and counted.
 
+### `POST /apps/{pid}/terminate|signal|suspend|resume`
+
+These routes exist only as useful controls when the node starts with
+`--app-control`; without the flag they answer `503 apps.control-disabled` and
+never call `kill(2)`. They are documented in
+[`phase4-app-control-report.md`](phase4-app-control-report.md).
+
+They never change the shape of `GET /apps`:
+
+- the target is an exact numeric pid; an optional caller-supplied start time
+  must match, and the node re-reads `/proc/<pid>/stat` start time before every
+  signal;
+- pid 0, pid 1, this node's process tree, kernel threads, zombies, and (by
+  default) other users' processes are refused;
+- an explicit `SIGKILL` requires `"confirm": true`;
+- every signal is preceded by a fresh start-time and policy re-check;
+- `terminate` is `SIGTERM`, a bounded 1–30 second wait (default 2), then one
+  `SIGKILL` only if the same process is still present;
+- no name/`comm`/`cmdline` matching is used.
+
+Typed failures keep the same shape as the read-only surfaces:
+`apps.not-found` (`404`), `apps.permission` (`403`),
+`apps.policy` (`403`), `apps.own-process` (`403`),
+`apps.invalid-request` (`400`), `apps.proc-unavailable` (`503`), and
+`apps.control-disabled` (`503`).
+
 ### `GET /self`
 
 The self report names this node process only:
@@ -247,14 +281,22 @@ The controller now exposes minimal pass-throughs next to its hardware proxies:
 | `GET /api/v1/nodes/{node_id}/storage/health?serials=&attributes=` | `/storage/health?...` |
 | `GET /api/v1/nodes/{node_id}/storage/smart?device=&serials=&attributes=` | `/storage/smart?device=...` |
 | `GET /api/v1/nodes/{node_id}/apps?limit=N` | `/apps?limit=N` |
+| `POST /api/v1/nodes/{node_id}/apps/{pid}/terminate` | `/apps/{pid}/terminate` |
+| `POST /api/v1/nodes/{node_id}/apps/{pid}/signal` | `/apps/{pid}/signal` |
+| `POST /api/v1/nodes/{node_id}/apps/{pid}/suspend` | `/apps/{pid}/suspend` |
+| `POST /api/v1/nodes/{node_id}/apps/{pid}/resume` | `/apps/{pid}/resume` |
 | `GET /api/v1/nodes/{node_id}/self` | `/self` |
 
-They use `_proxy_node_surface`, so a node's typed error (`storage.*`,
-`apps.*`, `self.*`) survives as JSON with its status, and the node bearer
-token is forwarded. The `limit` query is passed through; the node remains
-responsible for clamping it to 100. The health/smart proxies forward the
-explicit privacy flags and URL-encode `device`; the node still validates the
-device and applies its own bounds.
+The read-only proxies use `_proxy_node_surface`, so a node's typed error
+(`storage.*`, `apps.*`, `self.*`) survives as JSON with its status, and the
+node bearer token is forwarded. The `limit` query is passed through; the node
+remains responsible for clamping it to 100. The health/smart proxies forward
+the explicit privacy flags and URL-encode `device`; the node still validates the
+device and applies its own bounds. The app-control proxies use
+`_node_app_control`, which preserves typed `apps.*` 403 policy/permission/
+own-process answers before mapping only an untyped 401/403 to a node-auth
+failure; they forward the exact pid and JSON body, and never resolve a name or
+add controller-side policy.
 
 No Python agent route used these paths: `agent/storage_manager.py` and
 `agent/app_monitor.py` were libraries, and `node/self_management.py` served its
@@ -267,6 +309,11 @@ dashboard's derived CPU/memory/storage/network values remain zero until that
 consumer is taught to use `/self` or a nested self document. This is recorded
 as a remaining gap rather than faking Python-shaped fields in the connection
 document.
+
+The app-control proxies currently have no controller UI or parental-control
+consumer. The Python agent enforced pushed whitelist/blacklist/kiosk/timer
+policy locally; that engine is not ported, so the routes are an operator/API
+primitive rather than enforcement.
 
 ## Tests
 
@@ -291,6 +338,15 @@ Rust (`cargo test -p ozma-node --lib host_surfaces::`):
 - a live Linux host test calls `/storage`, `/apps`, and `/self` collectors
   directly and checks bounds, capacity consistency, memory presence, and the
   absence of `cmdline`;
+- app-control tests use a fake proc/signal backend for the full policy matrix
+  (pid 0, pid 1, this process, its ancestors/descendants, another uid, kernel
+  threads, zombies, missing pids, and a stale/reused start time), the
+  `SIGTERM → SIGKILL` escalation and its bound, explicit `SIGKILL`
+  confirmation, suspend/resume, allowlist rejection, and the 1–30 second
+  production clamp;
+- a live Linux app-control test spawns an orphan scratch `sleep`, reads its real
+  start time, terminates it through `AppControl`, waits for the pid to
+  disappear, and refuses this process's pid and pid 1;
 - storage-health tests cover NVMe/SATA SMART normalization, serial/attribute
   redaction and opt-in, mdstat healthy/degraded/malformed parsing,
   `mdadm --detail --scan`, traversal/missing-device validation, the 32-device
@@ -303,13 +359,16 @@ Rust (`cargo test -p ozma-node --lib host_surfaces::`):
 Controller
 (`python3 -m pytest tests/unit/controller/test_node_api_token_proxy.py`):
 
-- `/storage`, `/storage/health`, `/storage/smart`, `/apps`, and `/self` are in
-  the bearer-token proxy matrix;
+- `/storage`, `/storage/health`, `/storage/smart`, `/apps`, `/self`, and the
+  app-control routes are in the bearer-token proxy matrix;
 - `test_apps_proxy_forwards_limit_to_the_node` proves the `limit` query and
   token reach the node;
 - the health/smart proxy test proves flag forwarding, device URL-encoding, and
   preservation of typed `400 storage.invalid-device` /
-  `503 storage.smart-unavailable` bodies without a token leak.
+  `503 storage.smart-unavailable` bodies without a token leak;
+- the app-control proxy test proves the exact pid and JSON body reach the node
+  and a typed `403 apps.own-process` body keeps its status/code/error without a
+  token leak.
 
 ## Live evidence
 
@@ -329,6 +388,14 @@ device and the same route reports per-device `storage.smart-unavailable`
 instead of inventing health; as root the live test asserts the real
 temperature/percentage-used values with serials omitted.
 
+With `--app-control`, the live app-control test spawns an orphan scratch
+`sleep` (not a child of the node), reads its real `/proc/<pid>/stat` start time,
+and terminates it through the exact-pid path. The process disappears after the
+`SIGTERM`, no escalation is needed, and the same test confirms the node refuses
+its own pid (`apps.own-process`) and pid 1 (`apps.policy`). A fake backend
+covers cases that cannot safely be exercised live, including other-user
+processes and a reused start time.
+
 ## Remaining gaps
 
 - **No storage administration.** ZFS pools/vdevs, md assembly/start/stop/add/
@@ -337,10 +404,12 @@ temperature/percentage-used values with serials omitted.
   `storage_manager.py`/`storage_admin.py` are not ported. `/storage/health`
   and `/storage/smart` are observational only. `/backup/*` remains a typed
   `501`.
-- **No app enforcement.** `app_monitor.py` blocked/killed processes, enforced
-  whitelist/blacklist/kiosk policy, timers/breaks, screen locking, and usage
-  reporting. The node only lists processes; it never reads `cmdline`, kills,
-  or reports usage to the controller.
+- **Policy-based app enforcement is still absent.** `--app-control` adds
+  exact-pid operator primitives (`terminate`, `signal`, `suspend`, `resume`),
+  but `app_monitor.py`'s whitelist/blacklist/kiosk modes, schedules, timers,
+  breaks, screen locking, kiosk relaunch, and usage reporting are not ported.
+  The node never reads `cmdline`, never matches by name, and only acts on an
+  explicitly supplied pid plus start time.
 - **Self-management is a subset.** Network throughput/errors/drops, Wi-Fi
   signal/channel/noise, link speed, load average, CPU temperature, swap, USB
   gadget speed, and controller RTT from `node/self_management.py` are not in

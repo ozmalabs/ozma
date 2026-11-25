@@ -25,15 +25,16 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use ozma_multiseat::{
     detect_drm, render_metrics, DrmDetection, DrmLeaseRequest, DrmLeaseStatus, DrmScanoutBackend,
-    DrmScanoutRequest, DrmScanoutStatus, EvdevGrabRouter, HelperClient, HelperClientConfig,
-    HostTopology, HotplugDebounce, HotplugOptions, HttpHealthProbe, InputTargetingMode,
-    MultiseatPlan, MultiseatPlanner, MultiseatStatus, OzmaAudioRouter, PlannerOptions, PortProbe,
-    ProcessCommandRunner, ProcessLauncher, ProcessSeatDisplayLauncher, ProcessSeatInputTargeter,
-    ProcessSeatSupervisor, ReadinessProbe, RealDrmLeaseBackend, RealDrmScanoutBackend,
-    SeatDisplayBackend, SeatDisplayOptions, SeatDisplaySize, SeatDisplayStatus, SeatProfile,
-    SeatReconciler, SeatResourceStatus, SeatState, SeatStore, SeatSupervisor, SupervisorOptions,
-    SysfsHotplugMonitor, SysfsInputBackend, XInputRouter, XrandrDisplayBackend,
-    XrandrOwnershipController, DEFAULT_DEBOUNCE, DEFAULT_HEALTH_PATH, DEFAULT_NODE_BIN,
+    DrmScanoutRequest, DrmScanoutStatus, DrmScanoutVerifyMode, EvdevGrabRouter, HelperClient,
+    HelperClientConfig, HostTopology, HotplugDebounce, HotplugOptions, HttpHealthProbe,
+    InputTargetingMode, MultiseatPlan, MultiseatPlanner, MultiseatStatus, OzmaAudioRouter,
+    PlannerOptions, PortProbe, ProcessCommandRunner, ProcessLauncher, ProcessSeatDisplayLauncher,
+    ProcessSeatInputTargeter, ProcessSeatSupervisor, ReadinessProbe, RealDrmLeaseBackend,
+    RealDrmScanoutBackend, SeatDisplayBackend, SeatDisplayOptions, SeatDisplaySize,
+    SeatDisplayStatus, SeatInputMode, SeatProfile, SeatReconciler, SeatResourceStatus, SeatState,
+    SeatStore, SeatSupervisor, SupervisorOptions, SysfsHotplugMonitor, SysfsInputBackend,
+    WaylandSeatInputInjector, XInputRouter, XrandrDisplayBackend, XrandrOwnershipController,
+    DEFAULT_DEBOUNCE, DEFAULT_HEALTH_PATH, DEFAULT_NODE_BIN,
 };
 
 /// Plan and supervise one `ozma-node` per seat on this host.
@@ -72,7 +73,9 @@ use ozma_multiseat::{
                   an inherited lessee fd to the seat child, but does not create scanout or \
                   compositor isolation; `auto` only selects a vkms card, while real outputs must \
                   be named explicitly. `--seat-drm-scanout` performs one atomic plane/CRTC proof \
-                  (legacy `set_crtc` only when atomic KMS is unsupported)."
+                  (legacy `set_crtc` only when atomic KMS is unsupported). `--seat-display sway` \
+                  with `--seat-input wayland` connects a virtual keyboard/pointer only to that \
+                  seat's private Wayland socket; it creates no global uinput device."
 )]
 struct Args {
     /// Node binary or path passed to every planned seat.
@@ -138,18 +141,27 @@ struct Args {
 
     /// Per-seat display: `shared` (default, one X root), `xvfb` (private Xvfb
     /// server per seat), `xephyr` (private Xephyr nested in the shared
-    /// display), `xorg` (real Xorg with a config file and libinput), or
-    /// `weston` (throwaway headless Weston compositor with a private
-    /// `WAYLAND_DISPLAY`). Nested backends are opt-in and stopped with the seat.
+    /// display), `xorg` (real Xorg with a config file and libinput), `weston`
+    /// (throwaway headless Weston compositor with a private
+    /// `WAYLAND_DISPLAY`), or `sway` (throwaway headless wlroots compositor
+    /// with virtual keyboard/pointer protocols). Nested backends are opt-in
+    /// and stopped with the seat.
     #[arg(
         long,
         default_value = "shared",
-        value_name = "shared|xvfb|xephyr|xorg|weston"
+        value_name = "shared|xvfb|xephyr|xorg|weston|sway"
     )]
     seat_display: String,
 
-    /// Private screen size for `--seat-display xvfb|xephyr|weston`, for example
-    /// `1280x800`. `xorg` takes geometry from its config file.
+    /// Per-seat synthetic input: `off` (default) or `wayland`. `wayland`
+    /// connects a virtual keyboard/pointer only to the seat's own private
+    /// Wayland socket (`sway`/compatible wlroots compositor). It creates no
+    /// global uinput device and never falls back to another display.
+    #[arg(long, default_value = "off", value_name = "off|wayland")]
+    seat_input: String,
+
+    /// Private screen size for `--seat-display xvfb|xephyr|weston|sway`, for
+    /// example `1280x800`. `xorg` takes geometry from its config file.
     #[arg(long, default_value = "1280x800", value_name = "WxH")]
     seat_display_size: String,
 
@@ -234,6 +246,24 @@ struct Args {
     /// in milliseconds.
     #[arg(long, value_name = "MS")]
     seat_drm_scanout_interval_ms: Option<u64>,
+
+    /// Opt-in pixel verification for `--seat-drm-scanout`: `writeback`
+    /// captures the composed CRTC through a leased writeback connector and
+    /// compares a visible-RGB checksum for every captured frame; `crc` records
+    /// the typed `kms-verification-unavailable` blocker on kernels where the
+    /// safe DRM API cannot issue CRC ioctls; `none` only re-reads KMS state.
+    #[arg(long, default_value = "none", value_name = "writeback|crc|none")]
+    seat_drm_verify: String,
+
+    /// Bounded wait for one `--seat-drm-verify writeback` capture job, in
+    /// milliseconds (default 1000, maximum 60000).
+    #[arg(long, value_name = "MS")]
+    seat_drm_verify_timeout_ms: Option<u64>,
+
+    /// Bounded retries for a transient `--seat-drm-verify writeback` commit
+    /// failure (default 1, maximum 3).
+    #[arg(long, value_name = "0..=3")]
+    seat_drm_verify_retries: Option<u32>,
 
     /// Create per-seat null sinks through ozma-audio before start and remove
     /// them after stop. Optional value: pipewire (default) or pulseaudio.
@@ -338,6 +368,7 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
     let seat_display_backend: SeatDisplayBackend = args.seat_display.parse()?;
     let seat_display_size: SeatDisplaySize = args.seat_display_size.parse()?;
     let input_targeting_mode: InputTargetingMode = args.input_targeting.parse()?;
+    let seat_input_mode: SeatInputMode = args.seat_input.parse()?;
     let seat_display_options = SeatDisplayOptions {
         backend: seat_display_backend,
         size: seat_display_size,
@@ -358,6 +389,7 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
         input_isolation: args.input_isolation == "helper",
         input_targeting: input_targeting_mode,
         seat_display: seat_display_options.clone(),
+        seat_input: seat_input_mode,
         drm_leases: drm_leases.clone(),
     };
 
@@ -389,6 +421,9 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
         supervisor = supervisor.with_display_launcher(Box::new(ProcessSeatDisplayLauncher::new(
             seat_display_options,
         )));
+    }
+    if seat_input_mode.is_wayland() {
+        supervisor = supervisor.with_seat_input_injector(Box::new(WaylandSeatInputInjector::new()));
     }
     if args.apply_ownership {
         supervisor = supervisor.with_ownership_controller(Box::new(
@@ -448,6 +483,7 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
                     || args.apply_routing
                     || args.input_isolation == "helper"
                     || args.seat_display != "shared"
+                    || args.seat_input != "off"
                     || !drm_leases.is_empty()
                 {
                     // The supervisor already released every applied resource
@@ -686,6 +722,17 @@ fn run_scanout_proof(args: &Args, selector: &str) -> Result<(), ozma_multiseat::
     if let Some(interval) = args.seat_drm_scanout_interval_ms {
         request = request.with_interval_ms(interval);
     }
+    let verify = args
+        .seat_drm_verify
+        .parse::<DrmScanoutVerifyMode>()
+        .map_err(|error| ozma_multiseat::MultiseatError::DrmScanout(error.to_string()))?;
+    request = request.with_verify(verify);
+    if let Some(timeout_ms) = args.seat_drm_verify_timeout_ms {
+        request = request.with_writeback_timeout_ms(timeout_ms);
+    }
+    if let Some(retries) = args.seat_drm_verify_retries {
+        request = request.with_writeback_retries(retries);
+    }
     if let Err(error) = request.validate() {
         return Err(ozma_multiseat::MultiseatError::DrmScanout(
             error.to_string(),
@@ -744,6 +791,9 @@ fn run_scanout_proof(args: &Args, selector: &str) -> Result<(), ozma_multiseat::
             "scanout": &status,
             "frames": &status.frames,
             "notes": &status.notes,
+            "verification_mode": status.verification_mode.as_str(),
+            "verification_blocker": &status.verification_blocker,
+            "capture": &status.capture,
             "verification": &status.verification,
             "frame_error": frame_error.as_ref().map(|error| serde_json::json!({
                 "kind": error.code(),
@@ -826,6 +876,23 @@ fn print_scanout_status(status: &DrmScanoutStatus) {
             frames.final_checksum
         );
     }
+    println!(
+        "  verify-mode: {} writeback={:?} capture={:?}",
+        status.verification_mode.as_str(),
+        status.writeback_connector_id,
+        status.capture.as_ref().map(|capture| (
+            capture.captured_frames,
+            capture.mismatches,
+            capture.timeouts,
+            capture.checksums.last().copied(),
+        ))
+    );
+    if let Some(blocker) = &status.verification_blocker {
+        println!(
+            "  verification-blocker[{}]: mechanism={} reason={} evidence={:?}",
+            blocker.kind, blocker.mechanism, blocker.reason, blocker.kernel_evidence
+        );
+    }
     if let Some(verification) = &status.verification {
         println!(
             "  verify: ok={} crtc_mode={:?} crtc_framebuffer={:?} connector={} \
@@ -895,12 +962,25 @@ fn validate(args: &Args) -> Result<(), ozma_multiseat::MultiseatError> {
     }
     if !matches!(
         args.seat_display.as_str(),
-        "shared" | "xvfb" | "xephyr" | "xorg" | "weston" | "wayland"
+        "shared" | "xvfb" | "xephyr" | "xorg" | "weston" | "wayland" | "sway"
     ) {
         return Err(ozma_multiseat::MultiseatError::SeatDisplay(format!(
-            "unknown seat display {:?}; expected shared, xvfb, xephyr, xorg, or weston",
+            "unknown seat display {:?}; expected shared, xvfb, xephyr, xorg, weston, or sway",
             args.seat_display
         )));
+    }
+    if !matches!(args.seat_input.as_str(), "off" | "wayland") {
+        return Err(ozma_multiseat::MultiseatError::SeatInput(format!(
+            "unknown seat input {:?}; expected off or wayland",
+            args.seat_input
+        )));
+    }
+    if args.seat_input == "wayland" && !matches!(args.seat_display.as_str(), "sway") {
+        return Err(ozma_multiseat::MultiseatError::SeatInput(
+            "--seat-input wayland requires --seat-display sway; Weston does not expose the \
+             wlroots virtual-pointer protocol"
+                .to_owned(),
+        ));
     }
     if args.seat_display == "xorg" && args.seat_display_xorg_config.is_none() {
         return Err(ozma_multiseat::MultiseatError::SeatDisplay(
@@ -935,6 +1015,39 @@ fn validate(args: &Args) -> Result<(), ozma_multiseat::MultiseatError> {
         return Err(ozma_multiseat::MultiseatError::DrmScanout(
             "--seat-drm-scanout-interval-ms is only valid with --seat-drm-scanout".to_owned(),
         ));
+    }
+    if !matches!(args.seat_drm_verify.as_str(), "writeback" | "crc" | "none") {
+        return Err(ozma_multiseat::MultiseatError::DrmScanout(format!(
+            "unknown --seat-drm-verify {:?}; expected writeback, crc, or none",
+            args.seat_drm_verify
+        )));
+    }
+    if args.seat_drm_scanout.is_none()
+        && (args.seat_drm_verify != "none"
+            || args.seat_drm_verify_timeout_ms.is_some()
+            || args.seat_drm_verify_retries.is_some())
+    {
+        return Err(ozma_multiseat::MultiseatError::DrmScanout(
+            "--seat-drm-verify and its timeout/retry flags are only valid with \
+             --seat-drm-scanout"
+                .to_owned(),
+        ));
+    }
+    if let Some(timeout) = args.seat_drm_verify_timeout_ms {
+        if timeout == 0 || timeout > ozma_multiseat::SCANOUT_MAX_WRITEBACK_TIMEOUT_MS {
+            return Err(ozma_multiseat::MultiseatError::DrmScanout(format!(
+                "--seat-drm-verify-timeout-ms must be 1..={}",
+                ozma_multiseat::SCANOUT_MAX_WRITEBACK_TIMEOUT_MS
+            )));
+        }
+    }
+    if let Some(retries) = args.seat_drm_verify_retries {
+        if retries > ozma_multiseat::SCANOUT_MAX_WRITEBACK_RETRIES {
+            return Err(ozma_multiseat::MultiseatError::DrmScanout(format!(
+                "--seat-drm-verify-retries must be 0..={}",
+                ozma_multiseat::SCANOUT_MAX_WRITEBACK_RETRIES
+            )));
+        }
     }
     let _: SeatDisplaySize = args.seat_display_size.parse()?;
     if args.input_isolation == "helper" && args.apply_routing {
@@ -1263,7 +1376,7 @@ fn lease_summary(lease: &DrmLeaseStatus) -> Option<String> {
 
 fn resource_summary(resources: &SeatResourceStatus) -> String {
     let mut summary = format!(
-        " resources(ownership={} routing={} isolation={} targeting={} audio={})",
+        " resources(ownership={} routing={} isolation={} targeting={} input={} audio={})",
         resource_state(resources.ownership_applied, resources.ownership_released),
         resource_state(resources.routing_applied, resources.routing_released),
         resource_state(
@@ -1274,8 +1387,18 @@ fn resource_summary(resources: &SeatResourceStatus) -> String {
             resources.input_targeting_applied,
             resources.input_targeting_released
         ),
+        resource_state(
+            resources.input_injection_applied,
+            resources.input_injection_released
+        ),
         resource_state(resources.audio_applied, resources.audio_released),
     );
+    if resources.input_injection_available || resources.input_injection_events != 0 {
+        summary.push_str(&format!(
+            " input_available={} input_events={}",
+            resources.input_injection_available, resources.input_injection_events
+        ));
+    }
     if resources.grabbed_device_count != 0 || !resources.uinput_devices.is_empty() {
         summary.push_str(&format!(
             " grabbed={} uinput={}",

@@ -3855,6 +3855,10 @@ pub struct ConnectionState {
     /// Bounded read-only storage/process/self surfaces and their startup
     /// availability advertisement.
     pub host_surfaces: crate::host_surfaces::HostSurfacesState,
+    /// Opt-in bounded process control installed by `--app-control`. `None`
+    /// leaves every `/apps/{pid}/*` control route at a typed 503 and never
+    /// signals a process.
+    pub app_control: Option<crate::app_control::AppControl>,
     /// Controller-facing display outputs (VM consoles or raw host outputs).
     pub display_outputs: serde_json::Value,
     /// Live capture console/provider and any multi-console limitation.
@@ -3967,6 +3971,7 @@ impl ConnectionState {
             metrics: crate::agent_metrics::AgentMetricsSampler::default(),
             hardware: None,
             host_surfaces,
+            app_control: None,
             display_outputs: serde_json::json!([]),
             display_capture: DisplayCaptureStatus::default(),
             display_control: None,
@@ -4203,6 +4208,16 @@ impl ConnectionState {
         self
     }
 
+    /// Attach the opt-in bounded application-control surface (`--app-control`).
+    ///
+    /// Without it, `/apps` stays read-only and every `/apps/{pid}/*` control
+    /// route returns a typed 503 `apps.control-disabled`; no process is ever
+    /// signalled.
+    pub fn with_app_control(mut self, app_control: Option<crate::app_control::AppControl>) -> Self {
+        self.app_control = app_control;
+        self
+    }
+
     /// Attach the one-shot display snapshot control.
     ///
     /// `None` keeps `GET /display/snapshot` at a typed 503; attaching an empty
@@ -4364,6 +4379,7 @@ pub fn compat_router(state: ConnectionState) -> Router {
         .merge(display_router(state.clone()))
         .merge(crate::desktop_compat::router(state.clone()))
         .merge(crate::host_surfaces::router(state.host_surfaces.clone()))
+        .merge(crate::app_control::router(state.app_control.clone()))
         .merge(crate::backup::router(state.backup.clone()))
         .merge(crate::bluetooth::router(state.bluetooth.clone()))
         .merge(legacy_router(state))

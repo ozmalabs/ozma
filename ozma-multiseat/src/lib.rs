@@ -56,10 +56,13 @@
 //! * [`audio`] is the synchronous per-seat null-sink seam over
 //!   [`ozma_audio::AudioRouter`]; it is only invoked when a router is installed.
 //!
-//! The library performs no input injection, opens no evdev node, creates no
-//! virtual display, creates no DRM lease, and allocates no PipeWire sink by
-//! default. Routing, ownership, isolation, audio, display-server, and DRM
-//! lease commands are only executed through explicitly injected
+//! The library performs no physical input injection, opens no evdev node,
+//! creates no virtual display, creates no DRM lease, and allocates no PipeWire
+//! sink by default. Synthetic per-seat Wayland keyboard/pointer events are
+//! created only when a caller explicitly installs the injector and connects it
+//! to a seat's private compositor socket; no global uinput device is created.
+//! Routing, ownership, isolation, audio, display-server, DRM lease, and
+//! synthetic-input commands are only executed through explicitly injected
 //! runners/controllers/helpers/backends; the default evdev grab backend returns
 //! a typed unsupported error. The library contains no `unsafe` code (the Unix
 //! SIGTERM helper is the safe `nix` API); only the `ozma-seat-input` binary's
@@ -88,6 +91,7 @@ pub mod planner;
 pub mod routing;
 pub mod seat;
 pub mod seat_display;
+pub mod seat_input;
 pub mod status;
 pub mod supervisor;
 
@@ -109,28 +113,32 @@ pub use drm_lease::{
     enumerate_at as enumerate_drm_cards_at, DrmCard, DrmCardSelector, DrmCrtcSelector,
     DrmLeaseBackend, DrmLeaseConnector, DrmLeaseError, DrmLeaseErrorStatus, DrmLeaseHandle,
     DrmLeaseNote, DrmLeaseNoteKind, DrmLeaseObjects, DrmLeaseRequest, DrmLeaseStatus,
-    DrmObjectKind, DrmPlaneSelector, DEFAULT_DRM_DEV_ROOT, DRM_LEASE_CARD_ENV,
-    DRM_LEASE_CONNECTOR_ENV, DRM_LEASE_CONNECTOR_ID_ENV, DRM_LEASE_CRTC_ID_ENV, DRM_LEASE_ENV,
-    DRM_LEASE_FD_ENV, DRM_LEASE_ID_ENV, DRM_LEASE_PLANE_ID_ENV, VIRTUAL_DRM_DRIVER,
+    DrmObjectKind, DrmPlaneSelector, DrmWritebackConnector, DEFAULT_DRM_DEV_ROOT,
+    DRM_LEASE_CARD_ENV, DRM_LEASE_CONNECTOR_ENV, DRM_LEASE_CONNECTOR_ID_ENV, DRM_LEASE_CRTC_ID_ENV,
+    DRM_LEASE_ENV, DRM_LEASE_FD_ENV, DRM_LEASE_ID_ENV, DRM_LEASE_PLANE_ID_ENV, VIRTUAL_DRM_DRIVER,
 };
 #[cfg(target_os = "linux")]
 pub use drm_scanout::RealDrmScanoutBackend;
 pub use drm_scanout::{
     apply_frame_damage, ensure_scanout_card, fill_pattern, frame_buffer_count, frame_damage_rect,
-    pattern_checksum, DrmScanoutBackend, DrmScanoutCommit, DrmScanoutError, DrmScanoutErrorStatus,
-    DrmScanoutFramePlan, DrmScanoutFrameStats, DrmScanoutHandle, DrmScanoutNote,
-    DrmScanoutNoteKind, DrmScanoutRequest, DrmScanoutStatus, DrmScanoutVerification, SCANOUT_BPP,
+    pattern_checksum, visible_rgb_checksum, DrmScanoutBackend, DrmScanoutCapture, DrmScanoutCommit,
+    DrmScanoutError, DrmScanoutErrorStatus, DrmScanoutFramePlan, DrmScanoutFrameStats,
+    DrmScanoutHandle, DrmScanoutNote, DrmScanoutNoteKind, DrmScanoutRequest, DrmScanoutStatus,
+    DrmScanoutVerification, DrmScanoutVerificationBlocker, DrmScanoutVerifyMode, SCANOUT_BPP,
     SCANOUT_DAMAGE_PATTERN, SCANOUT_DEFAULT_FRAMES, SCANOUT_DEPTH, SCANOUT_FLIP_TIMEOUT_MS,
-    SCANOUT_FOURCC, SCANOUT_MAX_FRAMES, SCANOUT_PATTERN,
+    SCANOUT_FOURCC, SCANOUT_MAX_CAPTURE_SAMPLES, SCANOUT_MAX_FRAMES, SCANOUT_MAX_VERIFY_BYTES,
+    SCANOUT_MAX_WRITEBACK_RETRIES, SCANOUT_MAX_WRITEBACK_TIMEOUT_MS, SCANOUT_PATTERN,
+    SCANOUT_WRITEBACK_RETRIES, SCANOUT_WRITEBACK_TIMEOUT_MS,
 };
 pub use error::MultiseatError;
 pub use fake::{
     FakeCommandRunner, FakeDeviceNameResolver, FakeDisplayBackend, FakeDrmLeaseBackend,
-    FakeDrmLeaseCard, FakeDrmLeaseFailure, FakeDrmScanoutBackend, FakeDrmScanoutCard,
-    FakeDrmScanoutFailure, FakeDrmScanoutFlipFailure, FakeEvdevGrabBackend, FakeGrabAction,
-    FakeGrabEvent, FakeHelperBackend, FakeHotplugMonitor, FakeInputBackend, FakeLeaseRecord,
-    FakeNodeLauncher, FakeReadinessProbe, FakeSeatAudioRouter, FakeSeatDisplayLauncher,
-    FakeSeatInputHelper, FakeSeatInputTargeter, FakeSeatSupervisor,
+    FakeDrmLeaseCard, FakeDrmLeaseFailure, FakeDrmScanoutBackend, FakeDrmScanoutCaptureFailure,
+    FakeDrmScanoutCard, FakeDrmScanoutFailure, FakeDrmScanoutFlipFailure, FakeEvdevGrabBackend,
+    FakeGrabAction, FakeGrabEvent, FakeHelperBackend, FakeHotplugMonitor, FakeInjectedKey,
+    FakeInputBackend, FakeLeaseRecord, FakeNodeLauncher, FakeReadinessProbe, FakeSeatAudioRouter,
+    FakeSeatDisplayLauncher, FakeSeatInputHelper, FakeSeatInputInjector, FakeSeatInputTargeter,
+    FakeSeatSupervisor,
 };
 pub use host::HostTopology;
 pub use hotplug::{
@@ -183,14 +191,19 @@ pub use seat::{
 };
 pub use seat_display::{
     display_error_kind, display_name, display_server_args, parse_display_number,
-    probe_wayland_display, probe_x11_display, resolve_program, wayland_display_name, weston_config,
-    weston_server_args, x11_setup_request, DisplayExit, DisplayNumberAllocator,
-    ProcessSeatDisplayLauncher, SeatDisplayBackend, SeatDisplayError, SeatDisplayHandle,
-    SeatDisplayLauncher, SeatDisplayNote, SeatDisplayNoteKind, SeatDisplayOptions,
-    SeatDisplayPrograms, SeatDisplayRequest, SeatDisplaySize, SeatDisplayStatus, SeatWaylandEnv,
-    DEFAULT_DISPLAY_NUMBER_END, DEFAULT_DISPLAY_NUMBER_START, DEFAULT_DISPLAY_READY_POLL,
-    DEFAULT_DISPLAY_READY_TIMEOUT, DEFAULT_SEAT_DISPLAY_HEIGHT, DEFAULT_SEAT_DISPLAY_WIDTH,
-    DISPLAY_TERMINATE_GRACE,
+    probe_wayland_display, probe_x11_display, resolve_program, sway_config, sway_display_name,
+    sway_server_args, wayland_display_name, weston_config, weston_server_args, x11_setup_request,
+    DisplayExit, DisplayNumberAllocator, ProcessSeatDisplayLauncher, SeatDisplayBackend,
+    SeatDisplayError, SeatDisplayHandle, SeatDisplayLauncher, SeatDisplayNote, SeatDisplayNoteKind,
+    SeatDisplayOptions, SeatDisplayPrograms, SeatDisplayRequest, SeatDisplaySize,
+    SeatDisplayStatus, SeatWaylandEnv, DEFAULT_DISPLAY_NUMBER_END, DEFAULT_DISPLAY_NUMBER_START,
+    DEFAULT_DISPLAY_READY_POLL, DEFAULT_DISPLAY_READY_TIMEOUT, DEFAULT_SEAT_DISPLAY_HEIGHT,
+    DEFAULT_SEAT_DISPLAY_WIDTH, DISPLAY_TERMINATE_GRACE,
+};
+pub use seat_input::{
+    ascii_key, SeatInputCapabilities, SeatInputError, SeatInputInjector, SeatInputMode,
+    SeatInputRequest, SeatKeyState, WaylandSeatInputInjector, BTN_LEFT, VIRTUAL_KEYBOARD_PROTOCOL,
+    VIRTUAL_POINTER_PROTOCOL, XKB_KEY_LEFT_SHIFT, XKB_V1_FORMAT,
 };
 pub use status::{render_metrics, MultiseatCapability, MultiseatStatus};
 pub use supervisor::{

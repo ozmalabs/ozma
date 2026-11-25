@@ -28,8 +28,12 @@ use crate::routing::{
 };
 use crate::seat::{SeatPlan, SeatRuntimeStatus, SeatState};
 use crate::seat_display::{
-    wayland_display_name, DisplayExit, SeatDisplayBackend, SeatDisplayHandle, SeatDisplayLauncher,
-    SeatDisplayRequest, SeatWaylandEnv,
+    sway_display_name, wayland_display_name, DisplayExit, SeatDisplayBackend, SeatDisplayHandle,
+    SeatDisplayLauncher, SeatDisplayRequest, SeatWaylandEnv,
+};
+use crate::seat_input::{
+    ascii_key, SeatInputCapabilities, SeatInputError, SeatInputInjector, SeatInputRequest,
+    SeatKeyState, XKB_KEY_LEFT_SHIFT,
 };
 use crate::supervisor::{
     ChildExit, ChildHandle, NodeLaunchSpec, NodeLauncher, ReadinessProbe, SeatSupervisor,
@@ -722,10 +726,17 @@ impl SeatDisplayLauncher for FakeSeatDisplayLauncher {
                 number
             }
         };
-        let (display, wayland) = if request.backend == SeatDisplayBackend::Weston {
-            let display = wayland_display_name(number);
-            let runtime = std::env::temp_dir()
-                .join(format!("ozma-fake-weston-{}-{number}", std::process::id()));
+        let (display, wayland) = if request.backend.is_wayland() {
+            let display = if request.backend == SeatDisplayBackend::Sway {
+                sway_display_name(number)
+            } else {
+                wayland_display_name(number)
+            };
+            let runtime = std::env::temp_dir().join(format!(
+                "ozma-fake-{}-{}-{number}",
+                request.backend.as_str(),
+                std::process::id()
+            ));
             (display.clone(), Some(SeatWaylandEnv::new(display, runtime)))
         } else {
             (format!(":{number}"), None)
@@ -2512,6 +2523,10 @@ pub struct FakeDrmScanoutCard {
     pub modes: Vec<String>,
     /// Plane object ids that can drive this card's CRTC.
     pub plane_ids: Vec<u32>,
+    /// Writeback connector object id, when this fake card models one.
+    pub writeback_connector_id: Option<u32>,
+    /// Writeback connector name.
+    pub writeback_connector: String,
 }
 
 /// Injected one-shot scanout failure.
@@ -2547,6 +2562,19 @@ pub enum FakeDrmScanoutFailure {
     MissingAtomicProperty,
 }
 
+/// Injected one-shot writeback capture failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeDrmScanoutCaptureFailure {
+    /// The capture completed but the checksum differed.
+    Mismatch,
+    /// The capture job never produced a frame inside the bounded wait.
+    Timeout,
+    /// The writeback commit itself failed.
+    CommitFailed,
+    /// No writeback connector is available.
+    Unavailable,
+}
+
 /// Injected one-shot frame-loop failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FakeDrmScanoutFlipFailure {
@@ -2564,6 +2592,8 @@ struct FakeDrmScanoutState {
     failure: Option<FakeDrmScanoutFailure>,
     flip_failures: VecDeque<FakeDrmScanoutFlipFailure>,
     flip_fail_at: BTreeMap<u32, FakeDrmScanoutFlipFailure>,
+    capture_failures: VecDeque<FakeDrmScanoutCaptureFailure>,
+    capture_fail_at: BTreeMap<u32, FakeDrmScanoutCaptureFailure>,
     events: Vec<String>,
     active: bool,
     next_lessee: u32,
@@ -2656,6 +2686,8 @@ impl FakeDrmScanoutBackend {
             crtc_id,
             modes: modes.iter().map(|mode| (*mode).to_owned()).collect(),
             plane_ids: vec![crtc_id.saturating_add(100)],
+            writeback_connector_id: Some(crtc_id.saturating_add(200)),
+            writeback_connector: format!("Writeback-{}", crtc_id),
         };
         let mut state = self.state.lock().expect("fake scanout lock");
         state.cards.retain(|existing| existing.name != name);
@@ -2700,6 +2732,45 @@ impl FakeDrmScanoutBackend {
             .lock()
             .expect("fake scanout lock")
             .flip_fail_at
+            .insert(frame, failure);
+    }
+
+    /// Remove writeback support from a named fake card.
+    pub fn without_writeback(&mut self, name: &str) -> &mut Self {
+        let mut state = self.state.lock().expect("fake scanout lock");
+        if let Some(card) = state.cards.iter_mut().find(|card| card.name == name) {
+            card.writeback_connector_id = None;
+        }
+        drop(state);
+        self
+    }
+
+    /// Configure a writeback connector on a named fake card.
+    pub fn with_writeback(&mut self, name: &str, connector_id: u32) -> &mut Self {
+        let mut state = self.state.lock().expect("fake scanout lock");
+        if let Some(card) = state.cards.iter_mut().find(|card| card.name == name) {
+            card.writeback_connector_id = Some(connector_id);
+            card.writeback_connector = format!("Writeback-{connector_id}");
+        }
+        drop(state);
+        self
+    }
+
+    /// Inject one typed failure into the next writeback capture.
+    pub fn fail_next_capture(&self, failure: FakeDrmScanoutCaptureFailure) {
+        self.state
+            .lock()
+            .expect("fake scanout lock")
+            .capture_failures
+            .push_back(failure);
+    }
+
+    /// Inject a typed failure for one specific zero-based capture index.
+    pub fn fail_capture_at(&self, frame: u32, failure: FakeDrmScanoutCaptureFailure) {
+        self.state
+            .lock()
+            .expect("fake scanout lock")
+            .capture_fail_at
             .insert(frame, failure);
     }
 
@@ -2990,6 +3061,45 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
         }
         state.active = true;
 
+        let mut verification_blocker = None;
+        let mut writeback_connector_id = None;
+        match request.verify {
+            crate::drm_scanout::DrmScanoutVerifyMode::None => {}
+            crate::drm_scanout::DrmScanoutVerifyMode::Crc => {
+                verification_blocker =
+                    Some(crate::drm_scanout::DrmScanoutVerificationBlocker::new(
+                        "crc",
+                        "fake backend models the safe-API CRC blocker",
+                        vec!["fake kernel evidence: CRC ioctl not exposed".to_owned()],
+                    ));
+            }
+            crate::drm_scanout::DrmScanoutVerifyMode::Writeback => {
+                if request.force_legacy || commit == DrmScanoutCommit::Legacy {
+                    verification_blocker =
+                        Some(crate::drm_scanout::DrmScanoutVerificationBlocker::new(
+                            "writeback",
+                            "writeback capture requires atomic KMS",
+                            vec!["fake commit path is legacy".to_owned()],
+                        ));
+                } else if let Some(writeback_id) = card.writeback_connector_id {
+                    writeback_connector_id = Some(writeback_id);
+                    state
+                        .events
+                        .push(format!("writeback_configure {writeback_id}"));
+                } else {
+                    verification_blocker =
+                        Some(crate::drm_scanout::DrmScanoutVerificationBlocker::new(
+                            "writeback",
+                            "fake card exposes no writeback connector",
+                            vec!["fake card writeback_connector_id is None".to_owned()],
+                        ));
+                }
+            }
+        }
+        let capture = writeback_connector_id.map(|writeback_id| {
+            crate::drm_scanout::DrmScanoutCapture::new(writeback_id, width, height, pitch)
+        });
+
         let initial_stats = crate::drm_scanout::DrmScanoutFrameStats::initial(
             request.frames,
             buffer_count,
@@ -3014,6 +3124,11 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
             pattern_checksum: Some(checksum),
             frames: Some(initial_stats),
             page_flipped: !page_flip_unavailable,
+            verification_mode: request.verify,
+            writeback_connector_id,
+            writeback_connector: writeback_connector_id.map(|_| card.writeback_connector.clone()),
+            capture,
+            verification_blocker,
             verification: None,
             applied: true,
             released: false,
@@ -3064,6 +3179,21 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
                 format!(
                     "fake real card {} was named explicitly",
                     card.path.display()
+                ),
+            ));
+        }
+        if let Some(writeback_id) = writeback_connector_id {
+            status.push_note(DrmScanoutNote::new(
+                DrmScanoutNoteKind::WritebackCapture,
+                format!("fake writeback connector {writeback_id} captures the CRTC"),
+            ));
+        }
+        if let Some(blocker) = status.verification_blocker.as_ref() {
+            status.push_note(DrmScanoutNote::new(
+                DrmScanoutNoteKind::VerificationUnavailable,
+                format!(
+                    "{} capture unavailable: {}",
+                    blocker.mechanism, blocker.reason
                 ),
             ));
         }
@@ -3125,6 +3255,76 @@ struct FakeDrmScanoutHandle {
     verification_fails: bool,
     active: bool,
     state: Arc<Mutex<FakeDrmScanoutState>>,
+}
+
+impl FakeDrmScanoutHandle {
+    fn capture_frame(
+        &mut self,
+        frame: u32,
+        expected: u32,
+    ) -> Result<(), crate::drm_scanout::DrmScanoutError> {
+        use crate::drm_scanout::{DrmScanoutError, DrmScanoutVerifyMode};
+        if self.status.verification_mode != DrmScanoutVerifyMode::Writeback
+            || self.status.verification_blocker.is_some()
+            || self.status.capture.is_none()
+            || self.status.writeback_connector_id.is_none()
+        {
+            return Ok(());
+        }
+        let failure = {
+            let mut state = self.state.lock().expect("fake scanout lock");
+            state
+                .capture_fail_at
+                .remove(&frame)
+                .or_else(|| state.capture_failures.pop_front())
+        };
+        match failure {
+            Some(crate::fake::FakeDrmScanoutCaptureFailure::Timeout) => {
+                let error = DrmScanoutError::WritebackTimeout {
+                    card: self.record.card.display().to_string(),
+                    frame,
+                    timeout_ms: 1,
+                };
+                if let Some(capture) = self.status.capture.as_mut() {
+                    capture.timeouts = capture.timeouts.saturating_add(1);
+                }
+                self.status.mark_error(&error);
+                return Err(error);
+            }
+            Some(crate::fake::FakeDrmScanoutCaptureFailure::CommitFailed) => {
+                let error = DrmScanoutError::WritebackFailed {
+                    card: self.record.card.display().to_string(),
+                    frame,
+                    reason: "injected writeback commit failure".to_owned(),
+                };
+                self.status.mark_error(&error);
+                return Err(error);
+            }
+            Some(crate::fake::FakeDrmScanoutCaptureFailure::Unavailable) => {
+                let error = DrmScanoutError::VerificationUnavailable {
+                    card: self.record.card.display().to_string(),
+                    mechanism: "writeback".to_owned(),
+                    reason: "injected unavailable writeback".to_owned(),
+                };
+                self.status.mark_error(&error);
+                return Err(error);
+            }
+            _ => {}
+        }
+        let mismatch = matches!(
+            failure,
+            Some(crate::fake::FakeDrmScanoutCaptureFailure::Mismatch)
+        );
+        let captured = if mismatch { expected ^ 1 } else { expected };
+        if let Some(capture) = self.status.capture.as_mut() {
+            capture.record(captured, expected, frame);
+        }
+        let mut state = self.state.lock().expect("fake scanout lock");
+        state
+            .events
+            .push(format!("writeback_capture {frame} {captured} {expected}"));
+        Ok(())
+    }
 }
 
 impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
@@ -3196,6 +3396,18 @@ impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
             return Err(error);
         }
         stats.page_flip_events += 1;
+        if self.status.capture.is_some() {
+            let expected = crate::drm_scanout::visible_rgb_checksum(
+                &self.buffers[0],
+                self.record.width,
+                self.record.height,
+                self.record.pitch,
+            );
+            if let Err(error) = self.capture_frame(0, expected) {
+                self.status.frames = Some(stats.clone());
+                return Err(error);
+            }
+        }
 
         for index in 1..plan.frames {
             if let (Some(interval), Some(last)) = (plan.interval, completions.last().copied()) {
@@ -3270,6 +3482,18 @@ impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
             self.status.framebuffer_id = Some(framebuffer_id);
             self.status.buffer_handle = Some(self.record.buffer_handles[slot]);
             self.status.pattern_checksum = Some(checksum);
+            if self.status.capture.is_some() {
+                let expected = crate::drm_scanout::visible_rgb_checksum(
+                    &self.buffers[slot],
+                    self.record.width,
+                    self.record.height,
+                    self.record.pitch,
+                );
+                if let Err(error) = self.capture_frame(index, expected) {
+                    self.status.frames = Some(stats.clone());
+                    return Err(error);
+                }
+            }
         }
 
         if completions.len() >= 2 {
@@ -3303,6 +3527,33 @@ impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
             self.status.mark_error(&error);
             return Err(error);
         }
+        if self.status.verification_blocker.is_none()
+            && self.status.verification_mode == crate::drm_scanout::DrmScanoutVerifyMode::Writeback
+            && self.status.capture.is_some()
+            && self.status.writeback_connector_id.is_some()
+        {
+            let expected = crate::drm_scanout::visible_rgb_checksum(
+                &self.buffers[self.current],
+                self.record.width,
+                self.record.height,
+                self.record.pitch,
+            );
+            let capture_frame = self
+                .status
+                .capture
+                .as_ref()
+                .map(|capture| capture.captured_frames)
+                .unwrap_or(0);
+            self.capture_frame(capture_frame, expected)?;
+        }
+        let mut mismatch = self
+            .status
+            .capture
+            .as_ref()
+            .filter(|capture| capture.mismatches > 0)
+            .and_then(|capture| capture.last_mismatch.clone());
+        let blocker = self.status.verification_blocker.clone();
+
         let framebuffer_id = self.record.framebuffer_ids[self.current];
         let buffer_handle = self.record.buffer_handles[self.current];
         let checksum = status_checksum(&self.buffers[self.current]);
@@ -3326,12 +3577,35 @@ impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
             buffer_pitch: self.record.pitch,
             buffer_handle,
             pattern_checksum: checksum,
-            ok: true,
-            mismatch: None,
+            verification_mode: self.status.verification_mode,
+            capture: self.status.capture.clone(),
+            verification_blocker: blocker.clone(),
+            ok: mismatch.is_none() && blocker.is_none(),
+            mismatch: mismatch.clone(),
         };
         self.status.verification = Some(verification.clone());
         self.status.pattern_checksum = Some(checksum);
-        Ok(verification)
+        if let Some(blocker) = blocker {
+            let error = DrmScanoutError::VerificationUnavailable {
+                card: self.record.card.display().to_string(),
+                mechanism: blocker.mechanism.clone(),
+                reason: blocker.reason.clone(),
+            };
+            self.status.mark_error(&error);
+            return Err(error);
+        }
+        if mismatch.is_none() {
+            return Ok(verification);
+        }
+        let error = DrmScanoutError::VerificationFailed {
+            card: self.record.card.display().to_string(),
+            connector: self.record.connector.clone(),
+            message: mismatch
+                .take()
+                .unwrap_or_else(|| "capture mismatch".to_owned()),
+        };
+        self.status.mark_error(&error);
+        Err(error)
     }
 
     fn teardown(&mut self) -> Result<(), crate::drm_scanout::DrmScanoutError> {
@@ -3339,6 +3613,18 @@ impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
             return Ok(());
         }
         let mut state = self.state.lock().expect("fake scanout lock");
+        if let Some(writeback_id) = self.status.writeback_connector_id {
+            state.events.push(format!("writeback_clear {writeback_id}"));
+            state
+                .events
+                .push(format!("writeback_detach {writeback_id}"));
+            state
+                .events
+                .push(format!("writeback_destroy_framebuffer {writeback_id}"));
+            state
+                .events
+                .push(format!("writeback_destroy_buffer {writeback_id}"));
+        }
         match self.record.commit {
             crate::drm_scanout::DrmScanoutCommit::Atomic => {
                 state.events.push(format!(
@@ -3412,4 +3698,274 @@ impl Drop for FakeDrmScanoutHandle {
 fn parse_mode_size(mode: &str) -> Option<(u32, u32)> {
     let (width, height) = mode.split_once('x')?;
     Some((width.parse().ok()?, height.parse().ok()?))
+}
+
+/// One key event recorded by [`FakeSeatInputInjector`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeInjectedKey {
+    /// XKB keycode.
+    pub keycode: u32,
+    /// Pressed/released.
+    pub state: SeatKeyState,
+}
+
+#[derive(Default)]
+struct FakeSeatInputState {
+    capabilities: BTreeMap<String, SeatInputCapabilities>,
+    fail_connect: BTreeMap<String, SeatInputError>,
+    keys: BTreeMap<String, Vec<FakeInjectedKey>>,
+    text: BTreeMap<String, String>,
+    motions: BTreeMap<String, Vec<(f64, f64)>>,
+    buttons: BTreeMap<String, Vec<(u32, SeatKeyState)>>,
+    connected: BTreeSet<String>,
+    requests: Vec<SeatInputRequest>,
+    disconnects: Vec<String>,
+}
+
+/// Test-only injector that records events by seat and never opens a socket.
+///
+/// It exists so supervisor/tests can prove per-seat dispatch without a
+/// compositor. It is exported from [`crate::fake`] and is never selected by
+/// production detection.
+#[derive(Clone, Default)]
+pub struct FakeSeatInputInjector {
+    state: Arc<Mutex<FakeSeatInputState>>,
+}
+
+impl FakeSeatInputInjector {
+    /// New fake with no special capabilities or failures.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override the capabilities returned for a seat (default keyboard+pointer).
+    pub fn set_capabilities(
+        &self,
+        seat_id: impl Into<String>,
+        capabilities: SeatInputCapabilities,
+    ) {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .capabilities
+            .insert(seat_id.into(), capabilities);
+    }
+
+    /// Make the next connect for a seat fail with a typed error.
+    pub fn fail_connect(&self, seat_id: impl Into<String>, error: SeatInputError) {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .fail_connect
+            .insert(seat_id.into(), error);
+    }
+
+    /// Connect requests in order.
+    pub fn requests(&self) -> Vec<SeatInputRequest> {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .requests
+            .clone()
+    }
+
+    /// Key events for a seat, in order.
+    pub fn keys(&self, seat_id: &str) -> Vec<FakeInjectedKey> {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .keys
+            .get(seat_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Text injected into a seat.
+    pub fn text(&self, seat_id: &str) -> String {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .text
+            .get(seat_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Relative pointer motions for a seat.
+    pub fn motions(&self, seat_id: &str) -> Vec<(f64, f64)> {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .motions
+            .get(seat_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Pointer buttons for a seat.
+    pub fn buttons(&self, seat_id: &str) -> Vec<(u32, SeatKeyState)> {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .buttons
+            .get(seat_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether the fake is connected to a seat.
+    pub fn is_connected(&self, seat_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .connected
+            .contains(seat_id)
+    }
+
+    /// Disconnect calls in order.
+    pub fn disconnects(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .disconnects
+            .clone()
+    }
+}
+
+impl SeatInputInjector for FakeSeatInputInjector {
+    fn connect(
+        &mut self,
+        request: &SeatInputRequest,
+    ) -> Result<SeatInputCapabilities, SeatInputError> {
+        let mut state = self.state.lock().expect("fake seat input lock");
+        if let Some(error) = state.fail_connect.remove(&request.seat_id) {
+            return Err(error);
+        }
+        let capabilities =
+            state
+                .capabilities
+                .get(&request.seat_id)
+                .cloned()
+                .unwrap_or(SeatInputCapabilities {
+                    keyboard: true,
+                    pointer: true,
+                    keyboard_protocol: Some(
+                        crate::seat_input::VIRTUAL_KEYBOARD_PROTOCOL.to_owned(),
+                    ),
+                    pointer_protocol: Some(crate::seat_input::VIRTUAL_POINTER_PROTOCOL.to_owned()),
+                });
+        state.connected.insert(request.seat_id.clone());
+        state.requests.push(request.clone());
+        Ok(capabilities)
+    }
+
+    fn capabilities(&self, seat_id: &str) -> Option<SeatInputCapabilities> {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .capabilities
+            .get(seat_id)
+            .cloned()
+    }
+
+    fn inject_key(
+        &mut self,
+        seat_id: &str,
+        keycode: u32,
+        state: SeatKeyState,
+    ) -> Result<(), SeatInputError> {
+        let mut inner = self.state.lock().expect("fake seat input lock");
+        if !inner.connected.contains(seat_id) {
+            return Err(SeatInputError::NotConnected(seat_id.to_owned()));
+        }
+        inner
+            .keys
+            .entry(seat_id.to_owned())
+            .or_default()
+            .push(FakeInjectedKey { keycode, state });
+        Ok(())
+    }
+
+    fn inject_text(&mut self, seat_id: &str, text: &str) -> Result<usize, SeatInputError> {
+        let mut events = 0;
+        for character in text.chars() {
+            let Some((keycode, shifted)) = ascii_key(character) else {
+                return Err(SeatInputError::UnsupportedKey(character));
+            };
+            if shifted {
+                self.inject_key(seat_id, XKB_KEY_LEFT_SHIFT, SeatKeyState::Pressed)?;
+                events += 1;
+            }
+            self.inject_key(seat_id, keycode, SeatKeyState::Pressed)?;
+            self.inject_key(seat_id, keycode, SeatKeyState::Released)?;
+            events += 2;
+            if shifted {
+                self.inject_key(seat_id, XKB_KEY_LEFT_SHIFT, SeatKeyState::Released)?;
+                events += 1;
+            }
+        }
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .text
+            .entry(seat_id.to_owned())
+            .or_default()
+            .push_str(text);
+        Ok(events)
+    }
+
+    fn pointer_motion(&mut self, seat_id: &str, dx: f64, dy: f64) -> Result<(), SeatInputError> {
+        let mut state = self.state.lock().expect("fake seat input lock");
+        if !state.connected.contains(seat_id) {
+            return Err(SeatInputError::NotConnected(seat_id.to_owned()));
+        }
+        state
+            .motions
+            .entry(seat_id.to_owned())
+            .or_default()
+            .push((dx, dy));
+        Ok(())
+    }
+
+    fn pointer_button(
+        &mut self,
+        seat_id: &str,
+        button: u32,
+        key_state: SeatKeyState,
+    ) -> Result<(), SeatInputError> {
+        let mut state = self.state.lock().expect("fake seat input lock");
+        if !state.connected.contains(seat_id) {
+            return Err(SeatInputError::NotConnected(seat_id.to_owned()));
+        }
+        state
+            .buttons
+            .entry(seat_id.to_owned())
+            .or_default()
+            .push((button, key_state));
+        Ok(())
+    }
+
+    fn disconnect(&mut self, seat_id: &str) {
+        let mut state = self.state.lock().expect("fake seat input lock");
+        state.connected.remove(seat_id);
+        state.disconnects.push(seat_id.to_owned());
+    }
+
+    fn events_sent(&self, seat_id: &str) -> u64 {
+        let state = self.state.lock().expect("fake seat input lock");
+        let keys = state.keys.get(seat_id).map(Vec::len).unwrap_or(0);
+        let motions = state.motions.get(seat_id).map(Vec::len).unwrap_or(0);
+        let buttons = state.buttons.get(seat_id).map(Vec::len).unwrap_or(0);
+        u64::try_from(keys + motions + buttons).unwrap_or(u64::MAX)
+    }
+
+    fn connected_seats(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .connected
+            .iter()
+            .cloned()
+            .collect()
+    }
 }

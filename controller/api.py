@@ -4602,6 +4602,64 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             suffix = f"?limit={max(1, min(limit, 100))}"
         return await _proxy_node_surface(node_id, f"/apps{suffix}")
 
+    async def _node_app_control(
+        node_id: str, pid: int, action: str, body: dict | None
+    ) -> Any:
+        """Proxy one exact-pid app-control action, preserving typed ``apps.*`` errors.
+
+        The node owns all policy (pid 1, its own process tree, kernel threads,
+        other users, start-time revalidation, SIGKILL confirmation). The
+        controller only forwards the pid, action, and caller body; it never
+        resolves a name, enumerates /proc, or invents a result.
+
+        A typed ``apps.*`` 403 (policy/permission/own-process) is a real node
+        answer and must keep its status. Only an untyped 401/403 is treated as a
+        bearer-token failure, so the general surface proxy's auth handling is
+        repeated here with that distinction.
+        """
+        status, payload = await _proxy_node_response(
+            node_id, f"/apps/{pid}/{action}", "POST", body or {}
+        )
+        if status in (401, 403) and not _is_typed_host_surface_error(payload):
+            raise HTTPException(status_code=502, detail=_node_auth_error(status))
+        if status >= 400:
+            if _is_typed_unsupported(payload) or _is_typed_host_surface_error(payload):
+                return JSONResponse(status_code=status, content=payload)
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise HTTPException(
+                status_code=502,
+                detail=detail or f"Node returned HTTP {status}",
+            )
+        return payload
+
+    @app.post("/api/v1/nodes/{node_id}/apps/{pid}/terminate")
+    async def node_app_terminate(
+        node_id: str, pid: int, body: dict | None = None
+    ) -> Any:
+        """Proxy SIGTERM plus the node's bounded SIGKILL escalation."""
+        return await _node_app_control(node_id, pid, "terminate", body)
+
+    @app.post("/api/v1/nodes/{node_id}/apps/{pid}/signal")
+    async def node_app_signal(
+        node_id: str, pid: int, body: dict | None = None
+    ) -> Any:
+        """Proxy one allow-listed signal (TERM/KILL/STOP/CONT)."""
+        return await _node_app_control(node_id, pid, "signal", body)
+
+    @app.post("/api/v1/nodes/{node_id}/apps/{pid}/suspend")
+    async def node_app_suspend(
+        node_id: str, pid: int, body: dict | None = None
+    ) -> Any:
+        """Proxy SIGSTOP for one exact pid."""
+        return await _node_app_control(node_id, pid, "suspend", body)
+
+    @app.post("/api/v1/nodes/{node_id}/apps/{pid}/resume")
+    async def node_app_resume(
+        node_id: str, pid: int, body: dict | None = None
+    ) -> Any:
+        """Proxy SIGCONT for one exact pid."""
+        return await _node_app_control(node_id, pid, "resume", body)
+
     @app.get("/api/v1/nodes/{node_id}/self")
     async def node_self(node_id: str) -> Any:
         """Proxy a node process's bounded self-management report."""

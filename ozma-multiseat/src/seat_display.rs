@@ -82,8 +82,18 @@ pub enum SeatDisplayBackend {
     /// `WAYLAND_DISPLAY` socket. It renders to memory: no DRM device, GPU
     /// mode-setting, physical output, or existing X/Wayland session is used.
     /// The headless backend has no libinput seat, so physical input isolation
-    /// is never claimed for this backend.
+    /// is never claimed for this backend. Weston does not implement the wlroots
+    /// virtual-pointer protocol, so synthetic pointer injection is unavailable.
     Weston,
+    /// One private headless `sway` (wlroots) compositor per seat.
+    ///
+    /// Like [`Self::Weston`] it uses the headless backend, the pixman software
+    /// renderer, a throwaway runtime directory, and a private socket. It
+    /// additionally exposes `zwp_virtual_keyboard_manager_v1` and
+    /// `zwlr_virtual_pointer_manager_v1`, which the opt-in
+    /// `--seat-input wayland` injector binds. No DRM, GPU, physical output, or
+    /// operator session is touched.
+    Sway,
 }
 
 impl SeatDisplayBackend {
@@ -95,6 +105,7 @@ impl SeatDisplayBackend {
             Self::Xephyr => "xephyr",
             Self::Xorg => "xorg",
             Self::Weston => "weston",
+            Self::Sway => "sway",
         }
     }
 
@@ -105,7 +116,7 @@ impl SeatDisplayBackend {
 
     /// Whether this backend exposes a Wayland socket instead of an X display.
     pub fn is_wayland(self) -> bool {
-        matches!(self, Self::Weston)
+        matches!(self, Self::Weston | Self::Sway)
     }
 }
 
@@ -125,9 +136,10 @@ impl FromStr for SeatDisplayBackend {
             "xephyr" => Ok(Self::Xephyr),
             "xorg" => Ok(Self::Xorg),
             "weston" | "wayland" => Ok(Self::Weston),
+            "sway" | "wlroots" => Ok(Self::Sway),
             other => Err(MultiseatError::SeatDisplay(format!(
-                "unknown seat display backend {other:?}; expected shared, xvfb, xephyr, xorg, or \
-                 weston"
+                "unknown seat display backend {other:?}; expected shared, xvfb, xephyr, xorg, \
+                 weston, or sway"
             ))),
         }
     }
@@ -214,6 +226,9 @@ pub enum SeatDisplayNoteKind {
     /// Input targeting was requested for a private display but no targeter or
     /// targeting policy was configured.
     InputTargetingUnavailable,
+    /// The compositor does not expose the virtual keyboard/pointer protocols,
+    /// or no injector was configured. Synthetic input is never claimed.
+    InputInjectionUnavailable,
     /// `xauth` was unavailable, so the server used `-ac` on its Unix socket.
     AuthDisabled,
 }
@@ -226,6 +241,7 @@ impl SeatDisplayNoteKind {
             Self::XinputRoutingUnsupported => "xinput_routing_unsupported",
             Self::InputTargetingFailed => "input_targeting_failed",
             Self::InputTargetingUnavailable => "input_targeting_unavailable",
+            Self::InputInjectionUnavailable => "input_injection_unavailable",
             Self::AuthDisabled => "auth_disabled",
         }
     }
@@ -486,6 +502,8 @@ pub struct SeatDisplayPrograms {
     pub xorg: PathBuf,
     /// `weston` binary name or path for the headless Wayland backend.
     pub weston: PathBuf,
+    /// `sway` binary name or path for the headless wlroots backend.
+    pub sway: PathBuf,
     /// `xauth` binary name or path.
     pub xauth: PathBuf,
 }
@@ -497,6 +515,7 @@ impl Default for SeatDisplayPrograms {
             xephyr: PathBuf::from("Xephyr"),
             xorg: PathBuf::from("Xorg"),
             weston: PathBuf::from("weston"),
+            sway: PathBuf::from("sway"),
             xauth: PathBuf::from("xauth"),
         }
     }
@@ -598,6 +617,15 @@ pub fn display_name(number: u32) -> String {
 /// collide with the operator's compositor even if it uses the same socket name.
 pub fn wayland_display_name(number: u32) -> String {
     format!("ozma-weston-{number}")
+}
+
+/// Unique `WAYLAND_DISPLAY` name for a sway seat.
+///
+/// Sway creates its own `wayland-N` socket inside the private runtime directory
+/// and ignores an inherited name. The launcher creates an `ozma-sway-N` symlink
+/// to that socket so the seat still has a stable, private display name.
+pub fn sway_display_name(number: u32) -> String {
+    format!("ozma-sway-{number}")
 }
 
 /// Environment that points a seat child at a private Wayland compositor.
@@ -762,8 +790,9 @@ impl ProcessSeatDisplayLauncher {
         };
 
         let wayland = SeatWaylandEnv::new(display, runtime);
-        Ok(Box::new(WestonDisplayHandle {
+        Ok(Box::new(WaylandDisplayHandle {
             child,
+            backend: SeatDisplayBackend::Weston,
             number,
             wayland,
             dir,
@@ -771,6 +800,147 @@ impl ProcessSeatDisplayLauncher {
             terminated: false,
             released: false,
         }))
+    }
+
+    #[cfg(unix)]
+    fn spawn_sway(
+        &self,
+        request: &SeatDisplayRequest,
+    ) -> Result<Box<dyn SeatDisplayHandle>, MultiseatError> {
+        let program = match resolve_program(&self.programs.sway) {
+            Some(program) => program,
+            None => {
+                return Err(MultiseatError::SeatDisplayTool {
+                    backend: "sway".to_owned(),
+                    program: self.programs.sway.display().to_string(),
+                    reason: "not found on PATH or not executable".to_owned(),
+                })
+            }
+        };
+
+        let number = self
+            .allocator
+            .lock()
+            .expect("display allocator lock")
+            .allocate()?;
+        let display = sway_display_name(number);
+
+        let sequence = AUTH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ozma-seat-sway-{}-{sequence}", std::process::id()));
+        let runtime = dir.join("runtime");
+        let setup = fs::create_dir_all(&runtime)
+            .map_err(|error| {
+                MultiseatError::SeatDisplay(format!(
+                    "creating sway runtime directory {}: {error}",
+                    runtime.display()
+                ))
+            })
+            .and_then(|()| {
+                restrict_directory(&dir);
+                restrict_directory(&runtime);
+                let config = dir.join("sway.conf");
+                fs::write(&config, sway_config(request.size)).map_err(|error| {
+                    MultiseatError::SeatDisplay(format!(
+                        "writing sway config {}: {error}",
+                        config.display()
+                    ))
+                })?;
+                Ok(config)
+            });
+        let config = match setup {
+            Ok(config) => config,
+            Err(error) => {
+                release_number(&self.allocator, number);
+                let _ = fs::remove_dir_all(&dir);
+                return Err(error);
+            }
+        };
+
+        let args = sway_server_args(&config);
+        let mut command = Command::new(&program);
+        command
+            .args(&args)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("WLR_BACKENDS", "headless")
+            .env("WLR_RENDERER", "pixman")
+            .env("WLR_LIBINPUT_NO_DEVICES", "1")
+            .env("WLR_NO_HARDWARE_CURSORS", "1")
+            .env("WLR_HEADLESS_OUTPUTS", "1")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("DISPLAY")
+            .env_remove("XAUTHORITY")
+            .env_remove("SWAYSOCK")
+            .env_remove("I3SOCK")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                release_number(&self.allocator, number);
+                let _ = fs::remove_dir_all(&dir);
+                return Err(map_spawn_error(
+                    SeatDisplayBackend::Sway,
+                    &program,
+                    &display,
+                    error,
+                ));
+            }
+        };
+
+        // Sway creates its own `wayland-N` socket; it ignores an inherited
+        // WAYLAND_DISPLAY. Wait for it, then expose the stable per-seat name as
+        // a symlink inside the same private runtime directory.
+        let socket = match wait_for_sway_socket(&runtime, &display, self.options.ready_timeout) {
+            Ok(socket) => socket,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                release_number(&self.allocator, number);
+                let _ = fs::remove_dir_all(&dir);
+                return Err(error);
+            }
+        };
+        let symlink = runtime.join(&display);
+        let link_name = socket
+            .file_name()
+            .map(std::ffi::OsString::from)
+            .unwrap_or_else(|| std::ffi::OsString::from("wayland-1"));
+        if let Err(error) = std::os::unix::fs::symlink(&link_name, &symlink) {
+            let _ = child.kill();
+            let _ = child.wait();
+            release_number(&self.allocator, number);
+            let _ = fs::remove_dir_all(&dir);
+            return Err(MultiseatError::SeatDisplay(format!(
+                "creating private sway socket link {} -> {}: {error}",
+                symlink.display(),
+                link_name.to_string_lossy()
+            )));
+        }
+
+        let wayland = SeatWaylandEnv::new(display, runtime);
+        Ok(Box::new(WaylandDisplayHandle {
+            child,
+            backend: SeatDisplayBackend::Sway,
+            number,
+            wayland,
+            dir,
+            allocator: Arc::clone(&self.allocator),
+            terminated: false,
+            released: false,
+        }))
+    }
+
+    #[cfg(not(unix))]
+    fn spawn_sway(
+        &self,
+        _request: &SeatDisplayRequest,
+    ) -> Result<Box<dyn SeatDisplayHandle>, MultiseatError> {
+        Err(MultiseatError::Unsupported(
+            "the sway backend requires a Unix host".to_owned(),
+        ))
     }
 }
 
@@ -782,6 +952,9 @@ impl SeatDisplayLauncher for ProcessSeatDisplayLauncher {
         if request.backend == SeatDisplayBackend::Weston {
             return self.spawn_weston(request);
         }
+        if request.backend == SeatDisplayBackend::Sway {
+            return self.spawn_sway(request);
+        }
         let (program, backend_name) = match request.backend {
             SeatDisplayBackend::Shared => {
                 return Err(MultiseatError::Unsupported(
@@ -791,7 +964,9 @@ impl SeatDisplayLauncher for ProcessSeatDisplayLauncher {
             SeatDisplayBackend::Xvfb => (self.programs.xvfb.clone(), "xvfb"),
             SeatDisplayBackend::Xephyr => (self.programs.xephyr.clone(), "xephyr"),
             SeatDisplayBackend::Xorg => (self.programs.xorg.clone(), "xorg"),
-            SeatDisplayBackend::Weston => unreachable!("Wayland handled above"),
+            SeatDisplayBackend::Weston | SeatDisplayBackend::Sway => {
+                unreachable!("Wayland handled above")
+            }
         };
 
         let program = match resolve_program(&program) {
@@ -1059,8 +1234,9 @@ fn release_number(allocator: &Arc<Mutex<DisplayNumberAllocator>>, number: u32) {
         .release(number);
 }
 
-struct WestonDisplayHandle {
+struct WaylandDisplayHandle {
     child: Child,
+    backend: SeatDisplayBackend,
     number: u32,
     wayland: SeatWaylandEnv,
     dir: PathBuf,
@@ -1069,9 +1245,9 @@ struct WestonDisplayHandle {
     released: bool,
 }
 
-impl SeatDisplayHandle for WestonDisplayHandle {
+impl SeatDisplayHandle for WaylandDisplayHandle {
     fn backend(&self) -> SeatDisplayBackend {
-        SeatDisplayBackend::Weston
+        self.backend
     }
 
     fn display(&self) -> &str {
@@ -1118,7 +1294,10 @@ impl SeatDisplayHandle for WestonDisplayHandle {
                 .child
                 .try_wait()
                 .map_err(|error| {
-                    MultiseatError::SeatDisplay(format!("polling Weston compositor: {error}"))
+                    MultiseatError::SeatDisplay(format!(
+                        "polling {} compositor: {error}",
+                        self.backend
+                    ))
                 })?
                 .is_none()
             {
@@ -1136,7 +1315,8 @@ impl SeatDisplayHandle for WestonDisplayHandle {
                             Ok(None) => {}
                             Err(error) => {
                                 return Err(MultiseatError::SeatDisplay(format!(
-                                    "polling Weston compositor for shutdown: {error}"
+                                    "polling {} compositor for shutdown: {error}",
+                                    self.backend
                                 )))
                             }
                         }
@@ -1150,15 +1330,24 @@ impl SeatDisplayHandle for WestonDisplayHandle {
                     .child
                     .try_wait()
                     .map_err(|error| {
-                        MultiseatError::SeatDisplay(format!("polling Weston compositor: {error}"))
+                        MultiseatError::SeatDisplay(format!(
+                            "polling {} compositor: {error}",
+                            self.backend
+                        ))
                     })?
                     .is_none()
                 {
                     self.child.kill().map_err(|error| {
-                        MultiseatError::SeatDisplay(format!("killing Weston compositor: {error}"))
+                        MultiseatError::SeatDisplay(format!(
+                            "killing {} compositor: {error}",
+                            self.backend
+                        ))
                     })?;
                     self.child.wait().map_err(|error| {
-                        MultiseatError::SeatDisplay(format!("reaping Weston compositor: {error}"))
+                        MultiseatError::SeatDisplay(format!(
+                            "reaping {} compositor: {error}",
+                            self.backend
+                        ))
                     })?;
                 }
             }
@@ -1168,7 +1357,7 @@ impl SeatDisplayHandle for WestonDisplayHandle {
     }
 }
 
-impl WestonDisplayHandle {
+impl WaylandDisplayHandle {
     fn release_resources(&mut self) {
         if !self.released {
             self.released = true;
@@ -1180,7 +1369,7 @@ impl WestonDisplayHandle {
     }
 }
 
-impl Drop for WestonDisplayHandle {
+impl Drop for WaylandDisplayHandle {
     fn drop(&mut self) {
         let _ = self.terminate();
     }
@@ -1219,6 +1408,69 @@ pub fn weston_server_args(display: &str, size: SeatDisplaySize, config: &Path) -
         format!("--width={}", size.width),
         format!("--height={}", size.height),
     ]
+}
+
+/// Generate the per-seat minimal `sway` config.
+///
+/// There is no bar, background process, or `exec`; the config is a single
+/// headless output with no borders and Xwayland disabled.
+pub fn sway_config(size: SeatDisplaySize) -> String {
+    format!(
+        "# Generated by ozma-multiseat for a throwaway {}x{} headless seat.\n\
+         output * resolution {}x{}\n\
+         default_border none\n\
+         xwayland disable\n",
+        size.width, size.height, size.width, size.height
+    )
+}
+
+/// Build the argv for a per-seat headless sway compositor.
+///
+/// The backend renderer and input policy come from the environment
+/// (`WLR_BACKENDS=headless`, `WLR_RENDERER=pixman`,
+/// `WLR_LIBINPUT_NO_DEVICES=1`), so a seat never probes DRM or the host's
+/// existing session.
+pub fn sway_server_args(config: &Path) -> Vec<String> {
+    vec!["--config".to_owned(), config.display().to_string()]
+}
+
+/// Wait for sway to create its Wayland socket inside the private runtime dir.
+#[cfg(unix)]
+fn wait_for_sway_socket(
+    runtime: &Path,
+    display: &str,
+    timeout: Duration,
+) -> Result<PathBuf, MultiseatError> {
+    use std::os::unix::fs::FileTypeExt;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(entries) = fs::read_dir(runtime) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("wayland-") || name.ends_with(".lock") {
+                    continue;
+                }
+                let path = entry.path();
+                if entry
+                    .file_type()
+                    .map(|kind| kind.is_socket())
+                    .unwrap_or(false)
+                {
+                    return Ok(path);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(MultiseatError::SeatDisplayStartupTimeout {
+                display: display.to_owned(),
+                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                detail: "sway did not create a Wayland socket in the private runtime directory"
+                    .to_owned(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 struct Xauthority {
@@ -1832,6 +2084,62 @@ mod tests {
             PathBuf::from("/tmp/ozma-seat-weston-1/runtime/ozma-weston-90")
         );
         assert_eq!(wayland_display_name(90), "ozma-weston-90");
+    }
+
+    #[test]
+    fn steerable_backends_report_their_wayland_names() {
+        assert_eq!(SeatDisplayBackend::Sway.as_str(), "sway");
+        assert_eq!(
+            "sway".parse::<SeatDisplayBackend>().expect("parse sway"),
+            SeatDisplayBackend::Sway
+        );
+        assert_eq!(
+            "wlroots"
+                .parse::<SeatDisplayBackend>()
+                .expect("parse wlroots alias"),
+            SeatDisplayBackend::Sway
+        );
+        assert!(SeatDisplayBackend::Sway.is_nested());
+        assert!(SeatDisplayBackend::Sway.is_wayland());
+        assert!(!SeatDisplayBackend::Xvfb.is_wayland());
+        assert_eq!(sway_display_name(90), "ozma-sway-90");
+    }
+
+    #[test]
+    fn sway_args_and_config_are_headless_and_disable_xwayland() {
+        let args = sway_server_args(Path::new("/tmp/ozma-seat-sway-1/sway.conf"));
+        assert_eq!(args, vec!["--config", "/tmp/ozma-seat-sway-1/sway.conf"]);
+        assert!(!args.iter().any(|arg| arg.contains("drm")));
+        let config = sway_config(size());
+        assert!(config.contains("output * resolution 1280x800"));
+        assert!(config.contains("default_border none"));
+        assert!(config.contains("xwayland disable"));
+    }
+
+    #[test]
+    fn missing_sway_binary_is_a_typed_missing_binary_error() {
+        let options = SeatDisplayOptions {
+            backend: SeatDisplayBackend::Sway,
+            ..SeatDisplayOptions::default()
+        };
+        let programs = SeatDisplayPrograms {
+            sway: PathBuf::from("/nonexistent/ozma-sway"),
+            ..SeatDisplayPrograms::default()
+        };
+        let launcher = ProcessSeatDisplayLauncher::new(options).with_programs(programs);
+        let request = SeatDisplayRequest {
+            seat_id: "seat-a".to_owned(),
+            backend: SeatDisplayBackend::Sway,
+            size: size(),
+            parent_display: None,
+        };
+        let error = match launcher.spawn(&request) {
+            Ok(_) => panic!("spawning without sway must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, MultiseatError::SeatDisplayTool { .. }));
+        assert_eq!(display_error_kind(&error), "missing_binary");
+        assert!(launcher.in_use().is_empty());
     }
 
     #[test]

@@ -76,6 +76,7 @@ fn vkms_lease_create_validate_duplicate_revoke() {
         connector: connector.name.clone(),
         crtc: DrmCrtcSelector::Auto,
         plane: Default::default(),
+        writeback_connector: None,
     };
 
     let mut lease = backend.acquire(&request).unwrap_or_else(|error| {

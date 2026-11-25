@@ -8,10 +8,12 @@ use std::path::PathBuf;
 
 use ozma_multiseat::{
     apply_frame_damage, ensure_scanout_card, fill_pattern, frame_buffer_count, frame_damage_rect,
-    pattern_checksum, DrmCard, DrmCardSelector, DrmCrtcSelector, DrmLeaseRequest,
-    DrmScanoutBackend, DrmScanoutCommit, DrmScanoutError, DrmScanoutNoteKind, DrmScanoutRequest,
-    DrmScanoutStatus, FakeDrmScanoutBackend, FakeDrmScanoutFailure, FakeDrmScanoutFlipFailure,
-    SCANOUT_MAX_FRAMES, SCANOUT_PATTERN,
+    pattern_checksum, visible_rgb_checksum, DrmCard, DrmCardSelector, DrmCrtcSelector,
+    DrmLeaseRequest, DrmScanoutBackend, DrmScanoutCommit, DrmScanoutError, DrmScanoutNoteKind,
+    DrmScanoutRequest, DrmScanoutStatus, DrmScanoutVerifyMode, FakeDrmScanoutBackend,
+    FakeDrmScanoutCaptureFailure, FakeDrmScanoutFailure, FakeDrmScanoutFlipFailure,
+    SCANOUT_MAX_FRAMES, SCANOUT_MAX_WRITEBACK_RETRIES, SCANOUT_PATTERN,
+    SCANOUT_WRITEBACK_TIMEOUT_MS,
 };
 
 fn request() -> DrmScanoutRequest {
@@ -646,4 +648,329 @@ fn frame_loop_status_serializes_accounting_fields() {
             "missing {expected} in {encoded}"
         );
     }
+}
+
+fn writeback_request() -> DrmScanoutRequest {
+    request().with_verify(DrmScanoutVerifyMode::Writeback)
+}
+
+#[test]
+fn writeback_verification_captures_every_frame_with_matching_checksums() {
+    let backend = FakeDrmScanoutBackend::new();
+    let request = writeback_request().with_frames(4);
+    let mut handle = backend.start(&request).expect("writeback start");
+    let status = handle.status().clone();
+    assert_eq!(status.verification_mode, DrmScanoutVerifyMode::Writeback);
+    assert_eq!(status.writeback_connector_id, Some(401));
+    assert!(status.capture.is_some());
+    assert!(status.verification_blocker.is_none());
+    assert!(status
+        .notes
+        .iter()
+        .any(|note| note.kind == DrmScanoutNoteKind::WritebackCapture));
+
+    let stats = handle
+        .run_frames(request.frame_plan())
+        .expect("frame loop with capture");
+    assert_eq!(stats.completed, 4);
+    let capture = handle.status().capture.clone().expect("capture accounting");
+    assert_eq!(capture.captured_frames, 4);
+    assert_eq!(capture.mismatches, 0);
+    assert_eq!(capture.timeouts, 0);
+    assert_eq!(capture.checksums, capture.expected_checksums);
+    assert_eq!(capture.checksums.len(), 4);
+
+    let verification = handle.verify().expect("verify captured frames");
+    assert!(verification.ok);
+    assert_eq!(
+        verification.verification_mode,
+        DrmScanoutVerifyMode::Writeback
+    );
+    let capture = verification.capture.expect("verification capture");
+    assert_eq!(capture.captured_frames, 5);
+    assert_eq!(capture.mismatches, 0);
+
+    handle.teardown().expect("teardown");
+    let events = backend.events();
+    let joined = events.join("\n");
+    assert!(joined.contains("writeback_configure 401"), "{joined}");
+    assert!(joined.contains("writeback_capture "), "{joined}");
+    assert!(joined.contains("writeback_clear 401"), "{joined}");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("writeback_destroy_framebuffer ")),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("writeback_destroy_buffer ")),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn writeback_mismatch_is_counted_and_verify_fails() {
+    let backend = FakeDrmScanoutBackend::new();
+    let request = writeback_request().with_frames(3);
+    let mut handle = backend.start(&request).expect("writeback start");
+    backend.fail_capture_at(1, FakeDrmScanoutCaptureFailure::Mismatch);
+
+    handle
+        .run_frames(request.frame_plan())
+        .expect("frame loop continues after a checksum mismatch");
+    let capture = handle.status().capture.clone().expect("capture accounting");
+    assert_eq!(capture.captured_frames, 3);
+    assert_eq!(capture.mismatches, 1);
+    assert!(capture.last_mismatch.is_some());
+    assert_ne!(capture.checksums, capture.expected_checksums);
+
+    let error = handle.verify().expect_err("verify must fail on mismatch");
+    assert!(matches!(error, DrmScanoutError::VerificationFailed { .. }));
+    assert_eq!(error.code(), "verification_failed");
+    assert_eq!(
+        handle
+            .status()
+            .error
+            .as_ref()
+            .map(|error| error.kind.as_str()),
+        Some("verification_failed")
+    );
+    handle.teardown().expect("teardown after mismatch");
+}
+
+#[test]
+fn writeback_timeout_is_typed_and_counted() {
+    let backend = FakeDrmScanoutBackend::new();
+    let request = writeback_request().with_frames(3);
+    let mut handle = backend.start(&request).expect("writeback start");
+    backend.fail_capture_at(0, FakeDrmScanoutCaptureFailure::Timeout);
+
+    let error = handle
+        .run_frames(request.frame_plan())
+        .expect_err("capture timeout");
+    assert!(matches!(error, DrmScanoutError::WritebackTimeout { .. }));
+    assert_eq!(error.code(), "writeback_timeout");
+    let capture = handle.status().capture.clone().expect("capture accounting");
+    assert_eq!(capture.captured_frames, 0);
+    assert_eq!(capture.timeouts, 1);
+    handle.teardown().expect("teardown after timeout");
+}
+
+#[test]
+fn writeback_commit_failure_is_typed() {
+    let backend = FakeDrmScanoutBackend::new();
+    let request = writeback_request();
+    let mut handle = backend.start(&request).expect("writeback start");
+    backend.fail_next_capture(FakeDrmScanoutCaptureFailure::CommitFailed);
+    let error = handle.verify().expect_err("capture commit failure");
+    assert!(matches!(error, DrmScanoutError::WritebackFailed { .. }));
+    assert_eq!(error.code(), "writeback_failed");
+    handle.teardown().expect("teardown");
+}
+
+#[test]
+fn unavailable_writeback_records_typed_blocker_and_claims_no_capture() {
+    let mut backend = FakeDrmScanoutBackend::new();
+    backend.without_writeback("card9");
+    let mut handle = backend
+        .start(&writeback_request())
+        .expect("scanout still starts");
+    let status = handle.status().clone();
+    assert_eq!(status.verification_mode, DrmScanoutVerifyMode::Writeback);
+    assert!(status.capture.is_none());
+    let blocker = status.verification_blocker.expect("typed blocker");
+    assert_eq!(blocker.kind, "kms-verification-unavailable");
+    assert_eq!(blocker.mechanism, "writeback");
+    assert!(!blocker.kernel_evidence.is_empty());
+
+    let error = handle.verify().expect_err("verify reports blocker");
+    assert!(matches!(
+        error,
+        DrmScanoutError::VerificationUnavailable { .. }
+    ));
+    assert_eq!(error.code(), "kms-verification-unavailable");
+    assert_eq!(
+        handle
+            .status()
+            .error
+            .as_ref()
+            .map(|error| error.kind.as_str()),
+        Some("kms-verification-unavailable")
+    );
+    handle.teardown().expect("teardown");
+}
+
+#[test]
+fn crc_mode_records_precise_typed_blocker_without_fake_capture() {
+    let backend = FakeDrmScanoutBackend::new();
+    let mut handle = backend
+        .start(&request().with_verify(DrmScanoutVerifyMode::Crc))
+        .expect("scanout still starts");
+    let status = handle.status().clone();
+    assert_eq!(status.verification_mode, DrmScanoutVerifyMode::Crc);
+    assert!(status.capture.is_none(), "no capture is invented");
+    let blocker = status.verification_blocker.expect("crc blocker");
+    assert_eq!(blocker.kind, "kms-verification-unavailable");
+    assert_eq!(blocker.mechanism, "crc");
+    assert!(blocker
+        .kernel_evidence
+        .iter()
+        .any(|line| line.contains("CRC")));
+
+    let error = handle.verify().expect_err("crc verify is unavailable");
+    assert_eq!(error.code(), "kms-verification-unavailable");
+    handle.teardown().expect("teardown");
+}
+
+#[test]
+fn writeback_with_forced_legacy_records_blocker() {
+    let backend = FakeDrmScanoutBackend::new();
+    let mut handle = backend
+        .start(&writeback_request().with_legacy_commit())
+        .expect("legacy scanout still starts");
+    assert_eq!(handle.status().commit, DrmScanoutCommit::Legacy);
+    assert!(handle.status().capture.is_none());
+    assert_eq!(
+        handle
+            .status()
+            .verification_blocker
+            .as_ref()
+            .map(|blocker| blocker.mechanism.as_str()),
+        Some("writeback")
+    );
+    let error = handle.verify().expect_err("blocker");
+    assert_eq!(error.code(), "kms-verification-unavailable");
+    handle.teardown().expect("teardown");
+}
+
+#[test]
+fn writeback_teardown_clears_capture_before_scanout() {
+    let backend = FakeDrmScanoutBackend::new();
+    let mut handle = backend
+        .start(&writeback_request())
+        .expect("writeback start");
+    handle.verify().expect("capture once");
+    handle.teardown().expect("teardown");
+    let events = backend.events();
+    let clear = events
+        .iter()
+        .position(|event| event == "writeback_clear 401")
+        .expect("writeback clear");
+    let detach = events
+        .iter()
+        .position(|event| event == "writeback_detach 401")
+        .expect("writeback detach");
+    let destroy_fb = events
+        .iter()
+        .position(|event| event == "writeback_destroy_framebuffer 401")
+        .expect("capture framebuffer destroy");
+    let destroy_buffer = events
+        .iter()
+        .position(|event| event == "writeback_destroy_buffer 401")
+        .expect("capture buffer destroy");
+    let scanout_disable = events
+        .iter()
+        .position(|event| event.starts_with("atomic_disable "))
+        .expect("scanout disable");
+    assert!(clear < detach, "{events:?}");
+    assert!(detach < destroy_fb, "{events:?}");
+    assert!(destroy_fb < destroy_buffer, "{events:?}");
+    assert!(destroy_buffer < scanout_disable, "{events:?}");
+}
+
+#[test]
+fn writeback_verification_request_bounds_are_typed() {
+    let request = writeback_request();
+    assert_eq!(request.verify, DrmScanoutVerifyMode::Writeback);
+    assert_eq!(request.writeback_timeout_ms, SCANOUT_WRITEBACK_TIMEOUT_MS);
+    assert!(request.validate().is_ok());
+    assert_eq!(
+        "writeback".parse::<DrmScanoutVerifyMode>().unwrap(),
+        DrmScanoutVerifyMode::Writeback
+    );
+    assert_eq!(
+        "crc".parse::<DrmScanoutVerifyMode>().unwrap(),
+        DrmScanoutVerifyMode::Crc
+    );
+    assert!("bogus".parse::<DrmScanoutVerifyMode>().is_err());
+
+    let zero = request.clone().with_writeback_timeout_ms(0);
+    assert!(matches!(
+        zero.validate(),
+        Err(DrmScanoutError::InvalidRequest(_, _))
+    ));
+    let too_many_retries = request
+        .clone()
+        .with_writeback_retries(SCANOUT_MAX_WRITEBACK_RETRIES + 1);
+    assert!(matches!(
+        too_many_retries.validate(),
+        Err(DrmScanoutError::InvalidRequest(_, _))
+    ));
+}
+
+#[test]
+fn writeback_status_serializes_capture_evidence() {
+    let backend = FakeDrmScanoutBackend::new();
+    let request = writeback_request().with_frames(3);
+    let mut handle = backend.start(&request).expect("start");
+    handle.run_frames(request.frame_plan()).expect("frame loop");
+    handle.verify().expect("verify");
+    handle.teardown().expect("teardown");
+    let encoded = serde_json::to_string(handle.status()).expect("serialize");
+    for expected in [
+        "\"verification_mode\":\"writeback\"",
+        "\"writeback_connector_id\":401",
+        "\"captured_frames\":4",
+        "\"mismatches\":0",
+        "\"timeouts\":0",
+        "\"checksums\"",
+        "\"expected_checksums\"",
+        "\"kind\":\"writeback_capture\"",
+    ] {
+        assert!(
+            encoded.contains(expected),
+            "missing {expected} in {encoded}"
+        );
+    }
+}
+
+#[test]
+fn visible_checksum_masks_alpha_and_ignores_pitch_padding() {
+    let width = 16;
+    let height = 4;
+    let pitch = 80;
+    let mut bytes = vec![0u8; (pitch * height) as usize];
+    fill_pattern(&mut bytes, width, height, pitch);
+    let baseline = visible_rgb_checksum(&bytes, width, height, pitch);
+
+    let mut alpha_set = bytes.clone();
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let offset = y * pitch as usize + x * 4 + 3;
+            alpha_set[offset] = 0xff;
+        }
+    }
+    assert_eq!(
+        baseline,
+        visible_rgb_checksum(&alpha_set, width, height, pitch)
+    );
+
+    let mut padded = bytes.clone();
+    for y in 0..height as usize {
+        let start = y * pitch as usize + width as usize * 4;
+        padded[start..start + 4].fill(0x5a);
+    }
+    assert_eq!(
+        baseline,
+        visible_rgb_checksum(&padded, width, height, pitch)
+    );
+
+    let mut changed = bytes;
+    changed[0] ^= 0xff;
+    assert_ne!(
+        baseline,
+        visible_rgb_checksum(&changed, width, height, pitch)
+    );
 }

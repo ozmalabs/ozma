@@ -9,6 +9,7 @@ pub mod aida64;
 // compiled and tested on every platform.
 pub mod aida64_windows;
 pub mod api;
+pub mod app_control;
 pub mod audio_runtime;
 pub mod backend;
 pub mod backup;

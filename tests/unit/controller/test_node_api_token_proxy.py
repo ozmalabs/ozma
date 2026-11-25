@@ -194,6 +194,30 @@ PROXY_CASES = [
         "/storage/smart",
     ),
     ("get", f"/api/v1/nodes/{NODE_ID}/apps", None, "/apps"),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/apps/4242/terminate",
+        {"start_time": 12345},
+        "/apps/4242/terminate",
+    ),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/apps/4242/signal",
+        {"signal": "TERM", "start_time": 12345},
+        "/apps/4242/signal",
+    ),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/apps/4242/suspend",
+        {"start_time": 12345},
+        "/apps/4242/suspend",
+    ),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/apps/4242/resume",
+        {"start_time": 12345},
+        "/apps/4242/resume",
+    ),
     ("get", f"/api/v1/nodes/{NODE_ID}/self", None, "/self"),
     ("get", f"/api/v1/nodes/{NODE_ID}/bluetooth/status", None, "/bluetooth/status"),
     (
@@ -271,6 +295,52 @@ def test_apps_proxy_forwards_limit_to_the_node(fake_node, tmp_path):
 
     client.get(f"/api/v1/nodes/{NODE_ID}/apps?limit=1000")
     assert fake_node.requests[-1]["path"].startswith("/apps?limit=100")
+
+
+def test_app_control_proxies_forward_exact_pid_body_and_typed_errors(fake_node, tmp_path):
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+    client = _client(app)
+
+    response = client.post(
+        f"/api/v1/nodes/{NODE_ID}/apps/4242/terminate",
+        json={"start_time": 12345, "confirm": False},
+    )
+    assert response.status_code == 200, response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "POST"
+    assert record["path"].startswith("/apps/4242/terminate")
+    assert record["body"] == {"start_time": 12345, "confirm": False}
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+    signal_body = {"signal": "KILL", "start_time": 12345, "confirm": True}
+    response = client.post(
+        f"/api/v1/nodes/{NODE_ID}/apps/4242/signal", json=signal_body
+    )
+    assert response.status_code == 200, response.text
+    record = fake_node.requests[-1]
+    assert record["path"].startswith("/apps/4242/signal")
+    assert record["body"] == signal_body
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+    typed = {
+        "ok": False,
+        "available": False,
+        "code": "apps.own-process",
+        "error": "pid 4242 belongs to the ozma-node process tree and is never signalled",
+    }
+    fake_node.responder = lambda _method, _record: (
+        403,
+        typed,
+        "application/json",
+    )
+    response = client.post(
+        f"/api/v1/nodes/{NODE_ID}/apps/4242/signal", json=signal_body
+    )
+    assert response.status_code == 403, response.text
+    assert response.json() == typed
+    record = fake_node.requests[-1]
+    assert record["path"].startswith("/apps/4242/signal")
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
 
 
 def _typed_unsupported(capability: str, surface: str) -> dict:

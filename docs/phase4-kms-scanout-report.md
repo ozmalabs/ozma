@@ -1,10 +1,12 @@
 # Phase 4 — KMS scanout proof report
 
 Date: 2026-11-26
-Scope: `ozma-multiseat` only (DRM lease plane extension, atomic KMS scanout,
-bounded frame-flip loop, tests, and this report). No commit was made;
+Scope: `ozma-multiseat` only (DRM lease plane/writeback extension, atomic KMS
+scanout, bounded frame-flip loop, writeback pixel capture, CRC blocker, tests,
+and this report). No commit was made;
 `docs/parity-matrix.md` and `docs/plan-execution-status.md` were not touched.
-`ozma-node`, `ozma-usb`, `ozma-mesh`, and controller Python were not modified.
+This task did not modify `ozma-node`, `ozma-usb`, `ozma-mesh`, or controller
+Python; unrelated working-tree edits from another session may be present.
 
 ## Problem
 
@@ -23,6 +25,10 @@ actually needs:
 3. **No frame loop.** The proof committed one static frame and never consumed
    a page-flip completion event. It could not show buffer rotation, repeated
    flips, damage-style updates, or flip accounting.
+4. **No pixel capture.** Verification re-read KMS object state and re-checksummed
+   the CPU mapping, but it never proved that the CRTC actually emitted the
+   expected pixels. It had no writeback job, no CRC comparison, and no typed
+   blocker for a kernel that supports neither.
 
 This phase extends the same opt-in proof:
 
@@ -35,7 +41,11 @@ This phase extends the same opt-in proof:
   `commit: "atomic" | "legacy"`;
 - `--seat-drm-scanout-frames 2..=300` runs a bounded frame loop over two or
   three rotating dumb buffers, draws a deterministic moving damage rectangle,
-  and waits for each flip completion with a bounded timeout.
+  and waits for each flip completion with a bounded timeout;
+- `--seat-drm-verify writeback` leases a compatible writeback connector on the
+  same CRTC, captures each frame into an XRGB8888 buffer, and compares
+  visible-RGB checksums; `crc` records a precise typed blocker where the safe
+  DRM API cannot issue CRC ioctls.
 
 It is still deliberately **not** a compositor, window manager, client renderer,
 or host display isolation mechanism. `DrmScanoutStatus` always carries the
@@ -50,8 +60,11 @@ Module: `ozma-multiseat/src/drm_scanout.rs`, with the lease extension in
 |---|---|
 | `DrmLeaseRequest` / `DrmPlaneSelector` | Adds an optional explicit plane to the existing card/connector/CRTC selector. |
 | `DrmLeaseHandle::plane_id` | Reports the explicitly requested plane separately from the kernel-reported `plane_ids`. |
-| `DrmScanoutRequest` | Same selector plus an optional mode, frame count, interval, flip timeout, and a deliberate `force_legacy` baseline flag. |
+| `DrmScanoutRequest` | Same selector plus an optional mode, frame count, interval, flip timeout, verification mode, writeback timeout/retries, and a deliberate `force_legacy` baseline flag. |
 | `DrmScanoutCommit` | Stable `atomic` / `legacy` marker in status and verification. |
+| `DrmScanoutVerifyMode` | Stable `none` / `writeback` / `crc` pixel-verification selector. |
+| `DrmScanoutCapture` | Bounded captured-frame count, visible-RGB checksums, expected checksums, mismatches, timeouts, and retries. |
+| `DrmScanoutVerificationBlocker` | Typed `kms-verification-unavailable` evidence when a requested mechanism cannot run. |
 | `DrmScanoutFramePlan` / `DrmScanoutFrameStats` | Bounded loop parameters and submitted/completed/dropped/missed/flip/interval/checksum accounting. |
 | `DrmScanoutBackend` / `DrmScanoutHandle` | Start, status, verify, bounded `run_frames`, teardown, active. |
 | `RealDrmScanoutBackend` | Production path over `RealDrmLeaseBackend` and `drm = 0.15`. |
@@ -186,22 +199,91 @@ to the frame-loop path:
 returns the initial single-frame stats, so callers cannot accidentally turn the
 proof into an unbounded loop.
 
+### Writeback verification
+
+This kernel's vkms (Linux 7.3.5-2-cachyos, `enable_writeback=Y`) exposes a
+writeback connector on the same CRTC as the virtual output. The connector
+advertises `WRITEBACK_PIXEL_FORMATS` including `XR24`/`AR24`; `WRITEBACK_FB_ID`,
+`CRTC_ID`, and `WRITEBACK_OUT_FENCE_PTR` are present. Writeback is therefore the
+strongest available mechanism and is the implemented `writeback` mode.
+
+The CRC path was also checked. vkms implements the kernel CRC callbacks
+(`vkms_get_crc_sources`/`vkms_set_crc_source`), but userspace capture requires
+`DRM_IOCTL_CRTC_GET_SEQUENCE`, `DRM_IOCTL_CRTC_SET_CRC_SOURCE`, and
+`DRM_IOCTL_CRTC_GET_CRC`. The safe `drm = 0.15` surface has no CRC wrapper and
+this crate has `#![forbid(unsafe_code)]`, so `crc` records the typed
+`kms-verification-unavailable` blocker with kernel evidence. It never claims a
+capture it did not perform.
+
+Writeback flow:
+
+1. When `--seat-drm-verify writeback` is requested, resolve the scanout CRTC
+   before leasing, discover writeback connectors on the lessor with
+   `DRM_CLIENT_CAP_WRITEBACK_CONNECTORS`, and select the lowest-id connector whose
+   encoder advertises that CRTC.
+2. Add the writeback connector id to the same `CREATE_LEASE` request
+   (`DrmLeaseRequest::with_writeback_connector`). The lessor enables `Atomic`
+   then `WritebackConnectors`; the connector is validated as `Writeback` and as
+   CRTC-compatible before the ioctl. `DrmLeaseHandle::writeback_connector_id`
+   reports it.
+3. On the lessee, enable `WritebackConnectors` after the scanout atomic commit,
+   read the writeback connector properties with the existing 256-property bound,
+   and confirm `WRITEBACK_PIXEL_FORMATS` contains `XR24`.
+4. Allocate one XRGB8888 capture dumb buffer/framebuffer of the current mode
+   size. The capture size is bounded by `SCANOUT_MAX_VERIFY_BYTES` (64 MiB); a
+   larger mode records a blocker rather than allocating unbounded memory.
+5. Queue a writeback job with `CRTC_ID` and `WRITEBACK_FB_ID` for the capture
+   framebuffer, wait for the commit's page-flip event, then wait (bounded) for
+   the capture buffer to leave the `0xA5` sentinel. The capture is compared with
+   the scanout buffer using `visible_rgb_checksum`: FNV-1a over exactly
+   `width * 4` bytes per row, masking the unused alpha byte. Pitch padding and
+   vkms's alpha normalisation therefore do not create false mismatches, while
+   every visible RGB pixel is covered.
+6. Capture after the initial modeset frame and after each completed loop frame;
+   `verify()` captures the current frame again. Status reports
+   `verification_mode`, `writeback_connector_id`, `capture.captured_frames`,
+   per-frame `checksums`/`expected_checksums`, `mismatches`, `timeouts`, and
+   `job_retries`. A mismatch is retained and makes `verify` return
+   `verification_failed`; a timeout is `writeback_timeout`.
+7. Teardown waits for the last capture, clears `WRITEBACK_FB_ID`, detaches the
+   writeback connector with `ALLOW_MODESET` (bounded retries absorb the kernel's
+   deferred job cleanup), destroys the capture framebuffer/buffer, then clears
+   the scanout plane/CRTC, destroys the rotating buffers, and revokes the lease.
+
+Bounds: `writeback_timeout_ms` is validated to `1..=60000` (default 1000),
+`writeback_retries` is `0..=3` (default 1 and used only for transient
+`EBUSY`/`EAGAIN` commit failures), checksum samples are capped at
+`SCANOUT_MAX_CAPTURE_SAMPLES = 300`, and the job queue is serialized by waiting
+for each capture before another commit.
+
+Atomic is required. `--seat-drm-verify writeback` with a forced legacy commit, a
+legacy fallback, no compatible writeback connector, missing writeback
+properties, a non-XRGB format set, or an oversized capture buffer leaves the
+scanout proof intact but records a typed blocker; `verify` then returns
+`kms-verification-unavailable`.
+
 ### CLI
 
 ```text
 ozma-multiseat --seat-drm-scanout [SEAT=]CARD:CONNECTOR[@CRTC][:PLANE] \
                [--seat-drm-scanout-mode WIDTHxHEIGHT] \
                [--seat-drm-scanout-frames 1..=300] \
-               [--seat-drm-scanout-interval-ms MS] [--json]
+               [--seat-drm-scanout-interval-ms MS] \
+               [--seat-drm-verify writeback|crc|none] \
+               [--seat-drm-verify-timeout-ms MS] \
+               [--seat-drm-verify-retries 0..=3] [--json]
 ```
 
 `--seat-drm-scanout-frames` defaults to `1`; out-of-range values are rejected
 before a device is opened. The optional interval paces completed frames, while
-flip completion events remain the source of truth for accounting. The proof runs
-before display/topology/plan work and exits. `--json` emits the request, final
-scanout status (including `plane_id`, `commit`, and `frames`), retained
-verification, notes, and typed `frame_error`/`error`/`teardown_error`. A seat
-prefix is accepted for CLI symmetry, but the proof is one standalone output.
+flip completion events remain the source of truth for accounting.
+`--seat-drm-verify` defaults to `none`; the timeout/retry flags are valid only
+with `--seat-drm-scanout` and are range-checked there. The proof runs before
+display/topology/plan work and exits. `--json` emits the request, final scanout
+status (including `plane_id`, `commit`, `frames`, `verification_mode`,
+`verification_blocker`, and `capture`), retained verification, notes, and typed
+`frame_error`/`error`/`teardown_error`. A seat prefix is accepted for CLI
+symmetry, but the proof is one standalone output.
 
 ### Typed errors
 
@@ -226,12 +308,18 @@ prefix is accepted for CLI symmetry, but the proof is one standalone output.
 | `FlipUnsupported` | `flip_unsupported` |
 | `FlipFailed` | `flip_failed` |
 | `VerificationFailed` | `verification_failed` |
+| `VerificationUnavailable` | `kms-verification-unavailable` |
+| `WritebackTimeout` | `writeback_timeout` |
+| `WritebackFailed` | `writeback_failed` |
 | `Released`, `InvalidRequest`, `Io` | matching snake-case names |
 | `Lease(DrmLeaseError)` | underlying lease code |
 
-Lease additions include `incompatible_plane`, plus `unknown_object` for a
-missing plane id. `DRM_LEASE_PLANE_ID_ENV` (`OZMA_DRM_PLANE_ID`) exports an
-explicitly leased plane id alongside the existing fd/connector/CRTC exports.
+Lease additions include `incompatible_plane` and `incompatible_writeback`, plus
+`unknown_object` for a missing plane or writeback connector id.
+`DRM_LEASE_PLANE_ID_ENV` (`OZMA_DRM_PLANE_ID`) exports an explicitly leased
+plane id alongside the existing fd/connector/CRTC exports. The writeback
+connector id is a scanout-verification detail rather than a seat environment
+export.
 
 ## Tests
 
@@ -245,7 +333,7 @@ CRTC.
 - fake lease plane compatibility, unknown plane, incompatible CRTC, and reported
   `plane_id`/`plane_ids`.
 
-`tests/drm_scanout.rs` (22 tests, was 12 before this phase) now covers:
+`tests/drm_scanout.rs` (33 tests, was 12 before this phase) now covers:
 
 - request parsing and explicit mode;
 - auto selection refusing a real card while an explicit path is allowed;
@@ -274,7 +362,21 @@ CRTC.
 - teardown after a loop destroying every framebuffer and buffer before revoke;
 - initial flip timeout accounting (`completed = 0`, `dropped = 1`,
   `missed = 1`) and a mid-loop `flip_failed` with partial stats;
-- `flip_unsupported` accounting and frame-stat JSON fields.
+- `flip_unsupported` accounting and frame-stat JSON fields;
+- writeback success: every loop frame captured, matching visible-RGB checksums,
+  `writeback_connector_id`, `writeback_capture` note, and capture teardown events
+  before scanout disable;
+- writeback checksum mismatch counted while the loop continues, followed by
+  `verification_failed` from `verify`;
+- writeback capture timeout (`writeback_timeout`, `timeouts=1`) and commit
+  failure (`writeback_failed`);
+- unavailable writeback and `crc` mode: typed `kms-verification-unavailable`
+  blocker with kernel evidence and no fabricated capture;
+- forced legacy plus writeback: typed blocker;
+- writeback timeout/retry request bounds and mode parsing;
+- writeback capture JSON fields (`verification_mode`, `captured_frames`,
+  `checksums`, `expected_checksums`, `mismatches`, `timeouts`);
+- `visible_rgb_checksum` masking alpha and ignoring pitch padding.
 
 `tests/live_drm_scanout.rs` is `#[ignore]`d and gated by `OZMA_DRM_LIVE=1`. It
 refuses any non-vkms card. On a configfs vkms instance it discovers an
@@ -293,8 +395,21 @@ three rotating buffers, the damage-update count, an average interval, a final
 checksum, verified current-framebuffer state, closed lessee fd after teardown,
 and a second successful frame loop on the same connector/CRTC/plane.
 
+`tests/live_drm_scanout.rs` also has two ignored writeback tests:
+
+- `vkms_scanout_writeback_capture_matches_pattern_and_tears_down` discovers the
+  writeback connector, leases it with the display connector/CRTC/plane, captures
+  three scanout frames plus a `verify` frame, asserts matching checksums and
+  zero mismatches/timeouts, tears down, checks the lessee fd is closed, and
+  repeats a second capture cycle on the same objects. If no writeback connector
+  is compatible it asserts the typed blocker and no capture instead.
+- `vkms_scanout_crc_records_precise_typed_blocker` asserts the
+  `kms-verification-unavailable` CRC blocker, its kernel evidence, and that no
+  capture is invented.
+
 `tests/live_drm_lease.rs` keeps its disconnect/reconnect/revoke cycle and now
-constructs the request with the new optional plane selector.
+constructs the request with the new optional plane and writeback selector
+fields.
 
 ## Live evidence
 
@@ -440,6 +555,62 @@ from while it was active. The automatic run proves a plane is selected from the
 lease even when the selector omits one; the explicit run proves a named plane is
 validated, leased, committed, verified, and reported.
 
+### Live writeback capture
+
+A fresh configfs vkms instance `/sys/kernel/config/vkms/ozma-live` was created
+with one primary plane, one CRTC with `writeback=1`, one encoder, and one
+connected virtual connector. To keep the host compositor/logind from taking DRM
+master before the proof opened the new test card, the udev exec queue was
+stopped for the run; the card node was also mode `000` while root ran the test.
+No real GPU or session was touched and the queue was restarted in the cleanup
+trap.
+
+Capability evidence from the live run:
+
+```text
+vkms writeback evidence: card=/dev/dri/card4 driver=faux_driver \
+  connector=Virtual-3 crtc=41 plane=Some(36) \
+  writeback=[DrmWritebackConnector { name: "Writeback-3", object_id: 43, \
+  possible_crtcs: [41] }]
+
+live writeback capture: DrmScanoutCapture {
+  writeback_connector_id: 43, width: 1024, height: 768, pitch: 4096, format: "XR24",
+  captured_frames: 3, mismatches: 0, timeouts: 0, job_retries: 0,
+  checksums: [3291019389, 463476861, 1910395005],
+  expected_checksums: [3291019389, 463476861, 1910395005],
+}
+live writeback verification: ... verification_mode: Writeback, capture: Some(
+  DrmScanoutCapture { captured_frames: 4, mismatches: 0, timeouts: 0,
+  checksums: [3291019389, 463476861, 1910395005, 1910395005], ... }), ok: true
+test result: ok. 1 passed; 0 failed
+```
+
+The four captured frames are the initial modeset frame, the two damage-update
+frames, and the extra `verify` capture of the current frame. The expected
+checksums came from the scanout buffers themselves; every captured visible-RGB
+checksum matched. Teardown cleared/detached writeback, destroyed the capture
+framebuffer/buffer, cleared scanout, revoked the lease, and a second full cycle
+succeeded.
+
+The CRC test on the same vkms card produced:
+
+```text
+crc blocker evidence: DrmScanoutVerificationBlocker {
+  kind: "kms-verification-unavailable", mechanism: "crc",
+  reason: "CRTC CRC capture is not exposed by the safe DRM API used by ozma-multiseat",
+  kernel_evidence: [
+    "card /dev/dri/card4 driver faux_driver",
+    "kernel 7.3.5-2-cachyos",
+    "vkms enable_writeback=Y",
+    "vkms create_default_dev=Y",
+    "vkms implements CRTC CRC callbacks (vkms_get_crc_sources/vkms_set_crc_source)",
+    "userspace CRC needs DRM_IOCTL_CRTC_GET_SEQUENCE, DRM_IOCTL_CRTC_SET_CRC_SOURCE, and DRM_IOCTL_CRTC_GET_CRC",
+    "drm 0.15.0 exposes no safe CRC wrapper and this crate forbids unsafe code; writeback capture is the implemented strongest mechanism",
+  ],
+}
+test result: ok. 1 passed; 0 failed
+```
+
 ## Cleanup
 
 After the runs:
@@ -456,23 +627,29 @@ $ ps -o stat,comm -p $(pidof systemd-logind)
 Ss systemd-logind
 ```
 
-The `ozma-frame` configfs instance and all plane/CRTC/encoder/connector links
-were removed, logind was resumed, and no temporary instance remains. The default
-vkms card and the real GPUs were not touched.
+The `ozma-frame`/writeback `ozma-live` configfs instances and all
+plane/CRTC/encoder/connector links were removed, the udev exec queue was
+restarted, and no temporary instance remains. The default vkms card and the real
+GPUs were not touched. `fuser`/`lsof` were checked before the writeback run; the
+proof accepted only the explicitly named vkms test node.
 
 ## Verification
 
 ```text
 cargo test -p ozma-multiseat
-  218 passed, 0 failed, 15 ignored (includes the 22 fake scanout tests,
-  14 lease tests, and the ignored live lease/scanout/frame-loop tests)
+  241 passed, 0 failed (includes the 33 fake scanout tests, 14 lease tests,
+  and the ignored live lease/scanout/frame-loop/writeback/CRC tests)
 
 cargo check -p ozma-multiseat --all-targets
   clean (only pre-existing ozma-pipewire warnings)
 
-rustfmt --edition 2021 <touched files>
+cargo fmt -p ozma-multiseat
   clean
 ```
+
+Live writeback and CRC tests were run explicitly with `OZMA_DRM_LIVE=1` against
+a temporary configfs vkms card; both passed. The temporary instance was removed
+after each run.
 
 ## Remaining compositor gaps
 
@@ -493,10 +670,22 @@ rustfmt --edition 2021 <touched files>
   vblank-driven clock, frame-drop policy, async flip, or latency target; the
   reported average interval is observed completion spacing, and a timeout is a
   typed error rather than a skipped frame.
-- **No capture of the pattern.** vkms writeback output was not wired into this
-  proof. Verification is KMS state (CRTC/plane/connector/framebuffer/buffer ids,
-  mode, size, pitch) plus a re-mapped checksum of the buffer bytes, not a
-  read-back image or CRC.
+- **Writeback-only pixel verification.** `writeback` captures the composed CRTC
+  into an XRGB8888 buffer and compares visible-RGB checksums. `crc` records a
+  typed blocker because the safe DRM surface cannot issue the CRC ioctls and
+  this crate forbids unsafe code; it is not a CRC fallback implementation.
+- **No writeback out-fence ownership.** The job waits for the commit page-flip
+  event and polls the capture buffer for the sentinel to clear. It does not pass
+  `WRITEBACK_OUT_FENCE_PTR` or own the returned sync-file fd, because that would
+  require raw-fd unsafe code. Commits are serialized and teardown waits, but a
+  hostile/slow driver could still make this weaker than a fence-complete proof.
+- **Alpha and pitch normalization.** The checksum masks the alpha byte and ignores
+  pitch padding. It therefore proves visible RGB pixels, not the exact stored
+  bytes or alpha channel. `WRITEBACK_PIXEL_FORMATS` is checked for `XR24`, but
+  other advertised formats are not exercised.
+- **Still one output/proof.** Capture is one CRTC and one writeback connector at a
+  time. There is no multi-output writeback, cloned output, scaled writeback, or
+  concurrent capture/composition test.
 - **Live scope is vkms.** Atomic plane leasing/commit is validated live only on
   a configfs vkms instance. An explicit real `/dev/dri/cardN` is still supported
   but requires the operator to already be DRM master; automatic real-card
