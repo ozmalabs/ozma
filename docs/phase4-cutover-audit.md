@@ -917,3 +917,12 @@ instead of restoring them to `axum`/`ozma-hardware`, so `cargo metadata
 `cargo metadata --locked --offline` now passes. The container gate, privileged
 install, and a live default-Rust demo/`demo test` at the frozen commit remain
 outstanding; deletion is still **NO-GO**.
+
+**Update (final validation, `7b9c0a1`):** the live default demo, `demo/run_demo.sh
+--webrtc`, VNC server + controller `screen/read` OCR, and `scripts/clean-host/run.sh
+--host` all passed at this HEAD. Settled fit produced native 1280x800 on both
+nodes with three concurrent peers; OCR returned readable Alpine console text at
+0.82 confidence. `demo test` reproduced only the known controller Connect drift
+plus two environment-induced macro/automation timeouts. The container gate is
+still blocked by a stale cached image missing `libxdo` (rebuild needs network
+`apt-get`), and the privileged install remains unrun. Deletion remains **NO-GO**.

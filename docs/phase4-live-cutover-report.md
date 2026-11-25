@@ -1622,3 +1622,194 @@ the detached worktree. The worktree, its venv, the reusable artifacts, and the
 clean-host target were removed after writing this section. Pre-existing
 `/tmp/ozma-webrtc-*` empty directories from earlier sessions were left
 untouched.
+
+## Final validation at 7b9c0a1 (2026-11-25)
+
+Date: 2026-11-25, 13:52-14:10 local (02:52-03:10 UTC).
+Host: CachyOS, Linux 7.3.5-2-cachyos, x86_64.
+Checkout: the live tree was again **dirty with unrelated AIDA64 work**, so this
+run used a detached worktree at `/tmp/opencode/final-7b9c0a1`.
+HEAD: `7b9c0a168838fe21a52b11526da39383070d8b22`
+(`feat(phase4): media auto-start, packaging, OCR fix, settled-fit default`).
+Node binary: worktree build with
+`CARGO_NET_OFFLINE=true cargo build -p ozma-node --bin ozma-node` (exit 0,
+45.31 s). Controller venv:
+`/tmp/opencode/final-venv313` (offline `uv` install of
+`controller/requirements.txt` plus `pytest`).
+
+This was validation only. No product source was changed and nothing was
+committed; the live checkout received only this report section. The demo's
+`demo/cache` was symlinked to the existing Alpine 3.21.3 ISO cache.
+
+### Result summary
+
+| Check | Result | Evidence |
+|---|---|---|
+| Build `ozma-node` at HEAD | **PASS** | offline `cargo build` exit 0 in 45.31 s; `ozma-node 0.1.0` |
+| Literal `demo/run_demo.sh --webrtc` | **PASS** | both Rust VM nodes + controller started; helper argv included `--webrtc-settle-ms 4000` |
+| Settled fit at native 1280x800 | **PASS** | both nodes `width=1280 height=800 settled=true settle_ms=4000`; `/api/v1/connection.webrtc_geometry` matched, not 720x400 |
+| Two real direct GStreamer peers | **PASS** | vm1 356 buffers / 546,816,000 B; vm2 351 / 539,136,000 B; `connected`, ICE `completed`, I420 1280x800@30, exit 0 |
+| Controller-proxy peer | **PASS** | 356 buffers / 546,816,000 B; `connected`, ICE `completed`, I420 1280x800@30, exit 0 |
+| Peer stream stability across boot/modeset | **PASS (caveat)** | the 4 s settle put helper start after the guest boot modeset, so peers attached to the native head; all three peers held 1280x800 for the full 12 s session with no reset or geometry change |
+| VNC server + real client | **PASS** | node bound `127.0.0.1:35983`; `asyncvnc` decoded `(800,1280,4)`, input changed 325 pixels (bbox `(0,626)-(182,655)`), 19 QMP input batches |
+| VNC registration advertises bound port | **PASS** | node registration `{"state":"configured","host":"127.0.0.1","port":35983}`; `ss` showed the same listener PID |
+| Controller VNC discovery | **PASS** | `/api/v1/nodes` returned `vnc1._ozma._udp.local.` with `vnc_host=127.0.0.1`, `vnc_port=35983` |
+| Controller `screen/read` (OCR fix) | **PASS** | HTTP 200, `ocr_method=tesseract`, `ocr_status=ok`, `ocr_confidence=0.82`, 235 text regions, readable Alpine console text |
+| Controller `screen/vectors` | **PASS** | HTTP 200, `{"width":1280,"height":800,"rectangles":[],"lines":[]}` in 0.39 s |
+| VNC registration retracts when source stops | **PASS** | after the QMP source ended, registration became `{"state":"not-configured"}` while `/health` stayed 200 |
+| `demo test` suite | **FAIL (known + 2 environment)** | 70 passed, 5 failed, 0 skipped: the three known Connect failures plus F19/F20 after the controller stalled on physical-capture OCR |
+| `demo test` cleanup on failure | **PASS** | failing suite still printed `Stopping Ozma demo...`, killed both nodes/controller, stopped both VMs, no leftovers |
+| Clean-host `--host` | **PASS** | 22 passed, 0 failed, 0 skipped; `ozma-node --lib` 479 passed/3 ignored; `ozma-softnode` 128 passed; synthetic `/health` PASS |
+| Clean-host `--container --full` | **FAIL (stale cache)** | dangling cached image existed but its `check-deps` failed `libxdo is missing`; rebuilding needs the network `apt-get` step |
+| Process/socket/temp cleanup | **PASS** | no demo processes, listeners, QMP sockets, pidfiles, or `/dev/shm/ozma-*` remain |
+
+### Settled geometry and peers
+
+Both nodes resolved the native head during the 4000 ms settle window, before
+the helper was spawned:
+
+```text
+03:00:44.457Z INFO ozma_node: WebRTC fit probe resolved the capture geometry
+  width=1280 height=800 frames=224 settled=true settle_ms=4000
+03:00:44.457Z INFO ozma_node: fitting WebRTC helper to the capture frame size
+  configured=640x480 capture=1280x800 settled=Some(true)
+
+03:00:44.412Z INFO ozma_node: WebRTC fit probe resolved the capture geometry
+  width=1280 height=800 frames=222 settled=true settle_ms=4000
+03:00:44.412Z INFO ozma_node: fitting WebRTC helper to the capture frame size
+  configured=640x480 capture=1280x800 settled=Some(true)
+```
+
+`/api/v1/connection` on 7382 and 7383 returned the same geometry:
+
+```json
+"webrtc_geometry": {
+  "width": 1280, "height": 800, "scale_to_fit": true, "fitted": true,
+  "capture_width": 1280, "capture_height": 800, "settled": true
+}
+```
+
+The two helper processes were launched as
+`--width 1280 --height 800 --fps 30`. Two direct
+`scripts/gate2/webrtc-client.py` peers and one peer through
+`/api/v1/streams/vm1._ozma._udp.local./webrtc` ran concurrently
+(03:00:59-03:01:12Z):
+
+```text
+vm1 direct:  ok=true conn=connected ice=completed 356 buffers / 546,816,000 B
+vm2 direct:  ok=true conn=connected ice=completed 351 buffers / 539,136,000 B
+vm1 proxy:   ok=true conn=connected ice=completed 356 buffers / 546,816,000 B
+caps: video/x-raw I420 1280x800 progressive 30/1
+```
+
+All three client processes exited 0. Because the 4 s settle intentionally
+waits past the Alpine boot modeset, the literal run no longer has a mid-stream
+boot transition: peers attach to the already-native 1280x800 head and show no
+stream reset, renegotiation, or geometry change for the whole session.
+
+### VNC and OCR
+
+An isolated node served the real QMP head through `--vnc-server
+--vnc-server-port 0` on HTTP 17382:
+
+```text
+RFB 3.8 VNC server listening bind=127.0.0.1:35983 loopback=true
+RFB 3.8 VNC server is serving the first capture source
+  advertised_host=127.0.0.1 advertised_port=35983
+VNC capture source published its first frame; ServerInit geometry fixed width=1280 height=800
+```
+
+`ss` and the node registration agreed on `127.0.0.1:35983`. A real `asyncvnc`
+client decoded a `(800,1280,4)` frame; typing `ab`, Return, a pointer move and a
+left click changed 325 pixels in `(0,626)-(182,655)` and produced 19
+`QMP input events sent on shared client` batches.
+
+The controller discovered `vnc1._ozma._udp.local.` at that port. OCR is now
+readable rather than the earlier bitmap garbage:
+
+```json
+"screen_type": "terminal",
+"ocr_method": "tesseract",
+"ocr_status": "ok",
+"ocr_confidence": 0.82,
+"text_regions": 235
+```
+
+`raw_text` (1,275 chars) included `OpenRC`, `Linux 6.12.13-0-virt (x86_64)`,
+`localhost`, and `login:`. `POST /api/v1/screen/vectors` returned
+`{"width":1280,"height":800,"rectangles":[],"lines":[]}` in 0.39 s.
+
+When the QMP capture source was stopped, the listener retracted:
+
+```text
+before: {"state":"configured","host":"127.0.0.1","port":35983}
+after:  {"state":"not-configured"}
+node /health: 200
+```
+
+The controller's cached node row still carried the old `vnc_port=35983`, the
+same in-memory discovery lag noted in earlier sections.
+
+### `demo test` and cleanup
+
+`bash demo/run_demo.sh test` ended with **70 passed, 5 failed, 0 skipped** and
+exit 1. The three expected controller-only Ozma Connect failures reproduced:
+`AI setups used: 0`, `noise_cancellation blocked on free tier`, and
+`reason mentions upgrade:`.
+
+Two extra failures appeared on this host and are environmental, not Rust-node
+regressions: F19 `GET /api/v1/macros returns data` and F20 `automation script
+accepted`. The controller had a physical display capture source
+(`hdmi-0`, Creative Live! Cam Sync 4K on `/dev/video0`); the F18 OCR call on
+that source blocked long enough for the nodes to be marked offline
+(`14:04:44 Node stale, marking offline: vm1/vm2`) and for the subsequent
+requests to time out. The macro record start/stop calls themselves succeeded.
+No node, WebRTC, VNC, or switching assertion failed.
+
+The failing suite still exercised cleanup: it printed `Stopping Ozma demo...`,
+killed controller and both node PIDs, stopped both QEMU VMs, and left no demo
+processes or listeners.
+
+### Clean-host
+
+`scripts/clean-host/run.sh --host` passed with its target redirected to
+`/home/matt/.cache/ozma-clean-host-final` (the worktree `/tmp` tmpfs is too
+small for a fresh target):
+
+```text
+PASS  cargo build -p ozma-node -p ozma-softnode -p ozma-multiseat --bins
+test result: ok. 479 passed; 0 failed; 3 ignored
+PASS  cargo test -p ozma-node --lib
+test result: ok. 128 passed; 0 failed
+PASS  cargo test -p ozma-softnode
+PASS  ozma-node desktop profile answered /health on port 30056
+22 passed, 0 failed, 0 skipped
+RESULT: PASS
+```
+
+`--container --full` was attempted because a dangling cached image from
+2026-11-24 20:09 UTC existed (`9a91e138532b`, history matching the harness
+Containerfile except the new `libxdo-dev`). It failed before building:
+
+```text
+FAIL  libxdo is missing (enigo link dependency for ozma-hid tests)
+FAIL  native build dependencies
+RESULT: FAIL
+```
+
+A rebuild would need the `apt-get` network step in
+`scripts/clean-host/Containerfile`, so the container run is recorded as a
+stale-cache failure rather than a product failure. The temporary
+`localhost/ozma-clean-host:1.95` tag was removed during cleanup.
+
+### Cleanup status
+
+After the runs there were no `ozma-node`, QEMU, controller, WebRTC helper,
+peer-client, or clean-host processes; no listeners on
+7380/7332/7333/7382/7383/5901/5922/17382 or the VNC port; no
+`/tmp/ozma-vm*.qmp`, demo pidfiles, or `/dev/shm/ozma-*`; and no live
+`_ozma._udp` responders. Controller state created by these runs lived only in
+the detached worktree and was removed with it. The worktree, venvs, node build
+target, clean-host targets, and temporary `/tmp/opencode/final-artifacts`
+evidence directory were removed after this section was written. Pre-existing
+`/tmp/ozma-webrtc-*` directories from earlier sessions were left untouched.
