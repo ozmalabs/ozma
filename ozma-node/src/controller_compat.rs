@@ -79,7 +79,7 @@ use crate::multi_hls::{
 };
 use crate::multi_webrtc::{MultiConsoleWebrtc, MultiConsoleWebrtcStatus};
 use crate::usb_uac2::{Uac2BridgeError, Uac2BridgeShared};
-use crate::webrtc::{WebRtcControl, WebRtcError};
+use crate::webrtc::{WebRtcControl, WebRtcError, WebRtcGeometryStatus};
 
 /// HID packet type for an 8-byte boot keyboard report.
 pub const PACKET_KEYBOARD: u8 = 0x01;
@@ -2895,6 +2895,12 @@ pub struct ConnectionResponse {
     pub webrtc: &'static str,
     /// Why WebRTC is not `running`, when it is configured and failing.
     pub webrtc_error: Option<String>,
+    /// Resolved helper geometry, when a helper is configured.
+    ///
+    /// Additive: consumers that only read `webrtc`/`webrtc_error` are
+    /// unaffected. Omitted entirely when WebRTC is not configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webrtc_geometry: Option<WebRtcGeometryStatus>,
     /// Audio routing status: `running`, `not-configured`, or `failed`.
     pub audio: &'static str,
     /// Why audio routing is `failed` (for example a missing `pactl`).
@@ -3182,18 +3188,18 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         .multi_console_webrtc
         .as_ref()
         .is_some_and(MultiConsoleWebrtc::supports_independent_consoles);
-    let (webrtc, webrtc_error) = if webrtc_manager_owns {
+    let (webrtc, webrtc_error, webrtc_geometry) = if webrtc_manager_owns {
         let status = state
             .multi_console_webrtc
             .as_ref()
             .expect("checked above")
             .active_status()
             .await;
-        (status.status_name(), status.error())
+        (status.status_name(), status.error(), status.geometry())
     } else {
         match &state.webrtc {
-            None => ("not-configured", None),
-            Some(control) => (control.status_name(), control.error()),
+            None => ("not-configured", None, None),
+            Some(control) => (control.status_name(), control.error(), control.geometry()),
         }
     };
     let (webrtc_audio_configured, webrtc_audio_source) = if webrtc_manager_owns {
@@ -3240,6 +3246,7 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         hls_error,
         webrtc,
         webrtc_error,
+        webrtc_geometry,
         audio,
         audio_error,
         usb,
@@ -6808,6 +6815,7 @@ mod tests {
         assert!(json["hls_error"].is_null());
         assert_eq!(json["webrtc"], "not-configured");
         assert!(json["webrtc_error"].is_null());
+        assert!(json["webrtc_geometry"].is_null());
         assert_eq!(json["audio"], "not-configured");
         assert!(json["audio_error"].is_null());
         assert_eq!(json["display_outputs"], serde_json::json!([]));

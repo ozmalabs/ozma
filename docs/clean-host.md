@@ -3,12 +3,12 @@
 Status: **harness, Rust-first systemd assets, user and system install layouts,
 the host integration surface (user/group, udev, AppArmor, libvirt snippet), and
 the demo Rust switch are implemented. Gate 4 is not yet met**: the privileged
-fresh-host install has not been run end-to-end on a real host (the new system
-surface is scripted and validated with `--dry-run`/`--root` instead), the
-controller is still Python, and the Python trees are intentionally still
-present for one release. The last recorded container run also had a red
-bounded node test selection in parallel product work (see
-[Known blocker](#known-blocker-moving-tree)).
+fresh-host install and the container `--full` gate have not been run end-to-end,
+the controller is still Python, and the Python trees are intentionally still
+present for one release. The 2026-11-25 refresh at `437468a` passed the host
+harness, workspace tests, and controller pytest; see
+[`phase4-cutover-audit.md`](phase4-cutover-audit.md) §16 for the current
+go/no-go.
 
 This page is the operational companion to
 [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md) Phase 4 and
@@ -464,13 +464,17 @@ Gate 4 evidence still required: a Python-free fresh-host install, the
 controller/demo regression against the Rust nodes, and a green
 `cargo test --workspace` on the release commit.
 
-Current state (2026-11-25): the only existing tag is annotated
-`rust-cutover-preview-4db92e1`, which dereferences to `4db92e1`; it is a
-preview, not the `rust-cutover-<version>-python-rollback` tag. A clean
-detached `4b3b875` run passed `scripts/clean-host/run.sh --host` 20/20
-(`ozma-node --lib` 390 passed / 3 ignored, `ozma-softnode` 111 passed).
-Deletion criteria, the full cutover matrix, the Gate 4a/4b split, and the
-staged plan are in [`phase4-cutover-audit.md`](phase4-cutover-audit.md).
+Current state (2026-11-25 refresh at `437468a`): only annotated
+`rust-cutover-preview-*` tags exist (latest at `437468a`); none is the
+`rust-cutover-<version>-python-rollback` tag. A clean
+detached run at `437468a` passed `scripts/clean-host/run.sh --host` 20/20
+(`ozma-node --lib` 469 passed / 3 ignored, `ozma-softnode` 125 passed),
+`cargo test --workspace` 2442 passed / 0 failed / 42 ignored, `cargo check
+--workspace --all-targets`, and controller pytest 2579 passed. The container
+`--full` gate and the privileged install remain unrun, and the committed
+`Cargo.lock` is stale (`--locked` fails). Deletion criteria, the refreshed
+cutover matrix, the Gate 4a/4b split, and the current go/no-go are in
+[`phase4-cutover-audit.md`](phase4-cutover-audit.md) §16.
 
 ## Known blocker (moving tree)
 

@@ -38,8 +38,9 @@ use evdev_provisioning::EvdevProvisionConfig;
 use manager::{ManagerOptions, VirtualNodeManager};
 use provisioning::{ProvisionConfig, DEFAULT_QMP_DIR};
 use supervisor::{
-    ChildOptions, GpuPassthroughChildOptions, HlsChildOptions, NodeFlagSupport, UnsupportedPolicy,
-    UsbChildOptions, VncChildOptions, WebRtcChildOptions,
+    ChildOptions, GpuPassthroughChildOptions, HlsChildOptions, MeshChildOptions,
+    MultiseatChildOptions, NodeFlagSupport, UnsupportedPolicy, UsbChildOptions, VncChildOptions,
+    WebRtcChildOptions,
 };
 use tracing::{info, warn};
 
@@ -228,6 +229,33 @@ struct Args {
     #[arg(long)]
     vnc_capture: bool,
 
+    /// Serve each selected child's capture source as an RFB 3.8/VNC endpoint
+    ///
+    /// Security is RFB None (no password, TLS, or authentication). The node
+    /// binds loopback by default. Without --vnc-vm every supervised child
+    /// serves its own capture source. This is independent of --vnc-capture.
+    #[arg(long)]
+    vnc_server: bool,
+
+    /// Bind address for --vnc-server (`127.0.0.1` by default)
+    ///
+    /// Supplying a non-loopback address is the explicit opt-in; the node
+    /// refuses one otherwise.
+    #[arg(long, value_name = "ADDR")]
+    vnc_bind: Option<String>,
+
+    /// Fixed TCP port for --vnc-server (0 or unset = OS-assigned per child)
+    ///
+    /// A non-zero port requires --vnc-vm: two children on one host cannot bind
+    /// the same port. Leave it unset/0 for multi-VM hosts so every child gets a
+    /// distinct OS-assigned port, which the node registers with the controller.
+    #[arg(long, value_name = "PORT")]
+    vnc_server_port: Option<u16>,
+
+    /// Scope all --vnc-server* flags to one VM (required for a fixed port)
+    #[arg(long, value_name = "VM")]
+    vnc_vm: Option<String>,
+
     /// External WebRTC helper executable (for example `/usr/bin/python3`)
     ///
     /// WebRTC stays disabled when unset. Other --webrtc-* options require this.
@@ -338,6 +366,27 @@ struct Args {
     #[arg(long)]
     usb_uac2: bool,
 
+    /// Start the UAC2 isochronous ↔ host-audio bridge
+    ///
+    /// Requires --usb-uac2 and is forwarded only to the --usb-vm child. The
+    /// node starts the bridge only when the gadget's ALSA card and the host
+    /// audio devices exist; otherwise `/usb` reports a typed `unsupported`
+    /// bridge rather than claiming live audio.
+    #[arg(long)]
+    usb_uac2_bridge: bool,
+
+    /// Host playback device receiving host→device UAC2 PCM
+    ///
+    /// Omitted by default so the node uses its own `default` ALSA device.
+    #[arg(long, value_name = "ALSA")]
+    usb_uac2_sink_device: Option<String>,
+
+    /// Host capture device feeding device→host UAC2 PCM
+    ///
+    /// Omitted by default so the node uses its own `default` ALSA device.
+    #[arg(long, value_name = "ALSA")]
+    usb_uac2_source_device: Option<String>,
+
     /// Add a FunctionFS vendor function
     #[arg(long)]
     usb_vendor: bool,
@@ -345,6 +394,54 @@ struct Args {
     /// Optional absolute FunctionFS vendor daemon path
     #[arg(long, value_name = "PATH")]
     usb_vendor_daemon: Option<PathBuf>,
+
+    /// Report a persisted multiseat plan at `GET /api/v1/seats` for one node
+    ///
+    /// Read-only: the supervisor never starts, stops, or restarts seats. The
+    /// standalone `ozma-multiseat` supervisor keeps that lifecycle. Requires
+    /// --seats-file and --multiseat-vm so exactly one child owns the report.
+    #[arg(long)]
+    multiseat: bool,
+
+    /// Versioned `seats.json` store shared with the multiseat supervisor
+    #[arg(long, value_name = "PATH")]
+    seats_file: Option<PathBuf>,
+
+    /// The single VM whose child serves the multiseat report
+    #[arg(long, value_name = "VM")]
+    multiseat_vm: Option<String>,
+
+    /// Opt in to the node-local mesh service for one VM child
+    ///
+    /// A mesh identity is unique per node, so --mesh-vm selects the single
+    /// child that binds the WireGuard UDP port and advertises the identity.
+    #[arg(long)]
+    mesh: bool,
+
+    /// IPv4 address assigned to the mesh VM
+    #[arg(long, value_name = "IP")]
+    mesh_ip: Option<String>,
+
+    /// WireGuard UDP port for mesh traffic (node default 51820)
+    #[arg(long, value_name = "PORT")]
+    mesh_port: Option<u16>,
+
+    /// Base64 X25519 WireGuard private-key file (path only; never read here)
+    #[arg(long, value_name = "PATH")]
+    mesh_key_file: Option<PathBuf>,
+
+    /// Request kernel WireGuard (not implemented; the node reports typed
+    /// unsupported and stays on userspace boringtun)
+    #[arg(long)]
+    mesh_kernel: bool,
+
+    /// Repeatable mesh peer JSON object, forwarded as `--mesh-peer`
+    #[arg(long = "mesh-peer", value_name = "JSON")]
+    mesh_peer: Vec<String>,
+
+    /// The single VM whose child owns this mesh identity
+    #[arg(long, value_name = "VM")]
+    mesh_vm: Option<String>,
 
     /// Per-VM Looking Glass KVMFR shared-memory path, repeatable (`VM=PATH`)
     ///
@@ -621,6 +718,10 @@ async fn main() -> anyhow::Result<()> {
         },
         vnc: VncChildOptions {
             capture: args.vnc_capture,
+            server: args.vnc_server,
+            bind: args.vnc_bind,
+            server_port: args.vnc_server_port,
+            vm: args.vnc_vm,
         },
         usb: UsbChildOptions {
             enabled: args.usb_gadget,
@@ -631,6 +732,9 @@ async fn main() -> anyhow::Result<()> {
             media_ro: args.usb_media_ro,
             media_cdrom: args.usb_media_cdrom,
             uac2: args.usb_uac2,
+            uac2_bridge: args.usb_uac2_bridge,
+            uac2_sink_device: args.usb_uac2_sink_device,
+            uac2_source_device: args.usb_uac2_source_device,
             vendor: args.usb_vendor,
             vendor_daemon: args.usb_vendor_daemon,
         },
@@ -642,6 +746,20 @@ async fn main() -> anyhow::Result<()> {
             looking_glass_fps: args.looking_glass_fps,
             looking_glass_id: args.looking_glass_id,
             looking_glass_name: args.looking_glass_name,
+        },
+        multiseat: MultiseatChildOptions {
+            enabled: args.multiseat,
+            seats_file: args.seats_file,
+            vm: args.multiseat_vm,
+        },
+        mesh: MeshChildOptions {
+            enabled: args.mesh,
+            ip: args.mesh_ip,
+            port: args.mesh_port,
+            key_file: args.mesh_key_file,
+            kernel: args.mesh_kernel,
+            peers: args.mesh_peer,
+            vm: args.mesh_vm,
         },
         audio_router: args.audio_router,
         audio_capture_from_sink: args.audio_capture_from_sink,
@@ -769,10 +887,27 @@ mod tests {
         assert!(args.display_output.is_empty());
         assert!(args.vm_guest_ip.is_empty());
         assert!(!args.vnc_capture);
+        assert!(!args.vnc_server);
+        assert!(args.vnc_bind.is_none());
+        assert!(args.vnc_server_port.is_none());
+        assert!(args.vnc_vm.is_none());
         assert!(args.webrtc_helper.is_none());
         assert!(args.webrtc_turn_password.is_none());
         assert!(!args.usb_gadget);
         assert!(args.usb_vm.is_none());
+        assert!(!args.usb_uac2_bridge);
+        assert!(args.usb_uac2_sink_device.is_none());
+        assert!(args.usb_uac2_source_device.is_none());
+        assert!(!args.multiseat);
+        assert!(args.seats_file.is_none());
+        assert!(args.multiseat_vm.is_none());
+        assert!(!args.mesh);
+        assert!(args.mesh_ip.is_none());
+        assert!(args.mesh_port.is_none());
+        assert!(args.mesh_key_file.is_none());
+        assert!(!args.mesh_kernel);
+        assert!(args.mesh_peer.is_empty());
+        assert!(args.mesh_vm.is_none());
         assert!(args.looking_glass_shm.is_empty());
         assert!(args.audio_router.is_none());
         assert!(!args.audio_capture_from_sink);
@@ -981,6 +1116,104 @@ mod tests {
             looking_glass.get("vm-b").map(String::as_str),
             Some("/dev/shm/looking-glass")
         );
+    }
+
+    #[test]
+    fn new_child_feature_flags_parse() {
+        let args = Args::try_parse_from([
+            "ozma-virtual-node",
+            "--usb-gadget",
+            "--usb-vm",
+            "vm-a",
+            "--usb-udc",
+            "dummy_udc.0",
+            "--usb-uac2",
+            "--usb-uac2-bridge",
+            "--usb-uac2-sink-device",
+            "default",
+            "--usb-uac2-source-device",
+            "hw:1,0",
+            "--vnc-server",
+            "--vnc-bind",
+            "127.0.0.1",
+            "--vnc-server-port",
+            "5901",
+            "--vnc-vm",
+            "vm-a",
+            "--multiseat",
+            "--seats-file",
+            "/etc/ozma/seats.json",
+            "--multiseat-vm",
+            "vm-a",
+            "--mesh",
+            "--mesh-ip",
+            "10.255.0.2",
+            "--mesh-port",
+            "51820",
+            "--mesh-key-file",
+            "/etc/ozma/mesh.key",
+            "--mesh-peer",
+            "{\"id\":\"peer-b\"}",
+            "--mesh-vm",
+            "vm-a",
+        ])
+        .expect("parse new child feature flags");
+
+        assert!(args.usb_uac2_bridge);
+        assert_eq!(args.usb_uac2_sink_device.as_deref(), Some("default"));
+        assert_eq!(args.usb_uac2_source_device.as_deref(), Some("hw:1,0"));
+        assert!(args.vnc_server);
+        assert_eq!(args.vnc_bind.as_deref(), Some("127.0.0.1"));
+        assert_eq!(args.vnc_server_port, Some(5901));
+        assert_eq!(args.vnc_vm.as_deref(), Some("vm-a"));
+        assert!(args.multiseat);
+        assert_eq!(args.seats_file, Some(PathBuf::from("/etc/ozma/seats.json")));
+        assert_eq!(args.multiseat_vm.as_deref(), Some("vm-a"));
+        assert!(args.mesh);
+        assert_eq!(args.mesh_ip.as_deref(), Some("10.255.0.2"));
+        assert_eq!(args.mesh_port, Some(51820));
+        assert_eq!(
+            args.mesh_key_file,
+            Some(PathBuf::from("/etc/ozma/mesh.key"))
+        );
+        assert_eq!(args.mesh_peer, vec!["{\"id\":\"peer-b\"}".to_owned()]);
+        assert_eq!(args.mesh_vm.as_deref(), Some("vm-a"));
+
+        let child = ChildOptions {
+            vnc: VncChildOptions {
+                server: args.vnc_server,
+                bind: args.vnc_bind.clone(),
+                server_port: args.vnc_server_port,
+                vm: args.vnc_vm.clone(),
+                ..VncChildOptions::default()
+            },
+            usb: UsbChildOptions {
+                enabled: args.usb_gadget,
+                vm: args.usb_vm.clone(),
+                udc: args.usb_udc.clone(),
+                uac2: args.usb_uac2,
+                uac2_bridge: args.usb_uac2_bridge,
+                uac2_sink_device: args.usb_uac2_sink_device.clone(),
+                uac2_source_device: args.usb_uac2_source_device.clone(),
+                ..UsbChildOptions::default()
+            },
+            multiseat: MultiseatChildOptions {
+                enabled: args.multiseat,
+                seats_file: args.seats_file.clone(),
+                vm: args.multiseat_vm.clone(),
+            },
+            mesh: MeshChildOptions {
+                enabled: args.mesh,
+                ip: args.mesh_ip.clone(),
+                port: args.mesh_port,
+                key_file: args.mesh_key_file.clone(),
+                kernel: args.mesh_kernel,
+                peers: args.mesh_peer.clone(),
+                vm: args.mesh_vm.clone(),
+            },
+            ..ChildOptions::default()
+        };
+        child.validate().expect("new flag combination is valid");
     }
 
     #[test]

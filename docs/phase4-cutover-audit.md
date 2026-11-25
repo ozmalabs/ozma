@@ -6,6 +6,10 @@ commit, but it also found product gaps that would break the packaged
 supervisor path, WebRTC, seat registration, and several controller features if
 `softnode/`, `node/`, and `agent/` were deleted today.
 
+> **Refresh (2026-11-25):** a post-P0 evidence run at `437468a` is in §16. It
+> revises the matrix, blockers, deletion status, and go/no-go. Deletion is
+> still **NO-GO**; the one-release overlap is **GO conditional**.
+
 - Audit date: 2026-11-25 (Australia/Sydney)
 - Audit baseline: `4b3b875c861a33ddacf7f641248ec99198dd6f47`
   (`feat(node): add Rust software source inventory`)
@@ -653,3 +657,263 @@ Audit artifacts:
 - Existing Phase 4 reports: [`phase4-clean-host-report.md`](phase4-clean-host-report.md),
   [`phase4-live-demo-report.md`](phase4-live-demo-report.md),
   [`phase4-system-install-report.md`](phase4-system-install-report.md).
+
+## 16. Refresh (2026-11-25)
+
+This section supersedes §2–§9 for the current cutover decision. The historical
+sections above are kept as the record of the `4b3b875` audit.
+
+- Refresh baseline: `437468ac342da1b5c2b99b349dde301e22f0ffe9`
+  (`feat(phase4): seat node report, USB/IP URB relay, live VNC validation`),
+  8 commits after `4b3b875`.
+- Evidence was taken in a detached worktree at that commit,
+  `/tmp/opencode/ozma-refresh-437468a`, verified clean before the run. The
+  primary checkout was **not** used because it holds uncommitted AIDA64 work
+  (`ozma-node/src/aida64.rs`, `ozma-hardware`, routing docs, `controller/
+  mesh_network.json`, `nodes_meta.json`, and other modified files).
+- Read-only with respect to product code: no Python or Rust source was changed,
+  no commit or tag was created. This section and the two short pointers in §16.6
+  are the only repository writes.
+
+### 16.1 Evidence run
+
+Exact commands (from the detached worktree unless noted):
+
+```bash
+git worktree add --detach /tmp/opencode/ozma-refresh-437468a 437468ac342da1b5c2b99b349dde301e22f0ffe9
+cd /tmp/opencode/ozma-refresh-437468a
+CARGO_TARGET_DIR=/home/matt/ozma/ozma-audit-refresh-target \
+    cargo test --workspace --no-fail-fast
+CARGO_TARGET_DIR=/home/matt/ozma/ozma-audit-refresh-target \
+    cargo check --workspace --all-targets
+OZMA_CLEAN_HOST_TARGET=/home/matt/ozma/ozma-audit-refresh-target \
+    scripts/clean-host/run.sh --host
+python -m pytest tests/unit/controller/test_seats.py \
+    tests/unit/controller/test_mesh_connect_proxy.py \
+    tests/unit/controller/test_discovery_fields.py \
+    tests/unit/controller/test_node_api_token_direct.py \
+    tests/unit/controller/test_node_api_token_proxy.py \
+    tests/unit/controller/test_node_token_store.py \
+    tests/unit/controller/test_dashboard_node_token_ui.py \
+    tests/unit/controller/test_screen_reader.py -q
+python -m pytest tests/unit/controller -q --continue-on-collection-errors
+```
+
+Controller pytest used a disposable venv with `--system-site-packages`; the
+seven missing pure-Python/ABI3 packages (`pynacl`, `mido`, `toml`,
+`strawberry-graphql`, `graphql-core`, `cross-web`, `python-multipart`) were
+installed **offline from the local uv cache**. No network install, sudo, or
+global package was used.
+
+| Check | Result | Exact evidence |
+|---|---|---|
+| `cargo test --workspace --no-fail-fast` | **PASS** | **2442 passed, 0 failed, 42 ignored** across **192** test binaries (unit, integration, and doc-tests). `ozma-node` lib 469 passed / 3 ignored; `ozma-node` bin 18; parity 22; `ozma-softnode` 125 (also independently run by the harness). |
+| `cargo check --workspace --all-targets` | **PASS** | exit 0, `Finished dev profile in 36.01s`; one pre-existing `unused_mut` warning in `ozma-node/src/controller_compat.rs:3511`. |
+| `scripts/clean-host/run.sh --host` | **PASS** | `RESULT: PASS`; harness summary **20 passed, 0 failed, 0 skipped**; dependency report 17 passed / 0 failed / 2 skipped (`apparmor_parser`, `shellcheck` absent); `ozma-node --lib` **469 passed / 3 ignored**; `ozma-softnode` **125 passed**; 6/6 unit files + `systemd-analyze verify`; `install-rust.sh --dry-run` wrote nothing; system install surface rendered to a temp root; synthetic desktop `/health` `ok:true`. |
+| Focused controller pytest (seats, mesh, discovery/VNC screen, node token) | **PASS** | **167 passed, 0 failed**, 1 deprecation warning, 84.90 s. |
+| Full controller pytest `tests/unit/controller` | **PASS** | **2579 passed, 4 skipped, 1 xfailed, 0 failed**, 1 warning, 103.94 s. |
+| `scripts/clean-host/run.sh --container --full` | **SKIP (environment)** | No cached `localhost/ozma-clean-host:1.95` image exists (`podman image exists` → 1). Building it needs a network `apt-get` for the Containerfile packages, which this task prohibits. The previous audit's cached image also predated `libxdo-dev`. Not a product failure, but **the container gate is unproven on this commit**. |
+| Live `demo/run_demo.sh` (default Rust) | **NOT RERUN** | Last live evidence is `1cd866d` for the default demo and `a7586a3` for the WebRTC/VNC revalidation (`phase4-live-cutover-report.md`). `437468a` changed `controller/seats.py`/`api.py`, `ozma-node/src/seats.rs`, VNC liveness, and `ozma-usb` libraries; a frozen-HEAD live rerun is still required. |
+| Privileged fresh-host install | **NOT RUN** | No sudo/global install, per constraints. Rootless scripted install surface is green. |
+| Freeze hygiene (`--locked`) | **FAIL** | The committed `Cargo.lock` is stale: `cargo metadata --locked --offline` exits 101 and the first build rewrites the lock (`ozma-node` loses `futures-util`/`sysinfo`, `ozma-hardware` gains `sysinfo`, `axum` gains `futures-util`). Regenerate and commit the lock before tagging a frozen baseline. |
+
+Environment note: the earlier audit's `/tmp` target exhaustion did not recur;
+this run used `/home/matt/ozma/ozma-audit-refresh-target` (20 GB). A parallel
+workstream was editing the primary checkout during the run (including a
+`cargo test -p ozma-node --lib webrtc::tests` invocation and a `touch` of
+`ozma-hardware/src/lib.rs`); it did not touch the detached worktree.
+
+### 16.2 Revised Python → Rust matrix
+
+Status vocabulary is unchanged: **Done** = checked-in test asserts it and passed
+here; **Partial** = implemented but missing a consumer/provider/live/packaging
+step; **Gap** = no Rust path.
+
+#### `softnode/` — 12,432 Python lines in 30 files
+
+| Python subsystem | Rust destination | Previous | Now | Still Python-only / remaining |
+|---|---|---|---|---|
+| `soft_node.py` — per-VM node | `ozma-node --profile vm` + `controller_compat` | Partial | **Partial (narrower)** | Newly closed: `seat_id`, `vm_ip`, configured `vnc_host`/`vnc_port`, supervised child `--hls`/display/guest-IP/USB/WebRTC/VNC argv, and a real RFB server. Still: no `/display/ws`/`/input/ws`, no VBAN, no v4l2loopback `capture_device` feed, no auth/TLS/Tight VNC. |
+| `virtual_node.py` — supervisor | `ozma-softnode` / `ozma-virtual-node` | Partial | **Partial** | `build_child_argv` parity is code- and test-complete (125 tests) with an opt-in `--help` probe. Still: GPU passthrough is discovered but not turned into capture/agent argv; no `--libvirt-domain` power/PCI metadata; no live packaged systemd supervisor run; USB is single-VM. |
+| `desktop_node.py` | `ozma-node --profile desktop` | Partial | **Partial** | Unchanged core capture/input/audio/routes. Still: portal fd/restore-token persistence, `/audio/nodes` + `/audio/sweep` typed 501, `/display/mjpeg` 501, Windows/macOS. |
+| `gst_webrtc*.py`, `webrtc_*.py` | `controller_compat` WebRTC helper | Partial | **Partial (relocated)** | The canonical worker now lives at `scripts/webrtc/gst_webrtc_worker.py`; `softnode/gst_webrtc_worker.py` is a compatibility shim. Demo wires `--webrtc` with `--webrtc-fit-capture`; two live peers survived a 720x400→1280x800 modeset. Still Python (no native Rust WebRTC), helper can fit the transient boot head, audio unvalidated, geometry absent from `/api/v1/connection`. |
+| `connect_client.py`, `mesh_interface.py` | `ozma-node --mesh` / `ozma-mesh` | Gap | **Partial** | Opt-in service with real userspace WireGuard backend, honest states, `/api/v1/connect/{status,peers,events}`, controller passthrough. Still: no TUN interface, routes, nftables, forwarding, mDNS peer browsing, automatic handshake/promotion, key generation/rotation, or Connect cloud/CA relay. |
+| `virtual_usb.py`, `usb_mass_storage.py`, `virtual_media.py` | `ozma-usb` + node USB routes | Partial | **Partial (deeper)** | New: FunctionFS SCSI bulk loop with overlay-backed writable media and persistence; `/usb/media` start/stop/status + bounded `/usb/hotplug`; UAC2 ALSA/PipeWire bridge with `/usb` state; USB/IP DEVLIST/IMPORT control plane and SUBMIT/RET/UNLINK relay library. Still: no real UDC/kernel mount, no wired USB/IP data session, no `usbip-host`/`vhci_hcd` adapter, no dummy_hcd passthrough, no PD/emulation, no VBAN. |
+| `evdev_input.py`, `evdev_create.py`, `evdev_service.py` | `ozma-input` + `--provision-evdev` | Partial | **Partial** | Unchanged; real `/dev/uinput`/udev validation remains opt-in. |
+| `qmp_client.py`, `hid_to_qmp.py`, `qemu_display.py`, `dbus_display.py`, `screen_capture.py`, `libvirt_power.py` | `ozma-qmp`, `ozma-input`, `ozma-capture`, `ozma-power` | Done / Done (unit) | **Done** | No change; fake/real-provider split unchanged. |
+| `virtual_capture.py`, `looking_glass.py` | `ozma-capture` | Partial | **Partial** | No real v4l2loopback feed and no node `capture_device` registration. |
+| VNC registration/serving | `ozma-node --vnc-server` | Gap/Partial | **Partial (server green)** | RFB 3.8 (3.3/3.7/3.8), Raw, loopback default, real geometry, key/pointer into the shared sink; live `asyncvnc`/TigerVNC. Registration liveness now retracts a stopped listener. Still Security None + Raw only, one source, one shared input sink, startup-time mDNS advertisement. |
+| `meeting_detect.py` | `ozma-meeting-detect` | Partial | **Partial** | Binary exists but is **not installed by `install-rust.sh`** and not wired to the controller report path. |
+| `hyperv_node.py`, `wallpaper.py` | none | Gap | **Gap** | No Rust Hyper-V backend or wallpaper provider. |
+| `prometheus_metrics.py` | `ozma-node` metrics | Partial | **Partial** | Flat CPU/RAM/disk/net/uptime only; GPU/temp/fan/power explicitly unavailable. |
+| `install/install.sh`, udev/AppArmor/libvirt | `scripts/install-system.sh` + `scripts/system/*` | Done (scripted) | **Done (scripted)** | Still present at `softnode/install/install.sh` for the overlap; privileged run outstanding. |
+
+#### `node/` — 6,082 Python lines in 20 files
+
+| Python subsystem | Rust destination | Previous | Now | Still Python-only / remaining |
+|---|---|---|---|---|
+| `node.py` — hardware node | `ozma-node --profile hardware` | Partial | **Partial** | Core registration/HID/capture/HLS/USB/health/connection routes remain. New typed `supported:false` 501s for `/api/v1/rpa/*`, `/serial/*`, `/rgb/*`, `/current`, `/backup/*`, `/ui/windows`, advertised in `/api/v1/connection.controller_surfaces`. Still no real providers for any of those, no `/video`, no sensor/PD/phone/self-management. |
+| `power.py` | `ozma-power` | Partial | **Partial** | QMP/libvirt only; GPIO power/reset pins still Python-only. |
+| `usb_audio.py` | `ozma-usb` UAC2 + `ozma-audio` | Partial | **Partial (software bridge)** | Node bridge reports `configured/running/stopped` and requires observed PCM; ALSA/PipeWire adapters exist. Real UDC/host enumeration, isochronous stalls, hotplug, and non-S16 node selection unproven. |
+| `usb_storage.py`, `usb_emulation.py`, `usb_pd.py` | `ozma-usb` | Partial/Gap | **Partial/Gap** | SCSI/FunctionFS/overlay path implemented at library+route level; emulation/PD/dummy_hcd and a wired USB/IP kernel data path remain absent. |
+| `rpa.py`, `serial_capture.py`, `rgb_leds.py`, `current_sensor.py`, `expansion_sensors.py`, `phone_endpoint.py`, `self_management.py` | none | Gap | **Gap (honest 501 for RPA/serial/RGB/current)** | Typed stubs keep the controller from a 502, but the features are not implemented. Sensors/phone/self-management have no route. |
+| `hw_detect.py` | partial platform detection | Partial | **Partial** | Profile/capability detection only; no full board matrix. |
+| `prometheus_metrics.py`, `connect_client.py` | node metrics / mesh | Partial/Gap | **Partial** | Same flat metrics; mesh service now exists but no dataplane. |
+| `node/usb_hid_rs/`, `node/usb_hid_udp/` standalone crates | — | Decision | **Decision outstanding** | Directories still present, outside the workspace; delete/archive with `node/`. |
+
+#### `agent/` — 24,508 Python lines in 39 files (10,267 in `agent/multiseat`)
+
+| Python subsystem | Rust destination | Previous | Now | Still Python-only / remaining |
+|---|---|---|---|---|
+| Desktop agent core (capture/input/audio/clipboard/geometry/metrics) | `ozma-node --profile desktop` | Partial | **Partial** | Capture/input/audio/routes stay green. `ozma-clipboard` still unwired; display geometry/resolution, wallpaper, room correction, backup/storage, app monitoring, chassis DB, tray, and Windows/macOS remain absent or typed 501. |
+| `multiseat/*` | `ozma-multiseat` + `ozma-node` | Partial | **Partial (substantially narrowed)** | New: explicit `seat_id` registration (`OZMA_SEAT_ID`), read-only public `GET /api/v1/seats` from a persisted plan, per-seat Xvfb private display with real X11 handshake, and a privileged `ozma-seat-input` helper (`EVIOCGRAB` + uinput, rollback/SIGTERM cleanup) with supervisor integration. Still: no node-owned seat start/stop, no DRM leasing/compositor/physical handoff, node/compositor does not consume the per-seat uinput devices, no cgroups/namespaces, `ozma-softnode` not integrated, `ozma-multiseat` not installed. |
+| `ozma_agent.py` (clipboard/geometry) | `ozma-clipboard` | Gap/Partial | **Partial** | Crate exists but no node process exposes controller clipboard/geometry sync. |
+| `backup.py`, `storage_manager.py`, `storage_admin.py`, `hardware_info.py`, `app_monitor.py`, `chassis_db.py`, `tray.py` | none | Gap | **Gap** | Controller `/backup/*` proxy now receives a stable typed 501 instead of a 502, but no storage/backup/hardware-inventory provider exists. |
+| `ui_hints.py` | `ozma-node /ui/hints` | Partial | **Partial** | Honest empty hint document; no window/control discovery. |
+| `service.py`, `cli.py`, installers | `scripts/install-rust.sh`, units, `install.sh` | Partial | **Partial (default switched)** | `install.sh` defaults to Rust `ozma-node`/`ozma-virtual-node` with `--dry-run`; `--legacy-python` is labelled and prints the old `uv pip install ozma-softnode`. Privileged install and tray/Windows/macOS packaging remain. |
+| `agent/*.rs` prototypes | — | Decision | **Decision outstanding** | `hardware_info.rs`, `hid_injector.rs`, `pipewire_audio.rs`, `display_geometry.rs` still present outside the workspace. |
+
+### 16.3 Remaining blockers
+
+**P0 — blocks deletion, and blocks an unconditional overlap release**
+
+1. **Freeze is not lock-clean.** `Cargo.lock` at `437468a` is stale; `cargo
+   metadata --locked --offline` fails and cargo rewrites the lock on first
+   build. Regenerate and commit it, then tag the frozen baseline.
+2. **Container gate unproven.** `scripts/clean-host/run.sh --container --full`
+   has no offline-cached image on this host. Either rebuild it in a network-
+   allowed window or record the container gate as an explicit, time-bounded
+   exception before an overlap release claims the full harness.
+3. **Privileged fresh-host install not run.** `scripts/install-rust.sh` +
+   `scripts/install-system.sh` are only validated by dry-run/`--root`. Gate 4a
+   requires a real node install with no Python node package.
+4. **No live demo or `demo test` at the frozen HEAD.** Last live evidence is
+   `1cd866d`/`a7586a3`; `demo test` last ended 73 passed / 3 failed on
+   controller-only Connect assertions. Full unit pytest is now green
+   (2579 passed), but the demo harness itself was not rerun here.
+5. **Python-only surfaces still have no Rust provider.** `/rpa/*`, `/backup/*`,
+   `/ui/windows`, `/serial/*`, `/rgb/*`, `/current` are honest typed 501s but
+   real behavior (including controller proxies and any UI that expects data) is
+   still Python. Meeting detection, Hyper-V, wallpaper, VBAN, v4l2loopback
+   capture, GPIO power, USB PD/emulation, and agent storage/backup/hardware
+   inventory are not even stubbed in some cases.
+6. **Runtime/CI references to the Python trees remain.** `ruff`/`py_compile`
+   still cover `softnode/`, `node/`, `agent/`; `build.yml` still builds
+   `softnode`/`agent` wheels and PyInstaller agents; `release.yml` still builds
+   `ozma-agent`; dev scripts (`dev/riscv-node`, `dev/windows-vm`,
+   `dev/scripts/*usb*.sh`) still start or instruct `softnode/`; Python tests
+   still import the trees.
+7. **Packaging scope is unresolved.** `ozma-multiseat` and
+   `ozma-meeting-detect` are still not installed by `install-rust.sh`; if seats
+   and meeting detection are in scope, this must be closed or explicitly
+   dropped.
+8. **One-release overlap and rollback tag not shipped.** Several
+   `rust-cutover-preview-*` tags exist (latest at `437468a`), but none is the
+   required `rust-cutover-<version>-python-rollback` tag.
+
+**P1 — required before claiming Phase 4 complete, but not all block the overlap**
+
+- **Controller VNC OCR garbling.** `POST /api/v1/screen/read` returns 200 with
+  the correct 1280x800 frame transport, but `controller/screen_reader.py`
+  selects its bitmap terminal decoder and returns garbage on the anti-aliased
+  VGA console; `tesseract` reads the same frame correctly. Fix screen-type/OCR
+  selection (controller-side, not RFB). `testbench._capture_results` inherits it.
+- **Native WebRTC.** The worker is still Python (`scripts/webrtc/`), invoked as
+  a helper; the demo now wires it and survives modesets, but fit can pick the
+  transient boot head, geometry is not reported, and audio is unvalidated.
+- **UAC2 real hardware.** No UDC/host enumeration, no isochronous stall/xrun
+  evidence, node format fixed at 48 kHz/S16, no hotplug/recreate.
+- **USB/IP kernel adapter.** Control codec and URB relay are library-green, but
+  the relay is not wired into `UsbIpServer` after IMPORT and there is no
+  `usbip-host`/`vhci_hcd` endpoint; default remains `usbip-kernel-required`.
+- **Mesh dataplane.** No TUN, routes, forwarding, mDNS peer discovery, or
+  Connect cloud/CA registration; peers must be supplied manually.
+- **DRM/compositor and seat input.** Xvfb/Xephyr private roots exist, but no DRM
+  leasing/KMS ownership/compositor, and the per-seat uinput devices are not
+  consumed by a seat session. One shared X focus remains.
+- **FunctionFS/SCSI durability.** No real UDC/kernel mount, no persistent
+  daemon or auto-attach, blocking endpoint reads do not enforce the loop
+  deadline, one LUN, no class-control/BOT reset, overlay-only writes.
+- **VNC surface hardening.** Security None, Raw only, no auth/TLS, no
+  Tight/ZRLE/resize; acceptable only as a loopback/trusted-LAN opt-in.
+- **Node/desktop breadth.** GPIO power, sensors, USB PD/emulation, phone
+  endpoint, self-management, hardware inventory, clipboard sync, geometry,
+  wallpaper, room correction, app monitor, tray, Windows/macOS.
+
+### 16.4 Deletion criteria status
+
+Common gate (§9):
+
+| Criterion | Status now |
+|---|---|
+| `cargo test --workspace` | **Satisfied** — 2442 passed / 0 failed / 42 ignored. |
+| `pytest tests/unit/controller -q` | **Satisfied** — 2579 passed / 4 skipped / 1 xfailed. |
+| `clean-host --host` (20/20 or better) | **Satisfied** — 20/20, node lib 469, softnode 125. |
+| `clean-host --container --full` | **Outstanding** — no offline-cached image; not run. |
+| Default demo uses Rust and passes live | **Outstanding at this HEAD** — last live evidence `1cd866d`; not rerun at `437468a`. |
+| `demo/run_demo.sh test` with Rust backend | **Outstanding** — last run 73/3 (controller-only Connect tests); not rerun after the green unit suite. |
+| `install-rust.sh --dry-run` / staged install | **Satisfied (dry-run/staged)**; privileged install **outstanding**. |
+| `verify-system-install.sh` / `verify-units.sh` | **Satisfied** — via clean-host host run. |
+| `git grep` has no runtime/CI/build/Dockerfile/test reference | **Outstanding** — CI, `build.yml`, `release.yml`, dev scripts, and Python tests still reference the trees. Dockerfile is controller-only and `demo/record.py` now defaults to Rust. |
+| One-release overlap shipped + rollback tag | **Outstanding** — no rollback tag, no overlap release. |
+| No parity row whose only provider is the deleted tree | **Outstanding** — typed 501s cover several surfaces, but Hyper-V, wallpaper, meeting detection, mesh dataplane, PD/emulation, GPIO power, and agent storage/backup/inventory still have Python-only providers (or no provider at all). |
+
+Per tree:
+
+- **`softnode/` — not ready.** Satisfied: WebRTC helper relocated; supervisor
+  child argv parity (code+tests); real VNC server and registration liveness;
+  FunctionFS/SCSI media and UAC2 software bridge; mesh service; registration
+  parity for seat/VNC/vm_ip. Outstanding: live packaged supervisor run; GPU
+  passthrough into argv; libvirt power/PCI metadata; real UDC/USB-IP kernel
+  path/PD/emulation; Hyper-V, wallpaper, meeting detection wiring, VBAN,
+  v4l2loopback `capture_device`; `softnode/install/install.sh` still present;
+  softnode tests/conftest still import the tree; CI/build/dev references.
+- **`node/` — not ready.** Satisfied: hardware core routes and typed 501s for
+  RPA/serial/RGB/current. Outstanding: real providers for those surfaces;
+  sensors/phone/self-management/PD/emulation; GPIO power; board matrix;
+  `node/usb_hid_*` crates; CI/tests.
+- **`agent/` — not ready.** Satisfied: `seat_id`, read-only seat report,
+  per-seat Xvfb, input-isolation helper, Rust-default installer. Outstanding:
+  `ozma-multiseat`/`ozma-meeting-detect` packaging; node-owned seat lifecycle;
+  DRM/compositor and per-seat input consumption; `/audio/nodes`, `/audio/sweep`,
+  `/ui/windows`, `/backup/*` real behavior; clipboard/geometry/wallpaper/room
+  correction; Windows/macOS; `ozma-agent` crate/release/PyInstaller retirement;
+  `agent/*.rs` prototypes; agent tests/conftest.
+- **`src/`** — already absent; no new prototype detected. Keep it that way.
+
+### 16.5 Go / no-go
+
+- **One-release overlap: GO, conditional.** The overlap ships both node paths
+  while the Python trees remain the rollback. Preconditions before tagging:
+  regenerate and commit `Cargo.lock` (`--locked` green); rerun the default Rust
+  demo and `demo test` on the frozen commit; resolve or explicitly waive the
+  three controller-only demo-test failures; record the container gate as
+  environment-waived or rerun it with network access; and create the
+  `rust-cutover-<version>-python-rollback` tag with the evidence bundle. The
+  Rust default, Rust-first units, typed 501 surfaces, relocated WebRTC helper,
+  and green workspace/pytest/clean-host results make the overlap safe now;
+  they do **not** make deletion safe.
+- **Deletion: NO-GO.** Phase 4 §9 is not met. The specific blockers are the
+  stale lockfile, unrun container and privileged-install gates, no live
+  demo/test at this HEAD, unresolved Python-only providers and packaging, and
+  the entire set of remaining `git grep` references and Python tests. Per §12,
+  the Python controller may remain under Gate 4a/4b; that does not relax these
+  node-tree criteria.
+
+### 16.6 Pointers
+
+- [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md) — status header
+  now points at this refresh.
+- [`clean-host.md`](clean-host.md) — current-state paragraph now points at this
+  refresh instead of the superseded `4b3b875` counts. `parity-matrix.md` and
+  `plan-execution-status.md` are intentionally **not** edited here.
+
+### 16.7 Post-audit update (2026-11-25)
+
+The audit's lockfile P0 was a real defect and is fixed in `abef162`: a filtered
+staging pass had moved `futures-util` and `sysinfo` edges to `ozma-node`
+instead of restoring them to `axum`/`ozma-hardware`, so `cargo metadata
+--locked` failed. The lock was regenerated from the committed manifests and
+`cargo metadata --locked --offline` now passes. The container gate, privileged
+install, and a live default-Rust demo/`demo test` at the frozen commit remain
+outstanding; deletion is still **NO-GO**.

@@ -1,7 +1,11 @@
 # Phase 4 USB/IP Data Relay Report
 
-Status: implementation complete in `ozma-usb` at the library level. The codec
-and relay are exercised entirely with in-memory transports and endpoints. No
+Status: implementation complete in `ozma-usb`. The control server now hands the
+same authenticated connection to the URB relay after a successful authorized
+import, through an injectable kernel data-endpoint seam. The default seam is a
+typed `usbip-kernel-required` failure, so no data path is fabricated when a
+kernel `vhci`/`usbip-host` adapter is absent. The codec, relay, and server
+handoff are exercised entirely with in-memory transports and endpoints. No
 kernel modules, `vhci_hcd`/`usbip-host` devices, `usbip` invocations, sudo, real
 device captures, or persistent sockets are used by the default test suite.
 
@@ -15,15 +19,22 @@ control plane or authorization:
   `USBIP_RET_UNLINK`, including bounded ISO packet descriptors and
   payload-redacted `Debug`.
 - `ozma-usb/src/usbip_relay.rs` — deterministic SUBMIT/RET pairing core,
-  injectable `UsbIpDataEndpoint`, bounded stream session with concurrent
-  in-flight URBs, unlink cancellation, idle timeout, and disconnect cleanup.
+  injectable `UsbIpDataEndpoint`, the `UsbIpKernelDataEndpoint` adapter seam
+  with the explicit `NoUsbIpKernelDataEndpoint` default, bounded stream session
+  with concurrent in-flight URBs, unlink cancellation, idle timeout, and
+  disconnect cleanup.
+- `ozma-usb/src/usbip_server.rs` — post-import handoff on the same authenticated
+  transport, injectable data-endpoint factory/relay bounds, success only after
+  both kernel attach and data-endpoint open, and rollback on data-seam failure.
 - `ozma-usb/src/error.rs` — typed `usbip-urb` and `usbip-relay` error kinds.
-- `ozma-usb/tests/usbip_urb.rs` and `ozma-usb/tests/usbip_relay.rs`.
+- `ozma-usb/tests/usbip_urb.rs`, `ozma-usb/tests/usbip_relay.rs`, and extended
+  `ozma-usb/tests/usbip_server.rs`.
 - `ozma-usb/README.md` and this report.
 
-Attach/import still requires a real kernel backend. The default
-`NoUsbIpKernel` continues to return `usbip-kernel-required`; the data relay never
-creates a successful import and never fabricates a bus id, port, or payload.
+Attach/import still requires a real kernel backend and a real data adapter. The
+default `NoUsbIpKernel`/`NoUsbIpKernelDataEndpoint` pair continues to return
+`usbip-kernel-required`; the control server never creates a successful import
+without both, and the data relay never fabricates a bus id, port, or payload.
 
 ## URB codec coverage
 
@@ -140,6 +151,38 @@ pub trait UsbIpDataEndpoint: Send + Sync {
 idle deadline (default 30 s; `None` disables it). Relay outcomes record counts
 and byte totals, never payload contents.
 
+## Server wiring and kernel data seam
+
+`serve_session_with_data` (used by `UsbIpServer` and exported for embedders)
+extends the existing control session without changing control semantics:
+
+1. It calls `UsbIpDaemon::accept_connection` before reading a frame, so the
+   daemon connection ceiling and host/token/key-fingerprint authorization apply
+   before both the control and data phases.
+2. `OP_REQ_DEVLIST` is answered by the existing control loop and returns to the
+   next frame. It never opens a data endpoint and never enters the relay.
+3. A failed `OP_REQ_IMPORT` (unknown/descriptor-less bus id, authorization
+   denial, kernel attach failure, or a backend with no `vhci` port) writes the
+   existing error status with no device body, rolls back any partial attach, and
+   returns. It never opens a data endpoint and never enters the relay.
+4. A successful attach is followed by exactly one
+   `UsbIpKernelDataEndpoint::open(&attachment)` call, before the success reply.
+   The seam distinguishes an absent adapter (`UsbError::UsbIpKernelRequired`,
+   no success body, local attach rolled back on a best-effort basis) from an
+   opened endpoint whose later runtime failures become negative-status
+   `USBIP_RET_SUBMIT` frames with zero bytes.
+5. Only after both succeed does the server write the 320-byte
+   `OP_REP_IMPORT`, record `attached_bus_id`, and call `serve_data_session` on
+   the same transport. `UsbIpSessionOutcome::data` embeds the relay counters.
+6. The tracked daemon connection is closed on every exit path, including after
+   the data session ends or errors.
+
+The seam/factory is bounded by construction: one endpoint per successful import,
+owned by one session, and sessions are already bounded by
+`UsbIpServerConfig::max_connections`. `UsbIpServer::with_data_endpoint` and
+`with_relay_config` inject the adapter and relay bounds; the convenience
+`serve_session` uses `NoUsbIpKernelDataEndpoint` and default relay bounds.
+
 ## Tests
 
 New suites:
@@ -156,9 +199,18 @@ New suites:
   completion (not-found reply); endpoint error status with no payload; disconnect
   cleanup; in-flight ceiling `-EBUSY`; idle timeout cleanup; outcome `Debug`
   without payload.
-- `src/usbip_relay.rs` unit tests (3): deterministic core pairing/ceiling,
-  duplicate/late completion handling, and devid mismatch without losing the
-  target.
+- `src/usbip_relay.rs` unit tests (4): deterministic core pairing/ceiling,
+  duplicate/late completion handling, devid mismatch without losing the target,
+  and the no-op kernel seam returning a typed `usbip-kernel-required` error
+  without opening an endpoint.
+- `tests/usbip_server.rs` (23 tests, extended): the original control-plane
+  coverage plus a control-only DEVLIST that never opens an endpoint; a failed
+  import that never enters the data phase; successful import relaying one and
+  many URBs on the same connection; unlink cancellation; disconnect cleanup;
+  an endpoint error returned as a negative-status RET with zero bytes; the
+  default no-kernel seam typed with no success body and an attach rollback;
+  authorization enforced before both phases; and a loopback TCP control + URB
+  exchange through the same codec.
 
 Commands run:
 
@@ -166,22 +218,26 @@ Commands run:
 cargo test -p ozma-usb
 cargo check -p ozma-usb --all-targets
 rustfmt --edition 2021 --check \
-  ozma-usb/src/usbip_urb.rs ozma-usb/src/usbip_relay.rs \
+  ozma-usb/src/usbip_server.rs ozma-usb/src/usbip_relay.rs \
   ozma-usb/src/lib.rs ozma-usb/src/error.rs \
-  ozma-usb/tests/usbip_urb.rs ozma-usb/tests/usbip_relay.rs
+  ozma-usb/tests/usbip_server.rs ozma-usb/tests/usbip_relay.rs \
+  ozma-usb/tests/usbip_urb.rs
 ```
 
 ## Remaining kernel/dataplane gaps
 
 - There is still no in-tree kernel `usbip-host` stub or `vhci_hcd` adapter. A
-  production `UsbIpDataEndpoint` would bridge these URBs to a real kernel USB
-  device (or a userspace device backend) and must supply genuine completion
-  bytes/statuses.
-- The relay is not wired into `UsbIpServer`: a successful `OP_REP_IMPORT` can
-  hand the connection to `serve_data_session`, but the node orchestration that
-  does so does not exist yet.
+  production `UsbIpKernelDataEndpoint` would open these URBs against a real
+  kernel USB device (or a userspace device backend) and must supply genuine
+  completion bytes/statuses. The default seam fails closed with
+  `usbip-kernel-required`.
+- The control server now performs the post-import handoff, but a node-level
+  orchestration/route that injects the kernel adapter, selects relay bounds,
+  and exposes data-session counters is not implemented. Client-side import
+  orchestration remains the existing argv-only controller/daemon path.
 - Attach/import success still requires `UsbIpKernelBackend::attach` to return a
-  real local port; default deployments remain `usbip-kernel-required`.
+  real local port **and** the data seam to open a real endpoint; default
+  deployments remain `usbip-kernel-required`.
 - ISO descriptors are validated and round-tripped, but wire-padding compaction
   into a real URB buffer and packet-level scheduling are endpoint duties.
 - TLS remains external; the listener and relay are plaintext.

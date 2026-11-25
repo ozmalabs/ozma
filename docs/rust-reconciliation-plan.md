@@ -9,8 +9,11 @@ validation, the remaining device/audio provisioning, multi-VM breadth, and
 Phases 4–5 remain plans.** The 2026-11-25 read-only cutover audit is in
 [`phase4-cutover-audit.md`](phase4-cutover-audit.md); it finds Phase 4
 incomplete and lists the exact blockers, per-tree deletion criteria, rollback
-tags, and staged plan. See [`plan-execution-status.md`](plan-execution-status.md)
-and [`parity-matrix.md`](parity-matrix.md) for the evidence and remaining gaps.
+tags, and staged plan. A 2026-11-25 refresh at `437468a` (§16 of that document)
+keeps deletion **NO-GO** and makes the one-release overlap **GO conditional**
+after the lockfile and remaining validation gates. See
+[`plan-execution-status.md`](plan-execution-status.md) and
+[`parity-matrix.md`](parity-matrix.md) for the evidence and remaining gaps.
 Scope: the Python `softnode/`, `node/`, and `agent/` processes are replaced by the
 Rust `ozma-node` runtime plus its crates. The Python **controller** is a separate,
 much larger program and is handled as a later workstream with a compatibility

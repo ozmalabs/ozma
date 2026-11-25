@@ -2,7 +2,9 @@
 
 Status: implemented in `ozma-softnode`, no default behavior change for existing
 deployments. This document records the flag matrix, the argv-builder semantics,
-the status surface, and the parity gaps that remain.
+the status surface, and the parity gaps that remain. A second parity pass added
+the UAC2 bridge, VNC server, read-only multiseat report, and node-local mesh
+flags; see `docs/phase4-supervisor-new-flags-report.md` for that pass's details.
 
 Scope: `ozma-softnode/src/{supervisor,main,manager,status}.rs` only. `ozma-node`
 and installers were not modified.
@@ -83,6 +85,67 @@ argv.
 This is **capture**, not `vnc_host`/`vnc_port` registration with the
 controller; `ozma-node` has no registration field for those yet.
 
+### VNC server (RFB)
+
+`--vnc-server` is independent of `--vnc-capture`: it rebroadcasts the child's
+own capture source (QMP, external VNC, Looking Glass, ...) as an RFB 3.8
+endpoint.
+
+| Supervisor CLI | Child flag(s) | Mapping |
+|---|---|---|
+| `--vnc-server` | `--vnc-server` | Forwarded to every child unless `--vnc-vm` scopes it. |
+| `--vnc-bind <addr>` | `--vnc-bind <addr>` | Requires `--vnc-server`. Loopback is the node default; a non-loopback bind is the explicit opt-in. |
+| `--vnc-server-port <n>` | `--vnc-server-port <n>` | Requires `--vnc-server`. `0`/unset is omitted so each child gets an OS-assigned port. |
+| `--vnc-vm <vm>` | (selector) | Scopes all `--vnc-server*` flags to one VM. Required for a non-zero port. |
+
+Port allocation rule: the supervisor never gives two children the same fixed
+TCP port. With no `--vnc-vm`, every child keeps the node's default `0` and the
+OS assigns a distinct port, which the node resolves and registers. A non-zero
+`--vnc-server-port` is accepted only together with `--vnc-vm`; otherwise
+validation fails with a typed error. Security remains RFB `None` (no password,
+TLS, or authentication).
+
+### Multiseat report
+
+The node's multiseat surface is a **read-only** report; seat lifecycle stays
+with the standalone `ozma-multiseat` supervisor. The persisted `seats.json`
+store is shared host state, so exactly one supervised child may own it.
+
+| Supervisor CLI | Child flag(s) | Mapping |
+|---|---|---|
+| `--multiseat` | `--multiseat` | Requires `--seats-file` and `--multiseat-vm`. |
+| `--seats-file <path>` | `--seats-file <path>` | Forwarded only to the selected VM. |
+| `--multiseat-vm <vm>` | (selector) | The single logical node that serves `GET /api/v1/seats`. |
+
+`--seats-file` without `--multiseat` and `--multiseat` without a selector are
+typed `InvalidOption` errors, not silent no-ops.
+
+### Mesh
+
+A mesh identity (mesh IPv4, WireGuard UDP port, private key) is unique per node.
+Forwarding the same configuration to every per-VM child would bind the same UDP
+port and advertise the same identity several times, so mesh flags are scoped to
+one selected child.
+
+| Supervisor CLI | Child flag(s) | Mapping |
+|---|---|---|
+| `--mesh` | `--mesh` | Requires `--mesh-vm`. |
+| `--mesh-ip <ipv4>` | `--mesh-ip <ipv4>` | |
+| `--mesh-port <n>` | `--mesh-port <n>` | Non-zero; omitted leaves the node default `51820`. |
+| `--mesh-key-file <path>` | `--mesh-key-file <path>` | Only the path is forwarded; the supervisor never reads key material. |
+| `--mesh-kernel` | `--mesh-kernel` | Forwarded; the node reports kernel WireGuard as typed unsupported and stays on userspace boringtun. |
+| `--mesh-peer <json>` (repeatable) | `--mesh-peer <json>` | One child flag per peer, like `--display-output`. |
+| `--mesh-vm <vm>` | (selector) | The single child that owns this mesh identity. |
+
+Any mesh sub-option without `--mesh`, `--mesh` without `--mesh-vm`, and
+`--mesh-port 0` are typed `InvalidOption` errors.
+
+### WebRTC settle
+
+There is no `--webrtc-settle-ms` in `ozma-node` as of this pass (no
+`settle` flag exists in the node CLI or WebRTC module), so the supervisor does
+not forward one. Nothing is invented for parity.
+
 ### WebRTC
 
 | Supervisor CLI | Child flag(s) | Mapping |
@@ -119,7 +182,14 @@ named VM.
 | `--usb-media <path>` | `--usb-media <path>` | |
 | `--usb-media-ro`, `--usb-media-cdrom` | same | |
 | `--usb-uac2`, `--usb-vendor` | same | |
+| `--usb-uac2-bridge` | `--usb-uac2-bridge` | Requires `--usb-uac2`; starts the ALSA isochronous bridge. |
+| `--usb-uac2-sink-device <alsa>` | `--usb-uac2-sink-device <alsa>` | Requires the bridge. Omitted leaves the node default `default`. |
+| `--usb-uac2-source-device <alsa>` | `--usb-uac2-source-device <alsa>` | Requires the bridge. Omitted leaves the node default `default`. |
 | `--usb-vendor-daemon <path>` | `--usb-vendor-daemon <path>` | |
+
+The UAC2 bridge only starts when the gadget's ALSA card and host audio devices
+exist; otherwise the node keeps `/usb` at a typed `unsupported` bridge. The
+supervisor forwards configuration but never claims live PCM.
 
 ### GPU passthrough / Looking Glass
 
@@ -156,7 +226,12 @@ support, policy) -> Result<NodeArgv, ChildArgvError>`
   `Some`/enabled and non-empty. Empty strings are never emitted, whether they
   came from CLI values or config.
 - **Exactly once.** Flags are emitted in a fixed order and never repeated
-  except `--display-output`, which is intentionally one per display.
+  except `--display-output` (one per display) and `--mesh-peer` (one per
+  configured peer), which are intentionally repeatable.
+- **Single-owner flags.** USB/media, the VNC server when `--vnc-vm` is set, the
+  multiseat report, and the mesh identity are forwarded to one selected child
+  only. Their configuration is host- or identity-scoped and cannot be shared by
+  sibling processes; misuse is a typed `InvalidOption` before any child starts.
 - **Unsupported target flags.** `NodeFlagSupport::from_help` parses the target
   `ozma-node --help`; `probe_node_flags` runs it once at startup. A configured
   flag the target does not advertise is
@@ -172,9 +247,14 @@ support, policy) -> Result<NodeArgv, ChildArgvError>`
   spawned, `last_error` carries the typed `UnsupportedFlag` message, and the
   status state is `argv-error`.
 - **Typed config errors.** Invalid combinations (HLS sub-options without HLS,
-  WebRTC options without a helper, USB without `--usb-vm`/`--usb-udc`, a
-  non-IP guest IP, malformed `--display-output`, invalid router/backend values)
-  return `ChildArgvError::InvalidOption` from `ChildOptions::validate`.
+  WebRTC options without a helper, USB without `--usb-vm`/`--usb-udc`,
+  `--usb-uac2-bridge` without `--usb-uac2`, UAC2 device flags without the
+  bridge, `--vnc-bind`/`--vnc-server-port`/`--vnc-vm` without `--vnc-server`, a
+  non-zero VNC port without `--vnc-vm`, multiseat without a seats file or
+  selector, mesh sub-options without `--mesh`, `--mesh` without `--mesh-vm`,
+  `--mesh-port 0`, a non-IP guest IP, malformed `--display-output`, invalid
+  router/backend values) return `ChildArgvError::InvalidOption` from
+  `ChildOptions::validate`.
 - **Per-VM file names.** HLS directories, WebRTC sockets, and shm paths replace
   path separators/whitespace in VM names rather than trusting hypervisor names.
 
@@ -196,7 +276,8 @@ Each `VmStatus` in `GET /status` now includes:
   every secret flag replaced by `<redacted>`.
 - Secret flags are `--api-token`, `--webrtc-turn-user`, and
   `--webrtc-turn-password`. Both `--flag value` and `--flag=value` forms are
-  handled.
+  handled. `--mesh-key-file` carries only a path; the supervisor never reads or
+  serializes the private-key contents.
 - `argv_warnings` names every configured option that was not forwarded and why.
 - Under `--reject-unsupported-node-flags`, a rejected option produces no child
   and the VM state is `argv-error` with the typed message in `last_error`.
@@ -210,15 +291,20 @@ Each `VmStatus` in `GET /status` now includes:
 
 - an argv parity table asserting each supported flag appears exactly once and
   key values (per-VM HLS dir, display spec, guest IP, WebRTC socket/shm/audio,
-  Looking Glass shm, USB media);
+  Looking Glass shm, USB media, UAC2 devices, VNC server bind/port, seats file,
+  mesh IP/port/key/peer);
 - absent options omitted with the exact legacy core argv;
+- per-VM/per-node scoping for VNC server, multiseat, mesh, display, and USB;
 - VNC capture selected only for non-passthrough VMs;
-- typed `UnsupportedFlag` under reject and warn-and-omit under warn;
-- typed `InvalidOption` for USB without a VM and WebRTC without a helper;
+- typed `UnsupportedFlag` under reject and warn-and-omit under warn, including
+  the new VNC-server and mesh flags;
+- typed `InvalidOption` for USB without a VM, WebRTC without a helper, a
+  non-zero VNC port without `--vnc-vm`, multiseat without a seats file or
+  selector, and mesh without a selector or with port `0`;
 - secret redaction for `--flag value` and `--flag=value`;
 - a fake-child process test that launches a real script through
-  `ProcessNodeLauncher` and compares the script's received argv with the built
-  argv;
+  `ProcessNodeLauncher` and compares the script's received argv (including the
+  VNC server and mesh flags) with the built argv;
 - a manager status test asserting `child_argv` is redacted and
   `argv_warnings` reports an unsupported `--hls`;
 - a manager reject-policy test asserting no child spawns and status reports
@@ -235,7 +321,9 @@ These are **not** claimed as fixed:
    supervisor warns and keeps qmp capture; the in-guest agent frame path is not
    supervised from the hypervisor.
 3. **USB is single-VM.** The supervisor does not create per-VM gadgets or
-   coordinate multiple UDCs. Operators must scope one `--usb-vm`.
+   coordinate multiple UDCs. Operators must scope one `--usb-vm`. The UAC2
+   bridge is likewise forwarded only to that VM and is not validated against
+   real UDC/ALSA hardware from the supervisor.
 4. **Power provider remains `qmp`.** Python `virtual_node.py` preferred
    `LibvirtPower`; the Rust supervisor does not forward `--libvirt-domain`.
 5. **No PCI-device registration.** `--pci-devices-json` / PCI passthrough
@@ -244,8 +332,9 @@ These are **not** claimed as fixed:
 6. **Display discovery.** `VMInfo.displays` is not populated by the
    Proxmox/libvirt/QMP discovery backends yet, so display outputs currently
    require explicit `--display-output VM=...`.
-7. **No seat identity.** `seat_id`/multiseat wiring remains outside the
-   supervisor.
+7. **No seat lifecycle.** The multiseat flags only forward the node's read-only
+   report for one selected VM. The supervisor never starts, stops, or restarts
+   seats; that remains the standalone `ozma-multiseat` supervisor's job.
 8. **No host/registration metadata forwarding.** `--register-host`, `--role`,
    `--machine-class`, `--hw`, `--fw`, `--heartbeat-interval`, `--cap`, and
    `--pci-devices-json` are not exposed by the supervisor.
@@ -260,6 +349,17 @@ These are **not** claimed as fixed:
     `--api-token` if it is ever added.
 12. **Codec beyond HLS.** There is no separate node-wide codec flag; the
     supervisor's codec choice is `--hls-encoder`.
+13. **VNC server is single-owner only for a fixed port.** A fixed
+    `--vnc-server-port` requires `--vnc-vm`; the supervisor does not allocate a
+    range of VNC ports per VM. Multi-VM hosts should leave the port unset and
+    rely on OS-assigned ports.
+14. **Mesh is one identity per supervisor.** The supervisor does not derive a
+    distinct mesh IP/port/key per VM, browse mesh peers, initiate handshakes, or
+    route a dataplane. It forwards one operator-supplied identity to one child.
+15. **No AIDA64 forwarding.** AIDA64 node flags are intentionally out of scope
+    for this pass and are not emitted.
+16. **No WebRTC settle flag.** `ozma-node` has no `--webrtc-settle-ms` yet, so
+    the supervisor has no settle/fit-time parity to forward.
 
 ## Verification
 

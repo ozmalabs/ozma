@@ -65,8 +65,11 @@
 //!   `USBIP_RET_UNLINK`) with bounded transfer/ISO lengths, and
 //!   [`usbip_relay`] pairs submits and completions by seqnum over an injectable
 //!   [`UsbIpDataEndpoint`], with a concurrent in-flight ceiling, unlink
-//!   cancellation, idle timeout, and disconnect cleanup. The relay is
-//!   library-level and never fabricates device data.
+//!   cancellation, idle timeout, and disconnect cleanup. The server wires that
+//!   relay to the same authenticated connection after a successful import,
+//!   through the [`UsbIpKernelDataEndpoint`] adapter seam; the default
+//!   [`NoUsbIpKernelDataEndpoint`] is a typed `usbip-kernel-required` failure,
+//!   and neither layer fabricates device data.
 //!
 //! No code in this crate uses `unsafe`, mounts a filesystem, opens a block
 //! device, writes a block device, or creates a real USB gadget. The ConfigFS
@@ -252,16 +255,18 @@ pub use usbip_protocol::{
     USBIP_PROTOCOL_VERSION,
 };
 pub use usbip_relay::{
-    serve_data_session as serve_usbip_data_session, UsbIpDataEndpoint, UsbIpDataError,
-    UsbIpInFlightUrb, UsbIpRelay, UsbIpRelayConfig, UsbIpRelayError, UsbIpRelaySessionOutcome,
-    UsbIpRelayStats, USBIP_RELAY_DEFAULT_IDLE_TIMEOUT_MS, USBIP_RELAY_DEFAULT_MAX_IN_FLIGHT,
+    serve_data_session as serve_usbip_data_session, NoUsbIpKernelDataEndpoint, UsbIpDataEndpoint,
+    UsbIpDataError, UsbIpInFlightUrb, UsbIpKernelDataEndpoint, UsbIpRelay, UsbIpRelayConfig,
+    UsbIpRelayError, UsbIpRelaySessionOutcome, UsbIpRelayStats,
+    USBIP_RELAY_DEFAULT_IDLE_TIMEOUT_MS, USBIP_RELAY_DEFAULT_MAX_IN_FLIGHT,
     USBIP_RELAY_MAX_IN_FLIGHT_LIMIT, USBIP_URB_STATUS_EAGAIN, USBIP_URB_STATUS_EBUSY,
     USBIP_URB_STATUS_EINVAL, USBIP_URB_STATUS_EMSGSIZE, USBIP_URB_STATUS_EPROTO,
 };
 pub use usbip_server::{
-    serve_session as serve_usbip_session, NoUsbIpCredentials, UsbIpClock, UsbIpCredentialSource,
-    UsbIpManualClock, UsbIpPresentedCredentials, UsbIpServer, UsbIpServerConfig, UsbIpServerHandle,
-    UsbIpServerStats, UsbIpSessionEnd, UsbIpSessionOutcome, UsbIpSystemClock, UsbIpTransport,
+    serve_session as serve_usbip_session, serve_session_with_data as serve_usbip_session_with_data,
+    NoUsbIpCredentials, UsbIpClock, UsbIpCredentialSource, UsbIpManualClock,
+    UsbIpPresentedCredentials, UsbIpServer, UsbIpServerConfig, UsbIpServerHandle, UsbIpServerStats,
+    UsbIpSessionEnd, UsbIpSessionOutcome, UsbIpSystemClock, UsbIpTransport,
     USBIP_SERVER_DEFAULT_IDLE_TIMEOUT_MS, USBIP_SERVER_MAX_CONNECTIONS,
 };
 pub use usbip_urb::{

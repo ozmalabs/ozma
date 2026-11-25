@@ -152,7 +152,8 @@ also never touch a real UDC, ConfigFS mount, or block device.
 | USB/IP wire protocol | Partial | Typed DEVLIST/IMPORT codec (`0x0111`), bounded server with out-of-band credentials and existing authorization, attach only from a real kernel vhci port; loopback TCP test. No URB data path or in-process TLS. See [`phase4-usbip-protocol-report.md`](phase4-usbip-protocol-report.md). |
 | Per-seat display isolation | Partial | Opt-in `--seat-display shared|xvfb|xephyr`, per-seat Xvfb with private auth, real X11 handshake, crash/restart/cleanup and nested-display typed notes. Live two-seat smoke. No DRM leasing/compositor/physical handoff. See [`phase4-multiseat-display-report.md`](phase4-multiseat-display-report.md). |
 | Multi-seat node report | Partial | Opt-in `--multiseat --seats-file`, public read-only `GET /api/v1/seats`, persisted plan/availability, `node_seat`, explicit external lifecycle; typed 503 on store failure. Controller grouping consumes it with typed `node_errors`. No node-owned start/stop. See [`phase4-multiseat-node-report.md`](phase4-multiseat-node-report.md). |
-| USB/IP bulk data path | Partial | Typed SUBMIT/RET/UNLINK codec plus bounded relay (unlink, cap, idle timeout, cleanup) with negative-status replies; payloads redacted from Debug. Not wired into the server/import path; no kernel endpoint adapter. See [`phase4-usbip-data-report.md`](phase4-usbip-data-report.md). |
+| USB/IP bulk data path | Partial | Typed SUBMIT/RET/UNLINK codec plus bounded relay (unlink, cap, idle timeout, cleanup); a successful IMPORT now requires a real vhci port **and** a kernel data endpoint, then relays on the same authenticated connection with attach rollback on failure. No in-tree kernel adapter. See [`phase4-usbip-data-report.md`](phase4-usbip-data-report.md). |
+| WebRTC modeset robustness | Partial | Settled-head probe (1.5 s default, `--webrtc-settle-ms` 0–5 s, 8 s bound), last-size fallback with `settled:false`, modeset scaling, and `webrtc_geometry` status. Live modeset survival proven; settled-fit live run pending. |
 
 Verification added by this work:
 
@@ -235,7 +236,7 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # 2442 passed, 42 ignored (current)
+cargo test --workspace                                   # 2458 passed, 42 ignored (current)
 cargo test -p ozma-node --test parity                    # Python/controller parity baseline (16)
 cargo test -p ozma-node --lib                            # node API, compat, session unit tests (136, 2 ignored)
 cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)

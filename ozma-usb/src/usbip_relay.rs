@@ -3,11 +3,14 @@
 //!
 //! [`UsbIpDataEndpoint`] is the injectable device boundary: it receives a
 //! [`UsbIpCmdSubmit`] and returns the real completion (or a typed status), and
-//! it can cancel an in-flight URB. This crate does not contain a kernel
-//! `vhci_hcd`/`usbip-host` stub, so the default deployment still needs a real
-//! [`crate::usbip_daemon::UsbIpKernelBackend`] for attach/import. The relay
-//! itself is a library-level state machine that can be driven by tests without
-//! a kernel module or a real USB device.
+//! it can cancel an in-flight URB. [`UsbIpKernelDataEndpoint`] is the separate
+//! kernel-adapter seam that opens one such endpoint after a successful import;
+//! [`NoUsbIpKernelDataEndpoint`] is its explicit no-op default. This crate does
+//! not contain a kernel `vhci_hcd`/`usbip-host` stub, so the default deployment
+//! still needs a real [`crate::usbip_daemon::UsbIpKernelBackend`] for
+//! attach/import plus a real data seam. The relay itself is a bounded state
+//! machine that can also be driven directly by tests without a kernel module or
+//! a real USB device.
 //!
 //! [`UsbIpRelay`] is the deterministic core: it pairs `USBIP_CMD_SUBMIT` and
 //! `USBIP_RET_SUBMIT` by `seqnum`, enforces an in-flight ceiling, cancels by
@@ -37,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::error::UsbError;
+use crate::usbip::UsbIpAttachment;
 use crate::usbip_server::{UsbIpClock, UsbIpSessionEnd, UsbIpTransport};
 use crate::usbip_urb::{
     UsbIpCmdSubmit, UsbIpCmdUnlink, UsbIpDirection, UsbIpRetSubmit, UsbIpRetUnlink, UsbIpUrb,
@@ -100,6 +104,49 @@ pub trait UsbIpDataEndpoint: Send + Sync {
 
     /// Cancel an in-flight URB by the submit's `seqnum`.
     fn unlink(&self, devid: u32, seqnum: u32) -> Result<UsbIpRetUnlink, UsbIpDataError>;
+}
+
+/// Kernel-backed data-endpoint seam and bounded factory.
+///
+/// The control server calls [`Self::open`] at most once for an authorized,
+/// successful `OP_REQ_IMPORT`, *before* it writes the success reply. The
+/// returned endpoint then serves URBs on that same connection. A factory that
+/// cannot obtain a real kernel `vhci_hcd`/`usbip-host` endpoint returns
+/// [`UsbError::UsbIpKernelRequired`]; the default
+/// [`NoUsbIpKernelDataEndpoint`] does exactly that. This is deliberately
+/// distinct from a runtime [`UsbIpDataError`] from an opened endpoint, which
+/// becomes a negative-status `USBIP_RET_SUBMIT` with zero bytes.
+///
+/// Implementations return at most one endpoint per `open` call, so the server
+/// holds a single bounded endpoint for the lifetime of one data session. They
+/// must not fabricate device bytes when no kernel adapter is attached.
+pub trait UsbIpKernelDataEndpoint: Send + Sync {
+    /// Whether a real kernel-backed URB endpoint is available.
+    fn available(&self) -> bool {
+        false
+    }
+
+    /// Open the URB endpoint for one imported device.
+    fn open(&self, attachment: &UsbIpAttachment) -> Result<Arc<dyn UsbIpDataEndpoint>, UsbError> {
+        let _ = attachment;
+        Err(kernel_data_required())
+    }
+}
+
+/// Explicitly absent kernel data-endpoint adapter.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoUsbIpKernelDataEndpoint;
+
+impl UsbIpKernelDataEndpoint for NoUsbIpKernelDataEndpoint {}
+
+fn kernel_data_required() -> UsbError {
+    UsbError::UsbIpKernelRequired {
+        operation: "data",
+        reason: "the kernel vhci_hcd/usbip-host data adapter is not available; load the modules, \
+                 run with the required privileges, and inject a UsbIpKernelDataEndpoint. \
+                 No endpoint was opened and no URB data was fabricated."
+            .to_owned(),
+    }
 }
 
 /// Bounds for one relay session.
@@ -1008,5 +1055,21 @@ mod tests {
             Err(UsbIpRelayError::MismatchedDevid { .. })
         ));
         assert!(!relay.contains(4));
+    }
+
+    #[test]
+    fn no_kernel_data_endpoint_is_typed_and_never_opens_an_endpoint() {
+        let seam = NoUsbIpKernelDataEndpoint;
+        assert!(!seam.available());
+        let attachment = UsbIpAttachment {
+            host: "192.0.2.10".to_owned(),
+            bus_id: "1-1".to_owned(),
+            port: Some(7),
+            vendor_id: None,
+            product_id: None,
+        };
+        let error = seam.open(&attachment).err().unwrap();
+        assert_eq!(error.kind(), "usbip-kernel-required");
+        assert!(error.to_string().contains("vhci_hcd"));
     }
 }

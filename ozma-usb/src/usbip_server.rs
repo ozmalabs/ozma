@@ -25,6 +25,17 @@
 //! body and the caller receives the typed `usbip-kernel-required` error. This
 //! server never invents a bus id, path, port, or successful attach.
 //!
+//! Immediately after a successful authorized import, and before the success
+//! reply is written, the same session asks the injected
+//! [`crate::usbip_relay::UsbIpKernelDataEndpoint`] factory to open one URB
+//! endpoint. If no kernel data adapter exists, the import fails closed
+//! (`usbip-kernel-required`), the server attempts to roll back the local
+//! attachment, and no success body or URB frame is produced. Only after both the
+//! kernel attach and the data endpoint succeed does the server write
+//! `OP_REP_IMPORT` and hand the still-authenticated transport to
+//! [`crate::usbip_relay::serve_data_session`]. `OP_REQ_DEVLIST` and failed
+//! imports never enter the data phase.
+//!
 //! TLS is unchanged: this listener is plaintext and is meant to sit behind the
 //! external `usbipd`/TLS terminator or encrypted tunnel described by
 //! [`crate::usbip::UsbIpTlsStatus`]. `UsbIpTlsPolicy::Required` still fails
@@ -52,6 +63,10 @@ use crate::usbip_protocol::{
     UsbIpOpHeader, UsbIpProtocolError, UsbIpStatus, USBIP_BUSID_BYTES, USBIP_DEVLIST_HEADER_BYTES,
     USBIP_IMPORT_REQUEST_BYTES, USBIP_MAX_FRAME_BYTES, USBIP_OP_HEADER_BYTES,
     USBIP_PROTOCOL_VERSION,
+};
+use crate::usbip_relay::{
+    serve_data_session, NoUsbIpKernelDataEndpoint, UsbIpDataEndpoint, UsbIpKernelDataEndpoint,
+    UsbIpRelayConfig, UsbIpRelaySessionOutcome,
 };
 
 /// Maximum simultaneous sessions accepted by one server.
@@ -300,6 +315,9 @@ pub struct UsbIpSessionOutcome {
     pub devices_listed: usize,
     /// Bus id whose import succeeded through the kernel backend.
     pub attached_bus_id: Option<String>,
+    /// URB relay summary when a post-import data session ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<UsbIpRelaySessionOutcome>,
     /// Bytes read from the peer.
     pub bytes_read: u64,
     /// Bytes written to the peer.
@@ -414,8 +432,10 @@ pub struct UsbIpServer {
     listener: TcpListener,
     daemon: Arc<UsbIpDaemon>,
     config: UsbIpServerConfig,
+    relay_config: UsbIpRelayConfig,
     credentials: Arc<dyn UsbIpCredentialSource>,
     clock: Arc<dyn UsbIpClock>,
+    data_endpoint: Arc<dyn UsbIpKernelDataEndpoint>,
 }
 
 impl UsbIpServer {
@@ -438,8 +458,10 @@ impl UsbIpServer {
             listener,
             daemon,
             config,
+            relay_config: UsbIpRelayConfig::default(),
             credentials: Arc::new(NoUsbIpCredentials),
             clock: Arc::new(UsbIpSystemClock),
+            data_endpoint: Arc::new(NoUsbIpKernelDataEndpoint),
         })
     }
 
@@ -455,6 +477,21 @@ impl UsbIpServer {
         self
     }
 
+    /// Inject the kernel-backed data-endpoint factory.
+    ///
+    /// The default [`NoUsbIpKernelDataEndpoint`] never opens an endpoint, so a
+    /// successful control import cannot silently enter a fabricated data phase.
+    pub fn with_data_endpoint(mut self, data_endpoint: Arc<dyn UsbIpKernelDataEndpoint>) -> Self {
+        self.data_endpoint = data_endpoint;
+        self
+    }
+
+    /// Override the bounds used by the post-import URB relay.
+    pub fn with_relay_config(mut self, relay_config: UsbIpRelayConfig) -> Self {
+        self.relay_config = relay_config;
+        self
+    }
+
     /// Bound local address.
     pub fn local_addr(&self) -> Result<SocketAddr, UsbError> {
         self.listener.local_addr().map_err(|source| UsbError::Io {
@@ -466,12 +503,15 @@ impl UsbIpServer {
 
     /// Start accepting control sessions on a background thread.
     pub fn start(self) -> Result<UsbIpServerHandle, UsbError> {
+        self.relay_config.validate()?;
         let UsbIpServer {
             listener,
             daemon,
             config,
+            relay_config,
             credentials,
             clock,
+            data_endpoint,
         } = self;
         listener
             .set_nonblocking(true)
@@ -489,9 +529,11 @@ impl UsbIpServer {
         let accept_counters = Arc::clone(&counters);
         let accept_active = Arc::clone(&active);
         let accept_config = config.clone();
+        let accept_relay_config = relay_config;
         let accept_credentials = Arc::clone(&credentials);
         let accept_clock = Arc::clone(&clock);
         let accept_daemon = Arc::clone(&daemon);
+        let accept_data_endpoint = Arc::clone(&data_endpoint);
         let join = thread::Builder::new()
             .name("ozma-usbip-accept".to_owned())
             .spawn(move || {
@@ -499,8 +541,10 @@ impl UsbIpServer {
                     listener,
                     accept_daemon,
                     accept_config,
+                    accept_relay_config,
                     accept_credentials,
                     accept_clock,
+                    accept_data_endpoint,
                     accept_stop,
                     accept_counters,
                     accept_active,
@@ -525,8 +569,10 @@ fn accept_loop(
     listener: TcpListener,
     daemon: Arc<UsbIpDaemon>,
     config: UsbIpServerConfig,
+    relay_config: UsbIpRelayConfig,
     credentials: Arc<dyn UsbIpCredentialSource>,
     clock: Arc<dyn UsbIpClock>,
+    data_endpoint: Arc<dyn UsbIpKernelDataEndpoint>,
     stop: Arc<AtomicBool>,
     counters: Arc<Counters>,
     active: Arc<AtomicU64>,
@@ -552,8 +598,10 @@ fn accept_loop(
                 counters.accepted.fetch_add(1, Ordering::Relaxed);
                 let session_daemon = Arc::clone(&daemon);
                 let session_config = config.clone();
+                let session_relay_config = relay_config.clone();
                 let session_credentials = Arc::clone(&credentials);
                 let session_clock = Arc::clone(&clock);
+                let session_data_endpoint = Arc::clone(&data_endpoint);
                 let session_stop = Arc::clone(&stop);
                 let session_counters = Arc::clone(&counters);
                 let session_active = Arc::clone(&active);
@@ -562,13 +610,15 @@ fn accept_loop(
                     .spawn(move || {
                         let mut stream = stream;
                         let _ = stream.set_io_timeout(Some(POLL_INTERVAL));
-                        let result = serve_session(
+                        let result = serve_session_with_data(
                             &mut stream,
                             session_daemon.as_ref(),
                             &session_config,
                             session_credentials.as_ref(),
                             session_clock.as_ref(),
                             session_stop.as_ref(),
+                            session_data_endpoint.as_ref(),
+                            &session_relay_config,
                         );
                         match result {
                             Ok(outcome) => session_counters.add_outcome(&outcome),
@@ -665,6 +715,11 @@ impl Drop for UsbIpServerHandle {
 /// closes its tracked connection on every exit path. Frame, connection, and
 /// deadline errors are typed; truncation/oversize/version/opcode failures are
 /// [`UsbError::UsbIpProtocol`].
+///
+/// This convenience entry point uses [`NoUsbIpKernelDataEndpoint`] and default
+/// relay bounds. A successful control import therefore fails with
+/// `usbip-kernel-required` rather than claiming a data path. Call
+/// [`serve_session_with_data`] to inject a kernel data-endpoint adapter.
 pub fn serve_session<S: UsbIpTransport>(
     stream: &mut S,
     daemon: &UsbIpDaemon,
@@ -673,7 +728,39 @@ pub fn serve_session<S: UsbIpTransport>(
     clock: &dyn UsbIpClock,
     stop: &AtomicBool,
 ) -> Result<UsbIpSessionOutcome, UsbError> {
+    serve_session_with_data(
+        stream,
+        daemon,
+        config,
+        credentials,
+        clock,
+        stop,
+        &NoUsbIpKernelDataEndpoint,
+        &UsbIpRelayConfig::default(),
+    )
+}
+
+/// Serve one USB/IP control session and, after a successful authorized import,
+/// the URB data session on the same transport.
+///
+/// `data_endpoint` is opened only after the daemon's `attach` succeeded and
+/// before the success reply is written. If the adapter is absent
+/// ([`UsbError::UsbIpKernelRequired`]) or fails to open, the server writes an
+/// error reply, attempts to roll back the local attachment, and never enters the
+/// data phase. `OP_REQ_DEVLIST` and failed imports never open an endpoint.
+#[allow(clippy::too_many_arguments)]
+pub fn serve_session_with_data<S: UsbIpTransport>(
+    stream: &mut S,
+    daemon: &UsbIpDaemon,
+    config: &UsbIpServerConfig,
+    credentials: &dyn UsbIpCredentialSource,
+    clock: &dyn UsbIpClock,
+    stop: &AtomicBool,
+    data_endpoint: &dyn UsbIpKernelDataEndpoint,
+    relay_config: &UsbIpRelayConfig,
+) -> Result<UsbIpSessionOutcome, UsbError> {
     config.validate()?;
+    relay_config.validate()?;
     let peer = stream.peer_host();
     let host = peer.clone().unwrap_or_else(|| "unknown".to_owned());
     let presented = credentials.credentials(&host);
@@ -685,6 +772,8 @@ pub fn serve_session<S: UsbIpTransport>(
         stream,
         daemon,
         config,
+        relay_config,
+        data_endpoint,
         clock,
         stop,
         host,
@@ -704,6 +793,8 @@ struct Session<'a, S: UsbIpTransport> {
     stream: &'a mut S,
     daemon: &'a UsbIpDaemon,
     config: &'a UsbIpServerConfig,
+    relay_config: &'a UsbIpRelayConfig,
+    data_endpoint: &'a dyn UsbIpKernelDataEndpoint,
     clock: &'a dyn UsbIpClock,
     stop: &'a AtomicBool,
     host: String,
@@ -716,6 +807,14 @@ struct Session<'a, S: UsbIpTransport> {
 enum ReadSignal {
     Complete,
     End(UsbIpSessionEnd),
+}
+
+/// Result of one valid `OP_REQ_IMPORT` frame.
+enum ImportSignal {
+    /// The peer closed/stopped while the body was read.
+    End(UsbIpSessionEnd),
+    /// A successful reply was written and the data session may start.
+    Data(Arc<dyn UsbIpDataEndpoint>),
 }
 
 impl<'a, S: UsbIpTransport> Session<'a, S> {
@@ -754,12 +853,16 @@ impl<'a, S: UsbIpTransport> Session<'a, S> {
 
             match opcode {
                 UsbIpOpCode::ReqDevList => self.handle_devlist(&header_bytes)?,
-                UsbIpOpCode::ReqImport => {
-                    if let Some(end) = self.handle_import(&header_bytes)? {
+                UsbIpOpCode::ReqImport => match self.handle_import(&header_bytes)? {
+                    ImportSignal::End(end) => {
                         self.outcome.end = Some(end);
                         return Ok(std::mem::take(&mut self.outcome));
                     }
-                }
+                    ImportSignal::Data(endpoint) => {
+                        self.run_data(endpoint)?;
+                        return Ok(std::mem::take(&mut self.outcome));
+                    }
+                },
                 UsbIpOpCode::RepDevList | UsbIpOpCode::RepImport => {
                     return Err(UsbIpProtocolError::UnexpectedOpcode {
                         expected: "a request",
@@ -789,7 +892,7 @@ impl<'a, S: UsbIpTransport> Session<'a, S> {
     fn handle_import(
         &mut self,
         header_bytes: &[u8; USBIP_OP_HEADER_BYTES],
-    ) -> Result<Option<UsbIpSessionEnd>, UsbError> {
+    ) -> Result<ImportSignal, UsbError> {
         if USBIP_IMPORT_REQUEST_BYTES > self.config.max_frame_bytes {
             return Err(UsbIpProtocolError::Oversized {
                 field: "frame",
@@ -801,7 +904,7 @@ impl<'a, S: UsbIpTransport> Session<'a, S> {
         let mut body = [0u8; USBIP_BUSID_BYTES];
         match self.read_exact(&mut body, false)? {
             ReadSignal::Complete => {}
-            ReadSignal::End(end) => return Ok(Some(end)),
+            ReadSignal::End(end) => return Ok(ImportSignal::End(end)),
         }
         let mut frame = [0u8; USBIP_IMPORT_REQUEST_BYTES];
         frame[..USBIP_OP_HEADER_BYTES].copy_from_slice(header_bytes);
@@ -835,20 +938,47 @@ impl<'a, S: UsbIpTransport> Session<'a, S> {
         // Only a backend that really assigned a local vhci port can make an
         // import successful. This is a defensive check; the daemon constructs
         // the attachment from the backend's `u16` port.
-        if attachment.port.is_none() {
+        let Some(port) = attachment.port else {
             let _ = self.send_error_reply(UsbIpOpCode::ReqImport, UsbIpStatus::DevErr);
             return Err(UsbError::UsbIpKernelRequired {
                 operation: "attach",
                 reason: "the kernel backend reported no local vhci port; no bus id was returned"
                     .to_owned(),
             });
-        }
+        };
+
+        // Do not announce a successful import unless a real endpoint can carry
+        // the URB phase. Absence is a typed `usbip-kernel-required`; a failure
+        // from the adapter is returned as-is. In both cases no success body is
+        // written, the local attach is rolled back, and no data session starts.
+        let endpoint = match self.data_endpoint.open(&attachment) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                let _ = self.daemon.detach(port);
+                let _ = self.send_error_reply(UsbIpOpCode::ReqImport, wire_status_for(&error));
+                return Err(error);
+            }
+        };
 
         let reply = UsbIpImportReply::new(descriptor);
         let bytes = reply.encode()?;
         self.write_frame(&bytes)?;
         self.outcome.attached_bus_id = Some(request.bus_id);
-        Ok(None)
+        Ok(ImportSignal::Data(endpoint))
+    }
+
+    /// Run the URB relay on the already-authenticated control transport.
+    fn run_data(&mut self, endpoint: Arc<dyn UsbIpDataEndpoint>) -> Result<(), UsbError> {
+        let relay_outcome = serve_data_session(
+            &mut *self.stream,
+            endpoint,
+            self.relay_config,
+            self.clock,
+            self.stop,
+        )?;
+        self.outcome.end = relay_outcome.end;
+        self.outcome.data = Some(relay_outcome);
+        Ok(())
     }
 
     fn send_error_reply(

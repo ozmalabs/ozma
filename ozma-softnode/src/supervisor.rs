@@ -272,11 +272,27 @@ impl WebRtcChildOptions {
     }
 }
 
-/// Opt-in VNC capture selection for VMs whose discovery backend exposed a VNC
-/// port. VNC *registration* is not part of this option.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Opt-in VNC capture selection and/or serving for a VM child.
+///
+/// `capture` selects a discovered external QEMU VNC endpoint as the input
+/// capture source. `server` makes the child serve its own capture source as an
+/// RFB 3.8 endpoint. They are independent: a child may capture from QMP and
+/// still rebroadcast that capture through `--vnc-server`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VncChildOptions {
+    /// Select the discovered VNC endpoint as the capture provider.
     pub capture: bool,
+    /// Serve the child's capture source as an RFB endpoint (`--vnc-server`).
+    pub server: bool,
+    /// `--vnc-bind`. The node defaults to loopback; a non-loopback bind must be
+    /// explicit here.
+    pub bind: Option<String>,
+    /// Fixed `--vnc-server-port`. `None`/`0` lets each child ask the OS for a
+    /// free port. A non-zero port requires [`Self::vm`], because two children
+    /// on one host cannot bind the same TCP port.
+    pub server_port: Option<u16>,
+    /// When set, all VNC *server* flags are forwarded only to this VM.
+    pub vm: Option<String>,
 }
 
 /// Host-scoped USB gadget/media forwarding, limited to one VM.
@@ -291,6 +307,13 @@ pub struct UsbChildOptions {
     pub media_ro: bool,
     pub media_cdrom: bool,
     pub uac2: bool,
+    /// Start the UAC2 isochronous ↔ host-audio bridge (`--usb-uac2-bridge`).
+    /// Requires `uac2`; without it the UAC2 function stays descriptor-only.
+    pub uac2_bridge: bool,
+    /// Host playback device receiving host→device PCM.
+    pub uac2_sink_device: Option<String>,
+    /// Host capture device feeding device→host PCM.
+    pub uac2_source_device: Option<String>,
     pub vendor: bool,
     pub vendor_daemon: Option<PathBuf>,
 }
@@ -304,9 +327,47 @@ impl UsbChildOptions {
             || self.media_ro
             || self.media_cdrom
             || self.uac2
+            || self.uac2_bridge
+            || self.uac2_sink_device.is_some()
+            || self.uac2_source_device.is_some()
             || self.vendor
             || self.vendor_daemon.is_some()
     }
+}
+
+/// Opt-in read-only multiseat report for exactly one logical node.
+///
+/// The node only reads the persisted seat store; the standalone
+/// `ozma-multiseat` supervisor keeps seat lifecycle. Because the store is
+/// shared host state, only one supervised child may own the report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MultiseatChildOptions {
+    pub enabled: bool,
+    /// Versioned `seats.json` store (`--seats-file`).
+    pub seats_file: Option<PathBuf>,
+    /// The single child that serves `GET /api/v1/seats`.
+    pub vm: Option<String>,
+}
+
+/// Opt-in node-local mesh service for exactly one logical node.
+///
+/// A mesh identity (mesh IP, WireGuard UDP port, private key) is unique per
+/// node, so forwarding the same configuration to every per-VM child would bind
+/// the same port and advertise the same identity several times. The supervisor
+/// therefore forwards mesh flags to one named child only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MeshChildOptions {
+    pub enabled: bool,
+    pub ip: Option<String>,
+    pub port: Option<u16>,
+    /// Path to the base64 X25519 private-key file. The supervisor never reads
+    /// its contents; only the path is forwarded.
+    pub key_file: Option<PathBuf>,
+    pub kernel: bool,
+    /// Repeatable `MeshNode` JSON peers.
+    pub peers: Vec<String>,
+    /// The single child that owns this mesh identity.
+    pub vm: Option<String>,
 }
 
 /// GPU-passthrough capture over Looking Glass.
@@ -336,6 +397,10 @@ pub struct ChildOptions {
     pub vnc: VncChildOptions,
     pub usb: UsbChildOptions,
     pub gpu: GpuPassthroughChildOptions,
+    /// Read-only multiseat report owned by one logical child.
+    pub multiseat: MultiseatChildOptions,
+    /// Node-local mesh identity owned by one logical child.
+    pub mesh: MeshChildOptions,
     /// `--audio-router` (`none`, `pipewire`, `pulseaudio`).
     pub audio_router: Option<String>,
     /// Derive `--audio-capture-target monitor:<audio-sink>` when a sink exists.
@@ -408,6 +473,146 @@ impl ChildOptions {
                     detail: "USB gadget forwarding requires --usb-udc".to_owned(),
                 });
             }
+            if self.usb.uac2_bridge && !self.usb.uac2 {
+                return Err(ChildArgvError::InvalidOption {
+                    option: "usb-uac2-bridge",
+                    detail: "--usb-uac2-bridge requires --usb-uac2".to_owned(),
+                });
+            }
+            if !self.usb.uac2_bridge && self.usb.uac2_sink_device.is_some() {
+                return Err(ChildArgvError::InvalidOption {
+                    option: "usb-uac2-sink-device",
+                    detail: "--usb-uac2-sink-device requires --usb-uac2-bridge".to_owned(),
+                });
+            }
+            if !self.usb.uac2_bridge && self.usb.uac2_source_device.is_some() {
+                return Err(ChildArgvError::InvalidOption {
+                    option: "usb-uac2-source-device",
+                    detail: "--usb-uac2-source-device requires --usb-uac2-bridge".to_owned(),
+                });
+            }
+            if self
+                .usb
+                .uac2_sink_device
+                .as_deref()
+                .is_some_and(|device| device.trim().is_empty())
+            {
+                return Err(ChildArgvError::InvalidOption {
+                    option: "usb-uac2-sink-device",
+                    detail: "ALSA sink device must not be empty".to_owned(),
+                });
+            }
+            if self
+                .usb
+                .uac2_source_device
+                .as_deref()
+                .is_some_and(|device| device.trim().is_empty())
+            {
+                return Err(ChildArgvError::InvalidOption {
+                    option: "usb-uac2-source-device",
+                    detail: "ALSA source device must not be empty".to_owned(),
+                });
+            }
+        }
+
+        if self.vnc.bind.is_some() && !self.vnc.server {
+            return Err(ChildArgvError::InvalidOption {
+                option: "vnc-bind",
+                detail: "--vnc-bind requires --vnc-server".to_owned(),
+            });
+        }
+        if self.vnc.server_port.is_some() && !self.vnc.server {
+            return Err(ChildArgvError::InvalidOption {
+                option: "vnc-server-port",
+                detail: "--vnc-server-port requires --vnc-server".to_owned(),
+            });
+        }
+        if self.vnc.vm.is_some() && !self.vnc.server {
+            return Err(ChildArgvError::InvalidOption {
+                option: "vnc-vm",
+                detail: "--vnc-vm requires --vnc-server".to_owned(),
+            });
+        }
+        if self
+            .vnc
+            .server_port
+            .is_some_and(|port| port != 0 && self.vnc.vm.as_deref().unwrap_or("").trim().is_empty())
+        {
+            return Err(ChildArgvError::InvalidOption {
+                option: "vnc-server-port",
+                detail: "a non-zero --vnc-server-port requires --vnc-vm <VM>: two children \
+                         cannot bind the same TCP port; leave the port unset/0 so each child \
+                         gets a distinct OS-assigned port"
+                    .to_owned(),
+            });
+        }
+
+        if self.multiseat.enabled {
+            if self.multiseat.vm.as_deref().unwrap_or("").trim().is_empty() {
+                return Err(ChildArgvError::InvalidOption {
+                    option: "multiseat-vm",
+                    detail: "--multiseat requires --multiseat-vm <VM> so exactly one logical \
+                             node owns the read-only seat report"
+                        .to_owned(),
+                });
+            }
+            if self
+                .multiseat
+                .seats_file
+                .as_deref()
+                .map_or(true, |path| path.as_os_str().is_empty())
+            {
+                return Err(ChildArgvError::InvalidOption {
+                    option: "seats-file",
+                    detail: "--multiseat requires --seats-file".to_owned(),
+                });
+            }
+        } else {
+            if self.multiseat.seats_file.is_some() {
+                return Err(ChildArgvError::InvalidOption {
+                    option: "seats-file",
+                    detail: "--seats-file requires --multiseat".to_owned(),
+                });
+            }
+            if self.multiseat.vm.is_some() {
+                return Err(ChildArgvError::InvalidOption {
+                    option: "multiseat-vm",
+                    detail: "--multiseat-vm requires --multiseat".to_owned(),
+                });
+            }
+        }
+
+        let mesh_configured = self.mesh.enabled
+            || self.mesh.ip.is_some()
+            || self.mesh.port.is_some()
+            || self.mesh.key_file.is_some()
+            || self.mesh.kernel
+            || !self.mesh.peers.is_empty();
+        if mesh_configured && !self.mesh.enabled {
+            return Err(ChildArgvError::InvalidOption {
+                option: "mesh",
+                detail: "mesh sub-options require --mesh".to_owned(),
+            });
+        }
+        if self.mesh.enabled && self.mesh.vm.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(ChildArgvError::InvalidOption {
+                option: "mesh-vm",
+                detail: "the mesh identity is unique per node; --mesh requires --mesh-vm <VM> \
+                         so only one child binds the UDP port and advertises the identity"
+                    .to_owned(),
+            });
+        }
+        if self.mesh.port == Some(0) {
+            return Err(ChildArgvError::InvalidOption {
+                option: "mesh-port",
+                detail: "--mesh-port must be non-zero".to_owned(),
+            });
+        }
+        if self.mesh.peers.iter().any(|peer| peer.trim().is_empty()) {
+            return Err(ChildArgvError::InvalidOption {
+                option: "mesh-peer",
+                detail: "--mesh-peer must not be empty".to_owned(),
+            });
         }
 
         for (vm, ip) in &self.guest_ips {
@@ -886,6 +1091,30 @@ pub fn build_child_argv(
         builder.push("vnc-port", "--vnc-port", Some(vm.vnc_port.to_string()));
     }
 
+    // Internal RFB server. It is independent of VNC *capture* above: a child
+    // can serve its QMP/VNC/Looking Glass capture source. A fixed port is
+    // single-VM scoped because sibling children cannot share a TCP port;
+    // without a fixed port every child asks the OS for a distinct one.
+    if options.vnc.server
+        && options
+            .vnc
+            .vm
+            .as_deref()
+            .map_or(true, |name| name == vm.name.as_str())
+    {
+        builder.push_flag("vnc-server", "--vnc-server", true);
+        builder.push("vnc-bind", "--vnc-bind", options.vnc.bind.clone());
+        builder.push(
+            "vnc-server-port",
+            "--vnc-server-port",
+            options
+                .vnc
+                .server_port
+                .filter(|port| *port != 0)
+                .map(|port| port.to_string()),
+        );
+    }
+
     if let Some(shm) = looking_glass {
         builder.push(
             "looking-glass-shm",
@@ -1056,6 +1285,21 @@ pub fn build_child_argv(
             options.usb.media_cdrom,
         );
         builder.push_flag("usb-uac2", "--usb-uac2", options.usb.uac2);
+        builder.push_flag(
+            "usb-uac2-bridge",
+            "--usb-uac2-bridge",
+            options.usb.uac2_bridge,
+        );
+        builder.push(
+            "usb-uac2-sink-device",
+            "--usb-uac2-sink-device",
+            options.usb.uac2_sink_device.clone(),
+        );
+        builder.push(
+            "usb-uac2-source-device",
+            "--usb-uac2-source-device",
+            options.usb.uac2_source_device.clone(),
+        );
         builder.push_flag("usb-vendor", "--usb-vendor", options.usb.vendor);
         builder.push(
             "usb-vendor-daemon",
@@ -1066,6 +1310,49 @@ pub fn build_child_argv(
                 .as_ref()
                 .map(|path| path.display().to_string()),
         );
+    }
+
+    // Read-only multiseat report. The store is shared host state and the node
+    // deliberately reports rather than mutates seats, so exactly one child
+    // owns it.
+    if options.multiseat.enabled && options.multiseat.vm.as_deref() == Some(vm.name.as_str()) {
+        builder.push_flag("multiseat", "--multiseat", true);
+        builder.push(
+            "seats-file",
+            "--seats-file",
+            options
+                .multiseat
+                .seats_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        );
+    }
+
+    // Node-local mesh service. One mesh identity per node; validate() requires
+    // --mesh-vm so siblings never bind the same UDP port or advertise the same
+    // key. The key file's contents are never read here.
+    if options.mesh.enabled && options.mesh.vm.as_deref() == Some(vm.name.as_str()) {
+        builder.push_flag("mesh", "--mesh", true);
+        builder.push("mesh-ip", "--mesh-ip", options.mesh.ip.clone());
+        builder.push(
+            "mesh-port",
+            "--mesh-port",
+            options.mesh.port.map(|port| port.to_string()),
+        );
+        builder.push(
+            "mesh-key-file",
+            "--mesh-key-file",
+            options
+                .mesh
+                .key_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        );
+        builder.push_flag("mesh-kernel", "--mesh-kernel", options.mesh.kernel);
+        // `--mesh-peer` is intentionally repeatable, like `--display-output`.
+        for peer in &options.mesh.peers {
+            builder.push("mesh-peer", "--mesh-peer", Some(peer.clone()));
+        }
     }
 
     builder.finish()
@@ -1799,7 +2086,13 @@ mod tests {
                 multi_console_max: Some(2),
                 multi_console_idle_seconds: Some(30),
             },
-            vnc: VncChildOptions { capture: false },
+            vnc: VncChildOptions {
+                capture: false,
+                server: true,
+                bind: Some("127.0.0.1".to_owned()),
+                server_port: Some(5901),
+                vm: Some("vm-a".to_owned()),
+            },
             usb: UsbChildOptions {
                 enabled: true,
                 vm: Some("vm-a".to_owned()),
@@ -1809,6 +2102,9 @@ mod tests {
                 media_ro: true,
                 media_cdrom: true,
                 uac2: true,
+                uac2_bridge: true,
+                uac2_sink_device: Some("default".to_owned()),
+                uac2_source_device: Some("hw:1,0".to_owned()),
                 vendor: true,
                 vendor_daemon: Some(PathBuf::from("/usr/libexec/ozma-usb-vendor")),
             },
@@ -1820,6 +2116,23 @@ mod tests {
                 looking_glass_fps: Some(60),
                 looking_glass_id: Some("lg-vm-a".to_owned()),
                 looking_glass_name: Some("VM A display".to_owned()),
+            },
+            multiseat: MultiseatChildOptions {
+                enabled: true,
+                seats_file: Some(PathBuf::from("/etc/ozma/seats.json")),
+                vm: Some("vm-a".to_owned()),
+            },
+            mesh: MeshChildOptions {
+                enabled: true,
+                ip: Some("10.255.0.2".to_owned()),
+                port: Some(51820),
+                key_file: Some(PathBuf::from("/etc/ozma/mesh.key")),
+                kernel: false,
+                peers: vec![
+                    r#"{"id":"peer-b","public_key":"cGVlci1i","endpoint":"192.0.2.9:51820"}"#
+                        .to_owned(),
+                ],
+                vm: Some("vm-a".to_owned()),
             },
             audio_router: Some("pipewire".to_owned()),
             audio_capture_from_sink: true,
@@ -1904,6 +2217,9 @@ mod tests {
             "--multi-console-webrtc",
             "--multi-console-webrtc-max",
             "--multi-console-webrtc-idle-seconds",
+            "--vnc-server",
+            "--vnc-bind",
+            "--vnc-server-port",
             "--usb-gadget",
             "--usb-udc",
             "--usb-configfs-root",
@@ -1911,8 +2227,18 @@ mod tests {
             "--usb-media-ro",
             "--usb-media-cdrom",
             "--usb-uac2",
+            "--usb-uac2-bridge",
+            "--usb-uac2-sink-device",
+            "--usb-uac2-source-device",
             "--usb-vendor",
             "--usb-vendor-daemon",
+            "--multiseat",
+            "--seats-file",
+            "--mesh",
+            "--mesh-ip",
+            "--mesh-port",
+            "--mesh-key-file",
+            "--mesh-peer",
         ] {
             assert_eq!(flag_count(&argv, flag), 1, "{flag} must appear once");
         }
@@ -1953,6 +2279,28 @@ mod tests {
             value_after(&argv, "--usb-media"),
             Some("/srv/media/installer.iso")
         );
+        assert_eq!(value_after(&argv, "--vnc-bind"), Some("127.0.0.1"));
+        assert_eq!(value_after(&argv, "--vnc-server-port"), Some("5901"));
+        assert_eq!(
+            value_after(&argv, "--usb-uac2-sink-device"),
+            Some("default")
+        );
+        assert_eq!(
+            value_after(&argv, "--usb-uac2-source-device"),
+            Some("hw:1,0")
+        );
+        assert_eq!(
+            value_after(&argv, "--seats-file"),
+            Some("/etc/ozma/seats.json")
+        );
+        assert_eq!(value_after(&argv, "--mesh-ip"), Some("10.255.0.2"));
+        assert_eq!(value_after(&argv, "--mesh-port"), Some("51820"));
+        assert_eq!(
+            value_after(&argv, "--mesh-key-file"),
+            Some("/etc/ozma/mesh.key")
+        );
+        assert!(value_after(&argv, "--mesh-peer")
+            .is_some_and(|peer| peer.contains("\"id\":\"peer-b\"")));
     }
 
     #[test]
@@ -1983,8 +2331,21 @@ mod tests {
             "--webrtc-shm",
             "--vnc-host",
             "--vnc-port",
+            "--vnc-server",
+            "--vnc-bind",
+            "--vnc-server-port",
             "--usb-gadget",
+            "--usb-uac2-bridge",
+            "--usb-uac2-sink-device",
+            "--usb-uac2-source-device",
             "--looking-glass-shm",
+            "--multiseat",
+            "--seats-file",
+            "--mesh",
+            "--mesh-ip",
+            "--mesh-port",
+            "--mesh-key-file",
+            "--mesh-peer",
             "--audio-router",
             "--audio-capture-target",
             "--audio-track-root",
@@ -2023,7 +2384,10 @@ mod tests {
         vm.vnc_host = "192.0.2.10".to_owned();
 
         let options = ChildOptions {
-            vnc: VncChildOptions { capture: true },
+            vnc: VncChildOptions {
+                capture: true,
+                ..VncChildOptions::default()
+            },
             ..ChildOptions::default()
         };
         let argv = build_child_argv(
@@ -2085,6 +2449,25 @@ mod tests {
                 udc: Some("dummy_udc.0".to_owned()),
                 ..UsbChildOptions::default()
             },
+            vnc: VncChildOptions {
+                server: true,
+                bind: Some("127.0.0.1".to_owned()),
+                vm: Some("vm-a".to_owned()),
+                ..VncChildOptions::default()
+            },
+            multiseat: MultiseatChildOptions {
+                enabled: true,
+                seats_file: Some(PathBuf::from("/etc/ozma/seats.json")),
+                vm: Some("vm-a".to_owned()),
+            },
+            mesh: MeshChildOptions {
+                enabled: true,
+                ip: Some("10.255.0.2".to_owned()),
+                port: Some(51820),
+                key_file: Some(PathBuf::from("/etc/ozma/mesh.key")),
+                vm: Some("vm-a".to_owned()),
+                ..MeshChildOptions::default()
+            },
             ..ChildOptions::default()
         };
 
@@ -2110,10 +2493,18 @@ mod tests {
         assert_eq!(flag_count(&vm_a, "--display-output"), 2);
         assert_eq!(flag_count(&vm_a, "--usb-gadget"), 1);
         assert_eq!(flag_count(&vm_a, "--vm-guest-ip"), 0);
+        assert_eq!(flag_count(&vm_a, "--vnc-server"), 1);
+        assert_eq!(flag_count(&vm_a, "--multiseat"), 1);
+        assert_eq!(flag_count(&vm_a, "--mesh"), 1);
 
         let vm_b = build("vm-b");
         assert_eq!(flag_count(&vm_b, "--display-output"), 0);
         assert_eq!(flag_count(&vm_b, "--usb-gadget"), 0);
+        assert_eq!(flag_count(&vm_b, "--vnc-server"), 0);
+        assert_eq!(flag_count(&vm_b, "--multiseat"), 0);
+        assert_eq!(flag_count(&vm_b, "--seats-file"), 0);
+        assert_eq!(flag_count(&vm_b, "--mesh"), 0);
+        assert_eq!(flag_count(&vm_b, "--mesh-peer"), 0);
         assert_eq!(value_after(&vm_b, "--vm-guest-ip"), Some("10.0.0.43"));
     }
 
@@ -2211,6 +2602,201 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.flag == "--hls"));
+    }
+
+    #[test]
+    fn new_server_and_mesh_flags_follow_warn_and_reject_policy() {
+        let options = ChildOptions {
+            vnc: VncChildOptions {
+                server: true,
+                bind: Some("127.0.0.1".to_owned()),
+                ..VncChildOptions::default()
+            },
+            mesh: MeshChildOptions {
+                enabled: true,
+                ip: Some("10.255.0.2".to_owned()),
+                port: Some(51820),
+                vm: Some("vm-a".to_owned()),
+                ..MeshChildOptions::default()
+            },
+            ..ChildOptions::default()
+        };
+        let support = NodeFlagSupport::from_help(
+            "--profile --name --qmp-socket --hid-udp-port --http-port \
+             --capture-provider --input-provider --power-provider",
+        );
+
+        let error = build_child_argv(
+            &vm("vm-a", "/run/ozma/a.qmp"),
+            NodePorts {
+                hid_udp: 7400,
+                http: 7500,
+            },
+            "",
+            None,
+            &options,
+            &support,
+            UnsupportedPolicy::Reject,
+        )
+        .expect_err("unsupported --vnc-server is rejected");
+        assert_eq!(
+            error,
+            ChildArgvError::UnsupportedFlag {
+                option: "vnc-server",
+                flag: "--vnc-server".to_owned(),
+            }
+        );
+
+        let warned = build_child_argv(
+            &vm("vm-a", "/run/ozma/a.qmp"),
+            NodePorts {
+                hid_udp: 7400,
+                http: 7500,
+            },
+            "",
+            None,
+            &options,
+            &support,
+            UnsupportedPolicy::Warn,
+        )
+        .expect("warning policy still builds");
+        assert_eq!(flag_count(&warned.args, "--vnc-server"), 0);
+        assert_eq!(flag_count(&warned.args, "--mesh"), 0);
+        assert!(warned
+            .warnings
+            .iter()
+            .any(|warning| warning.flag == "--vnc-server"));
+        assert!(warned
+            .warnings
+            .iter()
+            .any(|warning| warning.flag == "--mesh"));
+    }
+
+    #[test]
+    fn new_flag_combinations_are_typed_errors() {
+        let cases = [
+            (
+                ChildOptions {
+                    vnc: VncChildOptions {
+                        bind: Some("0.0.0.0".to_owned()),
+                        ..VncChildOptions::default()
+                    },
+                    ..ChildOptions::default()
+                },
+                "vnc-bind",
+            ),
+            (
+                ChildOptions {
+                    vnc: VncChildOptions {
+                        server: true,
+                        server_port: Some(5901),
+                        ..VncChildOptions::default()
+                    },
+                    ..ChildOptions::default()
+                },
+                "vnc-server-port",
+            ),
+            (
+                ChildOptions {
+                    usb: UsbChildOptions {
+                        enabled: true,
+                        vm: Some("vm-a".to_owned()),
+                        udc: Some("dummy_udc.0".to_owned()),
+                        uac2_bridge: true,
+                        ..UsbChildOptions::default()
+                    },
+                    ..ChildOptions::default()
+                },
+                "usb-uac2-bridge",
+            ),
+            (
+                ChildOptions {
+                    usb: UsbChildOptions {
+                        enabled: true,
+                        vm: Some("vm-a".to_owned()),
+                        udc: Some("dummy_udc.0".to_owned()),
+                        uac2: true,
+                        uac2_sink_device: Some("default".to_owned()),
+                        ..UsbChildOptions::default()
+                    },
+                    ..ChildOptions::default()
+                },
+                "usb-uac2-sink-device",
+            ),
+            (
+                ChildOptions {
+                    multiseat: MultiseatChildOptions {
+                        enabled: true,
+                        seats_file: Some(PathBuf::from("/etc/ozma/seats.json")),
+                        ..MultiseatChildOptions::default()
+                    },
+                    ..ChildOptions::default()
+                },
+                "multiseat-vm",
+            ),
+            (
+                ChildOptions {
+                    multiseat: MultiseatChildOptions {
+                        enabled: true,
+                        vm: Some("vm-a".to_owned()),
+                        ..MultiseatChildOptions::default()
+                    },
+                    ..ChildOptions::default()
+                },
+                "seats-file",
+            ),
+            (
+                ChildOptions {
+                    multiseat: MultiseatChildOptions {
+                        seats_file: Some(PathBuf::from("/etc/ozma/seats.json")),
+                        ..MultiseatChildOptions::default()
+                    },
+                    ..ChildOptions::default()
+                },
+                "seats-file",
+            ),
+            (
+                ChildOptions {
+                    mesh: MeshChildOptions {
+                        ip: Some("10.255.0.2".to_owned()),
+                        ..MeshChildOptions::default()
+                    },
+                    ..ChildOptions::default()
+                },
+                "mesh",
+            ),
+            (
+                ChildOptions {
+                    mesh: MeshChildOptions {
+                        enabled: true,
+                        ..MeshChildOptions::default()
+                    },
+                    ..ChildOptions::default()
+                },
+                "mesh-vm",
+            ),
+            (
+                ChildOptions {
+                    mesh: MeshChildOptions {
+                        enabled: true,
+                        port: Some(0),
+                        vm: Some("vm-a".to_owned()),
+                        ..MeshChildOptions::default()
+                    },
+                    ..ChildOptions::default()
+                },
+                "mesh-port",
+            ),
+        ];
+
+        for (options, option) in cases {
+            match options.validate() {
+                Err(ChildArgvError::InvalidOption { option: actual, .. }) => {
+                    assert_eq!(actual, option)
+                }
+                other => panic!("expected typed --{option} error, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -2331,6 +2917,20 @@ mod tests {
                 vec!["0:Console_0:1920x1080".to_owned()],
             )]),
             guest_ips: HashMap::from([("vm-a".to_owned(), "10.0.0.42".to_owned())]),
+            vnc: VncChildOptions {
+                server: true,
+                bind: Some("127.0.0.1".to_owned()),
+                server_port: Some(5901),
+                vm: Some("vm-a".to_owned()),
+                ..VncChildOptions::default()
+            },
+            mesh: MeshChildOptions {
+                enabled: true,
+                ip: Some("10.255.0.2".to_owned()),
+                port: Some(51820),
+                vm: Some("vm-a".to_owned()),
+                ..MeshChildOptions::default()
+            },
             ..ChildOptions::default()
         };
         let spec = build_node_spec_with_options(

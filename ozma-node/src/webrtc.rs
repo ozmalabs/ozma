@@ -76,6 +76,13 @@ pub const DEFAULT_BITRATE_KBPS: u32 = 4_000;
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default bounded wait for one signaling response.
 pub const DEFAULT_OFFER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default window a capture size must stay unchanged before the fit probe
+/// accepts it as the settled geometry.
+pub const DEFAULT_FIT_SETTLE: Duration = Duration::from_millis(1_500);
+/// Largest `--webrtc-settle-ms` value the node accepts.
+pub const MAX_FIT_SETTLE_MS: u64 = 5_000;
+/// Hard bound for the whole fit probe, including frame waits and settling.
+pub const MAX_FIT_PROBE: Duration = Duration::from_secs(8);
 /// Largest error string retained for `/api/v1/connection`.
 const MAX_STATUS_ERROR_CHARS: usize = 512;
 /// How long `stop` waits for the frame feeder before aborting it.
@@ -452,6 +459,53 @@ struct WebRtcStatusInner {
     error: Option<String>,
     helper_pid: Option<u32>,
     audio_configured: bool,
+    geometry: Option<WebRtcGeometryStatus>,
+}
+
+/// Resolved helper/capture geometry reported by `/api/v1/connection`.
+///
+/// `width`/`height` are the size advertised to the helper and written to shared
+/// memory. When `scale_to_fit` is set, later frames with a different native size
+/// are nearest-neighbour rescaled to this target. `fitted` records whether the
+/// opt-in fit probe replaced the configured `--webrtc-width/--webrtc-height`;
+/// `settled` is present only when the probe actually ran (`Some(true)` means the
+/// size was stable for the settle window; `Some(false)` means the probe used the
+/// last observed size when it could not confirm stability).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct WebRtcGeometryStatus {
+    /// Helper frame width.
+    pub width: u32,
+    /// Helper frame height.
+    pub height: u32,
+    /// Whether mismatched frames are nearest-neighbour rescaled rather than
+    /// rejected (`--webrtc-fit-capture`).
+    pub scale_to_fit: bool,
+    /// Whether the fit probe changed the configured helper size.
+    pub fitted: bool,
+    /// Native capture width observed by the fit probe, when it ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_width: Option<u32>,
+    /// Native capture height observed by the fit probe, when it ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_height: Option<u32>,
+    /// Whether the probed capture size settled, when the probe ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settled: Option<bool>,
+}
+
+impl WebRtcGeometryStatus {
+    /// Geometry implied by a validated helper configuration.
+    pub fn from_config(config: &WebRtcConfig) -> Self {
+        Self {
+            width: config.width,
+            height: config.height,
+            scale_to_fit: config.scale_to_fit,
+            fitted: false,
+            capture_width: None,
+            capture_height: None,
+            settled: None,
+        }
+    }
 }
 
 /// Cloneable, bounded helper status for `/api/v1/connection`.
@@ -485,6 +539,7 @@ impl WebRtcStatus {
                 error: None,
                 helper_pid: None,
                 audio_configured: false,
+                geometry: None,
             })),
         }
     }
@@ -504,6 +559,15 @@ impl WebRtcStatus {
 
     fn set_audio_configured(&self, configured: bool) {
         self.lock().audio_configured = configured;
+    }
+
+    fn set_geometry(&self, geometry: WebRtcGeometryStatus) {
+        self.lock().geometry = Some(geometry);
+    }
+
+    /// Resolved helper geometry, when one is known.
+    pub fn geometry(&self) -> Option<WebRtcGeometryStatus> {
+        self.lock().geometry
     }
 
     fn set_failed(&self, message: impl Into<String>) {
@@ -874,6 +938,7 @@ impl WebRtcHelper {
 
         let status = WebRtcStatus::starting();
         status.set_audio_configured(config.audio_source.is_some());
+        status.set_geometry(WebRtcGeometryStatus::from_config(&config));
         let spawned = match spawner.spawn(&config) {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -913,6 +978,15 @@ impl WebRtcHelper {
     /// Configuration this helper runs with.
     pub fn config(&self) -> &WebRtcConfig {
         &self.config
+    }
+
+    /// Replace the reported geometry with the fit probe's observation.
+    ///
+    /// The helper starts with [`WebRtcGeometryStatus::from_config`]; `main`
+    /// calls this after probing a runtime capture size so status names the
+    /// actual helper target and whether the probe settled.
+    pub fn record_geometry(&self, geometry: WebRtcGeometryStatus) {
+        self.status.set_geometry(geometry);
     }
 
     /// True while the helper socket is connected and the feeder has not
@@ -1178,6 +1252,11 @@ impl WebRtcControl {
         self.lock().status.error()
     }
 
+    /// Resolved helper geometry for `/api/v1/connection`.
+    pub fn geometry(&self) -> Option<WebRtcGeometryStatus> {
+        self.lock().status.geometry()
+    }
+
     /// Whether the helper was configured with an audio monitor source.
     pub fn audio_configured(&self) -> bool {
         let inner = self.lock();
@@ -1315,6 +1394,113 @@ impl WebRtcControl {
 // ---------------------------------------------------------------------------
 // Frame conversion and feeder
 // ---------------------------------------------------------------------------
+
+/// Bounds for the opt-in fit probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FitProbe {
+    /// How long one capture size must stay unchanged before it is accepted.
+    pub settle_window: Duration,
+    /// Hard bound for the whole probe, including frame waits.
+    pub max_wait: Duration,
+}
+
+impl Default for FitProbe {
+    fn default() -> Self {
+        Self {
+            settle_window: DEFAULT_FIT_SETTLE,
+            max_wait: MAX_FIT_PROBE,
+        }
+    }
+}
+
+/// Geometry chosen by [`probe_settled_geometry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FitProbeResult {
+    /// Observed capture width.
+    pub width: u32,
+    /// Observed capture height.
+    pub height: u32,
+    /// True when the size stayed unchanged for the settle window.
+    pub settled: bool,
+    /// Frames consumed while probing. They are not replayed to the feeder.
+    pub frames: u32,
+}
+
+/// Read frames until the capture size settles, bounded by [`FitProbe::max_wait`].
+///
+/// Callers use this only when discovery geometry is unknown (`0x0`), as with
+/// QMP/VNC sources that learn their size from the first screendump. Waiting for
+/// a settle window avoids latching a transient boot mode. If the size never
+/// settles, the last observed non-zero size is returned with
+/// [`FitProbeResult::settled`] `false`; the caller keeps the ordinary
+/// nearest-neighbour scaling fallback. `None` means no usable frame arrived, so
+/// the configured helper size should stay unchanged.
+pub async fn probe_settled_geometry(
+    source: &mut dyn CaptureSource,
+    probe: FitProbe,
+) -> Option<FitProbeResult> {
+    let deadline = tokio::time::Instant::now() + probe.max_wait;
+    let mut last: Option<(u32, u32)> = None;
+    let mut stable_since = tokio::time::Instant::now();
+    let mut frames = 0u32;
+
+    loop {
+        let now = tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            break;
+        }
+        let frame = match tokio::time::timeout(remaining, source.next_frame()).await {
+            Ok(Ok(frame)) => frame,
+            // A source error or the overall timeout ends the probe; any size
+            // already observed is still better than the configured fallback.
+            Ok(Err(_)) | Err(_) => break,
+        };
+        frames += 1;
+
+        let size = (frame.format().width, frame.format().height);
+        if size.0 == 0 || size.1 == 0 {
+            // Not usable geometry; keep waiting for the first real frame.
+            continue;
+        }
+
+        let now = tokio::time::Instant::now();
+        match last {
+            Some(previous) if previous == size => {
+                if now.saturating_duration_since(stable_since) >= probe.settle_window {
+                    return Some(FitProbeResult {
+                        width: size.0,
+                        height: size.1,
+                        settled: true,
+                        frames,
+                    });
+                }
+            }
+            _ => {
+                last = Some(size);
+                stable_since = now;
+                if probe.settle_window.is_zero() {
+                    return Some(FitProbeResult {
+                        width: size.0,
+                        height: size.1,
+                        settled: true,
+                        frames,
+                    });
+                }
+            }
+        }
+    }
+
+    let settled = last.is_some_and(|_| {
+        tokio::time::Instant::now().saturating_duration_since(stable_since) >= probe.settle_window
+    });
+    last.map(|(width, height)| FitProbeResult {
+        width,
+        height,
+        settled,
+        frames,
+    })
+}
 
 async fn run_feeder(
     mut source: Box<dyn CaptureSource>,
@@ -1863,6 +2049,55 @@ mod tests {
                 Some(frame) => Ok(frame),
                 None => Err(MediaError::EndOfStream),
             }
+        }
+    }
+
+    /// A source with scripted per-frame delays and geometries.
+    ///
+    /// `cycle` repeats the script forever, which lets the never-settles test
+    /// stay within a short probe budget instead of allocating a long script.
+    struct ScriptedSource {
+        format: FrameFormat,
+        script: Vec<(Duration, FrameFormat)>,
+        index: usize,
+        cycle: bool,
+    }
+
+    impl ScriptedSource {
+        fn new(format: FrameFormat, script: Vec<(Duration, FrameFormat)>, cycle: bool) -> Self {
+            Self {
+                format,
+                script,
+                index: 0,
+                cycle,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CaptureSource for ScriptedSource {
+        fn id(&self) -> &str {
+            "scripted"
+        }
+
+        fn format(&self) -> FrameFormat {
+            self.format
+        }
+
+        async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+            if self.script.is_empty() || (self.index >= self.script.len() && !self.cycle) {
+                return Err(MediaError::EndOfStream);
+            }
+            let (delay, format) = self.script[self.index % self.script.len()];
+            self.index += 1;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let len = format.width as usize * format.height as usize * 3;
+            Ok(
+                Frame::with_data(format, 0, self.index as u64, true, vec![0u8; len])
+                    .expect("scripted frame is valid"),
+            )
         }
     }
 
@@ -2741,5 +2976,137 @@ mod tests {
         let same = convert_to_bgra(&frame, PixelFormat::Rgb24, 2, 2, false)
             .expect("matching dimensions need no scaling");
         assert_eq!(same.len(), 2 * 2 * 4);
+    }
+
+    #[tokio::test]
+    async fn fit_probe_prefers_the_settled_geometry_not_the_boot_mode() {
+        // QMP reports 0x0 until the first screendump; the guest briefly boots
+        // at 720x400, then settles at 1280x800.
+        let mut script = vec![(Duration::ZERO, FrameFormat::rgb24(720, 400))];
+        for _ in 0..10 {
+            script.push((Duration::from_millis(5), FrameFormat::rgb24(1280, 800)));
+        }
+        let mut source = ScriptedSource::new(FrameFormat::rgb24(0, 0), script, false);
+        let probe = FitProbe {
+            settle_window: Duration::from_millis(40),
+            max_wait: Duration::from_secs(2),
+        };
+
+        let result = probe_settled_geometry(&mut source, probe)
+            .await
+            .expect("the scripted source produced frames");
+
+        assert_eq!((result.width, result.height), (1280, 800));
+        assert!(result.settled, "the repeated tail must settle");
+        assert!(
+            result.frames >= 3,
+            "the probe consumed only {} frames",
+            result.frames
+        );
+    }
+
+    #[tokio::test]
+    async fn fit_probe_is_bounded_when_the_size_never_settles() {
+        let script = vec![
+            (Duration::from_millis(2), FrameFormat::rgb24(64, 40)),
+            (Duration::from_millis(2), FrameFormat::rgb24(128, 80)),
+        ];
+        let mut source = ScriptedSource::new(FrameFormat::rgb24(0, 0), script, true);
+        let probe = FitProbe {
+            settle_window: Duration::from_millis(30),
+            max_wait: Duration::from_millis(70),
+        };
+        let started = tokio::time::Instant::now();
+
+        let result = probe_settled_geometry(&mut source, probe)
+            .await
+            .expect("the last observed size is still usable");
+
+        assert!(!result.settled, "an alternating size must not settle");
+        assert!(
+            matches!((result.width, result.height), (64, 40) | (128, 80)),
+            "unexpected fallback geometry {}x{}",
+            result.width,
+            result.height
+        );
+        assert!(result.frames > 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the probe exceeded its bounded wait: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn fit_off_keeps_a_typed_dimension_error() {
+        let source = Box::new(PendingSource::new(FrameFormat::rgb24(720, 400)));
+        let mut config = config("fit-off");
+        config.width = 640;
+        config.height = 480;
+        config.helper_program = PathBuf::from("/fake/helper");
+        let spawner = Arc::new(RecordingSpawner::new(silent_signaler()));
+
+        let error = match WebRtcHelper::start_with_spawner(source, config, spawner) {
+            Ok(mut helper) => {
+                helper.stop().await.unwrap();
+                panic!("fit off must reject a mismatched explicit size");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                WebRtcError::FrameDimensions {
+                    width: 720,
+                    height: 400,
+                    expected_width: 640,
+                    expected_height: 480
+                }
+            ),
+            "expected a typed dimension error, got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_configured_and_probed_geometry() {
+        let source = Box::new(PendingSource::new(FrameFormat::rgb24(2, 2)));
+        let mut config = config("geometry-status");
+        config.helper_program = PathBuf::from("/fake/helper");
+        config.scale_to_fit = true;
+        let spawner = Arc::new(RecordingSpawner::new(silent_signaler()));
+        let helper =
+            WebRtcHelper::start_with_spawner(source, config, spawner).expect("fake helper starts");
+
+        let configured = helper.status().geometry().expect("configured geometry");
+        assert_eq!((configured.width, configured.height), (2, 2));
+        assert!(configured.scale_to_fit);
+        assert!(!configured.fitted);
+        assert!(configured.capture_width.is_none());
+        assert!(configured.settled.is_none());
+
+        helper.record_geometry(WebRtcGeometryStatus {
+            width: 1280,
+            height: 800,
+            scale_to_fit: true,
+            fitted: true,
+            capture_width: Some(1280),
+            capture_height: Some(800),
+            settled: Some(true),
+        });
+        let control = WebRtcControl::from_helper(helper);
+        let geometry = control.geometry().expect("probed geometry");
+        assert_eq!((geometry.width, geometry.height), (1280, 800));
+        assert!(geometry.fitted);
+
+        let json = serde_json::to_value(geometry).unwrap();
+        assert_eq!(json["width"], 1280);
+        assert_eq!(json["height"], 800);
+        assert_eq!(json["scale_to_fit"], true);
+        assert_eq!(json["fitted"], true);
+        assert_eq!(json["capture_width"], 1280);
+        assert_eq!(json["capture_height"], 800);
+        assert_eq!(json["settled"], true);
+
+        control.shutdown().await;
     }
 }

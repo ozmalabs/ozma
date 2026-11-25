@@ -54,7 +54,10 @@ use ozma_node::{
     platform, registration, shutdown,
     software::report::{InventoryReporter, DEFAULT_REPORT_INTERVAL},
     usb_audio, usb_uac2,
-    webrtc::{WebRtcAudioBackend, WebRtcConfig, WebRtcControl, WebRtcHelper},
+    webrtc::{
+        probe_settled_geometry, FitProbe, WebRtcAudioBackend, WebRtcConfig, WebRtcControl,
+        WebRtcGeometryStatus, WebRtcHelper, MAX_FIT_PROBE, MAX_FIT_SETTLE_MS,
+    },
 };
 
 /// Ozma hardware KVM node process.
@@ -802,6 +805,20 @@ pub struct Args {
     /// this; explicit dimensions still apply when capture declares no size.
     #[arg(long, env = "OZMA_WEBRTC_FIT_CAPTURE")]
     pub webrtc_fit_capture: bool,
+
+    /// How long the fit probe waits for the capture size to stay unchanged
+    /// before accepting it (milliseconds, clamped to 0-5000; default 1500).
+    ///
+    /// Only used with `--webrtc-fit-capture` when the discovery geometry is
+    /// unknown. The whole probe is still bounded (about 8 s), so a source that
+    /// never settles falls back to its last observed size.
+    #[arg(
+        long,
+        env = "OZMA_WEBRTC_SETTLE_MS",
+        default_value_t = 1_500,
+        value_name = "MS"
+    )]
+    pub webrtc_settle_ms: u64,
 
     /// WebRTC helper frame rate (must be greater than zero).
     #[arg(long, env = "OZMA_WEBRTC_FPS", default_value_t = 30)]
@@ -1831,43 +1848,61 @@ async fn run() -> std::process::ExitCode {
                     }
                     Ok(mut source) => {
                         let mut start_config = webrtc_config.clone();
+                        let mut fit_source_geometry: Option<(u32, u32)> = None;
+                        let mut fit_settled: Option<bool> = None;
                         if args.webrtc_fit_capture {
-                            // Discovery-time formats may be zero (QMP/VNC learn
-                            // geometry from the first frame), so probe one
-                            // bounded frame before choosing the helper size.
-                            let mut format = source.format();
-                            if format.width == 0 || format.height == 0 {
-                                match tokio::time::timeout(
-                                    std::time::Duration::from_secs(3),
-                                    source.next_frame(),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(frame)) => format = frame.format(),
-                                    Ok(Err(error)) => warn!(
-                                        error = %error,
-                                        "WebRTC fit: the first capture frame failed; keeping the configured size"
-                                    ),
-                                    Err(_) => warn!(
-                                        "WebRTC fit: the first capture frame timed out; keeping the configured size"
-                                    ),
+                            // QMP/VNC sources report 0x0 until the first
+                            // screendump, and the guest can modeset during
+                            // boot. When discovery geometry is unknown, wait
+                            // for a stable size instead of latching the first
+                            // transient frame.
+                            let declared = source.format();
+                            let resolved = if declared.width > 0 && declared.height > 0 {
+                                Some((declared.width, declared.height))
+                            } else {
+                                let settle_ms = args.webrtc_settle_ms.min(MAX_FIT_SETTLE_MS);
+                                let probe = FitProbe {
+                                    settle_window: std::time::Duration::from_millis(settle_ms),
+                                    max_wait: MAX_FIT_PROBE,
+                                };
+                                match probe_settled_geometry(source.as_mut(), probe).await {
+                                    Some(result) => {
+                                        fit_settled = Some(result.settled);
+                                        info!(
+                                            width = result.width,
+                                            height = result.height,
+                                            frames = result.frames,
+                                            settled = result.settled,
+                                            settle_ms,
+                                            "WebRTC fit probe resolved the capture geometry"
+                                        );
+                                        Some((result.width, result.height))
+                                    }
+                                    None => {
+                                        warn!(
+                                            settle_ms,
+                                            "WebRTC fit: no usable capture frame arrived; \
+                                             keeping the configured size"
+                                        );
+                                        None
+                                    }
                                 }
-                            }
-                            if format.width > 0 && format.height > 0 {
-                                if format.width != start_config.width
-                                    || format.height != start_config.height
-                                {
+                            };
+                            if let Some((width, height)) = resolved {
+                                if width != start_config.width || height != start_config.height {
                                     info!(
                                         configured = %format!(
                                             "{}x{}",
                                             start_config.width, start_config.height
                                         ),
-                                        capture = %format!("{}x{}", format.width, format.height),
+                                        capture = %format!("{width}x{height}"),
+                                        settled = ?fit_settled,
                                         "fitting WebRTC helper to the capture frame size"
                                     );
                                 }
-                                start_config.width = format.width;
-                                start_config.height = format.height;
+                                start_config.width = width;
+                                start_config.height = height;
+                                fit_source_geometry = Some((width, height));
                             }
                         }
                         match WebRtcHelper::start(source, start_config) {
@@ -1876,6 +1911,18 @@ async fn run() -> std::process::ExitCode {
                                 // console switch restarts at the same size.
                                 let used = helper.config();
                                 webrtc_switch_config = Some(used.clone());
+                                let mut geometry = WebRtcGeometryStatus::from_config(used);
+                                geometry.fitted =
+                                    fit_source_geometry.is_some_and(|(width, height)| {
+                                        width != webrtc_config.width
+                                            || height != webrtc_config.height
+                                    });
+                                if let Some((width, height)) = fit_source_geometry {
+                                    geometry.capture_width = Some(width);
+                                    geometry.capture_height = Some(height);
+                                }
+                                geometry.settled = fit_settled;
+                                helper.record_geometry(geometry);
                                 info!(
                                     pid = ?helper.status().helper_pid(),
                                     socket = %used.socket_path.display(),

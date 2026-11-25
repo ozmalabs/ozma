@@ -1275,3 +1275,95 @@ sources, were left untouched. No product source was edited by this validation
 and nothing was committed. The only tracked files this validation wrote are
 this report and the VNC report note; the other tracked modifications in the
 working tree belong to the parallel workstream.
+
+## WebRTC settled fit probe (2026-11-25, code change; not live-validated)
+
+This change addresses gaps 1 and 2 in "Remaining gaps after this re-validation"
+above. It is covered by unit tests only: no demo, QEMU guest, helper, or peer
+was run for this change, so it does **not** claim the literal `--webrtc` demo
+is fixed end to end.
+
+### Probe behaviour
+
+- `--webrtc-fit-capture` remains opt-in. Without it, a declared capture size
+  that differs from `--webrtc-width/--webrtc-height` is still a typed
+  `frame dimensions ... do not match` error before the helper spawns.
+- With the flag, `ozma-node` only probes when discovery geometry is unknown
+  (`0x0`, as with QMP/VNC before the first screendump). A known discovery size
+  is used directly, as before; no frames are consumed.
+- An unknown probe now requires the observed size to stay unchanged for a
+  settle window before accepting it, instead of latching the first frame. The
+  default is **1500 ms**, tunable with `--webrtc-settle-ms` /
+  `OZMA_WEBRTC_SETTLE_MS` (clamped to 0-5000 ms; `0` accepts the first usable
+  frame). The whole probe is hard-bounded at **8 s**, including frame waits.
+- If the size never settles, or the source ends/errors/times out after frames
+  were seen, the **last observed non-zero size** is used and
+  `webrtc_geometry.settled` is `false`. The existing nearest-neighbour scaling
+  fallback still rescales later frames to the helper target, so a modeset does
+  not kill the stream.
+- If no usable frame arrives at all, the configured `--webrtc-width/height`
+  stays in place and the helper's own dimension check still fails honestly.
+- The probe consumes the frames it reads; they are not replayed to the feeder,
+  so the stream starts after the settle wait.
+
+### Status fields
+
+`GET /api/v1/connection` keeps the existing `webrtc` string and
+`webrtc_error`, and adds an additive `webrtc_geometry` object when a helper is
+configured:
+
+```json
+"webrtc_geometry": {
+  "width": 1280,
+  "height": 800,
+  "scale_to_fit": true,
+  "fitted": true,
+  "capture_width": 1280,
+  "capture_height": 800,
+  "settled": true
+}
+```
+
+- `width`/`height` are the helper target written to shared memory.
+- `scale_to_fit` is the opt-in runtime rescale flag.
+- `fitted` is true when the probe changed the configured helper size.
+- `capture_width`/`capture_height`/`settled` are present only when the probe
+  ran; `settled=false` means the bounded fallback was used.
+- `webrtc_geometry` is omitted when WebRTC is not configured, so consumers
+  that read only `webrtc`/`webrtc_error` are unaffected. For the opt-in
+  multi-console manager the object describes the active console's helper.
+
+### Tests and checks run
+
+- `cargo test -p ozma-node --lib` — 479 passed, 3 ignored (including the
+  existing GStreamer helper tests).
+- `cargo check -p ozma-node --all-targets` — clean.
+- `rustfmt --edition 2021 --check` on
+  `ozma-node/src/{main,webrtc,controller_compat}.rs` — clean.
+
+New unit tests: a 720x400-then-1280x800 scripted source settles on 1280x800;
+an alternating source never settles and returns a bounded last-size fallback;
+fit-off still produces the typed dimension error; status exposes configured
+and probed geometry (including JSON field shape).
+
+### Remaining WebRTC gaps
+
+1. **No live re-run yet.** The demo/QMP path, helper argv, peer SDP caps, and
+   `/api/v1/connection` were not exercised against a running guest with this
+   binary. A frozen-tree `demo/run_demo.sh --webrtc` run is still required to
+   confirm native 1280x800 end to end.
+2. **No re-fit after startup.** If the guest modesets after the settle window,
+   the helper target stays at the probed size and later frames are
+   nearest-neighbour scaled. A capture-format-change restart (or deferred
+   helper start) is still future work. A boot mode that persists longer than
+   the settle window can still be latched; raise `--webrtc-settle-ms` (up to
+   the 5000 ms bound) for such a guest.
+3. **The multi-console WebRTC manager does not run this probe.** It uses the
+   per-console geometry supplied by the display selection and reports that
+   geometry in status.
+4. **Probed frames are discarded.** A future change could replay the last
+   probe frame as the first feeder frame to remove the initial gap.
+5. **Scaling remains nearest-neighbour**, with no aspect-ratio or colour-space
+   correction.
+6. **WebRTC audio and the GStreamer/Python helper are unchanged**; there is
+   still no native WebRTC implementation.
