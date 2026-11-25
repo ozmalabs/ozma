@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::UsbError;
 use crate::functionfs::FunctionFsEndpoint;
 use crate::functionfs_daemon::{
-    FileEndpointIo, FunctionFsDaemonCore, FunctionFsEndpointIo,
+    FileEndpointIo, FunctionFsDaemonCore, FunctionFsEndpointIo, PollingFileEndpointIo,
     MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES,
 };
 use crate::mass_storage::{
@@ -769,6 +769,92 @@ impl MassStorageBulkTransport for FileBulkTransport {
 
     fn flush_in(&mut self, _timeout_ms: u64) -> Result<(), UsbError> {
         self.input.flush()
+    }
+}
+
+/// Owned, nonblocking file-endpoint transport that enforces each
+/// [`MassStorageLoop`] per-call deadline.
+///
+/// Unlike [`FileBulkTransport`], both endpoints are opened `O_NONBLOCK` and every
+/// read/write waits with `poll(2)` for the timeout supplied by the loop. A
+/// stalled peer therefore returns
+/// [`UsbError::MassStorageEndpointTimeout`] instead of blocking the worker
+/// forever. The endpoint files are still only the ones the caller supplies; this
+/// type never mounts FunctionFS, selects a UDC, or opens a device by default.
+pub struct PollingFileBulkTransport {
+    out: PollingFileEndpointIo,
+    input: PollingFileEndpointIo,
+    default_timeout_ms: u64,
+}
+
+impl PollingFileBulkTransport {
+    /// Open one OUT and one IN endpoint file with a default deadline.
+    pub fn open(
+        out_endpoint: FunctionFsEndpoint,
+        out_path: impl Into<PathBuf>,
+        in_endpoint: FunctionFsEndpoint,
+        in_path: impl Into<PathBuf>,
+        timeout_ms: u64,
+    ) -> Result<Self, UsbError> {
+        if out_endpoint.is_in()
+            || !in_endpoint.is_in()
+            || out_endpoint.address & 0x0f == 0
+            || in_endpoint.address & 0x0f == 0
+        {
+            return Err(UsbError::InvalidFunctionFsState {
+                reason: "PollingFileBulkTransport requires one non-zero OUT and one non-zero IN \
+                         endpoint"
+                    .to_owned(),
+            });
+        }
+        Ok(Self {
+            out: PollingFileEndpointIo::open(out_endpoint, out_path, timeout_ms)?,
+            input: PollingFileEndpointIo::open(in_endpoint, in_path, timeout_ms)?,
+            default_timeout_ms: timeout_ms,
+        })
+    }
+
+    /// Configured fallback deadline.
+    pub fn timeout_ms(&self) -> u64 {
+        self.default_timeout_ms
+    }
+
+    fn effective_timeout(&self, timeout_ms: u64) -> u64 {
+        if timeout_ms == 0 {
+            self.default_timeout_ms
+        } else {
+            timeout_ms
+        }
+    }
+}
+
+impl MassStorageBulkTransport for PollingFileBulkTransport {
+    fn read_out(&mut self, buffer: &mut [u8], timeout_ms: u64) -> Result<usize, UsbError> {
+        let max_bytes = buffer.len().min(MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES);
+        let timeout_ms = self.effective_timeout(timeout_ms);
+        self.out.read_timeout(&mut buffer[..max_bytes], timeout_ms)
+    }
+
+    fn write_in(&mut self, data: &[u8], timeout_ms: u64) -> Result<usize, UsbError> {
+        let timeout_ms = self.effective_timeout(timeout_ms);
+        let mut written = 0usize;
+        while written < data.len() {
+            let end = (written + MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES).min(data.len());
+            let count = self.input.write_timeout(&data[written..end], timeout_ms)?;
+            if count == 0 {
+                return Err(UsbError::MassStorageTransport {
+                    operation: "write",
+                    reason: "file endpoint accepted zero bytes".to_owned(),
+                });
+            }
+            written += count;
+        }
+        Ok(written)
+    }
+
+    fn flush_in(&mut self, timeout_ms: u64) -> Result<(), UsbError> {
+        let timeout_ms = self.effective_timeout(timeout_ms);
+        self.input.flush_timeout(timeout_ms)
     }
 }
 

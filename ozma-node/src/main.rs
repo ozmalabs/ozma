@@ -9,6 +9,7 @@
 //! 4. serve the versioned node API;
 //! 5. run the UAC2 audio bridge when the `audio` capability is present.
 
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -195,20 +196,50 @@ pub struct Args {
 
     /// Serve this node's first capture source as an RFB 3.8/VNC endpoint.
     ///
-    /// The server has security type None (no password/TLS); it binds loopback
-    /// by default. Enabling it on a node with no capture source is a warned
-    /// no-listener state, not a fake endpoint.
+    /// Security type None is used on loopback unless `--vnc-password-file`
+    /// enables VNC authentication. The transport is plain TCP: a password is
+    /// not encryption and there is no TLS. A non-loopback bind requires either
+    /// a password or `--vnc-allow-unauthenticated`. Enabling the server on a
+    /// node with no capture source is a warned no-listener state, not a fake
+    /// endpoint.
     #[arg(long, env = "OZMA_VNC_SERVER")]
     pub vnc_server: bool,
 
     /// Bind address for `--vnc-server`. Supplying this flag is the explicit
     /// opt-in that permits a non-loopback address (`0.0.0.0`, a LAN IP, ...).
+    /// A non-loopback address also requires `--vnc-password-file` (preferred)
+    /// or `--vnc-allow-unauthenticated`.
     #[arg(long, env = "OZMA_VNC_BIND")]
     pub vnc_bind: Option<String>,
 
     /// TCP port for `--vnc-server` (0 asks the OS for a free port).
     #[arg(long, env = "OZMA_VNC_SERVER_PORT", default_value_t = 0)]
     pub vnc_server_port: u16,
+
+    /// File containing the RFB VNC authentication password (read once at
+    /// startup). Enables security type 2, not encryption. The file must be
+    /// 0600 or stricter and contain 1-8 bytes after one trailing newline.
+    #[arg(long, env = "OZMA_VNC_PASSWORD_FILE", value_name = "PATH")]
+    pub vnc_password_file: Option<PathBuf>,
+
+    /// Permit a non-loopback `--vnc-server` bind without a password. Without
+    /// this flag, a non-loopback bind requires `--vnc-password-file`. The
+    /// transport remains plaintext either way.
+    #[arg(long, env = "OZMA_VNC_ALLOW_UNAUTHENTICATED")]
+    pub vnc_allow_unauthenticated: bool,
+
+    /// Maximum concurrent RFB viewers (1-32).
+    #[arg(
+        long,
+        env = "OZMA_VNC_MAX_CLIENTS",
+        default_value_t = ozma_node::vnc_server::DEFAULT_MAX_CLIENTS
+    )]
+    pub vnc_max_clients: usize,
+
+    /// Close an RFB viewer that sends no client message for this many seconds
+    /// (0 disables the timeout; maximum 86400).
+    #[arg(long, env = "OZMA_VNC_IDLE_TIMEOUT_SECONDS", default_value_t = 0)]
+    pub vnc_idle_timeout_seconds: u64,
 
     /// QEMU D-Bus console index (`Console_N`). Supplying any D-Bus display
     /// flag selects D-Bus capture on a VM node; the effective default is 0.
@@ -1216,6 +1247,10 @@ async fn run() -> std::process::ExitCode {
         vnc_server: args.vnc_server,
         vnc_bind: args.vnc_bind.clone(),
         vnc_server_port: args.vnc_server_port,
+        vnc_password_file: args.vnc_password_file.clone(),
+        vnc_allow_unauthenticated: args.vnc_allow_unauthenticated,
+        vnc_max_clients: args.vnc_max_clients,
+        vnc_idle_timeout_seconds: args.vnc_idle_timeout_seconds,
         dbus_console: args
             .capture_console
             .or(args.dbus_console)
@@ -1658,14 +1693,36 @@ async fn run() -> std::process::ExitCode {
     let local_ip = resolve_local_ip(&args);
     info!(ip = %local_ip, "Resolved local IP");
 
+    // Read the VNC password once, before binding. A bad file is a startup
+    // error rather than a silently unauthenticated listener. The password
+    // value itself is never logged.
+    let vnc_password = match args.vnc_password_file.as_deref() {
+        Some(path) => match ozma_node::vnc_server::VncPassword::from_file(path) {
+            Ok(password) => Some(password),
+            Err(error) => {
+                error!("Invalid VNC password file: {error}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    let vnc_options = ozma_node::vnc_server::VncServerOptions {
+        bind: args.vnc_bind.clone(),
+        port: args.vnc_server_port,
+        password: vnc_password,
+        max_clients: args.vnc_max_clients,
+        idle_timeout: (args.vnc_idle_timeout_seconds > 0)
+            .then(|| Duration::from_secs(args.vnc_idle_timeout_seconds)),
+        allow_unauthenticated: args.vnc_allow_unauthenticated,
+    };
+
     // Opt-in RFB 3.8 server. It binds only when --vnc-server is set *and* the
     // capture registry has a source to feed it; otherwise registration keeps
     // the honest typed not-configured state. The endpoint is captured before
     // the handle is moved to its shutdown task.
     let vnc_server = match ozma_node::vnc_server::start_if_configured(
         args.vnc_server,
-        args.vnc_bind.as_deref(),
-        args.vnc_server_port,
+        vnc_options,
         &capture_registry,
         input_sink.clone(),
         &config.name,
@@ -1673,6 +1730,16 @@ async fn run() -> std::process::ExitCode {
     .await
     {
         Ok(server) => server,
+        Err(
+            error @ ozma_node::vnc_server::VncServerError::UnauthenticatedWiderBindRefused {
+                ..
+            },
+        ) => {
+            // A policy failure must stop startup, not fall through to a
+            // warning that could be mistaken for "VNC simply unavailable".
+            error!("VNC server bind policy refused: {error}");
+            std::process::exit(2);
+        }
         Err(error) => {
             warn!(
                 error = %error,
@@ -1718,8 +1785,10 @@ async fn run() -> std::process::ExitCode {
             bind = %server.bound_addr(),
             advertised_host = %host,
             advertised_port = port,
-            security = "none",
-            "RFB 3.8 VNC server is serving the first capture source"
+            security = if server.auth_enabled() { "vnc-auth" } else { "none" },
+            encrypted = false,
+            "RFB 3.8 VNC server is serving the first capture source \
+             (transport is plain TCP; VNC auth is not encryption)"
         );
         let vnc_shutdown = shutdown.clone();
         background.push((
@@ -3751,6 +3820,10 @@ mod tests {
         assert!(!defaults.vnc_server);
         assert!(defaults.vnc_bind.is_none());
         assert_eq!(defaults.vnc_server_port, 0);
+        assert!(defaults.vnc_password_file.is_none());
+        assert!(!defaults.vnc_allow_unauthenticated);
+        assert_eq!(defaults.vnc_max_clients, 4);
+        assert_eq!(defaults.vnc_idle_timeout_seconds, 0);
 
         let args = Args::parse_from([
             "ozma-node",
@@ -3759,10 +3832,32 @@ mod tests {
             "0.0.0.0",
             "--vnc-server-port",
             "5900",
+            "--vnc-password-file",
+            "/run/ozma/vnc.pass",
+            "--vnc-max-clients",
+            "8",
+            "--vnc-idle-timeout-seconds",
+            "120",
         ]);
         assert!(args.vnc_server);
         assert_eq!(args.vnc_bind.as_deref(), Some("0.0.0.0"));
         assert_eq!(args.vnc_server_port, 5900);
+        assert_eq!(
+            args.vnc_password_file.as_deref(),
+            Some(std::path::Path::new("/run/ozma/vnc.pass"))
+        );
+        assert_eq!(args.vnc_max_clients, 8);
+        assert_eq!(args.vnc_idle_timeout_seconds, 120);
+        assert!(!args.vnc_allow_unauthenticated);
+
+        let overridden = Args::parse_from([
+            "ozma-node",
+            "--vnc-server",
+            "--vnc-bind",
+            "0.0.0.0",
+            "--vnc-allow-unauthenticated",
+        ]);
+        assert!(overridden.vnc_allow_unauthenticated);
     }
 
     #[test]

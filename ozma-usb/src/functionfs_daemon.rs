@@ -19,6 +19,11 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
+use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+use rustix::io::Errno;
 
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
@@ -57,6 +62,12 @@ pub const MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES: usize = 64 * 1024;
 
 /// Size of one encoded `usb_functionfs_event`.
 pub const FUNCTIONFS_EVENT_BYTES: usize = 12;
+
+/// Default deadline for one nonblocking file-endpoint read/write.
+pub const DEFAULT_FUNCTIONFS_ENDPOINT_TIMEOUT_MS: u64 = 5_000;
+
+/// Largest accepted nonblocking file-endpoint deadline.
+pub const MAX_FUNCTIONFS_ENDPOINT_TIMEOUT_MS: u64 = 60_000;
 
 /// One function-scoped descriptor set and the FunctionFS `ep0` encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -901,6 +912,277 @@ impl FunctionFsEndpointIo for FileEndpointIo {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+/// Nonblocking, deadline-enforcing file endpoint for FunctionFS pipes/files.
+///
+/// This is the cancellation-safe sibling of [`FileEndpointIo`]. The underlying
+/// descriptor is switched to `O_NONBLOCK`; every read/write waits with `poll(2)`
+/// until it is ready or the per-call deadline expires. It never spins, never
+/// blocks a worker thread forever, and returns
+/// [`UsbError::MassStorageEndpointTimeout`] so the existing mass-storage loop
+/// records the same typed timeout as its fake transports.
+///
+/// A timed-out read consumes no bytes. A timed-out write reports the deadline
+/// after a partial transfer; the bytes already accepted by the kernel cannot be
+/// taken back, so the caller must abort the command rather than retry it as if
+/// nothing was written. Dropping the handle closes the descriptor, and a blocked
+/// poll is bounded by the deadline, so teardown does not leak a thread.
+#[derive(Debug)]
+pub struct PollingFileEndpointIo {
+    endpoint: FunctionFsEndpoint,
+    path: PathBuf,
+    file: File,
+    default_timeout_ms: u64,
+}
+
+impl PollingFileEndpointIo {
+    /// Open one endpoint file, set `O_NONBLOCK`, and use `timeout_ms` for the
+    /// [`FunctionFsEndpointIo`] methods.
+    pub fn open(
+        endpoint: FunctionFsEndpoint,
+        path: impl Into<PathBuf>,
+        timeout_ms: u64,
+    ) -> Result<Self, UsbError> {
+        let path = path.into();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| {
+                if source.kind() == io::ErrorKind::NotFound {
+                    UsbError::MissingFunctionFsEndpoint(path.clone())
+                } else {
+                    endpoint_error(endpoint.address, "open", source)
+                }
+            })?;
+        Self::from_file(endpoint, path, file, timeout_ms)
+    }
+
+    /// Wrap an already-open descriptor (for example one end of an OS pipe).
+    pub fn from_file(
+        endpoint: FunctionFsEndpoint,
+        path: impl Into<PathBuf>,
+        file: File,
+        timeout_ms: u64,
+    ) -> Result<Self, UsbError> {
+        validate_endpoint_timeout(timeout_ms)?;
+        let flags = fcntl_getfl(&file).map_err(|error| {
+            endpoint_error(endpoint.address, "configure", io_error_from_errno(error))
+        })?;
+        fcntl_setfl(&file, flags | OFlags::NONBLOCK).map_err(|error| {
+            endpoint_error(endpoint.address, "configure", io_error_from_errno(error))
+        })?;
+        Ok(Self {
+            endpoint,
+            path: path.into(),
+            file,
+            default_timeout_ms: timeout_ms,
+        })
+    }
+
+    /// Path backing this endpoint.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Deadline used by the trait methods.
+    pub fn timeout_ms(&self) -> u64 {
+        self.default_timeout_ms
+    }
+
+    /// Read up to `buffer.len()` bytes before `timeout_ms` elapses.
+    ///
+    /// A zero-length buffer returns `Ok(0)` without polling. A closed writer
+    /// returns `Ok(0)` (EOF); the caller treats zero as an endpoint failure.
+    pub fn read_timeout(&mut self, buffer: &mut [u8], timeout_ms: u64) -> Result<usize, UsbError> {
+        validate_endpoint_timeout(timeout_ms)?;
+        if buffer.len() > MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES {
+            return Err(UsbError::FunctionFsBuffer {
+                context: "endpoint read buffer",
+                limit: MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES,
+                requested: buffer.len(),
+            });
+        }
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let deadline = deadline_after(timeout_ms);
+        loop {
+            match self.file.read(buffer) {
+                Ok(count) => return Ok(count),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_ready(PollFlags::IN, deadline, "read", timeout_ms)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(source) => return Err(endpoint_error(self.endpoint.address, "read", source)),
+            }
+        }
+    }
+
+    /// Write every byte before `timeout_ms` elapses.
+    ///
+    /// Short writes are retried until the buffer drains or the deadline expires.
+    pub fn write_timeout(&mut self, data: &[u8], timeout_ms: u64) -> Result<usize, UsbError> {
+        validate_endpoint_timeout(timeout_ms)?;
+        if data.len() > MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES {
+            return Err(UsbError::FunctionFsBuffer {
+                context: "endpoint write",
+                limit: MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES,
+                requested: data.len(),
+            });
+        }
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let deadline = deadline_after(timeout_ms);
+        let mut written = 0usize;
+        while written < data.len() {
+            match self.file.write(&data[written..]) {
+                Ok(0) => {
+                    return Err(endpoint_error(
+                        self.endpoint.address,
+                        "write",
+                        io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            format!("short endpoint write: {written} of {} bytes", data.len()),
+                        ),
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_ready(PollFlags::OUT, deadline, "write", timeout_ms)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(source) => return Err(endpoint_error(self.endpoint.address, "write", source)),
+            }
+        }
+        Ok(written)
+    }
+
+    /// Flush the endpoint before `timeout_ms` elapses.
+    pub fn flush_timeout(&mut self, timeout_ms: u64) -> Result<(), UsbError> {
+        validate_endpoint_timeout(timeout_ms)?;
+        self.file
+            .flush()
+            .map_err(|source| endpoint_error(self.endpoint.address, "flush", source))
+    }
+
+    fn wait_ready(
+        &self,
+        events: PollFlags,
+        deadline: Instant,
+        operation: &'static str,
+        timeout_ms: u64,
+    ) -> Result<(), UsbError> {
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(endpoint_timeout(operation, timeout_ms));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let timeout = Timespec {
+                tv_sec: remaining.as_secs().min(i64::MAX as u64) as i64,
+                tv_nsec: remaining.subsec_nanos() as i64,
+            };
+            let mut descriptors = [PollFd::new(
+                &self.file,
+                events | PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL,
+            )];
+            match poll(&mut descriptors, Some(&timeout)) {
+                Ok(0) => return Err(endpoint_timeout(operation, timeout_ms)),
+                Ok(_) => return Ok(()),
+                Err(Errno::INTR) => {}
+                Err(error) => {
+                    return Err(endpoint_error(
+                        self.endpoint.address,
+                        "poll",
+                        io_error_from_errno(error),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+impl FunctionFsEndpointIo for PollingFileEndpointIo {
+    fn endpoint(&self) -> &FunctionFsEndpoint {
+        &self.endpoint
+    }
+
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, UsbError> {
+        let timeout_ms = self.default_timeout_ms;
+        self.read_timeout(buffer, timeout_ms)
+    }
+
+    fn write(&mut self, data: &[u8]) -> Result<usize, UsbError> {
+        let timeout_ms = self.default_timeout_ms;
+        self.write_timeout(data, timeout_ms)
+    }
+
+    fn flush(&mut self) -> Result<(), UsbError> {
+        let timeout_ms = self.default_timeout_ms;
+        self.flush_timeout(timeout_ms)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+fn deadline_after(timeout_ms: u64) -> Instant {
+    Instant::now() + Duration::from_millis(timeout_ms)
+}
+
+fn validate_endpoint_timeout(timeout_ms: u64) -> Result<(), UsbError> {
+    if timeout_ms == 0 || timeout_ms > MAX_FUNCTIONFS_ENDPOINT_TIMEOUT_MS {
+        return Err(UsbError::InvalidField {
+            field: "functionfs.endpoint_timeout_ms",
+            reason: format!("timeout must be 1..={MAX_FUNCTIONFS_ENDPOINT_TIMEOUT_MS} ms"),
+        });
+    }
+    Ok(())
+}
+
+fn endpoint_timeout(operation: &'static str, timeout_ms: u64) -> UsbError {
+    UsbError::MassStorageEndpointTimeout {
+        operation,
+        timeout_ms,
+    }
+}
+
+fn io_error_from_errno(error: Errno) -> io::Error {
+    io::Error::from(error)
+}
+
+/// Opens nonblocking, deadline-enforcing endpoint files under a mount.
+#[derive(Clone, Debug)]
+pub struct PollingFileEndpointOpener {
+    mount: FunctionFsMount,
+    timeout_ms: u64,
+}
+
+impl PollingFileEndpointOpener {
+    /// Opener for one mount and default deadline.
+    pub fn new(mount: FunctionFsMount, timeout_ms: u64) -> Result<Self, UsbError> {
+        validate_endpoint_timeout(timeout_ms)?;
+        Ok(Self { mount, timeout_ms })
+    }
+}
+
+impl FunctionFsEndpointOpener for PollingFileEndpointOpener {
+    fn open(
+        &mut self,
+        index: u8,
+        endpoint: &FunctionFsEndpoint,
+    ) -> Result<Box<dyn FunctionFsEndpointIo>, UsbError> {
+        let path = self.mount.endpoint_path(index)?;
+        Ok(Box::new(PollingFileEndpointIo::open(
+            endpoint.clone(),
+            path,
+            self.timeout_ms,
+        )?))
     }
 }
 

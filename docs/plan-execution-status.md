@@ -155,6 +155,9 @@ also never touch a real UDC, ConfigFS mount, or block device.
 | Per-seat display isolation | Partial | Opt-in `--seat-display shared|xvfb|xephyr`, per-seat Xvfb with private auth, real X11 handshake, crash/restart/cleanup and nested-display typed notes. Live two-seat smoke. No DRM leasing/compositor/physical handoff. See [`phase4-multiseat-display-report.md`](phase4-multiseat-display-report.md). |
 | Multi-seat node report | Partial | Opt-in `--multiseat --seats-file`, public read-only `GET /api/v1/seats`, persisted plan/availability, `node_seat`, explicit external lifecycle; typed 503 on store failure. Controller grouping consumes it with typed `node_errors`. No node-owned start/stop. See [`phase4-multiseat-node-report.md`](phase4-multiseat-node-report.md). |
 | USB/IP bulk data path | Partial | Typed SUBMIT/RET/UNLINK codec plus bounded relay (unlink, cap, idle timeout, cleanup); a successful IMPORT now requires a real vhci port **and** a kernel data endpoint, then relays on the same authenticated connection with attach rollback on failure. No in-tree kernel adapter. See [`phase4-usbip-data-report.md`](phase4-usbip-data-report.md). |
+| USB kernel + FunctionFS adapters | Partial | `LinuxUsbIpHostBackend` (fake sysfs/runner, exact argv, auth-before-command, rollback, zero-based ports), `LinuxUsbIpKernelDataEndpoint` over the imported TCP URB phase, and `PollingFileEndpointIo` with safe `poll(2)` deadlines. Real kernel/hardware tests env-gated. See [`phase4-usb-kernel-adapters-report.md`](phase4-usb-kernel-adapters-report.md). |
+| VNC authentication | Resolved (software) | Opt-in RFB type 2, DES known-answer tested, constant-time compare, redacted/zeroized key, one attempt; non-loopback requires password or explicit override; max clients/idle timeout. No TLS. See [`phase4-vnc-server-report.md`](phase4-vnc-server-report.md). |
+| CI / release / container gate | Resolved (assets + gate) | Blocking Rust workspace gate, optional legacy Python jobs, Rust binary/helper release assets, controller-only image, Rust-first Makefile. `--container --full` passed at `08393e7` (2469/0/42); `--host` 22/0/0. See [`phase4-ci-release-report.md`](phase4-ci-release-report.md), [`phase4-container-gate-report.md`](phase4-container-gate-report.md). |
 | WebRTC modeset robustness | Resolved (live) | Settled-head probe (default 4000 ms, `--webrtc-settle-ms` 0–5 s, 8 s bound), last-size fallback, modeset scaling, and `webrtc_geometry`. Live at `7b9c0a1`: both nodes native 1280x800 `settled=true`, two direct peers + proxy connected/ICE completed, ~350 buffers each. |
 
 Verification added by this work:
@@ -238,7 +241,7 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # 2469 passed, 42 ignored (current)
+cargo test --workspace                                   # 2508 passed, 45 ignored (current)
 cargo test -p ozma-node --test parity                    # Python/controller parity baseline (16)
 cargo test -p ozma-node --lib                            # node API, compat, session unit tests (136, 2 ignored)
 cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)

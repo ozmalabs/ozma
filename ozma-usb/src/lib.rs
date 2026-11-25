@@ -53,7 +53,10 @@
 //!   (start/stop, export/list/attach/detach/unexport, peer connections,
 //!   authorization, hotplug log) with an injectable kernel backend. The default
 //!   [`NoUsbIpKernel`] returns typed `usbip-kernel-required` instead of faking a
-//!   `vhci_hcd`/`usbip-host` device; TLS remains fail-closed and external.
+//!   `vhci_hcd`/`usbip-host` device; [`LinuxUsbIpHostBackend`] is the real
+//!   argv/sysfs adapter for bind/unbind/attach/detach with module checks,
+//!   binding verification/rollback, and no invented ports. TLS remains
+//!   fail-closed and external.
 //! * [`usbip_protocol`] is the typed version-`0x0111` control codec
 //!   (`OP_REQ_DEVLIST`/`OP_REP_DEVLIST`, `OP_REQ_IMPORT`/`OP_REP_IMPORT`,
 //!   device/interface records), and [`UsbIpServer`] serves those messages over
@@ -69,17 +72,21 @@
 //!   relay to the same authenticated connection after a successful import,
 //!   through the [`UsbIpKernelDataEndpoint`] adapter seam; the default
 //!   [`NoUsbIpKernelDataEndpoint`] is a typed `usbip-kernel-required` failure,
-//!   and neither layer fabricates device data.
+//!   and neither layer fabricates device data. [`LinuxUsbIpKernelDataEndpoint`]
+//!   is the real userspace adapter over an imported USB/IP TCP URB stream, with
+//!   devid translation, unlink, and per-request deadlines.
 //!
 //! No code in this crate uses `unsafe`, mounts a filesystem, opens a block
-//! device, writes a block device, or creates a real USB gadget. The ConfigFS
+//! device, writes a block device, or creates a real USB gadget. Nonblocking
+//! endpoint deadlines use the safe `rustix` wrappers for `O_NONBLOCK` and
+//! `poll(2)`; the crate itself still contains no `unsafe` block. The ConfigFS
 //! implementation only creates/removes directories, writes attribute files,
 //! and creates configuration symlinks. FAT32 construction is an in-memory byte
 //! buffer; ISO inspection reads only a bounded descriptor header; the NBD
 //! server opens regular files and loopback sockets only. Tests use a temporary
 //! root and synthetic images; FunctionFS defaults to a temp mountpoint and fake
-//! mounter; the real-ConfigFS and live-NBD-boot tests are `#[ignore]` and
-//! environment-gated.
+//! mounter; the real-ConfigFS, live-NBD-boot, and real USB/IP/FunctionFS tests
+//! are `#[ignore]` and environment-gated.
 //!
 //! # Example
 //!
@@ -136,9 +143,11 @@ pub mod uac2;
 pub mod uac2_bridge;
 pub mod usbip;
 pub mod usbip_daemon;
+pub mod usbip_kernel;
 pub mod usbip_protocol;
 pub mod usbip_relay;
 pub mod usbip_server;
+pub mod usbip_tcp;
 pub mod usbip_urb;
 
 pub use config::{
@@ -170,10 +179,11 @@ pub use functionfs_daemon::{
     FunctionFsEndpointTransfer, FunctionFsEp0Io, FunctionFsEvent, FunctionFsEventOutcome,
     FunctionFsEventType, FunctionFsMount, FunctionFsWriteReport, LoopbackEndpoint,
     LoopbackEndpointOpener, LoopbackFunctionFsDaemon, MemoryEp0, ParsedFunctionFsDescriptors,
+    PollingFileEndpointIo, PollingFileEndpointOpener, DEFAULT_FUNCTIONFS_ENDPOINT_TIMEOUT_MS,
     FUNCTIONFS_DESCRIPTORS_MAGIC_V2, FUNCTIONFS_EVENT_BYTES, FUNCTIONFS_HAS_FS_DESC,
     FUNCTIONFS_HAS_HS_DESC, FUNCTIONFS_HAS_MS_OS_DESC, FUNCTIONFS_HAS_SS_DESC,
-    FUNCTIONFS_STRINGS_MAGIC, MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES,
-    MAX_FUNCTIONFS_EP0_WRITE_BYTES,
+    FUNCTIONFS_STRINGS_MAGIC, MAX_FUNCTIONFS_ENDPOINT_TIMEOUT_MS,
+    MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES, MAX_FUNCTIONFS_EP0_WRITE_BYTES,
 };
 pub use functionfs_lifecycle::{
     CommandFunctionFsMounter, FakeFunctionFsMounter, FunctionFsDeviceState, FunctionFsDeviceStatus,
@@ -194,7 +204,7 @@ pub use mass_storage::{
 pub use mass_storage_loop::{
     BoxedMassStorageTransport, BulkTransportFault, FileBulkTransport, FunctionFsBulkTransport,
     IdleBulkTransport, MassStorageBulkTransport, MassStorageCommandOutcome, MassStorageLoop,
-    MassStorageLoopConfig, MassStorageLoopStats, MemoryBulkTransport,
+    MassStorageLoopConfig, MassStorageLoopStats, MemoryBulkTransport, PollingFileBulkTransport,
     MASS_STORAGE_DEFAULT_TIMEOUT_MS, MASS_STORAGE_MAX_TIMEOUT_MS,
 };
 pub use media::{MassStorageImage, MediaFormat, MediaMode, MediaState, VirtualMedia};
@@ -252,6 +262,10 @@ pub use usbip_daemon::{
     NoUsbIpKernel, UsbIpConnection, UsbIpDaemon, UsbIpDaemonConfig, UsbIpDaemonState,
     UsbIpDaemonStatus, UsbIpKernelBackend, MAX_USBIP_DAEMON_CONNECTIONS,
 };
+pub use usbip_kernel::{
+    parse_attach_port, LinuxUsbIpHostBackend, UsbIpKernelSysfs, DEFAULT_USBIP_PROGRAM,
+    DEFAULT_USBIP_SYSFS_ROOT,
+};
 pub use usbip_protocol::{
     UsbIpDevListReply, UsbIpDevListRequest, UsbIpDeviceDescriptor, UsbIpImportReply,
     UsbIpImportRequest, UsbIpInterface, UsbIpOpCode, UsbIpOpHeader, UsbIpProtocolError,
@@ -275,6 +289,11 @@ pub use usbip_server::{
     UsbIpPresentedCredentials, UsbIpServer, UsbIpServerConfig, UsbIpServerHandle, UsbIpServerStats,
     UsbIpSessionEnd, UsbIpSessionOutcome, UsbIpSystemClock, UsbIpTransport,
     USBIP_SERVER_DEFAULT_IDLE_TIMEOUT_MS, USBIP_SERVER_MAX_CONNECTIONS,
+};
+pub use usbip_tcp::{
+    LinuxUsbIpDataConfig, LinuxUsbIpKernelDataEndpoint, LinuxUsbIpUrbSession, TcpUsbIpConnector,
+    UsbIpUrbConnector, UsbIpUrbSessionStats, UsbIpUrbStream, USBIP_TCP_DEFAULT_TIMEOUT_MS,
+    USBIP_TCP_MAX_TIMEOUT_MS,
 };
 pub use usbip_urb::{
     UsbIpCmdSubmit, UsbIpCmdUnlink, UsbIpDirection, UsbIpIsoPacketDescriptor, UsbIpRetSubmit,

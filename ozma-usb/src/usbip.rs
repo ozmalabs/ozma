@@ -695,7 +695,7 @@ impl UsbIpAttachment {
         validate_host(&self.host)?;
         validate_bus_id(&self.bus_id)?;
         if let Some(port) = self.port {
-            validate_port_number(port)?;
+            validate_vhci_port(port)?;
         }
         Ok(())
     }
@@ -1268,7 +1268,7 @@ pub(crate) fn validate_host(host: &str) -> Result<(), UsbError> {
     }
 }
 
-/// Validate a numeric USB/IP port.
+/// Validate a numeric USB/IP TCP port.
 pub(crate) fn validate_port_number(port: u16) -> Result<(), UsbError> {
     if port > 0 {
         Ok(())
@@ -1278,6 +1278,16 @@ pub(crate) fn validate_port_number(port: u16) -> Result<(), UsbError> {
             reason: "USB/IP port must be in 1..=65535".to_owned(),
         })
     }
+}
+
+/// Validate a local `vhci_hcd` port number.
+///
+/// Kernel vhci ports are zero-based (`usbip port` prints `Port 00`), so unlike a
+/// TCP port, zero is valid. The model stores the kernel value verbatim; it never
+/// renumbers a reported port.
+pub(crate) fn validate_vhci_port(port: u16) -> Result<(), UsbError> {
+    let _ = port;
+    Ok(())
 }
 
 /// Validate a textual USB/IP port (`usbip detach -p`).
@@ -1331,7 +1341,7 @@ pub(crate) fn parse_usbip_list(output: &str) -> Vec<UsbIpDevice> {
     devices
 }
 
-fn parse_usbip_ports(output: &str) -> Vec<UsbIpAttachment> {
+pub(crate) fn parse_usbip_ports(output: &str) -> Vec<UsbIpAttachment> {
     let lines: Vec<&str> = output.lines().collect();
     let mut attachments = Vec::new();
     let mut index = 0;

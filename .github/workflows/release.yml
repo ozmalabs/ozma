@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 #
-# Builds ozma-agent for every supported platform and publishes a GitHub Release
-# whenever a tag matching v* is pushed.
+# LEGACY / DEPRECATED — one-release Python rollback only.
 #
-# Artifacts
-# ---------
+# The default Rust-first release is .github/workflows/build.yml. It publishes
+# ozma-node, ozma-virtual-node, ozma-multiseat, ozma-meeting-detect, the WebRTC
+# helper, the controller wheel/image, and the Debian packages.
+#
+# This workflow is retained only to rebuild the deprecated ozma-agent desktop
+# installers during the overlap release. It never runs on a tag. It must be
+# started manually with legacy_agent=true, and every job is non-blocking.
+#
+# Artifacts (legacy)
+# ------------------
 #   ozma-agent-linux-x86_64.AppImage
 #   ozma-agent-linux-x86_64.deb
 #   ozma-agent-linux-aarch64.AppImage
@@ -12,12 +19,15 @@
 #   ozma-agent-windows-x86_64.msi
 #   ozma-agent-macos-universal.dmg
 
-name: Release ozma-agent
+name: Legacy ozma-agent installers (deprecated)
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      legacy_agent:
+        description: 'Build the deprecated ozma-agent AppImage/deb/MSI/DMG'
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,7 +36,9 @@ env:
 jobs:
   # ── Linux x86_64 ────────────────────────────────────────────────────────
   linux-x86_64:
-    name: Linux x86_64 (AppImage + deb)
+    name: Linux x86_64 (AppImage + deb) [legacy]
+    if: ${{ inputs.legacy_agent }}
+    continue-on-error: true
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -87,14 +99,17 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-x86_64
+          name: legacy-linux-x86_64
           path: |
             ozma-agent-linux-x86_64.AppImage
             ozma-agent-linux-x86_64.deb
+          if-no-files-found: warn
 
   # ── Linux aarch64 ───────────────────────────────────────────────────────
   linux-aarch64:
-    name: Linux aarch64 (AppImage + deb)
+    name: Linux aarch64 (AppImage + deb) [legacy]
+    if: ${{ inputs.legacy_agent }}
+    continue-on-error: true
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -155,14 +170,17 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-aarch64
+          name: legacy-linux-aarch64
           path: |
             ozma-agent-linux-aarch64.AppImage
             ozma-agent-linux-aarch64.deb
+          if-no-files-found: warn
 
   # ── Windows x86_64 MSI ──────────────────────────────────────────────────
   windows-x86_64:
-    name: Windows x86_64 (MSI)
+    name: Windows x86_64 (MSI) [legacy]
+    if: ${{ inputs.legacy_agent }}
+    continue-on-error: true
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -192,12 +210,15 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-x86_64
+          name: legacy-windows-x86_64
           path: ozma-agent-windows-x86_64.msi
+          if-no-files-found: warn
 
   # ── macOS universal DMG ─────────────────────────────────────────────────
   macos-universal:
-    name: macOS universal (DMG)
+    name: macOS universal (DMG) [legacy]
+    if: ${{ inputs.legacy_agent }}
+    continue-on-error: true
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -232,12 +253,15 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-universal
+          name: legacy-macos-universal
           path: ozma-agent-macos-universal.dmg
+          if-no-files-found: warn
 
-  # ── Publish GitHub Release ──────────────────────────────────────────────
+  # ── Publish GitHub Release (legacy only) ────────────────────────────────
   release:
-    name: Publish GitHub Release
+    name: Publish legacy ozma-agent release
+    if: ${{ inputs.legacy_agent }}
+    continue-on-error: true
     needs: [linux-x86_64, linux-aarch64, windows-x86_64, macos-universal]
     runs-on: ubuntu-22.04
     permissions:

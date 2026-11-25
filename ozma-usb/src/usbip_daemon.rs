@@ -33,9 +33,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::UsbError;
 use crate::usbip::{
-    validate_bus_id, validate_host, validate_port_number, UsbIpAttachment, UsbIpAuthorization,
-    UsbIpConfig, UsbIpDevice, UsbIpHotplugEvent, UsbIpHotplugKind, UsbIpHotplugLog, UsbIpPeerGrant,
-    UsbIpTlsPolicy, UsbIpTlsStatus, DEFAULT_USBIP_PORT, MAX_USBIP_HOTPLUG_EVENTS,
+    validate_bus_id, validate_host, validate_port_number, validate_vhci_port, UsbIpAttachment,
+    UsbIpAuthorization, UsbIpConfig, UsbIpDevice, UsbIpHotplugEvent, UsbIpHotplugKind,
+    UsbIpHotplugLog, UsbIpPeerGrant, UsbIpTlsPolicy, UsbIpTlsStatus, DEFAULT_USBIP_PORT,
+    MAX_USBIP_HOTPLUG_EVENTS,
 };
 use crate::usbip_protocol::UsbIpDeviceDescriptor;
 
@@ -539,7 +540,7 @@ impl UsbIpDaemon {
 
     /// Detach a previously attached local port and record cleanup.
     pub fn detach(&self, port: u16) -> Result<(), UsbError> {
-        validate_port_number(port)?;
+        validate_vhci_port(port)?;
         let mut inner = self.require_running()?;
         let Some(index) = inner
             .attached

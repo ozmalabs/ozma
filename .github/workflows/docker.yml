@@ -9,7 +9,9 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # Controller-only image. Rust nodes are installed on their target hosts with
+  # scripts/install-rust.sh; no Python softnode/node tree is in this image.
+  IMAGE_NAME: ozmalabs/ozma-controller
 
 jobs:
   build-and-push:
@@ -36,6 +38,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha

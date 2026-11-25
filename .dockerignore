@@ -9,5 +9,10 @@ demo/cache
 demo/logs
 images
 tests
+/target
+/node
+/softnode
+/agent
+/ozma-agent
 *.md
 !controller/requirements.txt

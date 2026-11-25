@@ -33,6 +33,12 @@ pub const SEAT_ID_ENV: &str = "OZMA_SEAT_ID";
 /// When both are configured the internal listener wins, so the controller
 /// connects to the node rather than to a guest-local endpoint that may not be
 /// reachable from the controller.
+///
+/// Registration describes only the endpoint. An internal listener started with
+/// `--vnc-password-file` requires RFB security type 2, but the password value
+/// is never placed in mDNS TXT data, direct registration, or
+/// `/api/v1/connection`. The advertised transport is still plain TCP; VNC
+/// authentication is not encryption.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum VncRegistration {

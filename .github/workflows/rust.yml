@@ -7,43 +7,74 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
+# The Rust workspace is the default node runtime for the Phase 4 overlap.
+# check/build/test are blocking; fmt and clippy are advisory until the existing
+# workspace is rustfmt-clean and clippy-clean (pre-existing diffs remain in
+# ozma-web and warnings remain in ozma-node).
 jobs:
+  fmt:
+    name: cargo fmt (advisory)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+
   check:
     name: cargo check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libasound2-dev pkg-config
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config build-essential \
+            libudev-dev libasound2-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libpam0g-dev libxdo-dev libclang-dev clang cmake nasm \
+            libdbus-1-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
-        continue-on-error: true  # Rust crates under heavy AI-agent development
 
   clippy:
-    name: cargo clippy
-    runs-on: ubuntu-latest
+    name: cargo clippy (advisory)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libasound2-dev pkg-config
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config build-essential \
+            libudev-dev libasound2-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libpam0g-dev libxdo-dev libclang-dev clang cmake nasm \
+            libdbus-1-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-        continue-on-error: true
 
   test:
-    name: cargo test
-    runs-on: ubuntu-latest
+    name: cargo build + test
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libasound2-dev pkg-config
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config build-essential \
+            libudev-dev libasound2-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libpam0g-dev libxdo-dev libclang-dev clang cmake nasm \
+            libdbus-1-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-        continue-on-error: true
+      - name: Build all workspace binaries
+        run: cargo build --workspace --bins
+      - name: Run workspace tests
+        run: cargo test --workspace --no-fail-fast

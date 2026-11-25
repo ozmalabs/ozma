@@ -145,7 +145,7 @@ python -m pytest tests/unit/controller/test_discovery_fields.py tests/unit/contr
 
 | Gap | Impact | Decision |
 |---|---|---|
-| No Rust VNC server | **Resolved 2026-11-25:** the Rust node now has an opt-in RFB 3.8 server (`--vnc-server`). Registration emits the bound `vnc_host`/`vnc_port` only while listening (internal server takes precedence over the external QEMU endpoint); otherwise the field stays absent and the controller keeps its "VNC unavailable" path. See [`phase4-vnc-server-report.md`](phase4-vnc-server-report.md). | Loopback-only, Security None, Raw encoding; no password/TLS or Tight/ZRLE yet. |
+| No Rust VNC server | **Resolved 2026-11-25:** the Rust node now has an opt-in RFB 3.8 server (`--vnc-server`). Registration emits the bound `vnc_host`/`vnc_port` only while listening (internal server takes precedence over the external QEMU endpoint); otherwise the field stays absent and the controller keeps its "VNC unavailable" path. See [`phase4-vnc-server-report.md`](phase4-vnc-server-report.md). | Loopback default; optional RFB security type 2 via `--vnc-password-file`; non-loopback binds require a password or `--vnc-allow-unauthenticated`. Transport is still plain TCP (no TLS); password auth is not encryption. Raw encoding only; no Tight/ZRLE yet. |
 | No VBAN | `audio_vban_port`/`mic_vban_port` omitted. Controller VBAN config/routing cannot target Rust nodes. | Capability gap; typed in `registration.unsupported_controller_fields`. |
 | No camera/Frigate | `camera_streams`/`frigate_*` omitted. Camera-node discovery/recording cannot target Rust nodes. | Capability gap; typed. |
 | No Sunshine | `sunshine_port` omitted. Controller game-stream discovery cannot target Rust nodes. | Capability gap; typed. |

@@ -9,9 +9,14 @@
 //! This server is deliberately minimal:
 //!
 //! * RFB 3.3, 3.7, and 3.8 clients are accepted; the server advertises 3.8.
-//! * Security type **None** only. There is no password, TLS, or authentication.
-//!   The default bind is loopback; a non-loopback bind is refused unless the
-//!   caller explicitly configured one (for example `--vnc-bind 0.0.0.0`).
+//! * Security type **None** on loopback by default. An optional password file
+//!   enables standard RFB VNC authentication (security type 2, DES
+//!   challenge/response). A non-loopback bind is refused unless a password is
+//!   configured (preferred) or the operator explicitly set
+//!   `--vnc-allow-unauthenticated`.
+//! * The transport is still plain TCP: VNC authentication proves knowledge of
+//!   a password, but it does **not** encrypt the session. There is no TLS and
+//!   no VeNCrypt.
 //! * Exactly one capture registry source feeds the framebuffer. Frames are
 //!   copied into the last published snapshot; a slow client gets the newest
 //!   frame, and intermediate frames are counted as coalesced, never queued
@@ -33,9 +38,13 @@
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use rand::rngs::OsRng;
+use rand::RngCore;
 
 use bytes::Bytes;
 use ozma_capture::CaptureRegistry;
@@ -50,7 +59,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-/// Default bind address. VNC is unauthenticated, so it stays on loopback.
+/// Default bind address. VNC auth is optional, so the default stays on
+/// loopback.
 pub const DEFAULT_VNC_BIND: &str = "127.0.0.1";
 /// Default port (`0` asks the OS for a free port).
 pub const DEFAULT_VNC_SERVER_PORT: u16 = 0;
@@ -58,6 +68,18 @@ pub const DEFAULT_VNC_SERVER_PORT: u16 = 0;
 pub const DEFAULT_MAX_CLIENTS: usize = 4;
 /// Upper bound accepted for [`VncServerConfig::max_clients`].
 pub const MAX_CLIENTS_LIMIT: usize = 32;
+/// Largest RFB VNC-authentication password accepted. Classic VNC auth uses a
+/// single DES key, so a longer password cannot contribute any bits.
+pub const MAX_VNC_PASSWORD_BYTES: usize = 8;
+/// Largest password file read before parsing. This is a read guard only; the
+/// parsed password still has to fit in [`MAX_VNC_PASSWORD_BYTES`].
+pub const MAX_VNC_PASSWORD_FILE_BYTES: u64 = 4096;
+/// Largest accepted idle timeout (24 hours).
+pub const MAX_IDLE_TIMEOUT_SECONDS: u64 = 86_400;
+/// RFB security type 1: no authentication.
+pub const SECURITY_TYPE_NONE: u8 = 1;
+/// RFB security type 2: VNC authentication (DES challenge/response).
+pub const SECURITY_TYPE_VNC_AUTH: u8 = 2;
 /// Largest framebuffer accepted by the Raw encoder (16 megapixels = 64 MiB
 /// at four bytes per pixel). 4K fits; 8K is refused rather than allocating an
 /// unbounded update.
@@ -86,7 +108,7 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 /// Configuration for the RFB listener.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VncServerConfig {
     /// Address to bind. Non-loopback is allowed only when
     /// `allow_non_loopback` is true.
@@ -97,12 +119,41 @@ pub struct VncServerConfig {
     pub name: String,
     /// Explicit opt-in required to bind a non-loopback address.
     pub allow_non_loopback: bool,
+    /// Optional RFB security type 2 password. `None` offers security type 1
+    /// (None) and is safe only on loopback unless the operator explicitly
+    /// overrode the bind policy.
+    pub password: Option<VncPassword>,
+    /// Explicit opt-in for a non-loopback bind **without** a password. This is
+    /// deliberately separate from `allow_non_loopback`, which only says the
+    /// caller meant to widen the bind address.
+    pub allow_unauthenticated: bool,
     /// Maximum concurrent viewers (1..=[`MAX_CLIENTS_LIMIT`]).
     pub max_clients: usize,
+    /// Close a viewer that sends no client message for this long. `None`
+    /// (or a zero duration) disables the idle timeout.
+    pub idle_timeout: Option<Duration>,
     /// Per-update write timeout.
     pub write_timeout: Duration,
     /// Handshake timeout.
     pub handshake_timeout: Duration,
+}
+
+impl fmt::Debug for VncServerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VncServerConfig")
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            .field("name", &self.name)
+            .field("allow_non_loopback", &self.allow_non_loopback)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("allow_unauthenticated", &self.allow_unauthenticated)
+            .field("max_clients", &self.max_clients)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("write_timeout", &self.write_timeout)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .finish()
+    }
 }
 
 impl Default for VncServerConfig {
@@ -114,11 +165,165 @@ impl Default for VncServerConfig {
             port: DEFAULT_VNC_SERVER_PORT,
             name: "Ozma node".to_owned(),
             allow_non_loopback: false,
+            password: None,
+            allow_unauthenticated: false,
             max_clients: DEFAULT_MAX_CLIENTS,
+            idle_timeout: None,
             write_timeout: WRITE_TIMEOUT,
             handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }
+}
+
+/// A configured RFB VNC-authentication password.
+///
+/// Only the DES key derived from the password is retained, and neither `Debug`
+/// nor any status surface formats it. Classic RFB VNC authentication uses one
+/// 8-byte DES key; shorter passwords are zero-padded and longer password files
+/// are rejected at load time rather than silently truncated.
+#[derive(Clone)]
+pub struct VncPassword {
+    des_key: [u8; MAX_VNC_PASSWORD_BYTES],
+}
+
+impl fmt::Debug for VncPassword {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VncPassword(<redacted>)")
+    }
+}
+
+impl Drop for VncPassword {
+    fn drop(&mut self) {
+        // Best-effort zeroing. The key still lives in process memory while the
+        // listener runs; this only avoids leaving a stale copy after teardown.
+        self.des_key.fill(0);
+    }
+}
+
+impl VncPassword {
+    /// Build a password from raw bytes.
+    ///
+    /// The caller is responsible for newline policy. [`VncPassword::from_file`]
+    /// removes one trailing newline and nothing else.
+    pub fn from_bytes(password: &[u8]) -> Result<Self, VncPasswordError> {
+        if password.is_empty() {
+            return Err(VncPasswordError::Empty);
+        }
+        if password.len() > MAX_VNC_PASSWORD_BYTES {
+            return Err(VncPasswordError::TooLong {
+                len: password.len(),
+                max: MAX_VNC_PASSWORD_BYTES,
+            });
+        }
+        let mut padded = [0u8; MAX_VNC_PASSWORD_BYTES];
+        padded[..password.len()].copy_from_slice(password);
+        // RFB VNC authentication reverses the bits of each password byte
+        // before using it as a DES key.
+        let mut des_key = [0u8; MAX_VNC_PASSWORD_BYTES];
+        for (key_byte, password_byte) in des_key.iter_mut().zip(padded.iter()) {
+            *key_byte = password_byte.reverse_bits();
+        }
+        Ok(Self { des_key })
+    }
+
+    /// Read a password file once at startup.
+    ///
+    /// Exactly one trailing newline is removed (`\n` or `\r\n`); spaces and
+    /// other bytes are preserved. On Unix the file must not grant any group or
+    /// other permission and no owner execute bit (0600 or stricter), otherwise
+    /// startup fails with [`VncPasswordError::Permissions`].
+    pub fn from_file(path: &Path) -> Result<Self, VncPasswordError> {
+        let metadata = std::fs::metadata(path).map_err(|source| VncPasswordError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if metadata.len() > MAX_VNC_PASSWORD_FILE_BYTES {
+            return Err(VncPasswordError::TooLong {
+                len: metadata.len() as usize,
+                max: MAX_VNC_PASSWORD_BYTES,
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & !0o600 != 0 {
+                return Err(VncPasswordError::Permissions {
+                    path: path.to_path_buf(),
+                    mode,
+                });
+            }
+        }
+        let bytes = std::fs::read(path).map_err(|source| VncPasswordError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let bytes = strip_one_newline(&bytes);
+        Self::from_bytes(bytes).map_err(|error| match error {
+            VncPasswordError::Empty => VncPasswordError::EmptyAt {
+                path: path.to_path_buf(),
+            },
+            VncPasswordError::TooLong { len, max } => VncPasswordError::TooLongAt {
+                path: path.to_path_buf(),
+                len,
+                max,
+            },
+            other => other,
+        })
+    }
+
+    fn key(&self) -> &[u8; MAX_VNC_PASSWORD_BYTES] {
+        &self.des_key
+    }
+}
+
+/// Remove exactly one trailing newline, preserving all other bytes.
+fn strip_one_newline(bytes: &[u8]) -> &[u8] {
+    if let Some(stripped) = bytes.strip_suffix(b"\r\n") {
+        stripped
+    } else if let Some(stripped) = bytes.strip_suffix(b"\n") {
+        stripped
+    } else {
+        bytes
+    }
+}
+
+/// Typed password-file/configuration errors. The password value is never part
+/// of any error or `Debug` rendering.
+#[derive(Debug, thiserror::Error)]
+pub enum VncPasswordError {
+    /// The password or file is empty after trimming one trailing newline.
+    #[error("VNC password is empty")]
+    Empty,
+    /// An in-memory password is empty.
+    #[error("VNC password file `{path}` is empty after trimming one trailing newline")]
+    EmptyAt { path: PathBuf },
+    /// An in-memory password is longer than one DES key.
+    #[error("VNC password is {len} bytes; RFB VNC authentication accepts at most {max} bytes")]
+    TooLong { len: usize, max: usize },
+    /// A password file is longer than one DES key.
+    #[error(
+        "VNC password file `{path}` is {len} bytes; RFB VNC authentication accepts at most {max} bytes"
+    )]
+    TooLongAt {
+        path: PathBuf,
+        len: usize,
+        max: usize,
+    },
+    /// The file could not be read.
+    #[error("reading VNC password file `{path}` failed: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// The file is readable/writable by group, other, or has an owner execute
+    /// bit.
+    #[error(
+        "VNC password file `{path}` has mode {mode:o}; it must be 0600 or stricter \
+         (owner read/write only)"
+    )]
+    Permissions { path: PathBuf, mode: u32 },
 }
 
 impl VncServerConfig {
@@ -162,10 +367,25 @@ impl VncServerConfig {
                 max: MAX_CLIENTS_LIMIT,
             });
         }
-        if !self.bind.is_loopback() && !self.allow_non_loopback {
-            return Err(VncServerError::WiderBindRefused {
-                bind: self.bind.to_string(),
-            });
+        if let Some(timeout) = self.idle_timeout {
+            if timeout.is_zero() || timeout > Duration::from_secs(MAX_IDLE_TIMEOUT_SECONDS) {
+                return Err(VncServerError::InvalidIdleTimeout {
+                    seconds: timeout.as_secs_f64(),
+                    max: MAX_IDLE_TIMEOUT_SECONDS,
+                });
+            }
+        }
+        if !self.bind.is_loopback() {
+            if !self.allow_non_loopback {
+                return Err(VncServerError::WiderBindRefused {
+                    bind: self.bind.to_string(),
+                });
+            }
+            if self.password.is_none() && !self.allow_unauthenticated {
+                return Err(VncServerError::UnauthenticatedWiderBindRefused {
+                    bind: self.bind.to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -195,10 +415,19 @@ pub enum VncServerError {
     },
     /// A non-loopback bind without an explicit `--vnc-bind`.
     #[error(
-        "refusing non-loopback VNC bind `{bind}`: the server has no authentication \
-         and requires an explicit --vnc-bind to widen it"
+        "refusing non-loopback VNC bind `{bind}`: widening the bind requires an \
+         explicit --vnc-bind"
     )]
     WiderBindRefused { bind: String },
+    /// A non-loopback bind with no password and no explicit override.
+    #[error(
+        "refusing unauthenticated non-loopback VNC bind `{bind}`: configure \
+         --vnc-password-file, or set --vnc-allow-unauthenticated to accept the risk"
+    )]
+    UnauthenticatedWiderBindRefused { bind: String },
+    /// Idle timeout outside the supported range.
+    #[error("VNC idle timeout must be between 1 and {max} seconds, got {seconds}")]
+    InvalidIdleTimeout { seconds: f64, max: u64 },
     /// The bind string is not an IP address.
     #[error("invalid VNC bind address `{bind}`: {reason}")]
     InvalidBind { bind: String, reason: String },
@@ -226,6 +455,8 @@ pub struct VncServerHandle {
     /// Cleared as soon as the listener task exits (including capture failure),
     /// so registration can stop advertising a dead port without a restart.
     listening: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the listener offers RFB security type 2.
+    auth_enabled: bool,
 }
 
 impl fmt::Debug for VncServerHandle {
@@ -234,6 +465,7 @@ impl fmt::Debug for VncServerHandle {
             .debug_struct("VncServerHandle")
             .field("bound_addr", &self.bound_addr)
             .field("listening", &self.is_listening())
+            .field("auth_enabled", &self.auth_enabled)
             .field("stats", &self.stats.snapshot())
             .finish()
     }
@@ -251,6 +483,11 @@ impl VncServerHandle {
     /// The address the OS actually bound (a real port for `--vnc-server-port 0`).
     pub fn bound_addr(&self) -> SocketAddr {
         self.bound_addr
+    }
+
+    /// Whether this listener requires RFB security type 2 (VNC password).
+    pub fn auth_enabled(&self) -> bool {
+        self.auth_enabled
     }
 
     /// True until [`VncServerHandle::shutdown`] is called or the listener fails.
@@ -387,16 +624,46 @@ impl VncStats {
     }
 }
 
+/// Optional listener settings supplied by `main` from the CLI.
+#[derive(Clone, Debug)]
+pub struct VncServerOptions {
+    /// Explicit bind address. `Some` is the opt-in that permits a widened bind.
+    pub bind: Option<String>,
+    /// TCP port; `0` asks the OS for a free port.
+    pub port: u16,
+    /// Password loaded once at startup. `None` offers security type None.
+    pub password: Option<VncPassword>,
+    /// Maximum concurrent viewers.
+    pub max_clients: usize,
+    /// Optional idle timeout.
+    pub idle_timeout: Option<Duration>,
+    /// Explicit opt-in for an unauthenticated non-loopback bind.
+    pub allow_unauthenticated: bool,
+}
+
+impl Default for VncServerOptions {
+    fn default() -> Self {
+        Self {
+            bind: None,
+            port: DEFAULT_VNC_SERVER_PORT,
+            password: None,
+            max_clients: DEFAULT_MAX_CLIENTS,
+            idle_timeout: None,
+            allow_unauthenticated: false,
+        }
+    }
+}
+
 /// Start the RFB server only when `enabled` is true and a capture source exists.
 ///
-/// This is the main-node entry point: `enabled` is `--vnc-server`, and `bind`
-/// being `Some` is the explicit opt-in that allows a non-loopback address.
-/// Returning `Ok(None)` means the flag was absent, so no socket was bound and
-/// the caller must keep VNC registration at `not-configured`.
+/// This is the main-node entry point: `enabled` is `--vnc-server`, and
+/// `options.bind` being `Some` is the explicit opt-in that allows a
+/// non-loopback address. Returning `Ok(None)` means the flag was absent, so no
+/// socket was bound and the caller must keep VNC registration at
+/// `not-configured`.
 pub async fn start_if_configured(
     enabled: bool,
-    bind: Option<&str>,
-    port: u16,
+    options: VncServerOptions,
     registry: &CaptureRegistry,
     sink: SharedSink,
     node_name: &str,
@@ -424,7 +691,11 @@ pub async fn start_if_configured(
         .ok_or(VncServerError::NoCaptureSource)?;
     let id = capability.id.clone();
     let name = format!("Ozma {node_name} ({id})");
-    let config = VncServerConfig::from_bind(bind, port, name)?;
+    let mut config = VncServerConfig::from_bind(options.bind.as_deref(), options.port, name)?;
+    config.password = options.password;
+    config.max_clients = options.max_clients;
+    config.idle_timeout = options.idle_timeout;
+    config.allow_unauthenticated = options.allow_unauthenticated;
 
     let source = registry
         .open(&capability)
@@ -474,6 +745,7 @@ pub async fn start(
             source: error,
         })?;
 
+    let auth_enabled = config.password.is_some();
     let config = Arc::new(config);
     let stats = Arc::new(VncStats::default());
     let cancel = CancellationToken::new();
@@ -519,9 +791,10 @@ pub async fn start(
     info!(
         bind = %bound_addr,
         loopback = bound_addr.ip().is_loopback(),
-        security = "none",
+        security = if auth_enabled { "vnc-auth" } else { "none" },
+        encrypted = false,
         encoding = "raw",
-        "RFB 3.8 VNC server listening"
+        "RFB 3.8 VNC server listening (transport is plain TCP; VNC auth is not encryption)"
     );
 
     Ok(VncServerHandle {
@@ -530,6 +803,7 @@ pub async fn start(
         cancel,
         task: Some(task),
         listening,
+        auth_enabled,
     })
 }
 
@@ -703,6 +977,8 @@ async fn accept_loop(
                 let client_id = stats.clients_accepted.load(Ordering::Relaxed);
                 let write_timeout = config.write_timeout;
                 let handshake_timeout = config.handshake_timeout;
+                let idle_timeout = config.idle_timeout;
+                let password = config.password.clone();
                 let name = config.name.clone();
                 let frames = frames.clone();
                 let input_active = Arc::new(AtomicBool::new(false));
@@ -728,6 +1004,8 @@ async fn accept_loop(
                         frames,
                         write_timeout,
                         handshake_timeout,
+                        idle_timeout,
+                        password,
                     )
                     .await;
                 });
@@ -871,10 +1149,18 @@ async fn handle_client(
     mut frames: watch::Receiver<Option<Arc<FrameSnapshot>>>,
     write_timeout: Duration,
     handshake_timeout: Duration,
+    idle_timeout: Option<Duration>,
+    password: Option<VncPassword>,
 ) {
     let handshake = tokio::time::timeout(
         handshake_timeout,
-        handshake(&mut stream, &name, known_geometry, &mut frames),
+        handshake(
+            &mut stream,
+            &name,
+            known_geometry,
+            &mut frames,
+            password.as_ref(),
+        ),
     )
     .await;
     let (shared, geometry) = match handshake {
@@ -903,7 +1189,7 @@ async fn handle_client(
     });
     let (read, write) = stream.into_split();
     let (commands_tx, commands_rx) = mpsc::channel(CLIENT_COMMAND_QUEUE);
-    let reader = client_read_loop(read, context.clone(), commands_tx);
+    let reader = client_read_loop(read, context.clone(), commands_tx, idle_timeout);
     let writer = client_write_loop(write, commands_rx, frames, context.clone(), write_timeout);
 
     tokio::select! {
@@ -924,6 +1210,7 @@ async fn handshake(
     name: &str,
     known_geometry: Option<FrameFormat>,
     frames: &mut watch::Receiver<Option<Arc<FrameSnapshot>>>,
+    password: Option<&VncPassword>,
 ) -> Result<(bool, FrameFormat), ProtocolError> {
     stream
         .write_all(b"RFB 003.008\n")
@@ -937,48 +1224,56 @@ async fn handshake(
         .map_err(ProtocolError::io)?;
     let minor = parse_version(&version)?;
 
+    // Offer exactly one type: password auth when configured, None otherwise.
+    // Never offer both, because a client that picks None would bypass the
+    // configured password.
+    let offered = if password.is_some() {
+        SECURITY_TYPE_VNC_AUTH
+    } else {
+        SECURITY_TYPE_NONE
+    };
+
     match minor {
         3 => {
             // RFB 3.3: the server sends one 32-bit security type and the
             // client does not answer with a selection.
             stream
-                .write_all(&1u32.to_be_bytes())
+                .write_all(&u32::from(offered).to_be_bytes())
                 .await
                 .map_err(ProtocolError::io)?;
+            if offered == SECURITY_TYPE_VNC_AUTH {
+                authenticate_vnc(stream, minor, password).await?;
+            }
         }
         7 | 8 => {
             // RFB 3.7/3.8: list of security types, then the client's choice.
-            stream.write_all(&[1, 1]).await.map_err(ProtocolError::io)?;
+            stream
+                .write_all(&[1, offered])
+                .await
+                .map_err(ProtocolError::io)?;
             let mut selected = [0u8; 1];
             stream
                 .read_exact(&mut selected)
                 .await
                 .map_err(ProtocolError::io)?;
-            if selected[0] != 1 {
-                if minor >= 8 {
-                    let reason = b"Ozma VNC accepts only security type None";
-                    stream
-                        .write_all(&1u32.to_be_bytes())
-                        .await
-                        .map_err(ProtocolError::io)?;
-                    stream
-                        .write_all(&(reason.len() as u32).to_be_bytes())
-                        .await
-                        .map_err(ProtocolError::io)?;
-                    stream.write_all(reason).await.map_err(ProtocolError::io)?;
+            if selected[0] != offered {
+                let reason = if password.is_some() {
+                    "Ozma VNC requires the configured password"
                 } else {
-                    stream
-                        .write_all(&1u32.to_be_bytes())
-                        .await
-                        .map_err(ProtocolError::io)?;
-                }
+                    "Ozma VNC accepts only security type None"
+                };
+                send_security_failure(stream, minor, reason.as_bytes()).await?;
                 return Err(ProtocolError::SecurityType(selected[0]));
             }
-            // SecurityResult success.
-            stream
-                .write_all(&0u32.to_be_bytes())
-                .await
-                .map_err(ProtocolError::io)?;
+            if offered == SECURITY_TYPE_VNC_AUTH {
+                authenticate_vnc(stream, minor, password).await?;
+            } else {
+                // SecurityResult success for None.
+                stream
+                    .write_all(&0u32.to_be_bytes())
+                    .await
+                    .map_err(ProtocolError::io)?;
+            }
         }
         other => return Err(ProtocolError::Version(u16::from(other))),
     }
@@ -1016,6 +1311,225 @@ async fn handshake(
         .map_err(ProtocolError::io)?;
 
     Ok((shared[0] != 0, geometry))
+}
+
+/// Write an RFB `SecurityResult` failure. 3.8 adds a reason string; 3.7 and
+/// 3.3 send only the 32-bit status.
+async fn send_security_failure(
+    stream: &mut TcpStream,
+    minor: u8,
+    reason: &[u8],
+) -> Result<(), ProtocolError> {
+    stream
+        .write_all(&1u32.to_be_bytes())
+        .await
+        .map_err(ProtocolError::io)?;
+    if minor >= 8 {
+        stream
+            .write_all(&(reason.len() as u32).to_be_bytes())
+            .await
+            .map_err(ProtocolError::io)?;
+        stream.write_all(reason).await.map_err(ProtocolError::io)?;
+    }
+    Ok(())
+}
+
+/// Perform standard RFB VNC authentication: 16-byte challenge, 16-byte DES
+/// response, one `SecurityResult`. A failure closes the connection; there is
+/// deliberately no retry loop.
+async fn authenticate_vnc(
+    stream: &mut TcpStream,
+    minor: u8,
+    password: Option<&VncPassword>,
+) -> Result<(), ProtocolError> {
+    let Some(password) = password else {
+        // Unreachable when the offered list is built correctly, but failing
+        // closed is better than treating a missing key as success.
+        send_security_failure(stream, minor, b"VNC password is not configured").await?;
+        return Err(ProtocolError::AuthenticationFailed);
+    };
+    let mut challenge = [0u8; 16];
+    OsRng.fill_bytes(&mut challenge);
+    stream
+        .write_all(&challenge)
+        .await
+        .map_err(ProtocolError::io)?;
+
+    let mut response = [0u8; 16];
+    stream
+        .read_exact(&mut response)
+        .await
+        .map_err(ProtocolError::io)?;
+    let expected = vnc_des::response(password.key(), &challenge);
+    if constant_time_eq(&expected, &response) {
+        stream
+            .write_all(&0u32.to_be_bytes())
+            .await
+            .map_err(ProtocolError::io)?;
+        Ok(())
+    } else {
+        send_security_failure(stream, minor, b"VNC authentication failed").await?;
+        Err(ProtocolError::AuthenticationFailed)
+    }
+}
+
+/// Compare two equal-length byte slices without an early exit on mismatch.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        difference |= a ^ b;
+    }
+    difference == 0
+}
+
+/// Minimal DES-ECB primitives needed by RFB VNC authentication.
+///
+/// Only two 8-byte blocks are ever encrypted, once per login attempt. This is
+/// not a general-purpose cipher API and it is not used for transport security.
+mod vnc_des {
+    const IP: [u8; 64] = [
+        58, 50, 42, 34, 26, 18, 10, 2, 60, 52, 44, 36, 28, 20, 12, 4, 62, 54, 46, 38, 30, 22, 14,
+        6, 64, 56, 48, 40, 32, 24, 16, 8, 57, 49, 41, 33, 25, 17, 9, 1, 59, 51, 43, 35, 27, 19, 11,
+        3, 61, 53, 45, 37, 29, 21, 13, 5, 63, 55, 47, 39, 31, 23, 15, 7,
+    ];
+    const FP: [u8; 64] = [
+        40, 8, 48, 16, 56, 24, 64, 32, 39, 7, 47, 15, 55, 23, 63, 31, 38, 6, 46, 14, 54, 22, 62,
+        30, 37, 5, 45, 13, 53, 21, 61, 29, 36, 4, 44, 12, 52, 20, 60, 28, 35, 3, 43, 11, 51, 19,
+        59, 27, 34, 2, 42, 10, 50, 18, 58, 26, 33, 1, 41, 9, 49, 17, 57, 25,
+    ];
+    const E: [u8; 48] = [
+        32, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 8, 9, 10, 11, 12, 13, 12, 13, 14, 15, 16, 17, 16, 17,
+        18, 19, 20, 21, 20, 21, 22, 23, 24, 25, 24, 25, 26, 27, 28, 29, 28, 29, 30, 31, 32, 1,
+    ];
+    const P: [u8; 32] = [
+        16, 7, 20, 21, 29, 12, 28, 17, 1, 15, 23, 26, 5, 18, 31, 10, 2, 8, 24, 14, 32, 27, 3, 9,
+        19, 13, 30, 6, 22, 11, 4, 25,
+    ];
+    const PC1: [u8; 56] = [
+        57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18, 10, 2, 59, 51, 43, 35, 27, 19, 11, 3,
+        60, 52, 44, 36, 63, 55, 47, 39, 31, 23, 15, 7, 62, 54, 46, 38, 30, 22, 14, 6, 61, 53, 45,
+        37, 29, 21, 13, 5, 28, 20, 12, 4,
+    ];
+    const PC2: [u8; 48] = [
+        14, 17, 11, 24, 1, 5, 3, 28, 15, 6, 21, 10, 23, 19, 12, 4, 26, 8, 16, 7, 27, 20, 13, 2, 41,
+        52, 31, 37, 47, 55, 30, 40, 51, 45, 33, 48, 44, 49, 39, 56, 34, 53, 46, 42, 50, 36, 29, 32,
+    ];
+    const SHIFTS: [u8; 16] = [1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1];
+    const S: [[[u8; 16]; 4]; 8] = [
+        [
+            [14, 4, 13, 1, 2, 15, 11, 8, 3, 10, 6, 12, 5, 9, 0, 7],
+            [0, 15, 7, 4, 14, 2, 13, 1, 10, 6, 12, 11, 9, 5, 3, 8],
+            [4, 1, 14, 8, 13, 6, 2, 11, 15, 12, 9, 7, 3, 10, 5, 0],
+            [15, 12, 8, 2, 4, 9, 1, 7, 5, 11, 3, 14, 10, 0, 6, 13],
+        ],
+        [
+            [15, 1, 8, 14, 6, 11, 3, 4, 9, 7, 2, 13, 12, 0, 5, 10],
+            [3, 13, 4, 7, 15, 2, 8, 14, 12, 0, 1, 10, 6, 9, 11, 5],
+            [0, 14, 7, 11, 10, 4, 13, 1, 5, 8, 12, 6, 9, 3, 2, 15],
+            [13, 8, 10, 1, 3, 15, 4, 2, 11, 6, 7, 12, 0, 5, 14, 9],
+        ],
+        [
+            [10, 0, 9, 14, 6, 3, 15, 5, 1, 13, 12, 7, 11, 4, 2, 8],
+            [13, 7, 0, 9, 3, 4, 6, 10, 2, 8, 5, 14, 12, 11, 15, 1],
+            [13, 6, 4, 9, 8, 15, 3, 0, 11, 1, 2, 12, 5, 10, 14, 7],
+            [1, 10, 13, 0, 6, 9, 8, 7, 4, 15, 14, 3, 11, 5, 2, 12],
+        ],
+        [
+            [7, 13, 14, 3, 0, 6, 9, 10, 1, 2, 8, 5, 11, 12, 4, 15],
+            [13, 8, 11, 5, 6, 15, 0, 3, 4, 7, 2, 12, 1, 10, 14, 9],
+            [10, 6, 9, 0, 12, 11, 7, 13, 15, 1, 3, 14, 5, 2, 8, 4],
+            [3, 15, 0, 6, 10, 1, 13, 8, 9, 4, 5, 11, 12, 7, 2, 14],
+        ],
+        [
+            [2, 12, 4, 1, 7, 10, 11, 6, 8, 5, 3, 15, 13, 0, 14, 9],
+            [14, 11, 2, 12, 4, 7, 13, 1, 5, 0, 15, 10, 3, 9, 8, 6],
+            [4, 2, 1, 11, 10, 13, 7, 8, 15, 9, 12, 5, 6, 3, 0, 14],
+            [11, 8, 12, 7, 1, 14, 2, 13, 6, 15, 0, 9, 10, 4, 5, 3],
+        ],
+        [
+            [12, 1, 10, 15, 9, 2, 6, 8, 0, 13, 3, 4, 14, 7, 5, 11],
+            [10, 15, 4, 2, 7, 12, 9, 5, 6, 1, 13, 14, 0, 11, 3, 8],
+            [9, 14, 15, 5, 2, 8, 12, 3, 7, 0, 4, 10, 1, 13, 11, 6],
+            [4, 3, 2, 12, 9, 5, 15, 10, 11, 14, 1, 7, 6, 0, 8, 13],
+        ],
+        [
+            [4, 11, 2, 14, 15, 0, 8, 13, 3, 12, 9, 7, 5, 10, 6, 1],
+            [13, 0, 11, 7, 4, 9, 1, 10, 14, 3, 5, 12, 2, 15, 8, 6],
+            [1, 4, 11, 13, 12, 3, 7, 14, 10, 15, 6, 8, 0, 5, 9, 2],
+            [6, 11, 13, 8, 1, 4, 10, 7, 9, 5, 0, 15, 14, 2, 3, 12],
+        ],
+        [
+            [13, 2, 8, 4, 6, 15, 11, 1, 10, 9, 3, 14, 5, 0, 12, 7],
+            [1, 15, 13, 8, 10, 3, 7, 4, 12, 5, 6, 11, 0, 14, 9, 2],
+            [7, 11, 4, 1, 9, 12, 14, 2, 0, 6, 10, 13, 15, 3, 5, 8],
+            [2, 1, 14, 7, 4, 10, 8, 13, 15, 12, 9, 0, 3, 5, 6, 11],
+        ],
+    ];
+
+    pub fn response(key: &[u8; 8], challenge: &[u8; 16]) -> [u8; 16] {
+        let mut output = [0u8; 16];
+        output[..8].copy_from_slice(&encrypt_block(key, &challenge[..8]));
+        output[8..].copy_from_slice(&encrypt_block(key, &challenge[8..]));
+        output
+    }
+
+    pub fn encrypt_block(key: &[u8; 8], block: &[u8]) -> [u8; 8] {
+        let mut block_bytes = [0u8; 8];
+        block_bytes.copy_from_slice(&block[..8]);
+        let subkeys = subkeys(key);
+        let permuted = permute(u64::from_be_bytes(block_bytes), &IP, 64);
+        let mut left = (permuted >> 32) as u32;
+        let mut right = permuted as u32;
+        for subkey in subkeys {
+            let next = left ^ feistel(right, subkey);
+            left = right;
+            right = next;
+        }
+        let preoutput = ((u64::from(right)) << 32) | u64::from(left);
+        permute(preoutput, &FP, 64).to_be_bytes()
+    }
+
+    fn subkeys(key: &[u8; 8]) -> [u64; 16] {
+        let permuted = permute(u64::from_be_bytes(*key), &PC1, 64);
+        let mut c = ((permuted >> 28) & 0x0fff_ffff) as u32;
+        let mut d = (permuted & 0x0fff_ffff) as u32;
+        let mut keys = [0u64; 16];
+        for (index, shift) in SHIFTS.iter().enumerate() {
+            c = rotate_left_28(c, *shift);
+            d = rotate_left_28(d, *shift);
+            let combined = (u64::from(c) << 28) | u64::from(d);
+            keys[index] = permute(combined, &PC2, 56);
+        }
+        keys
+    }
+
+    fn rotate_left_28(value: u32, shift: u8) -> u32 {
+        ((value << shift) | (value >> (28 - shift))) & 0x0fff_ffff
+    }
+
+    fn feistel(right: u32, subkey: u64) -> u32 {
+        let expanded = permute(u64::from(right), &E, 32) ^ subkey;
+        let mut substituted = 0u32;
+        for index in 0..8 {
+            let six = ((expanded >> (42 - 6 * index)) & 0x3f) as u8;
+            let row = ((six >> 4) & 0x2 | (six & 0x1)) as usize;
+            let column = ((six >> 1) & 0x0f) as usize;
+            substituted = (substituted << 4) | u32::from(S[index][row][column]);
+        }
+        permute(u64::from(substituted), &P, 32) as u32
+    }
+
+    fn permute(input: u64, table: &[u8], input_bits: u32) -> u64 {
+        let mut output = 0u64;
+        for position in table {
+            let bit = (input >> (input_bits - u32::from(*position))) & 1;
+            output = (output << 1) | bit;
+        }
+        output
+    }
 }
 
 async fn wait_for_first_geometry(
@@ -1059,15 +1573,41 @@ async fn client_read_loop(
     mut read: OwnedReadHalf,
     context: Arc<ClientContext>,
     commands: mpsc::Sender<ClientCommand>,
+    idle_timeout: Option<Duration>,
 ) {
     let mut buttons = 0u8;
     loop {
         let mut message_type = [0u8; 1];
-        if let Err(error) = read.read_exact(&mut message_type).await {
-            if error.kind() != io::ErrorKind::UnexpectedEof {
-                debug!(client = context.id, error = %error, "VNC read ended");
+        match idle_timeout {
+            Some(limit) => {
+                match tokio::time::timeout(limit, read.read_exact(&mut message_type)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        if error.kind() != io::ErrorKind::UnexpectedEof {
+                            debug!(client = context.id, error = %error, "VNC read ended");
+                        }
+                        return;
+                    }
+                    Err(_) => {
+                        // The viewer stopped sending client messages (usually
+                        // FramebufferUpdateRequest) for the configured window.
+                        debug!(
+                            client = context.id,
+                            timeout_secs = limit.as_secs(),
+                            "VNC client idle timeout"
+                        );
+                        return;
+                    }
+                }
             }
-            return;
+            None => {
+                if let Err(error) = read.read_exact(&mut message_type).await {
+                    if error.kind() != io::ErrorKind::UnexpectedEof {
+                        debug!(client = context.id, error = %error, "VNC read ended");
+                    }
+                    return;
+                }
+            }
         }
 
         let result = match message_type[0] {
@@ -1644,6 +2184,7 @@ enum ProtocolError {
     MalformedVersion,
     Version(u16),
     SecurityType(u8),
+    AuthenticationFailed,
     UnsupportedPixelFormat(String),
     TooManyEncodings(usize),
     UnknownMessage(u8),
@@ -1669,11 +2210,9 @@ impl fmt::Display for ProtocolError {
                 write!(formatter, "unsupported RFB version 3.{minor:03}")
             }
             Self::SecurityType(kind) => {
-                write!(
-                    formatter,
-                    "unsupported security type {kind}; only None is served"
-                )
+                write!(formatter, "unsupported security type {kind}")
             }
+            Self::AuthenticationFailed => formatter.write_str("VNC authentication failed"),
             Self::UnsupportedPixelFormat(reason) => {
                 write!(formatter, "unsupported pixel format: {reason}")
             }
@@ -1831,6 +2370,17 @@ mod tests {
         stream.write_all(bytes).await.expect("write failed");
     }
 
+    async fn read_server_init(stream: &mut TcpStream) -> (u16, u16, Vec<u8>) {
+        let mut init = [0u8; 24];
+        read_exact(stream, &mut init).await;
+        let width = u16::from_be_bytes([init[0], init[1]]);
+        let height = u16::from_be_bytes([init[2], init[3]]);
+        let name_len = u32::from_be_bytes([init[20], init[21], init[22], init[23]]) as usize;
+        let mut name = vec![0u8; name_len];
+        read_exact(stream, &mut name).await;
+        (width, height, name)
+    }
+
     async fn handshake_client(stream: &mut TcpStream) -> (u16, u16, Vec<u8>) {
         let mut version = [0u8; 12];
         read_exact(stream, &mut version).await;
@@ -1847,15 +2397,61 @@ mod tests {
         assert_eq!(result, 0u32.to_be_bytes());
 
         write_all(stream, &[1]).await;
+        read_server_init(stream).await
+    }
 
-        let mut init = [0u8; 24];
-        read_exact(stream, &mut init).await;
-        let width = u16::from_be_bytes([init[0], init[1]]);
-        let height = u16::from_be_bytes([init[2], init[3]]);
-        let name_len = u32::from_be_bytes([init[20], init[21], init[22], init[23]]) as usize;
-        let mut name = vec![0u8; name_len];
-        read_exact(stream, &mut name).await;
-        (width, height, name)
+    /// Independent test-side implementation of the RFB 3.8 VNC-auth response:
+    /// pad/truncate to eight bytes, reverse each password byte's bits, and DES-
+    /// encrypt both halves of the challenge.
+    fn client_vnc_response(password: &[u8], challenge: &[u8; 16]) -> [u8; 16] {
+        let mut key = [0u8; 8];
+        for (index, key_byte) in key.iter_mut().enumerate() {
+            *key_byte = password.get(index).copied().unwrap_or(0).reverse_bits();
+        }
+        let mut response = [0u8; 16];
+        response[..8].copy_from_slice(&vnc_des::encrypt_block(&key, &challenge[..8]));
+        response[8..].copy_from_slice(&vnc_des::encrypt_block(&key, &challenge[8..]));
+        response
+    }
+
+    async fn handshake_client_with_password(
+        stream: &mut TcpStream,
+        password: &[u8],
+    ) -> (u16, u16, Vec<u8>) {
+        let mut version = [0u8; 12];
+        read_exact(stream, &mut version).await;
+        assert_eq!(&version, b"RFB 003.008\n");
+        write_all(stream, b"RFB 003.008\n").await;
+
+        let mut security = [0u8; 2];
+        read_exact(stream, &mut security).await;
+        assert_eq!(
+            security,
+            [1, SECURITY_TYPE_VNC_AUTH],
+            "a password-configured server must offer only VNC authentication"
+        );
+        write_all(stream, &[SECURITY_TYPE_VNC_AUTH]).await;
+
+        let mut challenge = [0u8; 16];
+        read_exact(stream, &mut challenge).await;
+        let response = client_vnc_response(password, &challenge);
+        write_all(stream, &response).await;
+
+        let mut result = [0u8; 4];
+        read_exact(stream, &mut result).await;
+        assert_eq!(result, 0u32.to_be_bytes());
+
+        write_all(stream, &[1]).await;
+        read_server_init(stream).await
+    }
+
+    async fn assert_connection_closed(stream: &mut TcpStream) {
+        let mut byte = [0u8; 1];
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte)).await;
+        match result {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            other => panic!("expected the connection to close, got {other:?}"),
+        }
     }
 
     async fn request_update(stream: &mut TcpStream, incremental: bool, width: u16, height: u16) {
@@ -1903,6 +2499,20 @@ mod tests {
         start(config, source, sink).await.expect("server starts")
     }
 
+    async fn start_server_with_password(
+        source: Box<dyn CaptureSource>,
+        sink: SharedSink,
+        password: &[u8],
+    ) -> VncServerHandle {
+        let config = VncServerConfig {
+            name: "Ozma test".to_owned(),
+            max_clients: 1,
+            password: Some(VncPassword::from_bytes(password).expect("valid test password")),
+            ..VncServerConfig::default()
+        };
+        start(config, source, sink).await.expect("server starts")
+    }
+
     async fn wait_for<F: Fn() -> bool>(predicate: F) {
         tokio::time::timeout(Duration::from_secs(2), async {
             while !predicate() {
@@ -1923,6 +2533,60 @@ mod tests {
         assert!(String::from_utf8_lossy(&name).contains("Ozma test"));
         let snapshot = server.stats();
         assert_eq!(snapshot.clients_accepted, 1);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn password_auth_accepts_the_correct_des_response() {
+        let sink: SharedSink = Arc::new(FakeInputSink::new());
+        let server =
+            start_server_with_password(Box::new(TestSource::new(4, 2)), sink, b"hunter2").await;
+        assert!(server.auth_enabled());
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        let (width, height, name) = handshake_client_with_password(&mut client, b"hunter2").await;
+        assert_eq!((width, height), (4, 2));
+        assert!(String::from_utf8_lossy(&name).contains("Ozma test"));
+
+        // A successful auth still produces a normal framebuffer session.
+        request_update(&mut client, false, 4, 2).await;
+        let (_, pixels) = read_raw_update(&mut client).await;
+        assert_eq!(pixels.len(), 4 * 2 * 4);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn password_auth_rejects_a_wrong_response_and_closes_without_retry() {
+        let sink: SharedSink = Arc::new(FakeInputSink::new());
+        let server =
+            start_server_with_password(Box::new(TestSource::new(4, 2)), sink, b"hunter2").await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+
+        let mut version = [0u8; 12];
+        read_exact(&mut client, &mut version).await;
+        write_all(&mut client, b"RFB 003.008\n").await;
+        let mut security = [0u8; 2];
+        read_exact(&mut client, &mut security).await;
+        assert_eq!(security, [1, SECURITY_TYPE_VNC_AUTH]);
+        write_all(&mut client, &[SECURITY_TYPE_VNC_AUTH]).await;
+
+        let mut challenge = [0u8; 16];
+        read_exact(&mut client, &mut challenge).await;
+        let mut response = client_vnc_response(b"hunter2", &challenge);
+        response[0] ^= 0xff;
+        write_all(&mut client, &response).await;
+
+        let mut result = [0u8; 4];
+        read_exact(&mut client, &mut result).await;
+        assert_eq!(u32::from_be_bytes(result), 1, "SecurityResult must fail");
+        // RFB 3.8 includes a reason string, then closes. There is no retry
+        // challenge after a failure.
+        let mut length = [0u8; 4];
+        read_exact(&mut client, &mut length).await;
+        let mut reason = vec![0u8; u32::from_be_bytes(length) as usize];
+        read_exact(&mut client, &mut reason).await;
+        assert!(!reason.is_empty());
+        assert_connection_closed(&mut client).await;
+        wait_for(|| server.stats().protocol_errors >= 1).await;
         server.shutdown().await;
     }
 
@@ -2001,11 +2665,21 @@ mod tests {
         assert_eq!(header[2..4], [0, 1]);
         assert_eq!(pixels.len(), 2 * 2 * 4);
 
-        // Let the source advance, then request only new frames.
+        // Let the source advance, then request only new frames. The 25 ms
+        // sleep used to race the 30 fps pump under parallel load, so poll a
+        // bounded number of times until a genuinely newer frame arrives.
         tokio::time::sleep(Duration::from_millis(25)).await;
-        request_update(&mut client, true, 2, 2).await;
-        let (_, second) = read_raw_update(&mut client).await;
-        assert_eq!(second.len(), 2 * 2 * 4);
+        let mut second = pixels.clone();
+        for _ in 0..25 {
+            request_update(&mut client, true, 2, 2).await;
+            let (_, next) = read_raw_update(&mut client).await;
+            assert_eq!(next.len(), 2 * 2 * 4);
+            second = next;
+            if second != pixels {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert_ne!(
             pixels, second,
             "incremental update should publish a newer frame"
@@ -2200,6 +2874,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_timeout_closes_a_viewer_that_stops_sending_requests() {
+        let sink: SharedSink = Arc::new(FakeInputSink::new());
+        let config = VncServerConfig {
+            name: "Ozma idle test".to_owned(),
+            max_clients: 1,
+            idle_timeout: Some(Duration::from_secs(1)),
+            ..VncServerConfig::default()
+        };
+        let server = start(config, Box::new(TestSource::new(2, 2)), sink)
+            .await
+            .expect("server starts");
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        wait_for(|| server.stats().clients_connected == 1).await;
+
+        // Send nothing after ClientInit. The read loop must close the session
+        // once the idle window expires.
+        wait_for(|| server.stats().clients_connected == 0).await;
+        assert_connection_closed(&mut client).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn non_loopback_bind_is_refused_without_explicit_configuration() {
         let config = VncServerConfig {
             bind: "0.0.0.0".parse().unwrap(),
@@ -2217,17 +2914,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_loopback_without_password_requires_the_explicit_override() {
+        let refused = VncServerConfig {
+            bind: "0.0.0.0".parse().unwrap(),
+            allow_non_loopback: true,
+            ..VncServerConfig::default()
+        };
+        let error = start(
+            refused.clone(),
+            Box::new(TestSource::new(2, 2)),
+            Arc::new(FakeInputSink::new()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            VncServerError::UnauthenticatedWiderBindRefused { .. }
+        ));
+
+        // The explicit override is accepted...
+        let override_config = VncServerConfig {
+            allow_unauthenticated: true,
+            ..refused.clone()
+        };
+        override_config
+            .validate()
+            .expect("the explicit unauthenticated override validates");
+
+        // ...and so is a non-loopback bind with a configured password.
+        let password_config = VncServerConfig {
+            password: Some(VncPassword::from_bytes(b"secret").unwrap()),
+            ..refused
+        };
+        password_config
+            .validate()
+            .expect("a password makes a non-loopback bind valid");
+    }
+
+    fn password_file_path(tag: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ozma-vnc-password-{}-{nonce}-{tag}",
+            std::process::id()
+        ))
+    }
+
+    fn write_password_file(tag: &str, bytes: &[u8], mode: Option<u32>) -> PathBuf {
+        let path = password_file_path(tag);
+        std::fs::write(&path, bytes).expect("write test password file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(mode) = mode {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                    .expect("set test password mode");
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        path
+    }
+
+    #[test]
+    fn password_file_policy_trims_one_newline_and_rejects_empty_oversize_and_wide_modes() {
+        let valid = write_password_file("valid", b"hunter2\n", Some(0o600));
+        let password = VncPassword::from_file(&valid).expect("0600 password file loads");
+        assert_eq!(format!("{password:?}"), "VncPassword(<redacted>)");
+        assert!(!format!("{password:?}").contains("hunter2"));
+        std::fs::remove_file(valid).unwrap();
+
+        let crlf = write_password_file("crlf", b"hunter2\r\n", Some(0o600));
+        VncPassword::from_file(&crlf).expect("CRLF is trimmed as one newline");
+        std::fs::remove_file(crlf).unwrap();
+
+        let empty = write_password_file("empty", b"", Some(0o600));
+        assert!(matches!(
+            VncPassword::from_file(&empty),
+            Err(VncPasswordError::EmptyAt { .. })
+        ));
+        std::fs::remove_file(empty).unwrap();
+
+        let newline_only = write_password_file("newline", b"\n", Some(0o600));
+        assert!(matches!(
+            VncPassword::from_file(&newline_only),
+            Err(VncPasswordError::EmptyAt { .. })
+        ));
+        std::fs::remove_file(newline_only).unwrap();
+
+        // One trailing newline is removed, so nine password bytes still fail.
+        let oversized = write_password_file("oversized", b"123456789\n", Some(0o600));
+        assert!(matches!(
+            VncPassword::from_file(&oversized),
+            Err(VncPasswordError::TooLongAt { .. })
+        ));
+        std::fs::remove_file(oversized).unwrap();
+
+        // A file larger than the read guard is rejected before parsing.
+        let huge = write_password_file("huge", &vec![b'x'; 8192], Some(0o600));
+        assert!(matches!(
+            VncPassword::from_file(&huge),
+            Err(VncPasswordError::TooLong { .. })
+        ));
+        std::fs::remove_file(huge).unwrap();
+
+        #[cfg(unix)]
+        {
+            let wide = write_password_file("wide", b"hunter2\n", Some(0o644));
+            assert!(matches!(
+                VncPassword::from_file(&wide),
+                Err(VncPasswordError::Permissions { .. })
+            ));
+            std::fs::remove_file(wide).unwrap();
+
+            // 0400 is stricter than 0600 and is accepted.
+            let readonly = write_password_file("readonly", b"hunter2\n", Some(0o400));
+            VncPassword::from_file(&readonly).expect("0400 is stricter than 0600");
+            std::fs::remove_file(readonly).unwrap();
+        }
+    }
+
+    #[test]
+    fn des_known_answer_and_rfb_key_expansion_are_correct() {
+        // FIPS/classic DES known-answer vector.
+        let key = [0x13, 0x34, 0x57, 0x79, 0x9b, 0xbc, 0xdf, 0xf1];
+        let block = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        assert_eq!(
+            vnc_des::encrypt_block(&key, &block),
+            [0x85, 0xe8, 0x13, 0x54, 0x0f, 0x0a, 0xb4, 0x05]
+        );
+
+        // "password" bit-reversed per byte is the classic VNC DES key.
+        let password = VncPassword::from_bytes(b"password").unwrap();
+        assert_eq!(
+            password.key(),
+            &[0x0e, 0x86, 0xce, 0xce, 0xee, 0xf6, 0x4e, 0x26]
+        );
+
+        assert!(constant_time_eq(b"same", b"same"));
+        assert!(!constant_time_eq(b"same", b"diff"));
+        assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
+    #[tokio::test]
+    async fn password_is_redacted_from_debug_and_status_surfaces() {
+        let password = VncPassword::from_bytes(b"hunter2").unwrap();
+        let config = VncServerConfig {
+            password: Some(password.clone()),
+            ..VncServerConfig::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+
+        let options = VncServerOptions {
+            password: Some(password),
+            ..VncServerOptions::default()
+        };
+        let debug = format!("{options:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+
+        let server = start_server_with_password(
+            Box::new(TestSource::new(2, 2)),
+            Arc::new(FakeInputSink::new()),
+            b"hunter2",
+        )
+        .await;
+        let debug = format!("{server:?}");
+        assert!(server.auth_enabled());
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(!format!("{:?}", server.stats()).contains("hunter2"));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn disabled_or_sourceless_config_never_binds_a_fake_listener() {
         let sink: SharedSink = Arc::new(FakeInputSink::new());
         let registry = CaptureRegistry::new();
 
-        let disabled =
-            start_if_configured(false, Some("0.0.0.0"), 1, &registry, sink.clone(), "test")
-                .await
-                .expect("disabled is not an error");
+        let disabled = start_if_configured(
+            false,
+            VncServerOptions {
+                bind: Some("0.0.0.0".to_owned()),
+                port: 1,
+                ..VncServerOptions::default()
+            },
+            &registry,
+            sink.clone(),
+            "test",
+        )
+        .await
+        .expect("disabled is not an error");
         assert!(disabled.is_none());
 
-        let error = start_if_configured(true, None, 0, &registry, sink, "test")
+        let error = start_if_configured(true, VncServerOptions::default(), &registry, sink, "test")
             .await
             .unwrap_err();
         assert!(matches!(error, VncServerError::NoCaptureSource));

@@ -34,6 +34,7 @@ jobs:
         run: buf breaking --against proto/baseline.bin
 
   lint:
+    name: Python lint (advisory)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +45,8 @@ jobs:
       - name: Install ruff
         run: uv pip install --system ruff
       - name: Lint
+        # controller/ is the shipping Python surface. node/, softnode/, and
+        # agent/ are the one-release rollback trees and are advisory only.
         run: ruff check controller/ node/ softnode/ agent/ || true
 
   typecheck:
@@ -61,7 +64,8 @@ jobs:
       - name: Type check
         run: mypy controller/ --ignore-missing-imports --no-error-summary || true
 
-  test:
+  python-controller:
+    name: Python controller tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,9 +77,36 @@ jobs:
         run: |
           uv pip install --system pytest pytest-timeout pytest-asyncio
           uv pip install --system -r controller/requirements.txt 2>/dev/null || true
-      - name: Run tests
+      - name: Run controller tests
+        run: |
+          python -m pytest tests/unit/controller --timeout 30 -v -p no:cacheprovider \
+            --ignore=tests/unit/controller/test_graphql_mutations.py \
+            --ignore=tests/unit/controller/test_graphql.py \
+            --ignore=tests/unit/controller/test_graphql_subscriptions.py \
+            --ignore=tests/unit/controller/test_capture_to_moonlight.py \
+            --ignore=tests/unit/controller/test_moonlight_app_mapping.py
+
+  python-legacy-tests:
+    name: Python legacy node/agent tests (optional, non-blocking)
+    # The Python node/softnode/agent trees remain the rollback path for one
+    # release. They must still be runnable, but they are not a Phase 4 cutover
+    # gate. Failures are reported and do not fail the workflow.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v4
+      - name: Install dependencies
+        run: |
+          uv pip install --system pytest pytest-timeout pytest-asyncio
+          uv pip install --system -r controller/requirements.txt 2>/dev/null || true
+      - name: Run legacy Python tests
         run: |
           python -m pytest tests/ --timeout 30 -v -p no:cacheprovider \
+            --ignore=tests/unit/controller \
             --ignore=tests/test_e2e_switching.py \
             --ignore=tests/test_e2e_features.py \
             --ignore=tests/test_e2e_v05.py \
@@ -90,14 +121,27 @@ jobs:
             --ignore=tests/unit/controller/test_moonlight_app_mapping.py
 
   compile-check:
+    name: Python controller compile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Compile all Python files
-        run: python -m py_compile controller/*.py node/*.py softnode/*.py
+      - name: Compile controller
+        run: python -m py_compile controller/*.py
+
+  python-legacy-compile:
+    name: Python legacy node/softnode/agent compile (optional)
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Compile legacy trees
+        run: python -m py_compile node/*.py softnode/*.py agent/*.py
 
   dco-check:
     runs-on: ubuntu-latest

@@ -1108,6 +1108,16 @@ pub struct NodeConfig {
     pub vnc_bind: Option<String>,
     /// RFB listener port; `0` asks the OS for a free port.
     pub vnc_server_port: u16,
+    /// File containing the RFB VNC authentication password. Read once at
+    /// startup; its presence enables RFB security type 2.
+    pub vnc_password_file: Option<PathBuf>,
+    /// Explicit opt-in for a non-loopback RFB bind **without** a password.
+    pub vnc_allow_unauthenticated: bool,
+    /// Maximum concurrent RFB viewers.
+    pub vnc_max_clients: usize,
+    /// Close an RFB viewer that sends no client message for this many seconds.
+    /// `0` disables the idle timeout.
+    pub vnc_idle_timeout_seconds: u64,
     /// Effective D-Bus console index (`Console_N`).
     pub dbus_console: u32,
     /// Largest D-Bus scanout width accepted.
@@ -1538,12 +1548,18 @@ impl NodeConfig {
         if self.vnc_fps == 0 {
             return Err("--vnc-fps must be greater than zero".to_owned());
         }
-        if !self.vnc_server && (self.vnc_bind.is_some() || self.vnc_server_port != 0) {
-            return Err(
-                "--vnc-bind and --vnc-server-port configure the internal RFB server and require \
+        let vnc_server_configured = self.vnc_bind.is_some()
+            || self.vnc_server_port != 0
+            || self.vnc_password_file.is_some()
+            || self.vnc_allow_unauthenticated
+            || self.vnc_max_clients != crate::vnc_server::DEFAULT_MAX_CLIENTS
+            || self.vnc_idle_timeout_seconds != 0;
+        if !self.vnc_server && vnc_server_configured {
+            return Err("--vnc-bind, --vnc-server-port, --vnc-password-file, \
+                 --vnc-allow-unauthenticated, --vnc-max-clients, and \
+                 --vnc-idle-timeout-seconds configure the internal RFB server and require \
                  --vnc-server"
-                    .to_owned(),
-            );
+                .to_owned());
         }
         if self.vnc_server {
             let raw = self
@@ -1551,9 +1567,39 @@ impl NodeConfig {
                 .as_deref()
                 .unwrap_or(crate::vnc_server::DEFAULT_VNC_BIND)
                 .trim();
-            raw.parse::<std::net::IpAddr>().map_err(|error| {
+            let bind = raw.parse::<std::net::IpAddr>().map_err(|error| {
                 format!("--vnc-bind `{raw}` must be an IP address for the RFB listener: {error}")
             })?;
+            if !bind.is_loopback()
+                && self.vnc_password_file.is_none()
+                && !self.vnc_allow_unauthenticated
+            {
+                return Err(format!(
+                    "refusing unauthenticated non-loopback VNC bind `{bind}`: configure \
+                     --vnc-password-file, or set --vnc-allow-unauthenticated to accept the risk"
+                ));
+            }
+            if self.vnc_max_clients == 0
+                || self.vnc_max_clients > crate::vnc_server::MAX_CLIENTS_LIMIT
+            {
+                return Err(format!(
+                    "--vnc-max-clients must be between 1 and {}, got {}",
+                    crate::vnc_server::MAX_CLIENTS_LIMIT,
+                    self.vnc_max_clients
+                ));
+            }
+            if self.vnc_idle_timeout_seconds > crate::vnc_server::MAX_IDLE_TIMEOUT_SECONDS {
+                return Err(format!(
+                    "--vnc-idle-timeout-seconds must be between 0 and {}, got {}",
+                    crate::vnc_server::MAX_IDLE_TIMEOUT_SECONDS,
+                    self.vnc_idle_timeout_seconds
+                ));
+            }
+            if let Some(path) = &self.vnc_password_file {
+                if path.as_os_str().is_empty() {
+                    return Err("--vnc-password-file must not be empty".to_owned());
+                }
+            }
         }
         if self.dbus_width == 0 {
             return Err("--dbus-width must be greater than zero".to_owned());
@@ -2031,6 +2077,10 @@ mod tests {
             vnc_server: false,
             vnc_bind: None,
             vnc_server_port: 0,
+            vnc_password_file: None,
+            vnc_allow_unauthenticated: false,
+            vnc_max_clients: crate::vnc_server::DEFAULT_MAX_CLIENTS,
+            vnc_idle_timeout_seconds: 0,
             dbus_console: ozma_capture::DBUS_DEFAULT_CONSOLE_INDEX,
             dbus_width: ozma_capture::DBUS_DEFAULT_WIDTH,
             dbus_height: ozma_capture::DBUS_DEFAULT_HEIGHT,
@@ -2433,20 +2483,48 @@ mod tests {
         let error = orphan.validate().unwrap_err();
         assert!(error.contains("--vnc-server"), "{error}");
 
+        let mut orphan = test_config(NodeProfile::Hardware);
+        orphan.vnc_password_file = Some(PathBuf::from("/run/ozma/vnc.pass"));
+        let error = orphan.validate().unwrap_err();
+        assert!(error.contains("--vnc-server"), "{error}");
+
         let mut enabled = test_config(NodeProfile::Hardware);
         enabled.vnc_server = true;
         enabled.validate().unwrap();
 
+        // A non-loopback bind without a password or the explicit override is
+        // refused at configuration time, before any socket is bound.
         let mut widened = test_config(NodeProfile::Hardware);
         widened.vnc_server = true;
         widened.vnc_bind = Some("0.0.0.0".into());
-        widened.validate().unwrap();
+        let error = widened.validate().unwrap_err();
+        assert!(error.contains("--vnc-password-file"), "{error}");
+
+        let mut overridden = widened.clone();
+        overridden.vnc_allow_unauthenticated = true;
+        overridden.validate().unwrap();
+
+        let mut authenticated = widened;
+        authenticated.vnc_password_file = Some(PathBuf::from("/run/ozma/vnc.pass"));
+        authenticated.validate().unwrap();
 
         let mut invalid = test_config(NodeProfile::Hardware);
         invalid.vnc_server = true;
         invalid.vnc_bind = Some("not-an-ip".into());
         let error = invalid.validate().unwrap_err();
         assert!(error.contains("--vnc-bind"), "{error}");
+
+        let mut too_many = test_config(NodeProfile::Hardware);
+        too_many.vnc_server = true;
+        too_many.vnc_max_clients = crate::vnc_server::MAX_CLIENTS_LIMIT + 1;
+        let error = too_many.validate().unwrap_err();
+        assert!(error.contains("--vnc-max-clients"), "{error}");
+
+        let mut idle = test_config(NodeProfile::Hardware);
+        idle.vnc_server = true;
+        idle.vnc_idle_timeout_seconds = crate::vnc_server::MAX_IDLE_TIMEOUT_SECONDS + 1;
+        let error = idle.validate().unwrap_err();
+        assert!(error.contains("--vnc-idle-timeout-seconds"), "{error}");
     }
 
     #[test]

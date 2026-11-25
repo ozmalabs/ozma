@@ -1,43 +1,84 @@
 # Phase 4 VNC/RFB Server Report
 
-Status: implemented and tested in `ozma-node`. The node can now serve its own
+Status: implemented and tested in `ozma-node`. The node can serve its own
 opt-in RFB 3.8 endpoint for the controller's VNC consumers instead of only
-registering an external QEMU VNC endpoint. No commit was made.
+registering an external QEMU VNC endpoint. Standard RFB VNC password
+authentication (security type 2) is now available. **The transport is still
+plain TCP: VNC authentication is not encryption and there is no TLS.** No
+commit was made.
 
 ## Scope
 
 Added:
 
-- `ozma-node/src/vnc_server.rs` — a bound RFB listener, handshake, Raw
-  framebuffer encoder, client-message parser, input adapter, and per-listener
-  counters.
-- `ozma-node/src/main.rs` — `--vnc-server`, `--vnc-bind`, and
-  `--vnc-server-port`, startup/shutdown wiring, and endpoint logging.
-- `ozma-node/src/config.rs` — validation and storage for the new flags.
+- `ozma-node/src/vnc_server.rs` — a bound RFB listener, handshake, optional
+  RFB security type 2 (DES challenge/response), Raw framebuffer encoder,
+  client-message parser, input adapter, and per-listener counters.
+- `ozma-node/src/main.rs` — `--vnc-server`, `--vnc-bind`,
+  `--vnc-server-port`, `--vnc-password-file`, `--vnc-allow-unauthenticated`,
+  `--vnc-max-clients`, and `--vnc-idle-timeout-seconds`, startup/shutdown
+  wiring, and endpoint logging.
+- `ozma-node/src/config.rs` — validation and storage for the new flags,
+  including refusal of unauthenticated non-loopback binds.
 - `ozma-node/src/registration.rs` — served-endpoint precedence over an external
-  QEMU endpoint.
-- `ozma-node/src/lib.rs` and `ozma-node/src/platform.rs` — module export and
-  test-config field updates.
+  QEMU endpoint, and documentation that the advertised endpoint may require a
+  password.
+- `ozma-node/src/platform.rs` — test-config field updates.
 - This report.
 
-No changes were made to `docs/parity-matrix.md` or
-`docs/plan-execution-status.md`. `docs/phase4-registration-parity.md` and the
-VNC row in `docs/phase4-cutover-audit.md` still describe the pre-server state
-("external QEMU endpoint only"); they are intentionally left for the separate
-parity-doc pass because this task's scope was one new report.
+No changes were made to the Rust/WebRTC/USB/multiseat paths, the controller, or
+the Python node.
+
+The VNC rows in `docs/parity-matrix.md`,
+`docs/phase4-registration-parity.md`, and `docs/phase4-cutover-audit.md` were
+updated to describe password authentication and the still-plaintext transport.
+`docs/plan-execution-status.md` was not changed in this pass.
 
 ## Configuration and safety policy
 
-| Flag | Default | Behavior |
+| Flag / env | Default | Behavior |
 |---|---|---|
-| `--vnc-server` | off | Binds only when enabled **and** the capture registry has a source. |
-| `--vnc-bind` | `127.0.0.1` | Supplying the flag is the explicit opt-in for a non-loopback address. |
-| `--vnc-server-port` | `0` | `0` asks the OS for a free port; the real port is the one registered. |
+| `--vnc-server` / `OZMA_VNC_SERVER` | off | Binds only when enabled **and** the capture registry has a source. |
+| `--vnc-bind` / `OZMA_VNC_BIND` | `127.0.0.1` | Supplying the flag is the explicit opt-in for a non-loopback address. |
+| `--vnc-server-port` / `OZMA_VNC_SERVER_PORT` | `0` | `0` asks the OS for a free port; the real port is the one registered. |
+| `--vnc-password-file` / `OZMA_VNC_PASSWORD_FILE` | unset | Read once at startup; enables RFB security type 2. |
+| `--vnc-allow-unauthenticated` / `OZMA_VNC_ALLOW_UNAUTHENTICATED` | off | Explicit opt-in for a non-loopback bind **without** a password. |
+| `--vnc-max-clients` / `OZMA_VNC_MAX_CLIENTS` | `4` | Bounded 1..=32 concurrent viewers. |
+| `--vnc-idle-timeout-seconds` / `OZMA_VNC_IDLE_TIMEOUT_SECONDS` | `0` | `0` disables it; otherwise 1..=86400 seconds without a client message closes the viewer. |
 
-Security is RFB "None" only. There is **no password, TLS, or authentication**.
-The listener therefore defaults to loopback and refuses a non-loopback bind
-unless the operator passed `--vnc-bind` explicitly. A wildcard bind is reported
-to the controller as the resolved local address, never as `0.0.0.0`.
+### Security and bind policy
+
+- With no password file, the server offers **security type 1 (None)** and is
+  safe only on loopback. The default bind is `127.0.0.1`.
+- With a password file, the server offers **only security type 2 (VNC
+  authentication)**. It never offers None alongside it, so a client cannot opt
+  out of the configured password.
+- A non-loopback bind requires either `--vnc-password-file` (preferred) or the
+  explicit `--vnc-allow-unauthenticated`. Without one of them, `NodeConfig`
+  validation and `VncServerConfig::validate` both return a typed startup error
+  (`UnauthenticatedWiderBindRefused`); the node exits instead of silently
+  serving an unauthenticated LAN listener.
+- A wildcard bind is reported to the controller as the resolved local address,
+  never as `0.0.0.0`.
+- **Plaintext transport:** RFB VNC authentication proves knowledge of a shared
+  password with a DES challenge/response. It does not encrypt pixels, input, or
+  clipboard traffic, and classic VNC DES is cryptographically weak by modern
+  standards. Do not treat a password as a substitute for a trusted network,
+  WireGuard/mesh transport, or SSH tunnel. There is no TLS and no VeNCrypt.
+
+### Password file policy
+
+- The file is read exactly once at startup and trimmed of **one** trailing
+  newline (`\n` or `\r\n`) only. Spaces and all other bytes are preserved.
+- Empty files (including a file containing only a newline) are rejected.
+- RFB VNC authentication uses one 8-byte DES key. Passwords longer than 8 bytes
+  are rejected rather than silently truncated, so operators can see that the
+  extra bytes would not contribute.
+- On Unix the file must be `0600` or stricter. Any group/other permission bit or
+  owner-execute bit is a typed error (`VncPasswordError::Permissions`).
+- The password value never appears in logs, `Debug`, errors, counters, mDNS TXT
+  records, or `/api/v1/connection`. Only `VncServerConfig` knows whether auth is
+  enabled (`VncServerHandle::auth_enabled` / log field `security = "vnc-auth"`).
 
 `--vnc-server` on a node with no capture source is a warned no-listener state:
 no socket is bound and registration keeps the typed `not-configured` state. It
@@ -52,11 +93,21 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
 
 - Sends the 12-byte version string.
 - Reads the client version and accepts only major 3 with minor 3, 7, or 8.
-- RFB 3.3: sends the 32-bit security type `None` (1).
-- RFB 3.7/3.8: sends `[1, 1]`, reads the client's security choice, and sends
-  `SecurityResult(0)` for `None`.
-- A non-`None` choice is refused. RFB 3.8 also receives a failure reason
-  string; RFB 3.7 receives only the failure result.
+- RFB 3.3: sends one 32-bit security type. Without a password it is `None` (1);
+  with a password it is `VNC authentication` (2). Type 2 then performs the
+  challenge/response below and sends `SecurityResult`.
+- RFB 3.7/3.8: sends a one-entry list — `[1, 1]` for None or `[1, 2]` for VNC
+  authentication — reads the client's choice, and requires it to match.
+- Security type 2: the server generates a fresh 16-byte challenge with the OS
+  CSPRNG, sends it, reads the 16-byte DES response, and compares it to the
+  expected value in constant time.
+- On success it sends `SecurityResult(0)`. On failure it sends
+  `SecurityResult(1)` (RFB 3.8 adds a short reason string) and closes the
+  connection. There is no retry loop and no fallback to None.
+- Any choice the server did not offer is refused with `SecurityResult(1)`;
+  RFB 3.8 also receives a failure reason string, RFB 3.7 only the result.
+- The password bytes are padded to 8, zero-padded, and each byte's bits are
+  reversed to form the DES key, matching the RFB VNC-authentication convention.
 - Reads `ClientInit.shared`.
 - Sends `ServerInit` with the **real capture source geometry** and a name of the
   form `Ozma <node> (<source-id>)`. A source whose geometry is unknown at open
@@ -103,7 +154,9 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
 - Bounded:
   - 16 megapixels / 64 MiB per frame (4K fits; 8K is refused at startup);
   - 255-byte RFB desktop name;
-  - 1..=32 concurrent viewers (default 4);
+  - 1..=32 concurrent viewers (default 4, `--vnc-max-clients`);
+  - optional idle timeout of 1..=86400 seconds
+    (`--vnc-idle-timeout-seconds`, default off);
   - 64 pending update-request commands per viewer;
   - 1 MiB `ClientCutText`;
   - 1024 `SetEncodings` entries;
@@ -156,12 +209,21 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
 
 ### Automated
 
-`cargo test -p ozma-node --lib` — **461 passed, 3 ignored** (the ignored tests
-are pre-existing opt-in WebRTC/GStreamer live tests).
+`cargo test -p ozma-node --lib vnc` — **37 passed, 0 failed** for the RFB,
+config, and registration coverage. The wider `ozma-node` lib suite remains
+green; its three ignored tests are pre-existing opt-in WebRTC/GStreamer live
+tests.
 
 New RFB tests in `ozma-node/src/vnc_server.rs`:
 
 - `handshake_negotiates_none_security_and_real_server_init`
+- `password_auth_accepts_the_correct_des_response`
+- `password_auth_rejects_a_wrong_response_and_closes_without_retry`
+- `password_file_policy_trims_one_newline_and_rejects_empty_oversize_and_wide_modes`
+- `password_is_redacted_from_debug_and_status_surfaces`
+- `des_known_answer_and_rfb_key_expansion_are_correct`
+- `idle_timeout_closes_a_viewer_that_stops_sending_requests`
+- `non_loopback_without_password_requires_the_explicit_override`
 - `dynamic_source_geometry_is_reported_in_server_init`
 - `set_pixel_format_rgb_and_bgr_both_encode_raw_correctly`
 - `full_and_incremental_requests_return_raw_frame_bytes`
@@ -222,10 +284,10 @@ implemented.
 ### Commands
 
 ```sh
-cargo test -p ozma-node --lib
+cargo test -p ozma-node --lib vnc
 cargo check -p ozma-node --all-targets
 rustfmt --edition 2021 --check \
-  ozma-node/src/vnc_server.rs ozma-node/src/lib.rs ozma-node/src/config.rs \
+  ozma-node/src/vnc_server.rs ozma-node/src/config.rs \
   ozma-node/src/platform.rs ozma-node/src/registration.rs ozma-node/src/main.rs
 ```
 
@@ -233,9 +295,20 @@ All passed; rustfmt exited 0.
 
 ## Remaining VNC gaps
 
-- **No authentication or encryption.** Security None only; no password, TLS, or
-  VeNCrypt. Loopback is the default invariant, not a security boundary against
-  a hostile local user.
+- **Authentication is optional and the transport is plaintext.** Security type
+  2 is implemented, but it only proves knowledge of a shared password. There is
+  no TLS, no VeNCrypt, no encryption of pixels/input, and classic VNC DES is
+  weak by modern standards. Loopback remains the safe default; a non-loopback
+  bind without a password requires the explicit `--vnc-allow-unauthenticated`
+  override. Use a trusted network, WireGuard/mesh, or an SSH tunnel when the
+  link is not trusted.
+- **No rate limiting or lockout for VNC auth.** Each TCP connection gets one
+  challenge/response attempt, so there is no in-connection retry loop, but an
+  attacker can still open new connections and guess offline-ish DES responses.
+  TLS/VeNCrypt or a network-level control is still required for hostile
+  networks.
+- **No password rotation while running.** The file is read once at startup; a
+  changed password requires a node restart.
 - **Raw only.** No Hextile/ZRLE/Tight/JPEG, no cursor pseudo-encoding, no
   `SetDesktopSize`, no Extended Desktop Size, no continuous updates, no fence,
   or other extensions. A client that only supports non-Raw encodings gets Raw
@@ -259,10 +332,11 @@ All passed; rustfmt exited 0.
   the already-advertised mDNS/TXT record is not retracted until the node
   restarts. `/api/v1/connection` also reports the startup registration object,
   not a live listener probe.
-- **Controller docs are stale.** The VNC rows in
-  `docs/phase4-registration-parity.md` and `docs/phase4-cutover-audit.md` still
-  say the Rust node never serves VNC and only registers an external QEMU
-  endpoint. They should be updated in the separate documentation/parity pass.
+- **Supervisor flag forwarding.** `ozma-softnode`/multiseat flag forwarding
+  documents and code were out of scope for this pass. A supervised child can
+  use the new flags directly, but the supervisor does not yet forward
+  `--vnc-password-file`, `--vnc-allow-unauthenticated`,
+  `--vnc-max-clients`, or `--vnc-idle-timeout-seconds`.
 - **Optional live tooling.** The live smoke used `--capture-provider fake`; no
   hardware V4L2, QMP, D-Bus, or guest VNC source was exercised in this task.
 

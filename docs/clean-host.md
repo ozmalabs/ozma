@@ -3,10 +3,13 @@
 Status: **harness, Rust-first systemd assets, user and system install layouts,
 the host integration surface (user/group, udev, AppArmor, libvirt snippet), and
 the demo Rust switch are implemented. Gate 4 is not yet met**: the privileged
-fresh-host install and the container `--full` gate have not been run end-to-end,
-the controller is still Python, and the Python trees are intentionally still
-present for one release. The 2026-11-25 refresh at `437468a` passed the host
-harness, workspace tests, and controller pytest; see
+fresh-host install has not been run end-to-end, the controller is still Python,
+and the Python trees are intentionally still present for one release. The
+2026-11-25 refresh at `437468a` passed the host harness, workspace tests, and
+controller pytest. On 2026-11-25 the container gate also passed:
+`scripts/clean-host/run.sh --container --full` at `08393e7` reported
+2469 passed / 0 failed / 42 ignored (see
+[`phase4-container-gate-report.md`](phase4-container-gate-report.md)). See
 [`phase4-cutover-audit.md`](phase4-cutover-audit.md) §16 for the current
 go/no-go.
 
@@ -48,6 +51,9 @@ user, or Python tree is changed.
 - Linux x86_64 or aarch64 with a Rust toolchain new enough for the workspace
   (CI uses the `rust:1.95` image).
 - Rootless Podman or Docker for the default mode. `podman` is preferred.
+- Network access (DNS plus `deb.debian.org`) for the first image build: the
+  `Containerfile` runs `apt-get update` and installs the native packages inside
+  the image. A pre-built `localhost/ozma-clean-host:1.95` can be reused offline.
 - About 15 GB free in `target/clean-host` for a fresh container build; the
   host's existing `target/` is not reused because the container is Debian
   bookworm while many dev hosts are newer.
@@ -120,6 +126,12 @@ If the only failure is a native dependency, install the matching package and
 rerun. If no container runtime is available, the harness reports the exact
 missing runtime and falls back to `--host` in `--auto` mode; with
 `--container` it exits 1 and tells you to use `--host`.
+
+The image is built on demand and cached. If the dependency report inside the
+container says `libxdo` is missing, the cached image predates `libxdo-dev`;
+rebuild it with `--rebuild` (network access is required). The rebuild adds
+`libxdo3` and `libxdo-dev`; Debian ships no `xdo.pc`, so the harness detects the
+library through its `/usr/lib/*/libxdo.so` fallback.
 
 ## Rust-first systemd assets
 
@@ -493,19 +505,54 @@ Gate 4 evidence still required: a Python-free fresh-host install, the
 controller/demo regression against the Rust nodes, and a green
 `cargo test --workspace` on the release commit.
 
-Current state (2026-11-25 refresh at `437468a`): only annotated
-`rust-cutover-preview-*` tags exist (latest at `437468a`); none is the
-`rust-cutover-<version>-python-rollback` tag. A clean
-detached run at `437468a` passed `scripts/clean-host/run.sh --host` 20/20
-(`ozma-node --lib` 469 passed / 3 ignored, `ozma-softnode` 125 passed),
-`cargo test --workspace` 2442 passed / 0 failed / 42 ignored, `cargo check
---workspace --all-targets`, and controller pytest 2579 passed. The container
-`--full` gate and the privileged install remain unrun, and the committed
-`Cargo.lock` is stale (`--locked` fails). Deletion criteria, the refreshed
-cutover matrix, the Gate 4a/4b split, and the current go/no-go are in
-[`phase4-cutover-audit.md`](phase4-cutover-audit.md) §16.
+Current state (2026-11-25): only annotated `rust-cutover-preview-*` tags exist
+(latest at `437468a`); none is the
+`rust-cutover-<version>-python-rollback` tag. A clean detached run at `437468a`
+passed `scripts/clean-host/run.sh --host` 20/20 (`ozma-node --lib` 469 passed /
+3 ignored, `ozma-softnode` 125 passed), `cargo test --workspace` 2442 passed /
+0 failed / 42 ignored, `cargo check --workspace --all-targets`, and controller
+pytest 2579 passed. A clean detached run at `08393e7` then passed the container
+gate `scripts/clean-host/run.sh --container --full` (2469 passed / 0 failed /
+42 ignored; image digest
+`sha256:c39f7af3fa52bc6135576b9fd03ffbdc1af2cdb90b6c348db94ee72ff0571a64`) and
+`--host` 22/22 (`ozma-node --lib` 479 passed / 3 ignored, `ozma-softnode` 128
+passed). The privileged install remains unrun. The `Cargo.lock` staleness
+reported at `437468a` did not reproduce as a working-tree rewrite at `08393e7`,
+but `--locked` was not asserted and the finding remains open. Deletion criteria,
+the refreshed cutover matrix, the Gate 4a/4b split, the container evidence, and
+the current go/no-go are in
+[`phase4-cutover-audit.md`](phase4-cutover-audit.md) §16 and
+[`phase4-container-gate-report.md`](phase4-container-gate-report.md).
+
+## Container gate evidence (2026-11-25)
+
+`scripts/clean-host/run.sh --container --full` passed at `08393e7` in a rootless
+Podman 6.2.0 container. The image build itself needs network access once; the
+`Containerfile` already listed `libxdo-dev`, so the earlier `libxdo` failure was
+a stale cached image, not a missing package. The rebuild added `libxdo3` and
+`libxdo-dev` 1:3.20160805.1-5.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Image build (`podman build --network=host`) | **PASS** | image `d84d9288cc78`, digest `sha256:c39f7af3…571a64`, 3.38 GB, 2026-11-25T03:31:31–03:31:51Z |
+| Container dependency report | **PASS** | 11 passed / 0 failed / 8 skipped (optional tools), `libxdo: found` |
+| `--container --full` harness | **PASS** | 20 passed / 0 failed / 1 skipped (`systemd-analyze` absent in image), 2026-11-25T03:32:16–03:34:44Z |
+| `cargo test --workspace` | **PASS** | 2469 passed / 0 failed / 42 ignored, 192 result blocks (`ozma-node --lib` 479/3, `ozma-softnode` 128) |
+| `--host` comparison | **PASS** | 22 passed / 0 failed / 0 skipped, deps 17/0/2, `systemd-analyze verify` PASS, 2026-11-25T03:35:10–03:36:39Z |
+
+Remaining issues: the first build needs container-network DNS unless the image
+is pre-built; the image omits `systemd-analyze`, `udevadm`, qemu/virsh/pactl,
+and shellcheck (expected `SKIP`); the privileged fresh-host install and a
+`--locked` check are still outstanding; and `in-container.sh` labels the host
+dependency report as `(container)` (cosmetic). Full commands, timestamps, and
+cleanup are in
+[`phase4-container-gate-report.md`](phase4-container-gate-report.md).
 
 ## Known blocker (moving tree)
+
+> **Historical (superseded 2026-11-25):** this records an earlier moving-tree
+> run. At `08393e7` the detached container `--full` and host harnesses are both
+> green; see [Container gate evidence](#container-gate-evidence-2026-11-25).
 
 On 2026-11-25 the container image built and the harness passed dependency,
 build, `--help`, shell/unit, installer dry-run, `ozma-softnode` (111 tests), and

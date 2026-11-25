@@ -9,6 +9,10 @@ license     = "AGPL-3.0-only"
 ozma-protocol = { path = "../ozma-protocol" }
 serde = { workspace = true }
 thiserror = { workspace = true }
+# Safe wrappers for `O_NONBLOCK`, `poll(2)`, and test pipes. The crate forbids
+# `unsafe`, so the raw fd layer lives in this audited dependency rather than in
+# an in-tree FFI shim.
+rustix = { version = "1.1", features = ["event", "fs", "pipe"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

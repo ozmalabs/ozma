@@ -4,14 +4,21 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      legacy_python_agents:
+        description: 'Also build the deprecated Python ozma-agent DMG/EXE (not part of the Rust release)'
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CROSS_VERSION: "0.2.5"
 
 jobs:
-  # ── Python wheels ───────────────────────────────────────────────────────
-  wheels:
+  # ── Controller wheel (blocking) ────────────────────────────────────────
+  wheel-controller:
+    name: Controller wheel
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        package: [controller, softnode, agent]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,15 +26,41 @@ jobs:
           python-version: '3.13'
       - uses: astral-sh/setup-uv@v4
       - run: uv pip install --system build
-      - name: Build wheel
+      - name: Build controller wheel
+        run: python -m build controller/ --outdir dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-controller
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # ── Legacy Python wheels (one-release rollback; non-blocking) ───────────
+  wheel-legacy:
+    name: Legacy Python wheel (${{ matrix.package }}) [legacy, non-blocking]
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [softnode, agent]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v4
+      - run: uv pip install --system build
+      - name: Build legacy wheel
         run: python -m build ${{ matrix.package }}/ --outdir dist/
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.package }}
           path: dist/*.whl
+          if-no-files-found: warn
 
-  # ── Container image ─────────────────────────────────────────────────────
+  # ── Controller image (Rust nodes are installed on their hosts) ──────────
   container:
+    name: Controller image
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -46,9 +79,115 @@ jobs:
             ghcr.io/ozmalabs/ozma-controller:latest
             ghcr.io/ozmalabs/ozma-controller:${{ github.ref_name }}
 
-  # ── macOS agent (.dmg, unsigned) ────────────────────────────────────────
-  # TODO: Add code signing and notarization (codesign + notarization workflow)
-  macos-agent:
+  # ── Rust node binaries (blocking) ──────────────────────────────────────
+  # Archive layout matches scripts/install-rust.sh: flat executables named
+  # ozma-node, ozma-virtual-node, ozma-multiseat, and ozma-meeting-detect.
+  #   tar -xzf ozma-rust-node-linux-x86_64.tar.gz -C /tmp/ozma-rust-node
+  #   scripts/install-rust.sh --from-target /tmp/ozma-rust-node
+  rust-binaries:
+    name: Rust node binaries (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            cross: false
+          - arch: aarch64
+            os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install native media dependencies
+        if: ${{ !matrix.cross }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config build-essential \
+            libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libudev-dev \
+            libpam0g-dev libxdo-dev libclang-dev clang cmake nasm
+
+      - name: Install cross ${{ env.CROSS_VERSION }}
+        if: ${{ matrix.cross }}
+        run: cargo install cross --version ${{ env.CROSS_VERSION }} --locked
+
+      - name: Cache cargo registry + build artefacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: ${{ matrix.arch }}
+
+      - name: Build release binaries (native)
+        if: ${{ !matrix.cross }}
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bins \
+            -p ozma-node -p ozma-softnode -p ozma-multiseat
+
+      - name: Build release binaries (cross)
+        if: ${{ matrix.cross }}
+        run: |
+          cross build --release --target ${{ matrix.target }} --bins \
+            -p ozma-node -p ozma-softnode -p ozma-multiseat
+
+      - name: Package install-rust layout
+        run: |
+          set -euo pipefail
+          out="ozma-rust-node-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$out"
+          for bin in ozma-node ozma-virtual-node ozma-meeting-detect ozma-multiseat; do
+            cp "target/${{ matrix.target }}/release/$bin" "dist/$out/$bin"
+          done
+          tar -C "dist/$out" -czf "$out.tar.gz" .
+          sha256sum "$out.tar.gz" > "$out.tar.gz.sha256"
+
+      - name: Upload Rust node archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ozma-rust-node-linux-${{ matrix.arch }}
+          path: |
+            ozma-rust-node-linux-${{ matrix.arch }}.tar.gz
+            ozma-rust-node-linux-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+
+  # ── WebRTC helper asset (Python + GStreamer; same for every arch) ───────
+  # The archive extracts to share/ozma/webrtc/gst_webrtc_worker.py, which is
+  # exactly the path scripts/install-rust.sh installs into <prefix>/share.
+  webrtc-helper:
+    name: WebRTC helper asset
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate helper syntax
+        run: python3 -m py_compile scripts/webrtc/gst_webrtc_worker.py
+      - name: Package helper
+        run: |
+          set -euo pipefail
+          mkdir -p dist/share/ozma/webrtc
+          cp scripts/webrtc/gst_webrtc_worker.py dist/share/ozma/webrtc/
+          tar -C dist -czf ozma-webrtc-helper.tar.gz share
+          sha256sum ozma-webrtc-helper.tar.gz > ozma-webrtc-helper.tar.gz.sha256
+      - name: Upload helper archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ozma-webrtc-helper
+          path: |
+            ozma-webrtc-helper.tar.gz
+            ozma-webrtc-helper.tar.gz.sha256
+          if-no-files-found: error
+
+  # ── Deprecated Python agent installers (manual opt-in only) ─────────────
+  macos-agent-legacy:
+    name: macOS ozma-agent DMG [legacy, non-blocking]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.legacy_python_agents }}
+    continue-on-error: true
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,11 +206,14 @@ jobs:
           hdiutil create -volname "Ozma Agent" -srcfolder dmg_stage -ov -format UDZO ozma-agent-macos.dmg
       - uses: actions/upload-artifact@v4
         with:
-          name: ozma-agent-macos
+          name: legacy-ozma-agent-macos
           path: ozma-agent-macos.dmg
+          if-no-files-found: warn
 
-  # ── Windows agent (.exe) ────────────────────────────────────────────────
-  windows-agent:
+  windows-agent-legacy:
+    name: Windows ozma-agent EXE [legacy, non-blocking]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.legacy_python_agents }}
+    continue-on-error: true
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,11 +228,13 @@ jobs:
           pyinstaller --onefile --name ozma-agent --console cli.py --noconfirm
       - uses: actions/upload-artifact@v4
         with:
-          name: ozma-agent-windows
+          name: legacy-ozma-agent-windows
           path: agent/dist/ozma-agent.exe
+          if-no-files-found: warn
 
   # ── Debian packages ─────────────────────────────────────────────────────
   deb:
+    name: Debian packages
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,11 +249,14 @@ jobs:
           path: "*.deb"
         if: always()
 
-  # ── Publish to PyPI ─────────────────────────────────────────────────────
+  # ── Publish to PyPI (controller blocking; legacy wheels if built) ───────
   publish-pypi:
-    needs: [wheels]
+    needs: [wheel-controller, wheel-legacy]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Publish the controller wheel as the gate. Legacy softnode/agent wheels are
+    # included when they built, but their failure (continue-on-error) does not
+    # block the upload.
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.wheel-controller.result == 'success' }}
     permissions:
       id-token: write
     steps:
@@ -122,7 +269,7 @@ jobs:
 
   # ── OTA image signing ───────────────────────────────────────────────────
   sign-ota:
-    needs: [wheels]
+    needs: [wheel-controller]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -167,9 +314,9 @@ jobs:
           name: ota-artifacts-signed
           path: /tmp/ota-artifacts/
 
-  # ── GitHub Release ──────────────────────────────────────────────────────
+  # ── GitHub Release (default Rust-first asset set) ───────────────────────
   release:
-    needs: [wheels, container, macos-agent, windows-agent, deb, sign-ota]
+    needs: [wheel-controller, container, rust-binaries, webrtc-helper, deb, sign-ota]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -178,12 +325,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts/
-      - uses: softprops/action-gh-release@v1
+      - uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/ozma-agent-windows/ozma-agent.exe
-            artifacts/ozma-agent-macos/ozma-agent-macos.dmg
-            artifacts/wheel-*/*.whl
+            artifacts/ozma-rust-node-linux-*/*.tar.gz
+            artifacts/ozma-rust-node-linux-*/*.sha256
+            artifacts/ozma-webrtc-helper/*.tar.gz
+            artifacts/ozma-webrtc-helper/*.sha256
+            artifacts/wheel-controller/*.whl
             artifacts/deb-packages/*.deb
             artifacts/ota-artifacts-signed/*.sig
+          fail_on_unmatched_files: false
           generate_release_notes: true

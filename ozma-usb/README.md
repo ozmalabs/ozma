@@ -15,8 +15,14 @@ bounded data relay (`USBIP_CMD_SUBMIT`/`USBIP_RET_SUBMIT`/
 `USBIP_CMD_UNLINK`/`USBIP_RET_UNLINK`) with an injectable endpoint. The server
 hands the same authenticated connection to the URB relay after a successful
 import, through an injectable `UsbIpKernelDataEndpoint` seam; the default seam is
-a typed `usbip-kernel-required` failure. It sequences FunctionFS from ConfigFS
-function creation through descriptor writes, readiness, and UDC bind/unbind.
+a typed `usbip-kernel-required` failure. Real adapters are now provided:
+`LinuxUsbIpHostBackend` drives the kernel `usbip`/sysfs host path with typed
+module/command checks, and `LinuxUsbIpKernelDataEndpoint` speaks the imported
+USB/IP TCP URB phase with devid translation and per-request deadlines. It
+sequences FunctionFS from ConfigFS function creation through descriptor writes,
+readiness, and UDC bind/unbind, and includes a `poll(2)`-based nonblocking
+`PollingFileEndpointIo`/`PollingFileBulkTransport` with enforced per-call
+deadlines alongside the original blocking file adapter.
 Default paths do not mount filesystems, open `/dev/hidg*`, or write a block
 device; an explicit `CommandFunctionFsMounter` can mount FunctionFS when the
 caller opts in and supplies the required privileges. `ozma-node` wires the
@@ -30,7 +36,7 @@ automatic gadget creation on a hardware profile.
 | Composite gadget model | `UsbGadgetConfig`, `UsbFunction`, `UsbFunctionKind`, `HidProtocol` |
 | Functions | HID keyboard/mouse/custom, mass storage, UAC2 (`Uac2Config`), FunctionFS vendor (`FunctionFsConfig`) |
 | FunctionFS model | `FunctionFsConfig`, `FunctionFsEndpoint`, `FunctionFsStrings`, `FunctionFsDaemonSpec`, `FunctionFsReadiness`, `FunctionFsStatus`, `FunctionFsDaemon`/`MissingFunctionFsDaemon`/`ObservedFunctionFsDaemon`, generated device/config/string descriptors, class-specific descriptors, Microsoft OS descriptors |
-| FunctionFS daemon core | `FunctionFsMount`, `FunctionFsDescriptors` (v2 `ep0` blob + strings), `FunctionFsDaemonCore`, `LoopbackFunctionFsDaemon`/`FakeFunctionFsDaemon`, `FileFunctionFsDaemon`, `FunctionFsControlRequest`/`FunctionFsControlResponse`, `FunctionFsEvent`, injectable `FunctionFsEp0Io`/`FunctionFsEndpointIo`, bounded endpoint loops |
+| FunctionFS daemon core | `FunctionFsMount`, `FunctionFsDescriptors` (v2 `ep0` blob + strings), `FunctionFsDaemonCore`, `LoopbackFunctionFsDaemon`/`FakeFunctionFsDaemon`, `FileFunctionFsDaemon`, `FunctionFsControlRequest`/`FunctionFsControlResponse`, `FunctionFsEvent`, injectable `FunctionFsEp0Io`/`FunctionFsEndpointIo`, bounded endpoint loops, blocking `FileEndpointIo` and nonblocking `PollingFileEndpointIo`/`PollingFileEndpointOpener` |
 | FunctionFS lifecycle | `FunctionFsLifecycleConfig`, `FunctionFsLifecycle`, `FunctionFsLifecyclePhase`/`Status`, `FunctionFsStateMachine`, `FunctionFsDeviceState`/`Status`, injectable `FunctionFsMounter` with `CommandFunctionFsMounter`/`FakeFunctionFsMounter`, deterministic `FunctionFsLifecycleClock`; ConfigFS function/link creation, mountpoint expectation, `ep0` descriptor write, readiness timeout, explicit UDC bind/unbind readiness, bind rollback, unbind/cleanup |
 | FunctionFS control | Standard `GET_DESCRIPTOR` (device/configuration/string), `SET_CONFIGURATION`, `GET_CONFIGURATION`, `GET/SET_INTERFACE`, `GET_STATUS`, feature requests; typed rejection for class/vendor and unknown requests |
 | FunctionFS status | `FunctionFsDaemonStatus` nested in `FunctionFsStatus.daemon`: `live` only when the descriptor blob, string table, and enable event all succeeded; `state`/`running`/`endpoint_events` only reach `running` after real endpoint traffic |
@@ -44,10 +50,11 @@ automatic gadget creation on a hardware profile.
 | USB/IP model | `UsbIpConfig`, `UsbIpDevice`, `UsbIpState`, `UsbIpAttachment`, `UsbIpAuthorization`/`UsbIpKey`/`UsbIpToken` (host + token allow-lists), `UsbIpPeerGrant`, `UsbIpHotplugLog`/`UsbIpHotplugEvent`, `UsbIpTlsPolicy`/`UsbIpTlsStatus` |
 | USB/IP control | `UsbIpController`, `SubprocessUsbIpController` (`attach_with_token`, peer-side `authorize_peer`/`export_with_token`), bounded hotplug events, argv-only `CommandRunner`; legacy `UsbIpControl`/`SubprocessUsbController` |
 | USB/IP daemon | `UsbIpDaemon`, `UsbIpDaemonConfig`/`UsbIpDaemonState`/`UsbIpDaemonStatus`, bounded `UsbIpConnection`s, injectable `UsbIpKernelBackend` with explicit `NoUsbIpKernel`, export/list/attach/detach/unexport state machine, typed `usbip-kernel-required`, fail-closed TLS |
+| USB/IP kernel adapter | `LinuxUsbIpHostBackend` over argv-only `CommandRunner` + injectable `UsbIpKernelSysfs` (default `/sys`): `usbip bind`/`unbind`/`attach`/`detach`/`port`, module/driver/attach-attribute checks, binding verification and rollback, vhci port parsing (zero-based, never invented), peer authorization before any command |
 | USB/IP wire protocol | `UsbIpOpHeader`/`UsbIpOpCode`/`UsbIpStatus`, `UsbIpDeviceDescriptor`/`UsbIpInterface`, `UsbIpDevListRequest`/`UsbIpDevListReply`, `UsbIpImportRequest`/`UsbIpImportReply`, version `0x0111`, network byte order, fixed-width path/busid, bounded counts, typed truncation/oversize/version/opcode errors |
 | USB/IP control server | `UsbIpServer`/`UsbIpServerHandle`/`UsbIpServerConfig`, injectable `UsbIpTransport`/`UsbIpClock`/`UsbIpCredentialSource`/`UsbIpKernelDataEndpoint`, bound TCP listener or in-memory duplex, `OP_REQ_DEVLIST` from descriptor-registered exports, authorized `OP_REQ_IMPORT` only after a real kernel attach **and** an opened data endpoint, same-connection URB handoff, bounded connections/frames/idle timeout |
 | USB/IP URB codec | `UsbIpCmdSubmit`/`UsbIpRetSubmit`/`UsbIpCmdUnlink`/`UsbIpRetUnlink`, `UsbIpUrb`/`UsbIpUrbCommand`, `UsbIpDirection`/`UsbIpIsoPacketDescriptor`, 48-byte header at kernel offsets, network byte order, transfer/ISO/count bounds, typed truncation/oversize/direction/endpoint errors, payload-redacted `Debug` |
-| USB/IP data relay | `UsbIpRelay` (seqnum pairing, in-flight ceiling, unlink, drain), `UsbIpDataEndpoint` (submit → completion, unlink), `UsbIpKernelDataEndpoint`/`NoUsbIpKernelDataEndpoint` adapter seam, `serve_data_session` (concurrent bounded workers, out-of-order completions, idle timeout, disconnect cleanup), `UsbIpRelayConfig`/`UsbIpRelayStats`/`UsbIpRelaySessionOutcome` |
+| USB/IP data relay | `UsbIpRelay` (seqnum pairing, in-flight ceiling, unlink, drain), `UsbIpDataEndpoint` (submit → completion, unlink), `UsbIpKernelDataEndpoint`/`NoUsbIpKernelDataEndpoint` adapter seam, `LinuxUsbIpKernelDataEndpoint`/`LinuxUsbIpUrbSession` over an imported TCP URB stream with `TcpUsbIpConnector`/injectable `UsbIpUrbConnector`, `serve_data_session` (concurrent bounded workers, out-of-order completions, idle timeout, disconnect cleanup), `UsbIpRelayConfig`/`UsbIpRelayStats`/`UsbIpRelaySessionOutcome` |
 | SCSI mass storage | `MassStorageDevice`, `ScsiCommandBlock`, `ScsiReply`/`ScsiSense`/`ScsiStatus`, `MassStoragePersistPolicy`, `MassStorageOverlayStatus`; BBB dispatch, read-only/CD-ROM rejection, copy-on-write writes through `WriteOverlay`, FLUSH/stop persistence |
 | FAT32 builder | `Fat32ImageBuilder`, `Fat32Node`, `build_fat32_image`, `fat32_image_from_directory`, `parse_fat32_image`, `Fat32Info`/`Fat32Layout` |
 | ISO media | `IsoImage::inspect`, `parse_iso_volume_descriptors`, read-only `MediaFormat::Iso9660` |
@@ -450,6 +457,30 @@ No test mounts FunctionFS, opens a real UDC endpoint, or claims a live host
 transfer. The node uses `IdleBulkTransport` for a configured-but-not-attached
 export, and only attaches a transport after the daemon enables its endpoints.
 
+#### Nonblocking endpoint deadlines
+
+`PollingFileEndpointIo` is the deadline-enforcing sibling of the original
+blocking `FileEndpointIo` (which remains available unchanged). It switches an
+already-open endpoint descriptor to `O_NONBLOCK` and waits with `poll(2)` for
+readability/writability or the supplied deadline; it never spins and never
+blocks an export worker forever. `read_timeout`/`write_timeout`/`flush_timeout`
+accept explicit millisecond deadlines (1 ms..=60 s), and the
+`FunctionFsEndpointIo` trait methods use the handle's configured default. A
+timed-out read consumes no bytes; a timed-out write reports
+`mass-storage-endpoint-timeout` after whatever prefix the kernel already
+accepted, so the caller must abort rather than retry as if unwritten. Closing
+the handle closes the descriptor and any blocked poll has already returned at
+its deadline.
+
+`PollingFileBulkTransport` owns one OUT and one IN endpoint and forwards the
+`MassStorageLoop` per-call timeout to those methods, so a `FileBulkTransport`
+style export can now satisfy the typed timeout contract against real pipes or
+FIFOs. `PollingFileEndpointOpener` does the same for a caller-supplied
+`FunctionFsMount`. Tests use real OS pipes/FIFOs (zero-length readiness, empty
+timeout, partial write prefix, EOF, a stalled `MassStorageLoop` that later
+recovers after a CBW arrives); there is still no live UDC transfer in the
+default suite.
+
 #### Bounded media restart supervision
 
 `MediaRestartPolicy` bounds recovery of a failed export:
@@ -817,6 +848,67 @@ This listener is plaintext. A successful IMPORT records a local `vhci` port only
 when the injected kernel backend actually returned one. TLS remains external as
 described above.
 
+### Linux kernel adapters
+
+`LinuxUsbIpHostBackend` is the real `UsbIpKernelBackend`. It drives the existing
+argv-only `CommandRunner` (never a shell) with these operations:
+
+| Operation | Command | Kernel precondition |
+|---|---|---|
+| export | `usbip bind -b <busid>` | `module/usbip_host` and `bus/usb/drivers/usbip-host` |
+| unexport | `usbip unbind -b <busid>` | `module/usbip_host` |
+| attach | `usbip attach -r <host> -b <busid>` | `module/vhci_hcd` and a `vhci_hcd*/attach` attribute |
+| detach | `usbip detach -p <port>` | the same vhci attribute |
+| status | `usbip port`, `usbip list -l` | the relevant module |
+
+The sysfs root is injectable (`UsbIpKernelSysfs::with_root`); production uses
+`/sys`. A missing module, missing platform attribute, or missing `usbip`
+executable is the stable `usbip-kernel-required` kind and no command runs. A
+non-zero exit remains `command-failed`. Export verifies the kernel created
+`bus/usb/drivers/usbip-host/<busid>`; if the binding is absent it runs
+`usbip unbind -b <busid>` as rollback and never reports a false export. Attach
+parses `usbip: info: using port 00` or falls back to `usbip port`; if neither
+reports a port it returns `usbip-kernel-required` instead of inventing one.
+Kernel vhci ports are zero-based, so `Port 00` is preserved as port `0` in
+attachments and detach calls.
+
+Peer-facing entry points (`export_for_peer`, `attach_authorized`) run the same
+constant-time host/token/key-fingerprint allow-list as the daemon before any
+sysfs probe or command. Tokens and fingerprints are never retained by the
+backend, never placed in argv, and never rendered in errors; the trait
+`export`/`attach` methods remain the local-administration path (the daemon has
+already authorized the peer before calling them). Tests use a fake sysfs tree
+and a scripted runner for bind/unbind/attach/detach, port parsing (including
+port zero), missing module/attribute/executable, command failure, authorization
+denial, invalid values, and bind rollback. One real-kernel test is `#[ignore]`
+and requires `OZMA_USBIP_REAL_BUSID` plus root and loaded modules.
+
+`LinuxUsbIpKernelDataEndpoint` is the real data seam. It validates the remote
+host/bus id, enforces any configured authorization, dials the remote USB/IP
+server through an injectable `UsbIpUrbConnector` (production
+`TcpUsbIpConnector`, default port `3240`), sends the real `OP_REQ_IMPORT`, and
+validates the reply with the control codec before returning a
+`LinuxUsbIpUrbSession`. That session writes `USBIP_CMD_SUBMIT`/`USBIP_CMD_UNLINK`
+frames on one writer lock while a reader thread pairs
+`USBIP_RET_SUBMIT`/`USBIP_RET_UNLINK` by sequence number. The downstream devid is
+rewritten to the remote `(busnum << 16) | devnum` on the way out and restored on
+the completion; unlink targets and reply statuses are translated the same way.
+
+Each submit/unlink has a configurable deadline (default 5 s, max 60 s). A
+timeout is a negative `USBIP_RET_SUBMIT` status `-ETIMEDOUT` for that URB only;
+a closed stream fails every waiter with `-ECONNRESET`; a refused import, missing
+device record, bus-id mismatch, wrong version/opcode, or malformed URB closes
+with a typed error and never fabricates bytes. The default
+`NoUsbIpKernelDataEndpoint` still fails closed. Tests use a loopback TCP server
+speaking the same codec (IN/OUT submit, devid translation, unlink, silent-remote
+timeout, refused import, version failure) plus fake connectors for authorization
+and availability; the real remote import test is `#[ignore]` and requires
+`OZMA_USBIP_REAL_HOST`/`OZMA_USBIP_REAL_BUSID`.
+
+This TCP adapter is a userspace implementation of the imported URB phase; it
+does not hand a socket to the kernel `usbip-host` driver, and it does not itself
+create a local `vhci_hcd` device. TLS is still not terminated in-process.
+
 ### USB/IP URB data relay
 
 `usbip_urb` is the typed codec for the four messages that follow a successful
@@ -873,11 +965,14 @@ carried `OP_REP_IMPORT`. The session outcome embeds the relay counters in
 The relay does **not** invent device data. `UsbIpKernelDataEndpoint` is the
 kernel adapter seam (trait plus the `NoUsbIpKernelDataEndpoint` no-op default);
 it is separate from `UsbIpDataEndpoint`, which carries the actual submit/unlink
-calls. A real adapter would bridge these URBs to a kernel USB device or a
-userspace device backend and supply genuine completion bytes/statuses; this
-crate still has no in-tree `usbip-host`/`vhci_hcd` implementation. The default
-seam fails a successful import with typed `usbip-kernel-required` before any
-success body or URB is written, and tests use in-memory endpoints only.
+calls. `LinuxUsbIpKernelDataEndpoint` now supplies the real userspace adapter
+over an imported USB/IP TCP URB stream (devid translation, unlink, deadlines);
+`LinuxUsbIpHostBackend` supplies the real `usbip`/sysfs export/attach path. The
+crate still has no in-tree kernel `usbip-host`/`vhci_hcd` module or socket
+hand-off: the TCP adapter does not create a local kernel vhci device. The default
+seam still fails a successful import with typed `usbip-kernel-required` before
+any success body or URB is written, and default tests use in-memory endpoints or
+a loopback TCP fake server only.
 
 `SubprocessUsbIpController` implements `UsbIpController` with an injected
 `CommandRunner`:
@@ -1042,12 +1137,13 @@ filesystem, opens a block device, writes an image, or changes an existing VM.
 ## Tests
 
 Default tests are CI-safe and use a temporary ConfigFS-shaped root, a fake
-controller, recording/scripted command runners, synthetic ISO/FAT32/NBD bytes,
-in-memory images/overlays, a fake FunctionFS mounter/clock, and in-memory
-transports. They never create a real gadget, bind a real UDC, run `usbip`,
-mount a filesystem, or write a block device. The NBD listener tests bind
-ephemeral loopback TCP/Unix sockets; the USB/IP control tests use an in-memory
-duplex plus one ephemeral loopback TCP listener; the QEMU client tests invoke
+controller, recording/scripted command runners, a fake sysfs tree, synthetic
+ISO/FAT32/NBD bytes, in-memory images/overlays, a fake FunctionFS
+mounter/clock, real OS pipes/FIFOs, and in-memory transports. They never create
+a real gadget, bind a real UDC, load a USB/IP module, export a real device, mount
+a filesystem, or write a block device. The NBD listener tests bind ephemeral
+loopback TCP/Unix sockets; the USB/IP control tests use an in-memory duplex plus
+ephemeral loopback TCP listeners; the QEMU client tests invoke
 `qemu-img`/`qemu-io` only when present, and the boot test is opt-in.
 
 ```bash
@@ -1064,11 +1160,14 @@ Relevant suites:
 | `tests/media_formats.rs` | ISO PVD/read-only media, `MediaFormat` consistency/JSON, FAT32 attach probe, NBD descriptors and framing |
 | `tests/functionfs.rs` | FunctionFS descriptor generation, endpoint/string/daemon bounds, explicit readiness states, ConfigFS `ffs.<instance>` creation/status, fake status |
 | `tests/functionfs_daemon.rs` | v2 descriptor/string encoding and alignment, class/OS descriptors, temporary-mount `ep0` writes, standard control requests, enable/disable/live status, endpoint read/write/loopback, malformed/oversized inputs, lazily opened file endpoints |
+| `tests/functionfs_polling.rs` | real OS pipes/FIFOs: immediate zero-length read, empty-pipe deadline, data after readiness, EOF without invented bytes, partial-write prefix before timeout, invalid deadlines, a stalled `MassStorageLoop` that recovers after a CBW |
 | `tests/functionfs_lifecycle.rs` | function/link creation, mountpoint validation, fake-mounter mount/unmount, `ep0` descriptor write, readiness success/timeout, bind failure rollback, unbind/cleanup, caller-supplied mount preservation, missing mount tool, config validation |
 | `tests/functionfs_state.rs` | typed `FunctionFsStateMachine` ordering, out-of-order typed errors, explicit UDC bind/unbind readiness, daemon status never `running` before endpoint traffic, bind/unbind events, lifecycle helper readiness gate, ignored real-UDC run |
 | `tests/mass_storage_scsi.rs` | SCSI CBW parse/dispatch, write/read-back through the overlay, base immutability, FLUSH/stop persistence + reload, read-only media and SCSI `DATA PROTECT`, typed bounds, malformed/phase errors, overlay exhaustion without partial allocation, read-only FAT32 image byte identity |
 | `tests/mass_storage_loop.rs` | CBW→data→CSW round trips over fake endpoints, write/read/flush, read-only rejection with sense, overlay persistence/reload, transfer bounds, short-transfer assembly, typed stall/I/O failures, stop cleanup, owned file endpoints, FunctionFS loopback endpoint adapter |
 | `tests/usbip_daemon.rs` | authorized/denied attach never reaches the kernel on denial, token/fingerprint enforcement, bounded connections, start/stop, export/detach/unexport cleanup, bounded hotplug log, typed `usbip-kernel-required`, fail-closed TLS, no secrets in status/Debug |
+| `tests/usbip_kernel.rs` | fake sysfs tree + scripted runner: availability/module checks, exact bind/unbind/attach/detach argv, attach port parsing (stdout and `usbip port`, including port zero), no invented port, missing module/attribute/executable, command failure, peer authorization before commands, invalid values, bind rollback; ignored real-kernel run |
+| `tests/usbip_tcp.rs` | loopback TCP fake USB/IP server: import reply validation, OUT/IN submit with devid translation, unlink forwarding, silent-remote deadline, refused import, version failure, authorization before any connect, unavailable connector; ignored real remote import |
 | `tests/usbip_protocol.rs` | version-`0x0111` header/opcode/status golden bytes, device-record network byte order at kernel offsets, DEVLIST/IMPORT round trips, fixed-width strings, truncated/trailing/oversized/unknown-version/opcode errors, import-reply body rules |
 | `tests/usbip_server.rs` | in-memory duplex DEVLIST empty/populated, descriptor-only advertising, authorized/denied IMPORT, kernel-required and unknown-device error replies with no device body, same-connection post-import URB relay (one/many submits, unlink, disconnect cleanup, endpoint error), default no-kernel data seam typed with no success body, authorization before control and data phases, version/opcode/truncation/frame-ceiling errors, idle timeout, concurrent connection ceiling, hotplug events, loopback TCP control + URB exchange |
 | `tests/usbip_urb.rs` | 48-byte URB header offsets and network byte order for submit/completion/unlink, OUT/IN payload rules, kernel `number_of_packets` sentinel, ISO descriptor round trips and offset/length/count bounds, truncation/trailing/unknown-command/direction/endpoint/oversize errors, bounded decode, payload-redacted `Debug`, typed `usbip-urb` kind |
@@ -1110,9 +1209,24 @@ status is not `live` without an observed enable event. A second ignored test,
 `OZMA_FUNCTIONFS_UDC`, `OZMA_FUNCTIONFS_MOUNT`,
 `OZMA_FUNCTIONFS_DAEMON`, and `OZMA_FUNCTIONFS_READY_MARKER` plus a real
 ConfigFS root; it binds and unbinds a UDC but still never claims `running`
-because the ConfigFS helper opens no data endpoints. The lifecycle helper's
-default tests use a temp root, a fake mounter, and a fake UDC name; they never
-mount or bind.
+because the ConfigFS helper opens no data endpoints. A third ignored test in
+`functionfs_polling` opens a caller-supplied `epN` through
+`PollingFileEndpointIo` when `OZMA_FUNCTIONFS_MOUNT` is set. The lifecycle
+helper's default tests use a temp root, a fake mounter, and a fake UDC name;
+they never mount or bind.
+
+The real USB/IP kernel adapters are opt-in and never run by default:
+
+```bash
+OZMA_USBIP_REAL_BUSID=1-1 cargo test -p ozma-usb --test usbip_kernel -- --ignored
+OZMA_USBIP_REAL_HOST=192.0.2.10 OZMA_USBIP_REAL_BUSID=1-1 \
+  cargo test -p ozma-usb --test usbip_tcp -- --ignored
+```
+
+The first requires root, a real `/sys`, and loaded `vhci-hcd`/`usbip-host`
+modules; it binds and unbinds the named local device. The second dials a real
+remote USB/IP export, performs `OP_REQ_IMPORT`, and sends one IN URB. Neither
+loads modules, uses sudo, or writes a real USB device.
 
 The real ALSA → UAC2 capture-packetiser test is opt-in and lives in
 `ozma-audio`:
@@ -1145,20 +1259,25 @@ existing VM; the disposable QEMU is quit over QMP or killed on timeout.
   authorization, and a bounded hotplug log, plus a typed URB codec and bounded
   data relay (`usbip_urb`/`usbip_relay`) with injectable endpoints. The control
   server hands a successful authorized import to that relay on the same
-  connection through the `UsbIpKernelDataEndpoint` seam. What is still missing is
-  the in-tree kernel adapter: there is no `usbip-host`/`vhci_hcd` stub, no
-  `UsbIpKernelDataEndpoint` implementation that reaches a real kernel USB device,
-  and no kernel hotplug monitor. `OP_REQ_IMPORT` reaches a successful reply only
-  through an injected `UsbIpKernelBackend` that returns a real local `vhci` port
-  **and** an injected data seam that opens a real endpoint; the defaults
-  `NoUsbIpKernel`/`NoUsbIpKernelDataEndpoint` (and every fake used in tests)
-  return typed `usbip-kernel-required` instead of faking a
-  `vhci_hcd`/`usbip-host` device or payload. ISO descriptor arrays are bounded
-  and round-trip, but ISO wire-padding compaction into a real URB buffer is left
-  to the endpoint adapter. The optional listener is plaintext and has no
-  in-process TLS; an external TLS terminator/tunnel must protect it, and
-  `Required` TLS fails closed. A node route exposing the daemon/server/relay and
-  the client-side import orchestration remain open.
+  connection through the `UsbIpKernelDataEndpoint` seam.
+  `LinuxUsbIpHostBackend` now drives the real `usbip`/sysfs bind/unbind/attach/
+  detach path with module checks, binding verification/rollback, and zero-based
+  port parsing. `LinuxUsbIpKernelDataEndpoint` speaks the real imported TCP URB
+  phase with devid translation, unlink, deadlines, and typed failures. What is
+  still missing is kernel integration beyond the userspace `usbip` CLI and TCP
+  protocol: the data adapter does not hand a socket to `usbip-host`, does not
+  create a local `vhci_hcd` device through usbfs, and there is no in-tree kernel
+  module, `vhci_hcd` stub, or kernel hotplug monitor. `OP_REQ_IMPORT` reaches a
+  successful reply only through an injected `UsbIpKernelBackend` that returns a
+  real local `vhci` port **and** an injected data seam that opens a real
+  endpoint; the defaults `NoUsbIpKernel`/`NoUsbIpKernelDataEndpoint` (and every
+  fake used in tests) still return typed `usbip-kernel-required` instead of
+  faking a device or payload. ISO descriptor arrays are bounded and round-trip,
+  but ISO wire-padding compaction into a real URB buffer is left to the endpoint
+  adapter. The optional listener is plaintext and has no in-process TLS; an
+  external TLS terminator/tunnel must protect it, and `Required` TLS fails
+  closed. A node route exposing the daemon/server/relay and the client-side
+  import orchestration remain open.
 - The FAT32 builder is a static snapshot, not the Python live `FATSynthesiser`
   (no sector-on-demand reads, inotify rescan, or long-name rescan stability).
   Generated images are read-only. `WriteOverlay` is wired into writable NBD
@@ -1187,9 +1306,11 @@ existing VM; the disposable QEMU is quit over QMP or killed on timeout.
   and node `/usb/media*` routes exist, and `--usb-media-export` auto-starts a
   configured export, but a live FunctionFS transport is still attached only by
   explicit code; the default node path starts with `IdleBulkTransport` and never
-  opens a UDC endpoint. Blocking file-endpoint reads do not enforce the loop
-  deadline themselves, so the typed timeout contract is proven with fakes until
-  a real UDC test is added. `running` is deliberately only reachable after a
+  opens a UDC endpoint. The original `FileBulkTransport` remains blocking, but
+  `PollingFileBulkTransport`/`PollingFileEndpointIo` now enforce the loop deadline
+  with `poll(2)` and are covered by real pipe/FIFO tests; there is still no live
+  UDC transfer in the default suite, and the node does not select the polling
+  transport automatically. `running` is deliberately only reachable after a
   real command cycle; a mount, marker, UDC bind, or enable event never suffices.
   Restart supervision is bounded by `MediaRestartPolicy` and exercised through
   fake transports; there is no background endpoint driver, so a production

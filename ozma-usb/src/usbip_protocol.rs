@@ -88,6 +88,13 @@ pub enum UsbIpProtocolError {
         available: usize,
     },
 
+    /// A complete USB/IP frame did not arrive before the deadline.
+    #[error("USB/IP frame timed out after {timeout_ms} ms")]
+    TimedOut {
+        /// Deadline in milliseconds.
+        timeout_ms: u64,
+    },
+
     /// The frame contained bytes after the last complete record.
     #[error("USB/IP frame has {actual} bytes; expected exactly {expected}")]
     TrailingBytes {

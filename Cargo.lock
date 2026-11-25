@@ -3830,6 +3830,7 @@ name = "ozma-usb"
 version = "0.1.0"
 dependencies = [
  "ozma-protocol",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",

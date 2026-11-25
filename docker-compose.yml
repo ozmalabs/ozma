@@ -19,7 +19,7 @@
 
 services:
   controller:
-    image: ghcr.io/ozmalabs/ozma:main
+    image: ghcr.io/ozmalabs/ozma-controller:latest
     build: .  # falls back to local build if image not available
     container_name: ozma-controller
     restart: unless-stopped
