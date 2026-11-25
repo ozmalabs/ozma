@@ -59,6 +59,7 @@ pub struct ActiveMeeting {
     pub calendar_uid: String,
 }
 
+#[allow(dead_code)] // Shared by both binaries; the supervisor only decodes.
 impl ActiveMeeting {
     pub fn new(id: String, platform: MeetingPlatform) -> Self {
         Self {
@@ -115,6 +116,7 @@ pub enum ServerMessage {
 }
 
 /// Messages sent from clients to the server.
+#[allow(dead_code)] // The supervisor only reads snapshots and never sends this enum.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {

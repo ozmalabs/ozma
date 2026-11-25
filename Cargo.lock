@@ -3564,6 +3564,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "boringtun",
+ "libc",
  "libmdns 0.7.5",
  "rand 0.8.5",
  "serde",
@@ -3602,6 +3603,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes 1.11.1",
  "clap",
+ "flate2",
  "hostname 0.4.2",
  "http-body-util",
  "jpeg-decoder",

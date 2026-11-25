@@ -31,6 +31,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use ozma_mesh::dataplane::{
+    CommandRunner, DataplaneConfig, DataplaneError, DataplaneState, DataplaneStatus, MeshDataplane,
+    Sysfs, SystemCommandRunner, SystemSysfs,
+};
+#[cfg(test)]
+use ozma_mesh::dataplane::{CommandSpec, FileOpener, NatConfig};
 use ozma_mesh::{MeshManager, MeshNode, WgPrivateKey};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -83,7 +89,19 @@ impl MeshServiceError {
                 | "mesh.not-configured"
                 | "mesh.ip-invalid"
                 | "mesh.peer-invalid"
+                | "mesh.dataplane-unavailable"
+                | "mesh.dataplane-invalid"
+                | "mesh.dataplane-not-configured"
         )
+    }
+}
+
+impl From<DataplaneError> for MeshServiceError {
+    fn from(error: DataplaneError) -> Self {
+        Self {
+            code: error.code,
+            reason: error.reason,
+        }
     }
 }
 
@@ -157,6 +175,7 @@ pub enum MeshEventKind {
     PeerAdded,
     PeerRemoved,
     TunnelState,
+    Dataplane,
     Error,
     Surface,
 }
@@ -268,6 +287,9 @@ pub struct MeshServiceConfig {
     pub requires_wg: bool,
     /// Configured peers.
     pub peers: Vec<MeshNode>,
+    /// Optional kernel dataplane (TUN, routes, forwarding, NAT). `None` keeps
+    /// the service at the userspace WireGuard layer only.
+    pub dataplane: Option<DataplaneConfig>,
     /// Optional event-log capacity override (bounded by the constant default).
     pub event_capacity: Option<usize>,
 }
@@ -282,6 +304,7 @@ impl Default for MeshServiceConfig {
             requires_root: false,
             requires_wg: false,
             peers: Vec::new(),
+            dataplane: None,
             event_capacity: None,
         }
     }
@@ -294,6 +317,12 @@ pub struct MeshEnvironment {
     pub is_root: bool,
     pub wg_binary: bool,
     pub userspace_wireguard: bool,
+    /// `/dev/net/tun` is present.
+    pub tun_available: bool,
+    /// `ip` is on `PATH`.
+    pub ip_binary: bool,
+    /// `nft` is on `PATH` (only required for opt-in NAT).
+    pub nft_binary: bool,
 }
 
 impl Default for MeshEnvironment {
@@ -308,6 +337,9 @@ impl MeshEnvironment {
             is_root: unsafe { libc::geteuid() == 0 },
             wg_binary: binary_on_path("wg"),
             userspace_wireguard: true,
+            tun_available: std::path::Path::new(ozma_mesh::dataplane::TUN_DEVICE).exists(),
+            ip_binary: binary_on_path("ip"),
+            nft_binary: binary_on_path("nft"),
         }
     }
 }
@@ -378,6 +410,34 @@ impl MeshServiceConfig {
                 "mesh.wg-missing",
                 "kernel WireGuard requires the wg binary, which is not on PATH",
             ));
+        }
+        if let Some(dataplane) = &self.dataplane {
+            dataplane.validate().map_err(MeshServiceError::from)?;
+            if !environment.is_root {
+                return Err(MeshServiceError::new(
+                    "mesh.root-required",
+                    "the mesh dataplane requires root to create its TUN link, routes, \
+                     forwarding, and firewall state",
+                ));
+            }
+            if !environment.tun_available {
+                return Err(MeshServiceError::new(
+                    "mesh.dataplane-unavailable",
+                    "the mesh dataplane requires /dev/net/tun, which is not present",
+                ));
+            }
+            if !environment.ip_binary {
+                return Err(MeshServiceError::new(
+                    "mesh.dataplane-unavailable",
+                    "the mesh dataplane requires the ip binary on PATH",
+                ));
+            }
+            if dataplane.nat.is_some() && !environment.nft_binary {
+                return Err(MeshServiceError::new(
+                    "mesh.dataplane-unavailable",
+                    "mesh NAT is configured but the nft binary is not on PATH",
+                ));
+            }
         }
         Ok(())
     }
@@ -829,18 +889,35 @@ impl MeshBackend for FakeMeshBackend {
 #[derive(Clone)]
 pub struct MeshService {
     backend: Arc<dyn MeshBackend>,
+    /// Optional kernel dataplane. `None` leaves the service userspace-only.
+    dataplane: Option<Arc<MeshDataplane>>,
     log: MeshEventLog,
 }
 
 impl MeshService {
     pub fn new(backend: Arc<dyn MeshBackend>, log: MeshEventLog) -> Self {
-        Self { backend, log }
+        Self::with_backend_and_dataplane(backend, None, log)
     }
 
     /// Build a service from configuration. Preflight/prerequisite failures
     /// produce an explicit unsupported service rather than an error the node
     /// would have to fabricate around.
     pub fn from_config(config: MeshServiceConfig, environment: &MeshEnvironment) -> Self {
+        Self::from_config_with_seams(
+            config,
+            environment,
+            Arc::new(SystemCommandRunner::new()),
+            Arc::new(SystemSysfs::new()),
+        )
+    }
+
+    /// Build a service with injectable dataplane seams (tests/embedding).
+    pub fn from_config_with_seams(
+        config: MeshServiceConfig,
+        environment: &MeshEnvironment,
+        runner: Arc<dyn CommandRunner>,
+        sysfs: Arc<dyn Sysfs>,
+    ) -> Self {
         let capacity = config
             .event_capacity
             .unwrap_or(MESH_EVENT_CAPACITY)
@@ -856,10 +933,15 @@ impl MeshService {
             Err(error) => return Self::unsupported(error, log),
         };
 
+        let dataplane = config
+            .dataplane
+            .clone()
+            .map(|dataplane| Arc::new(MeshDataplane::new(dataplane, runner, sysfs)));
         let backend =
             BoringtunMeshBackend::new(identity, private_key, config.peers.clone(), log.clone());
         Self {
             backend: Arc::new(backend),
+            dataplane,
             log,
         }
     }
@@ -871,50 +953,122 @@ impl MeshService {
                 error,
                 identity: None,
             }),
+            dataplane: None,
             log,
         }
     }
 
     /// Build a service with a caller-supplied backend (tests/embedding).
     pub fn with_backend(backend: Arc<dyn MeshBackend>, log: MeshEventLog) -> Self {
-        Self { backend, log }
+        Self::with_backend_and_dataplane(backend, None, log)
+    }
+
+    /// Build a service with caller-supplied backend and dataplane (tests).
+    pub fn with_backend_and_dataplane(
+        backend: Arc<dyn MeshBackend>,
+        dataplane: Option<Arc<MeshDataplane>>,
+        log: MeshEventLog,
+    ) -> Self {
+        Self {
+            backend,
+            dataplane,
+            log,
+        }
     }
 
     pub fn log(&self) -> MeshEventLog {
         self.log.clone()
     }
 
+    /// Effective service state. When a dataplane is configured it must be
+    /// running too; a failed or still-starting dataplane is never reported as
+    /// `running`.
     pub fn state(&self) -> MeshState {
-        self.backend.state()
+        let backend = self.backend.state();
+        let Some(dataplane) = &self.dataplane else {
+            return backend;
+        };
+        match dataplane.status().state {
+            DataplaneState::Failed => MeshState::Failed,
+            DataplaneState::Starting => MeshState::Starting,
+            DataplaneState::Running => backend,
+            DataplaneState::Stopped | DataplaneState::NotConfigured => {
+                if backend == MeshState::Running {
+                    MeshState::Starting
+                } else {
+                    backend
+                }
+            }
+        }
     }
 
     pub fn error(&self) -> Option<MeshServiceError> {
-        self.backend.error()
+        self.backend.error().or_else(|| {
+            self.dataplane
+                .as_ref()
+                .and_then(|dataplane| dataplane.status().last_error)
+                .map(MeshServiceError::from)
+        })
     }
 
     pub fn identity(&self) -> Option<MeshIdentity> {
         self.backend.identity()
     }
 
+    /// Start the dataplane first (so an unavailable TUN/root never leaves a
+    /// WireGuard socket bound), then the WireGuard manager. A manager start
+    /// failure rolls the dataplane back.
     pub async fn start(&self) -> Result<(), MeshServiceError> {
-        let result = self.backend.start().await;
-        match &result {
-            Ok(()) => {
-                self.log
-                    .record(MeshEventKind::Started, "mesh service started", None);
-            }
-            Err(error) => {
-                self.log
-                    .record(MeshEventKind::Error, error.reason.clone(), None);
-            }
+        let mut dataplane_started = false;
+        if let Some(dataplane) = &self.dataplane {
+            dataplane.start().map_err(MeshServiceError::from)?;
+            dataplane_started = true;
+            self.log.record(
+                MeshEventKind::Dataplane,
+                format!("mesh dataplane {} is running", dataplane.config().interface),
+                None,
+            );
         }
-        result
+
+        let result = self.backend.start().await;
+        if let Err(error) = &result {
+            if dataplane_started {
+                if let Some(dataplane) = &self.dataplane {
+                    let _ = dataplane.stop();
+                    self.log.record(
+                        MeshEventKind::Dataplane,
+                        "mesh dataplane rolled back after manager start failure",
+                        None,
+                    );
+                }
+            }
+            self.log
+                .record(MeshEventKind::Error, error.reason.clone(), None);
+            return result;
+        }
+
+        self.log
+            .record(MeshEventKind::Started, "mesh service started", None);
+        Ok(())
     }
 
+    /// Stop the WireGuard manager and tear the dataplane down in reverse order.
     pub async fn stop(&self) -> Result<(), MeshServiceError> {
-        let result = self.backend.stop().await;
+        let dataplane_result = match &self.dataplane {
+            Some(dataplane) => dataplane.stop().map_err(MeshServiceError::from),
+            None => Ok(()),
+        };
+        let backend_result = self.backend.stop().await;
+        let result = match dataplane_result {
+            Err(error) => Err(error),
+            Ok(()) => backend_result,
+        };
         match &result {
             Ok(()) => {
+                if self.dataplane.is_some() {
+                    self.log
+                        .record(MeshEventKind::Dataplane, "mesh dataplane stopped", None);
+                }
                 self.log
                     .record(MeshEventKind::Stopped, "mesh service stopped", None);
             }
@@ -928,7 +1082,35 @@ impl MeshService {
 
     pub async fn add_peer(&self, node: MeshNode) -> Result<(), MeshServiceError> {
         let peer_id = node.id.clone();
+        let mesh_ip = node.mesh_ip.clone();
         let result = self.backend.add_peer(node).await;
+        if result.is_ok() {
+            if let Some(dataplane) = &self.dataplane {
+                let route = mesh_ip
+                    .parse::<Ipv4Addr>()
+                    .map_err(|_| {
+                        MeshServiceError::new(
+                            "mesh.peer-invalid",
+                            format!("peer {peer_id} has an invalid IPv4 mesh address"),
+                        )
+                    })
+                    .and_then(|route| {
+                        dataplane.add_route(route).map_err(|error| {
+                            if error.code == "mesh.dataplane-invalid" {
+                                MeshServiceError::new("mesh.peer-invalid", error.reason)
+                            } else {
+                                MeshServiceError::from(error)
+                            }
+                        })
+                    });
+                if let Err(error) = route {
+                    let _ = self.backend.remove_peer(&peer_id).await;
+                    self.log
+                        .record(MeshEventKind::Error, error.reason.clone(), Some(peer_id));
+                    return Err(error);
+                }
+            }
+        }
         match &result {
             Ok(()) => {
                 self.log.record(
@@ -946,7 +1128,28 @@ impl MeshService {
     }
 
     pub async fn remove_peer(&self, peer_id: &str) -> Result<(), MeshServiceError> {
+        let route = if self.dataplane.is_some() {
+            self.backend
+                .peers()
+                .await
+                .into_iter()
+                .find(|peer| peer.id == peer_id)
+                .and_then(|peer| peer.mesh_ip.parse::<Ipv4Addr>().ok())
+        } else {
+            None
+        };
         let result = self.backend.remove_peer(peer_id).await;
+        if result.is_ok() {
+            if let (Some(dataplane), Some(route)) = (&self.dataplane, route) {
+                if let Err(error) = dataplane.remove_route(route) {
+                    self.log.record(
+                        MeshEventKind::Error,
+                        error.reason.clone(),
+                        Some(peer_id.to_owned()),
+                    );
+                }
+            }
+        }
         match &result {
             Ok(()) => {
                 self.log.record(
@@ -975,8 +1178,8 @@ impl MeshService {
     }
 
     pub async fn status(&self) -> MeshStatus {
-        let state = self.backend.state();
-        let error = self.backend.error();
+        let state = self.state();
+        let error = self.error();
         let running = state == MeshState::Running;
         let peers = if running {
             Some(self.backend.peers().await)
@@ -998,6 +1201,7 @@ impl MeshService {
             code: error.as_ref().map(|value| value.code.clone()),
             reason: error.as_ref().map(|value| value.reason.clone()),
             identity: self.backend.identity(),
+            dataplane: self.dataplane.as_ref().map(|dataplane| dataplane.status()),
             peer_count: peers.as_ref().map(Vec::len),
             peers,
             event_count: Some(self.log.len()),
@@ -1066,6 +1270,10 @@ pub struct MeshStatus {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<MeshIdentity>,
+    /// Kernel TUN/routing/forwarding/NAT state, present only when
+    /// `--mesh-dataplane` was configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataplane: Option<DataplaneStatus>,
     /// Omitted unless the service is running; `Some(0)` is a real empty table.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_count: Option<usize>,
@@ -1092,6 +1300,7 @@ impl MeshStatus {
             code: None,
             reason: Some("mesh service is not enabled (--mesh / OZMA_MESH)".to_owned()),
             identity: None,
+            dataplane: None,
             peer_count: None,
             peers: None,
             event_count: None,
@@ -1400,6 +1609,9 @@ mod tests {
             is_root: false,
             wg_binary: false,
             userspace_wireguard: true,
+            tun_available: true,
+            ip_binary: true,
+            nft_binary: true,
         };
         assert_eq!(
             base.preflight_with(false, &env).unwrap_err().code,
@@ -1418,6 +1630,9 @@ mod tests {
             is_root: true,
             wg_binary: false,
             userspace_wireguard: true,
+            tun_available: true,
+            ip_binary: true,
+            nft_binary: true,
         };
         let error = kernel.preflight_with(true, &root_env).unwrap_err();
         assert_eq!(error.code, "mesh.wg-missing");
@@ -1426,6 +1641,9 @@ mod tests {
             is_root: true,
             wg_binary: true,
             userspace_wireguard: true,
+            tun_available: true,
+            ip_binary: true,
+            nft_binary: true,
         };
         kernel.preflight_with(true, &complete).unwrap();
     }
@@ -1436,6 +1654,9 @@ mod tests {
             is_root: true,
             wg_binary: true,
             userspace_wireguard: true,
+            tun_available: true,
+            ip_binary: true,
+            nft_binary: true,
         };
         let empty = MeshServiceConfig::default();
         assert_eq!(
@@ -1595,6 +1816,374 @@ mod tests {
         assert!(status.peer_count.is_none());
         assert!(status.peers.is_none());
         assert_eq!(status.code.as_deref(), Some("mesh.start-failed"));
+    }
+
+    #[tokio::test]
+    async fn dataplane_running_status_is_honest() {
+        let (service, runner) = dataplane_service(dataplane_config(), NodeSysfs::rooted());
+        assert_eq!(service.state(), MeshState::Stopped);
+        let before = service.status().await.dataplane.unwrap();
+        assert_eq!(before.state, DataplaneState::Stopped);
+        assert!(!before.up);
+
+        service.start().await.unwrap();
+        assert_eq!(service.state(), MeshState::Running);
+        assert!(!runner.calls().is_empty());
+
+        let status = service.status().await;
+        assert!(status.available);
+        let dataplane = status.dataplane.clone().unwrap();
+        assert_eq!(dataplane.state, DataplaneState::Running);
+        assert!(dataplane.up);
+        assert!(dataplane.forwarding);
+        assert!(!dataplane.nat);
+        assert_eq!(dataplane.interface.as_deref(), Some("ozma0"));
+        assert_eq!(dataplane.address.as_deref(), Some("10.200.9.1/24"));
+        assert_eq!(dataplane.mtu, Some(1420));
+        assert_eq!(dataplane.routes, vec!["10.200.9.2/32".to_owned()]);
+        assert!(dataplane.last_error.is_none());
+
+        service
+            .add_peer(peer("peer-a", "10.200.9.3"))
+            .await
+            .unwrap();
+        let status = service.status().await;
+        assert_eq!(
+            status.dataplane.as_ref().unwrap().routes,
+            vec!["10.200.9.2/32".to_owned(), "10.200.9.3/32".to_owned()]
+        );
+        let peer = status.peers.unwrap().remove(0);
+        assert_eq!(peer.tunnel, MeshTunnelState::Idle);
+        assert!(
+            !peer.established,
+            "dataplane readiness must not fabricate a handshake"
+        );
+
+        service.remove_peer("peer-a").await.unwrap();
+        assert_eq!(
+            service.status().await.dataplane.unwrap().routes,
+            vec!["10.200.9.2/32".to_owned()]
+        );
+
+        service.stop().await.unwrap();
+        assert_eq!(service.state(), MeshState::Stopped);
+        let status = service.status().await;
+        assert!(!status.available);
+        let dataplane = status.dataplane.unwrap();
+        assert_eq!(dataplane.state, DataplaneState::Stopped);
+        assert!(!dataplane.up);
+        assert!(dataplane.routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dataplane_failed_status_is_typed_and_never_running() {
+        let (service, runner) =
+            dataplane_service(dataplane_config(), NodeSysfs::rooted().not_root());
+        let error = service.start().await.unwrap_err();
+        assert_eq!(error.code, "mesh.root-required");
+        assert!(runner.calls().is_empty());
+
+        let status = service.status().await;
+        assert_eq!(status.state, MeshState::Failed);
+        assert!(!status.available);
+        assert!(status.peer_count.is_none());
+        assert!(status.peers.is_none());
+        assert_eq!(status.code.as_deref(), Some("mesh.root-required"));
+        let dataplane = status.dataplane.unwrap();
+        assert_eq!(dataplane.state, DataplaneState::Failed);
+        assert!(!dataplane.up);
+        assert!(dataplane.routes.is_empty());
+        assert_eq!(
+            dataplane
+                .last_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("mesh.root-required")
+        );
+    }
+
+    #[tokio::test]
+    async fn dataplane_missing_tun_and_nft_are_typed() {
+        let (no_tun, no_tun_runner) =
+            dataplane_service(dataplane_config(), NodeSysfs::rooted().without_tun());
+        let error = no_tun.start().await.unwrap_err();
+        assert_eq!(error.code, "mesh.dataplane-unavailable");
+        assert!(no_tun_runner.calls().is_empty());
+        assert_eq!(no_tun.status().await.state, MeshState::Failed);
+
+        let nat_config = dataplane_config().with_nat(NatConfig::new());
+        let (no_nft, no_nft_runner) =
+            dataplane_service(nat_config, NodeSysfs::rooted().without_nft());
+        let error = no_nft.start().await.unwrap_err();
+        assert_eq!(error.code, "mesh.dataplane-unavailable");
+        assert!(error.reason.contains("nft"));
+        assert!(no_nft_runner.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dataplane_starting_is_reported_but_never_as_running() {
+        let log = MeshEventLog::new(8);
+        let backend = Arc::new(FakeMeshBackend::new(
+            fake_node("self", "10.200.9.1"),
+            log.clone(),
+        ));
+        let runner = Arc::new(NodeRunner::default());
+        let observed = Arc::new(Mutex::new(None));
+        let slot: Arc<Mutex<Option<MeshService>>> = Arc::new(Mutex::new(None));
+        {
+            let observed = observed.clone();
+            let slot = slot.clone();
+            runner.set_probe(move || {
+                if let Some(service) = slot
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                {
+                    *observed.lock().unwrap_or_else(|error| error.into_inner()) =
+                        Some(service.state());
+                }
+            });
+        }
+        let dataplane = Arc::new(MeshDataplane::new(
+            dataplane_config(),
+            runner,
+            Arc::new(NodeSysfs::rooted()),
+        ));
+        let service = MeshService::with_backend_and_dataplane(backend, Some(dataplane), log);
+        *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(service.clone());
+
+        service.start().await.unwrap();
+        assert_eq!(
+            *observed.lock().unwrap_or_else(|error| error.into_inner()),
+            Some(MeshState::Starting)
+        );
+        assert_eq!(service.state(), MeshState::Running);
+    }
+
+    #[test]
+    fn preflight_reports_dataplane_prerequisites_typed() {
+        let config = MeshServiceConfig {
+            node_id: "node".into(),
+            mesh_ip: "10.200.9.1".into(),
+            wg_port: 51_820,
+            dataplane: Some(dataplane_config()),
+            ..MeshServiceConfig::default()
+        };
+        let base = MeshEnvironment {
+            is_root: true,
+            wg_binary: false,
+            userspace_wireguard: true,
+            tun_available: true,
+            ip_binary: true,
+            nft_binary: true,
+        };
+        config.preflight_with(true, &base).unwrap();
+
+        let no_root = MeshEnvironment {
+            is_root: false,
+            ..base
+        };
+        assert_eq!(
+            config.preflight_with(true, &no_root).unwrap_err().code,
+            "mesh.root-required"
+        );
+
+        let no_tun = MeshEnvironment {
+            tun_available: false,
+            ..base
+        };
+        assert_eq!(
+            config.preflight_with(true, &no_tun).unwrap_err().code,
+            "mesh.dataplane-unavailable"
+        );
+
+        let no_ip = MeshEnvironment {
+            ip_binary: false,
+            ..base
+        };
+        assert_eq!(
+            config.preflight_with(true, &no_ip).unwrap_err().code,
+            "mesh.dataplane-unavailable"
+        );
+
+        let nat = MeshServiceConfig {
+            dataplane: Some(dataplane_config().with_nat(NatConfig::new())),
+            ..config.clone()
+        };
+        let no_nft = MeshEnvironment {
+            nft_binary: false,
+            ..base
+        };
+        assert_eq!(
+            nat.preflight_with(true, &no_nft).unwrap_err().code,
+            "mesh.dataplane-unavailable"
+        );
+        // NAT is opt-in: nft is irrelevant without a NAT config.
+        config.preflight_with(true, &no_nft).unwrap();
+
+        let invalid = MeshServiceConfig {
+            dataplane: Some(DataplaneConfig::new(
+                "ozma0",
+                Ipv4Addr::new(10, 200, 9, 1),
+                24,
+                0,
+            )),
+            ..config
+        };
+        assert_eq!(
+            invalid.preflight_with(true, &base).unwrap_err().code,
+            "mesh.dataplane-invalid"
+        );
+    }
+
+    fn dataplane_config() -> DataplaneConfig {
+        DataplaneConfig::new("ozma0", Ipv4Addr::new(10, 200, 9, 1), 24, 1420)
+            .with_peer_routes(vec![Ipv4Addr::new(10, 200, 9, 2)])
+    }
+
+    fn dataplane_service(
+        config: DataplaneConfig,
+        sysfs: NodeSysfs,
+    ) -> (MeshService, Arc<NodeRunner>) {
+        let log = MeshEventLog::new(16);
+        let backend = Arc::new(FakeMeshBackend::new(
+            fake_node("self", "10.200.9.1"),
+            log.clone(),
+        ));
+        let runner = Arc::new(NodeRunner::default());
+        let dataplane = Arc::new(MeshDataplane::new(config, runner.clone(), Arc::new(sysfs)));
+        (
+            MeshService::with_backend_and_dataplane(backend, Some(dataplane), log),
+            runner,
+        )
+    }
+
+    #[derive(Default)]
+    struct NodeRunner {
+        calls: Mutex<Vec<CommandSpec>>,
+        probe: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl NodeRunner {
+        fn calls(&self) -> Vec<CommandSpec> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+
+        fn set_probe(&self, probe: impl Fn() + Send + Sync + 'static) {
+            *self.probe.lock().unwrap_or_else(|error| error.into_inner()) = Some(Box::new(probe));
+        }
+    }
+
+    impl CommandRunner for NodeRunner {
+        fn run(
+            &self,
+            command: &CommandSpec,
+        ) -> std::io::Result<ozma_mesh::dataplane::CommandOutput> {
+            if let Some(probe) = self
+                .probe
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                probe();
+            }
+            self.calls
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(command.clone());
+            Ok(ozma_mesh::dataplane::CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    struct NodeSysfs {
+        root: bool,
+        tun: bool,
+        ip: bool,
+        nft: bool,
+        files: Mutex<BTreeMap<std::path::PathBuf, String>>,
+    }
+
+    impl NodeSysfs {
+        fn rooted() -> Self {
+            Self {
+                root: true,
+                tun: true,
+                ip: true,
+                nft: true,
+                files: Mutex::new(BTreeMap::from([(
+                    std::path::PathBuf::from(ozma_mesh::dataplane::IPV4_FORWARD),
+                    "0\n".to_owned(),
+                )])),
+            }
+        }
+
+        fn not_root(mut self) -> Self {
+            self.root = false;
+            self
+        }
+
+        fn without_tun(mut self) -> Self {
+            self.tun = false;
+            self
+        }
+
+        fn without_nft(mut self) -> Self {
+            self.nft = false;
+            self
+        }
+    }
+
+    impl FileOpener for NodeSysfs {
+        fn exists(&self, path: &std::path::Path) -> bool {
+            match path.to_str() {
+                Some(ozma_mesh::dataplane::TUN_DEVICE) => self.tun,
+                _ => self
+                    .files
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .contains_key(path),
+            }
+        }
+
+        fn read_to_string(&self, path: &std::path::Path) -> std::io::Result<String> {
+            self.files
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(path)
+                .cloned()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "missing fake file")
+                })
+        }
+
+        fn write(&self, path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+            self.files
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(path.to_owned(), contents.to_owned());
+            Ok(())
+        }
+    }
+
+    impl Sysfs for NodeSysfs {
+        fn is_root(&self) -> bool {
+            self.root
+        }
+
+        fn command_available(&self, program: &str) -> bool {
+            match program {
+                "ip" => self.ip,
+                "nft" => self.nft,
+                _ => false,
+            }
+        }
     }
 
     async fn body_json(response: Response) -> serde_json::Value {

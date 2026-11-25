@@ -29,6 +29,9 @@ serde_json   = "1"
 # Logging
 tracing      = "0.1"
 
+# Root detection for the optional Linux dataplane (no other kernel access).
+libc         = { workspace = true }
+
 # Error handling
 thiserror    = "1"
 

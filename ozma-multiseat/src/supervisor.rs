@@ -26,6 +26,9 @@ use crate::audio::{SeatAudioRouter, SeatAudioSpec};
 use crate::error::MultiseatError;
 use crate::input::InputGroup;
 use crate::input_isolation::{helper_devices, SeatInputHelper};
+use crate::input_targeting::{
+    InputTargetingMode, SeatInputTargetRequest, SeatInputTargeter, SeatInputTargeting,
+};
 use crate::ownership::{DisplayOwnership, DisplayOwnershipController};
 use crate::routing::{InputRoutePlan, InputRouter, InputRoutingStrategy, InputTarget};
 use crate::seat::{
@@ -367,6 +370,10 @@ pub struct SupervisorOptions {
     /// input) and a helper that is missing or fails a grab is a typed start
     /// failure, never a silent unisolated spawn.
     pub input_isolation: bool,
+    /// How a private display is restricted to the seat's helper uinput devices.
+    /// `Warn` is the default: targeting failure is recorded but the seat still
+    /// starts. `Strict` prevents the spawn. `Off` never runs `xinput`.
+    pub input_targeting: InputTargetingMode,
     /// Opt-in per-seat X server strategy. `Shared` (the default) starts
     /// nothing; `Xvfb`/`Xephyr` start a private display before the node and stop
     /// it after the node.
@@ -386,6 +393,7 @@ impl Default for SupervisorOptions {
             apply_ownership: false,
             apply_routing: false,
             input_isolation: false,
+            input_targeting: InputTargetingMode::Warn,
             seat_display: SeatDisplayOptions::default(),
         }
     }
@@ -490,6 +498,7 @@ pub struct ProcessSeatSupervisor {
     routing: Option<Box<dyn InputRouter>>,
     evdev_routing: Option<Box<dyn InputRouter>>,
     input_helper: Option<Box<dyn SeatInputHelper>>,
+    input_targeter: Option<Box<dyn SeatInputTargeter>>,
     audio: Option<Box<dyn SeatAudioRouter>>,
     display_launcher: Option<Box<dyn SeatDisplayLauncher>>,
     seats: BTreeMap<String, ManagedSeat>,
@@ -526,6 +535,7 @@ impl ProcessSeatSupervisor {
             routing: None,
             evdev_routing: None,
             input_helper: None,
+            input_targeter: None,
             audio: None,
             display_launcher: None,
             seats: BTreeMap::new(),
@@ -594,6 +604,19 @@ impl ProcessSeatSupervisor {
     /// released. Stop/remove/shutdown release every confirmed seat.
     pub fn with_input_isolation_helper(mut self, helper: Box<dyn SeatInputHelper>) -> Self {
         self.input_helper = Some(helper);
+        self
+    }
+
+    /// Install the `xinput` targeter that restricts a private X display to the
+    /// seat's helper-created uinput devices.
+    ///
+    /// Applied after the helper confirms its grab and before the node child is
+    /// spawned, only when the display backend is `Xvfb`/`Xephyr`. Without a
+    /// targeter a private display is left unrestricted and a typed
+    /// `input_targeting_failed` note is recorded under the default warn
+    /// policy; strict policy refuses to spawn.
+    pub fn with_input_targeter(mut self, targeter: Box<dyn SeatInputTargeter>) -> Self {
+        self.input_targeter = Some(targeter);
         self
     }
 
@@ -794,6 +817,7 @@ impl ProcessSeatSupervisor {
                 seat.display_status.display_pid = None;
                 seat.display_status.display_ready = false;
             }
+            self.clear_input_targeting(seat_id);
             return Ok(());
         };
         let display = handle.display().to_owned();
@@ -804,6 +828,10 @@ impl ProcessSeatSupervisor {
                     seat.display_status.display_pid = None;
                     seat.display_status.display_ready = false;
                 }
+                // The private server is gone, so any XInput restriction it
+                // held is gone with it. Drop local state without running
+                // commands against a dead display.
+                self.clear_input_targeting(seat_id);
                 Ok(())
             }
             Err(error) => {
@@ -842,6 +870,140 @@ impl ProcessSeatSupervisor {
             }
         }
         self.ensure_seat_audio(seat_id);
+        Ok(())
+    }
+
+    /// Forget targeter state without running `xinput`. Used when the private
+    /// server that owned the devices has already exited.
+    fn clear_input_targeting(&mut self, seat_id: &str) {
+        if let Some(targeter) = self.input_targeter.as_mut() {
+            targeter.clear(seat_id);
+        }
+        if let Some(seat) = self.seats.get_mut(seat_id) {
+            seat.resources.input_targeting_applied = false;
+            seat.resources.targeted_devices.clear();
+            seat.resources.disabled_devices.clear();
+        }
+    }
+
+    fn record_targeting_applied(&mut self, seat_id: &str, targeting: &SeatInputTargeting) {
+        if let Some(seat) = self.seats.get_mut(seat_id) {
+            seat.resources.input_targeting_applied = true;
+            seat.resources.input_targeting_released = false;
+            seat.resources.targeted_devices = targeting.enabled.clone();
+            seat.resources.disabled_devices = targeting.disabled.clone();
+        }
+    }
+
+    /// Restrict the seat's private X display to its helper-created uinput
+    /// devices. Shared displays and `InputTargetingMode::Off` are no-ops.
+    fn apply_input_targeting(
+        &mut self,
+        seat_id: &str,
+        own_devices: &[String],
+    ) -> Result<(), MultiseatError> {
+        if own_devices.is_empty() || !self.display_is_nested(seat_id) {
+            return Ok(());
+        }
+        let mode = self.options.input_targeting;
+        if mode == InputTargetingMode::Off {
+            self.push_display_note(
+                seat_id,
+                SeatDisplayNote::new(
+                    SeatDisplayNoteKind::InputTargetingUnavailable,
+                    format!(
+                        "private display input targeting is disabled for seat {seat_id}; the \
+                         display may expose other seats' uinput devices"
+                    ),
+                ),
+            );
+            self.clear_input_targeting(seat_id);
+            return Ok(());
+        }
+
+        let Some((display, xauthority)) = self.seats.get(seat_id).and_then(|seat| {
+            seat.display_status.display.clone().map(|display| {
+                (
+                    display,
+                    seat.launch
+                        .env
+                        .get("XAUTHORITY")
+                        .map(std::path::PathBuf::from),
+                )
+            })
+        }) else {
+            let error = MultiseatError::InputTargeting(format!(
+                "seat {seat_id} has no ready private display to target"
+            ));
+            return self.targeting_failure(seat_id, mode, error);
+        };
+
+        if let Some(targeter) = self.input_targeter.as_ref() {
+            if let Some(existing) = targeter.status_for(seat_id) {
+                if existing.matches(&display, own_devices) {
+                    self.record_targeting_applied(seat_id, &existing);
+                    return Ok(());
+                }
+            }
+        }
+
+        let Some(targeter) = self.input_targeter.as_mut() else {
+            let error = MultiseatError::Unsupported(format!(
+                "seat {seat_id} has a private display and helper input isolation but no XInput \
+                 targeter is configured"
+            ));
+            return self.targeting_failure(seat_id, mode, error);
+        };
+
+        let request = SeatInputTargetRequest {
+            seat_id: seat_id.to_owned(),
+            display: display.clone(),
+            xauthority,
+            devices: own_devices.to_vec(),
+        };
+        match targeter.apply(&request) {
+            Ok(targeting) => {
+                self.record_targeting_applied(seat_id, &targeting);
+                Ok(())
+            }
+            Err(error) => {
+                targeter.clear(seat_id);
+                self.targeting_failure(seat_id, mode, error)
+            }
+        }
+    }
+
+    /// Record a typed targeting failure and apply the warn/strict policy.
+    fn targeting_failure(
+        &mut self,
+        seat_id: &str,
+        mode: InputTargetingMode,
+        error: MultiseatError,
+    ) -> Result<(), MultiseatError> {
+        self.record_resource_error(
+            seat_id,
+            ResourceKind::InputTargeting,
+            ResourceAction::Apply,
+            &error.to_string(),
+        );
+        self.push_display_note(
+            seat_id,
+            SeatDisplayNote::new(
+                SeatDisplayNoteKind::InputTargetingFailed,
+                format!(
+                    "private display for seat {seat_id} is not restricted to the seat's uinput \
+                     devices: {error}"
+                ),
+            ),
+        );
+        if let Some(seat) = self.seats.get_mut(seat_id) {
+            seat.resources.input_targeting_applied = false;
+            seat.resources.targeted_devices.clear();
+            seat.resources.disabled_devices.clear();
+        }
+        if mode == InputTargetingMode::Strict {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -890,15 +1052,17 @@ impl ProcessSeatSupervisor {
                 .seat_status(seat_id);
             match status {
                 Ok(Some(status)) if status.grabbed == expected_paths => {
+                    let uinput_devices = status.uinput_devices.clone();
                     if let Some(seat) = self.seats.get_mut(seat_id) {
                         seat.resources.grabbed_device_count = status.grabbed.len();
                         seat.resources.uinput_devices = status.uinput_devices;
                     }
-                    return Ok(());
+                    return self.apply_input_targeting(seat_id, &uinput_devices);
                 }
                 Ok(_) => {
                     // The helper lost the assignment. Do not keep claiming
                     // isolation; fall through to a fresh grab.
+                    self.clear_input_targeting(seat_id);
                     if let Some(seat) = self.seats.get_mut(seat_id) {
                         seat.resources.input_isolation_applied = false;
                         seat.resources.grabbed_device_count = 0;
@@ -912,6 +1076,7 @@ impl ProcessSeatSupervisor {
                     );
                 }
                 Err(error) => {
+                    self.clear_input_targeting(seat_id);
                     if let Some(seat) = self.seats.get_mut(seat_id) {
                         seat.resources.input_isolation_applied = false;
                         seat.resources.grabbed_device_count = 0;
@@ -965,7 +1130,12 @@ impl ProcessSeatSupervisor {
             seat.resources.grabbed_device_count = assignment.grabbed.len();
             seat.resources.uinput_devices = assignment.uinput_devices;
         }
-        Ok(())
+        let uinput_devices = self
+            .seats
+            .get(seat_id)
+            .map(|seat| seat.resources.uinput_devices.clone())
+            .unwrap_or_default();
+        self.apply_input_targeting(seat_id, &uinput_devices)
     }
 
     /// Ensure the seat's audio sink when a router is installed.
@@ -1164,6 +1334,7 @@ impl ProcessSeatSupervisor {
             ownership_applied,
             audio_applied,
             isolation_applied,
+            targeting_applied,
             strategy,
             audio_sink,
         )) = self.seats.get(seat_id).map(|seat| {
@@ -1172,6 +1343,7 @@ impl ProcessSeatSupervisor {
                 seat.resources.ownership_applied,
                 seat.resources.audio_applied,
                 seat.resources.input_isolation_applied,
+                seat.resources.input_targeting_applied,
                 seat.input_route
                     .as_ref()
                     .map(|route| route.strategy)
@@ -1182,6 +1354,36 @@ impl ProcessSeatSupervisor {
         else {
             return;
         };
+
+        // Display targeting is released before the helper grab (reverse of
+        // apply order). Re-enabling the other seats' devices while the private
+        // server still exists keeps the shared XInput state honest. A failure
+        // leaves the applied flag set for a later retry.
+        if targeting_applied {
+            let result = match self.input_targeter.as_mut() {
+                Some(targeter) => targeter.release(seat_id).map(|_| ()),
+                None => Err(MultiseatError::Unsupported(format!(
+                    "seat {seat_id} has applied display input targeting but no targeter is \
+                     configured"
+                ))),
+            };
+            match result {
+                Ok(()) => {
+                    if let Some(seat) = self.seats.get_mut(seat_id) {
+                        seat.resources.input_targeting_applied = false;
+                        seat.resources.input_targeting_released = true;
+                        seat.resources.targeted_devices.clear();
+                        seat.resources.disabled_devices.clear();
+                    }
+                }
+                Err(error) => self.record_resource_error(
+                    seat_id,
+                    ResourceKind::InputTargeting,
+                    ResourceAction::Release,
+                    &error.to_string(),
+                ),
+            }
+        }
 
         // Isolation is released before routing/ownership (reverse of apply
         // order). A failure leaves the applied flag set for a later retry.
@@ -1321,6 +1523,7 @@ impl ProcessSeatSupervisor {
                 seat.resources.ownership_applied
                     || seat.resources.routing_applied
                     || seat.resources.input_isolation_applied
+                    || seat.resources.input_targeting_applied
                     || seat.resources.audio_applied
             })
             .map(|(seat_id, _)| seat_id.clone())
@@ -1405,6 +1608,10 @@ impl ProcessSeatSupervisor {
                     backend: backend.as_str().to_owned(),
                     detail,
                 };
+                // The private server is gone; drop targeting state so the
+                // restart re-applies it to the replacement display instead of
+                // trusting a stale `input_targeting_applied` flag.
+                self.clear_input_targeting(&seat_id);
                 let seat = self.seats.get_mut(&seat_id).expect("tracked seat");
                 let mut cleanup_failure = None;
                 let mut display_released = false;
@@ -1603,6 +1810,9 @@ impl ProcessSeatSupervisor {
                 seat.resources.grabbed_device_count = 0;
                 seat.resources.uinput_devices.clear();
             }
+            // A restarted helper creates new uinput devices, so any previous
+            // display restriction must be re-applied rather than trusted.
+            self.clear_input_targeting(&seat_id);
             self.record_resource_error(
                 &seat_id,
                 ResourceKind::InputIsolation,
@@ -1651,6 +1861,7 @@ impl ProcessSeatSupervisor {
         if status.resources.ownership_applied
             || status.resources.routing_applied
             || status.resources.input_isolation_applied
+            || status.resources.input_targeting_applied
             || status.resources.audio_applied
             || status.display.display.is_some()
         {
@@ -1834,6 +2045,7 @@ impl ProcessSeatSupervisor {
             if !seat.resources.ownership_applied
                 && !seat.resources.routing_applied
                 && !seat.resources.input_isolation_applied
+                && !seat.resources.input_targeting_applied
             {
                 seat.resources = SeatResourceStatus::default();
             }
@@ -1876,6 +2088,13 @@ impl ProcessSeatSupervisor {
                 }
                 if self.options.input_isolation && seat.input.is_some() {
                     message.push_str("; would grab input through the seat-input helper");
+                    if backend.is_nested() {
+                        message.push_str(&format!(
+                            "; would restrict the private display to seat uinput devices \
+                             (policy={})",
+                            self.options.input_targeting
+                        ));
+                    }
                 }
                 seat.message = Some(message);
                 return Ok(seat.status(now));

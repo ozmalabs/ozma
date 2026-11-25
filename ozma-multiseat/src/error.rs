@@ -197,6 +197,12 @@ pub enum MultiseatError {
     #[error("seat input isolation error: {0}")]
     InputIsolation(String),
 
+    /// A private X display could not be restricted to the seat's uinput
+    /// devices through `xinput`. The helper grab may still be applied, but full
+    /// display isolation is never claimed after this error.
+    #[error("seat input targeting error: {0}")]
+    InputTargeting(String),
+
     /// A per-seat display server backend needs an external binary (`Xvfb`,
     /// `Xephyr`, or `xauth`) that is not installed or not executable.
     #[error(
@@ -293,6 +299,7 @@ impl MultiseatError {
             Self::Audio(_) => "audio",
             Self::Hotplug(_) => "hotplug",
             Self::InputIsolation(_) => "input_isolation",
+            Self::InputTargeting(_) => "input_targeting",
             Self::SeatDisplayTool { .. } => "seat_display_tool",
             Self::SeatDisplayNumberExhausted { .. } => "seat_display_number_exhausted",
             Self::SeatDisplayStartupTimeout { .. } => "seat_display_startup_timeout",

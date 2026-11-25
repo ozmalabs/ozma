@@ -181,6 +181,7 @@ fn options(dry_run: bool, apply_ownership: bool, apply_routing: bool) -> Supervi
         apply_ownership,
         apply_routing,
         input_isolation: false,
+        input_targeting: Default::default(),
         seat_display: Default::default(),
     }
 }

@@ -56,7 +56,7 @@ fn grab_confirms_both_devices_and_release_cleans_up() {
             assert_eq!(seat_id, "host-seat-0");
             assert_eq!(grabbed, vec!["/dev/input/event0", "/dev/input/event1"]);
             assert_eq!(uinput_devices.len(), 2);
-            assert!(uinput_devices[0].starts_with("ozma-seat-host-seat-0-event0"));
+            assert!(uinput_devices[0].starts_with("ozma-seat-host-seat-0-kbd-event0"));
         }
         other => panic!("unexpected response: {other:?}"),
     }

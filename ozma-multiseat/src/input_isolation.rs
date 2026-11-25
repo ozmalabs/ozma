@@ -338,8 +338,35 @@ fn validate_seat_id(seat_id: &str) -> Result<(), HelperError> {
     Ok(())
 }
 
-/// Build the per-seat uinput name. Kept below the kernel's 80-byte limit.
-pub fn default_uinput_name(seat_id: &str, device_path: &str) -> String {
+/// Prefix shared by every helper-created uinput device.
+///
+/// The private-display content filter uses this prefix to recognise devices
+/// that belong to a seat and should therefore be enabled or disabled together.
+pub const UINPUT_NAME_PREFIX: &str = "ozma-seat-";
+
+/// Short capability token embedded in a uinput device name.
+pub fn uinput_kind_token(kind: InputDeviceKind) -> &'static str {
+    match kind {
+        InputDeviceKind::Keyboard => "kbd",
+        InputDeviceKind::Mouse => "mouse",
+        InputDeviceKind::Gamepad => "pad",
+        InputDeviceKind::Other => "other",
+    }
+}
+
+/// Whether a device name was created by the seat-input helper.
+pub fn is_uinput_name(name: &str) -> bool {
+    name.starts_with(UINPUT_NAME_PREFIX)
+}
+
+/// Build the per-seat uinput name, for example
+/// `ozma-seat-host-seat-0-kbd-event0`.
+///
+/// The name carries the seat id, the capability class, and the source event
+/// node. The class token lets a display targeter match the seat's keyboard,
+/// mouse, and gamepad devices without parsing a hyphenated seat id. The whole
+/// name stays below the kernel's 80-byte limit.
+pub fn default_uinput_name(seat_id: &str, kind: InputDeviceKind, device_path: &str) -> String {
     let event = device_path.rsplit('/').next().unwrap_or("event");
     let seat: String = seat_id
         .chars()
@@ -350,9 +377,12 @@ pub fn default_uinput_name(seat_id: &str, device_path: &str) -> String {
                 '_'
             }
         })
-        .take(40)
+        .take(36)
         .collect();
-    format!("ozma-seat-{seat}-{event}")
+    format!(
+        "{UINPUT_NAME_PREFIX}{seat}-{}-{event}",
+        uinput_kind_token(kind)
+    )
 }
 
 /// One device in a successful assignment.

@@ -3,18 +3,20 @@
 Status: **library + real subprocess supervisor + CLI + controller read-only
 grouping + persisted seats/hotplug reconciliation + opt-in
 input-routing/display-ownership/audio execution + opt-in privileged input
-isolation + opt-in per-seat X servers + packaged systemd unit (2026-11-25).**
+isolation + private-display input targeting + opt-in per-seat X servers +
+packaged systemd unit (2026-11-25).**
 The crate enumerates display/input topology, plans one desktop seat per output,
 can spawn, health-check, restart, stop, and report one `ozma-node --profile
 desktop` child per seat, and models the opt-in resource layers: `xinput
 map-to-output` input routing with rollback, per-seat `xrandr`
 output/mode/position ownership, per-seat PipeWire/PulseAudio null sinks, a
 privileged `ozma-seat-input` helper that performs real `EVIOCGRAB` and per-seat
-uinput creation, and opt-in `Xvfb`/`Xephyr` private X servers per seat. The
+uinput creation, `xinput` targeting that restricts a private display to one
+seat's helper devices, and opt-in `Xvfb`/`Xephyr` private X servers per seat. The
 supervisor **applies those resources before spawning and releases them on
 stop/remove/shutdown** when the explicit
 `--apply-ownership`/`--apply-routing`/`--audio-router`/`--input-isolation
-helper`/`--seat-display` CLI flags (or the matching
+helper`/`--input-targeting`/`--seat-display` CLI flags (or the matching
 `SupervisorOptions`/builder calls) are enabled; all default to off, and dry-run
 still performs no action. The default input path remains the xinput strategy;
 the helper path is never selected implicitly. The default display backend
@@ -87,7 +89,18 @@ Implemented:
   `EVIOCGRAB`, creates per-seat uinput devices, and relays events; its single
   unsafe module sets `O_NONBLOCK` on a grabbed fd. `HelperClient` is the
   non-privileged supervisor client and refuses a fake helper unless a test
-  explicitly opts in.
+  explicitly opts in. Helper uinput names carry the seat, capability class, and
+  source event node (`ozma-seat-<seat>-<kbd|mouse|pad|other>-<eventN>`).
+- **Private-display input targeting** (`input_targeting`): once a private
+  `Xvfb`/`Xephyr` display is ready and the helper has confirmed its grab,
+  `ProcessSeatInputTargeter` runs `xinput list --short` on that seat's
+  `DISPLAY`/`XAUTHORITY`, enables the seat's own helper uinput names, and
+  disables every other `ozma-seat-...` device. Core pointer/keyboard/XTEST
+  devices and unrelated devices are never touched. The real runner bounds each
+  `xinput` invocation. `InputTargetingMode::Warn` (default) records a typed
+  `input_targeting` error and continues; `Strict` prevents the spawn; `Off`
+  never runs `xinput`. Targeting is only claimed after every own device was
+  found and enabled, and the disabled devices are exposed in status.
 - `ownership`: `DisplayOwnership` and `XrandrOwnershipController` model
   per-seat output ownership as
   `xrandr --output <output> --mode <mode> --pos <x>x<y>`, with apply/release
@@ -103,8 +116,9 @@ Implemented:
   Stop, remove, rollback, and `Drop` release isolation, routing, and ownership,
   best effort, with failures kept in status.
 - Status carries `resources` (`ownership_applied`, `routing_applied`,
-  `input_isolation_applied`, `audio_applied`, matching `*_released` flags,
-  `grabbed_device_count`, `uinput_devices`, and typed `errors`). The field is
+  `input_isolation_applied`, `input_targeting_applied`, `audio_applied`,
+  matching `*_released` flags, `grabbed_device_count`, `uinput_devices`,
+  `targeted_devices`, `disabled_devices`, and typed `errors`). The field is
   omitted when no resource action happened, so default status is unchanged.
 - **Opt-in per-seat displays** (`seat_display`): `shared` (default, one X root),
   `xvfb` (private `Xvfb :N -screen 0 WxHx24 -nolisten tcp` per seat), and
@@ -191,13 +205,18 @@ Deliberately not implemented yet:
 - **Compositor integration for private displays.** `Xvfb`/`Xephyr` prove real
   per-seat display isolation for X11 applications, but no window manager,
   compositor, DRM scanout, physical-output handoff, or per-node compositor
-  launch is managed. The helper's uinput devices are still relayed only to the
-  host input stack; injecting them into the private X server/compositor seat is
-  not wired.
+  launch is managed. `xinput` targeting now restricts a private display to the
+  seat's helper uinput devices, but the OS/compositor must actually enumerate
+  those uinput nodes (for example an Xorg/libinput or Wayland compositor seat);
+  `Xvfb` itself exposes only core/XTEST devices, so a live `Xvfb` targeting
+  attempt honestly fails with `input_targeting_failed`. Kernel evdev ownership
+  (`EVIOCGRAB`) remains with the helper, not a DRM-lease/compositor seat.
 - **Kernel/compositor seat targeting for the helper's uinput devices.** The
-  helper creates and reports per-seat uinput devices and relays physical events,
-  but no node/compositor integration yet consumes those names as a seat input
-  source. The node's own uinput sink still does not choose an X screen.
+  helper creates, names, and relays to per-seat uinput devices and the
+  supervisor restricts a private X display to those names. There is still no
+  node/compositor integration that claims a physical output for a seat or
+  selects those devices as a compositor seat; the node's own uinput sink still
+  does not choose an X screen.
 - **Per-process audio routing and DSP.** `ozma-audio` creates/removes the null
   sink and exposes its monitor target; moving individual application streams,
   microphone remaps, room correction, and a Windows virtual audio endpoint are
@@ -232,6 +251,8 @@ Deliberately not implemented yet:
 | Audio | `SeatAudioRouter`, `SeatAudioSpec`, `SeatAudioState`, `OzmaAudioRouter` |
 | Seat | `SeatProfile`, `ProfileDefaults`, `SeatConfig`, `SeatPlan`, `CapturePlan`, `NodeCommand`, `SeatPorts`, `SeatState`, `SeatStatus`, `SeatRuntimeStatus` |
 | Input routing | `InputRouter`, `XInputRouter`, `EvdevGrabRouter`, `InputTarget`, `InputAssignment`, `InputRelease`, `InputRoutePlan`, `InputRoutingStrategy`, `assign_seats`, `parse_xinput_list`, `XInputDevice`, `RouteCommand`, `CommandRunner`, `ProcessCommandRunner`, `DeviceNameResolver`, `SysfsDeviceNameResolver`, `EvdevGrabBackend`, `EvdevGrabCommand`, `UnsupportedEvdevGrabBackend` |
+| Input isolation | `SeatInputHelper`, `HelperClient`, `HelperClientConfig`, `InputIsolationHelper`, `HelperBackend`, `HelperDevice`, `HelperRequest`, `HelperResponse`, `HelperError`, `HelperErrorCode`, `HelperSeatStatus`, `InputIsolationAssignment`, `InputIsolationRelease`, `default_uinput_name`, `UINPUT_NAME_PREFIX` |
+| Input targeting | `SeatInputTargeter`, `ProcessSeatInputTargeter`, `SeatInputTargetRequest`, `SeatInputTargeting`, `SeatInputTargetingRelease`, `InputTargetingMode`, `BoundedProcessCommandRunner`, `TARGETING_PROGRAM` |
 | Display ownership | `DisplayOwnership`, `DisplayOwnershipKind`, `DisplayOwnershipController`, `XrandrOwnershipController`, `apply_ownership` |
 | Seat display | `SeatDisplayBackend`, `SeatDisplayOptions`, `SeatDisplaySize`, `SeatDisplayRequest`, `SeatDisplayHandle`, `SeatDisplayLauncher`, `ProcessSeatDisplayLauncher`, `SeatDisplayPrograms`, `DisplayNumberAllocator`, `SeatDisplayStatus`, `SeatDisplayError`, `SeatDisplayNote`, `SeatDisplayNoteKind`, `probe_x11_display`, `display_server_args` |
 | Plan result | `MultiseatPlan`, `PlanDiagnostic`, `DiagnosticCode` |
@@ -239,7 +260,7 @@ Deliberately not implemented yet:
 | Status | `MultiseatCapability`, `MultiseatStatus`, `render_metrics` |
 | Supervision | `SeatSupervisor`, `ProcessSeatSupervisor`, `SupervisorOptions`, `NodeLaunchSpec`, `NodeLauncher`, `ProcessLauncher`, `ChildHandle`, `ChildExit`, `ReadinessProbe`, `HttpHealthProbe`, `PortProbe`, `restart_delay` |
 | CLI | `ozma-multiseat` binary |
-| Test-only | `fake::FakeDisplayBackend`, `fake::FakeInputBackend`, `fake::FakeSeatSupervisor`, `fake::FakeNodeLauncher`, `fake::FakeReadinessProbe`, `fake::FakeCommandRunner`, `fake::FakeDeviceNameResolver`, `fake::FakeEvdevGrabBackend`, `fake::FakeSeatAudioRouter`, `fake::FakeSeatDisplayLauncher`, `fake::FakeHotplugMonitor` |
+| Test-only | `fake::FakeDisplayBackend`, `fake::FakeInputBackend`, `fake::FakeSeatSupervisor`, `fake::FakeNodeLauncher`, `fake::FakeReadinessProbe`, `fake::FakeCommandRunner`, `fake::FakeDeviceNameResolver`, `fake::FakeEvdevGrabBackend`, `fake::FakeSeatAudioRouter`, `fake::FakeSeatDisplayLauncher`, `fake::FakeSeatInputHelper`, `fake::FakeSeatInputTargeter`, `fake::FakeHotplugMonitor` |
 
 `fake` is not selected by detection and never touches `/dev`, sysfs, X11,
 PipeWire, or processes. Production code must choose `XrandrDisplayBackend` /
@@ -401,29 +422,54 @@ separate `ozma-seat-input` helper, which is the only component that opens
   device. The real backend additionally rejects symlinked event paths.
 - **Ordering and rollback.** For each seat the helper grabs each device, creates
   one uinput device mirroring the source's key/relative/absolute/switch
-  capabilities, and starts a relay thread that forwards events. If any step
-  fails, it stops relays, destroys uinput devices, and ungrabs every device
-  already acquired before returning the typed error. No partial assignment is
-  recorded.
+  capabilities, and starts a relay thread that forwards events. Uinput names are
+  `ozma-seat-<seat>-<kbd|mouse|pad|other>-<eventN>`, so a display targeter can
+  recognise a seat without parsing a hyphenated seat id. If any step fails, it
+  stops relays, destroys uinput devices, and ungrabs every device already
+  acquired before returning the typed error. No partial assignment is recorded.
+- **Private-display targeting.** A helper grab alone does not stop another
+  seat's uinput devices from appearing on a private X server. After display
+  readiness and the confirmed grab, `ProcessSeatInputTargeter` runs `xinput list
+  --short` with `DISPLAY` and, when present, `XAUTHORITY` for the seat, then:
+  - validates that every helper-confirmed own name is visible before changing
+    anything; a missing own device is a typed `InputTargeting` error;
+  - disables every other `ozma-seat-...` device (other seats' devices), with
+    rollback re-enabling them if a later command fails;
+  - enables the seat's own names. Core pointer/keyboard/XTEST devices and
+    non-`ozma-seat-...` devices are never enabled, disabled, or detached.
+  Each `xinput` call is bounded (5 s by default). `--input-targeting warn`
+  (default) records the typed `input_targeting` apply error and
+  `input_targeting_failed` display note but still starts the seat; `strict`
+  returns the error, releases the helper grab and private display, and never
+  spawns; `off` skips targeting with an `input_targeting_unavailable` note.
+  Targeting is never reported applied when it failed.
 - **Supervisor semantics.** With `input_isolation` enabled, start applies
-  ownership (if requested), then the confirmed helper grab, then audio; on any
-  failure the seat is not spawned, the typed `input_isolation` apply error is
-  stored, and earlier seats are released. Stop/remove/rollback/`Drop` release
-  isolation before routing/ownership. A release failure keeps
-  `input_isolation_applied` true and retains the seat for `remove` retry.
+  ownership (if requested), then the confirmed helper grab, then private-display
+  targeting, then audio; on any failure the seat is not spawned, the typed
+  `input_isolation`/`input_targeting` apply error is stored, and earlier seats
+  are released. Stop/remove/rollback/`Drop` release targeting (re-enabling other
+  seats' devices) before isolation, routing, and ownership. A release failure
+  leaves its applied flag set for a later retry and is kept in status. The
+  private display is stopped last, and its teardown clears targeting state
+  without running commands against a dead server.
 - **Crash/restart honesty.** `tick` re-checks each applied seat with the helper.
   If the helper restarted or lost the grab, the applied flag and grabbed count
-  are cleared, a typed error is recorded, and a fresh grab is attempted. If the
-  fresh grab fails, an unisolated running child is terminated and scheduled for
-  restart instead of leaving a false isolation claim.
+  are cleared, targeting is cleared, a typed error is recorded, and a fresh grab
+  and targeting apply are attempted. A private-display crash clears targeting
+  before the replacement server starts, so the new display is re-targeted. If
+  the fresh grab/targeting fails, an unisolated running child is terminated and
+  scheduled for restart instead of leaving a false isolation claim.
 - **SIGTERM restore.** The helper blocks SIGTERM/SIGINT in the main thread,
   waits on a safe `sigwait` thread, releases every seat's relays/uinput devices,
   and exits. EOF or a malformed client also triggers release/shutdown.
 - **Status.** Each seat's `resources` carries `input_isolation_applied`,
-  `input_isolation_released`, `grabbed_device_count`, and `uinput_devices`
-  (for example `ozma-seat-host-seat-0-event0`), plus typed
-  `{"kind":"input_isolation",...}` errors. Nothing is redacted: the status is
-  loopback-only and is meant to be diagnostic.
+  `input_isolation_released`, `input_targeting_applied`,
+  `input_targeting_released`, `grabbed_device_count`, `uinput_devices`
+  (for example `ozma-seat-host-seat-0-kbd-event0`), `targeted_devices` (own
+  names enabled on the private display), `disabled_devices` (other-seat names
+  disabled there), plus typed `{"kind":"input_isolation"|"input_targeting",...}`
+  errors. Nothing is redacted: the status is loopback-only and is meant to be
+  diagnostic.
 - **Default behavior.** With the flag absent, the helper is not spawned, no
   device is opened, and the modelled `EvdevGrabRouter` still returns a typed
   `Unsupported` error if an evdev strategy is requested without a real backend.
@@ -432,7 +478,7 @@ separate `ozma-seat-input` helper, which is the only component that opens
 {"op":"hello","protocol":1}
 {"event":"ready","protocol":1,"helper":"ozma-seat-input","backend":"real","pid":4242}
 {"op":"grab","seat_id":"host-seat-0","devices":[{"path":"/dev/input/event3","kind":"keyboard"}]}
-{"event":"grabbed","seat_id":"host-seat-0","grabbed":["/dev/input/event3"],"uinput_devices":["ozma-seat-host-seat-0-event3"]}
+{"event":"grabbed","seat_id":"host-seat-0","grabbed":["/dev/input/event3"],"uinput_devices":["ozma-seat-host-seat-0-kbd-event3"]}
 {"op":"release","seat_id":"host-seat-0"}
 {"event":"released","seat_id":"host-seat-0","released":["/dev/input/event3"]}
 ```
@@ -501,20 +547,23 @@ Lifecycle and honesty rules:
   the configured `--seat-display-size`. A PipeWire capture seat keeps its
   configured target; only the application display changes.
 - **Start order.** Private X server → ownership/routing/helper/audio resources →
-  node child. **Stop order** is node child → resources → private X server. A
-  failed resource apply or node readiness releases the server, and rollback
-  releases servers that have no child.
+  private-display input targeting → node child. **Stop order** is node child →
+  targeting/resource release → private X server. A failed resource apply or node
+  readiness releases the server, and rollback releases servers that have no
+  child.
 - **Crash.** `tick` polls each private server. If it exits while the seat is
-  running, the node is terminated, the server is released, and the seat is
-  scheduled for a bounded restart. The next attempt starts a fresh server and
-  reuses the display number.
+  running, the node is terminated, targeting state is cleared, the server is
+  released, and the seat is scheduled for a bounded restart. The next attempt
+  starts a fresh server, reuses the display number, and re-applies targeting.
 - **Ownership/routing on a private root.** xrandr output ownership and xinput
   `map-to-output` assume a physical output/pointer in the shared X server.
   With a nested display they are **not executed**; the seat reports typed
   `ownership_unsupported` / `xinput_routing_unsupported` notes instead of a
   fake applied flag. `--input-isolation helper` still runs before the node and
-  is not regressed: the helper grabs the physical devices and creates the
-  per-seat uinput devices even when the display is private.
+  is not regressed: the helper grabs the physical devices, creates the per-seat
+  uinput devices, and `--input-targeting warn|strict` restricts the private
+  display to those names with `xinput`. A display that does not expose those
+  uinput nodes reports `input_targeting_failed` rather than claiming isolation.
 - **Status.** Each seat carries `display_backend`, `display`, `display_pid`,
   `display_ready`, `display_notes`, and a typed `display_error`
   (`missing_binary`, `number_exhausted`, `startup_timeout`, `crashed`,
@@ -543,17 +592,26 @@ fn status(&self) -> Vec<SeatRuntimeStatus>;
   never spawns that seat, records a typed `SeatResourceError`, and releases
   every resource already applied for earlier seats in reverse order.
   Controllers are installed with `with_ownership_controller`,
-  `with_routing_controller`, `with_evdev_routing_controller`, and
-  `with_input_isolation_helper`; without the flags no controller/helper is
-  called.
+  `with_routing_controller`, `with_evdev_routing_controller`,
+  `with_input_isolation_helper`, and `with_input_targeter`; without the flags no
+  controller/helper/targeter is called.
 - **Input isolation (opt-in).** `SeatInputHelper` is the supervisor seam;
   `HelperClient` starts the privileged process lazily, negotiates protocol
   version 1, and reports only helper-confirmed grabs. `resources` carries the
   grabbed count, uinput names, and typed errors. A helper crash clears the
-  applied claim on the next tick; a re-grab is attempted, and a running child is
-  stopped/restarted when isolation cannot be restored. Dry-run never starts the
-  helper. When the last confirmed seat is released, the helper is asked to
-  release everything and stop; the next start starts it lazily again.
+  applied claim on the next tick; targeting is cleared, a re-grab and
+  re-targeting are attempted, and a running child is stopped/restarted when
+  isolation cannot be restored. Dry-run never starts the helper. When the last
+  confirmed seat is released, the helper is asked to release everything and
+  stop; the next start starts it lazily again.
+- **Input targeting (opt-in with private displays).** `SeatInputTargeter` is the
+  display-content seam. `ProcessSeatInputTargeter` runs the real `xinput`
+  commands, while `FakeSeatInputTargeter` records requests and failures in
+  tests. Targeting applies after display readiness and the helper grab, before
+  the child. Stop/rollback/release re-enables the other seats' devices while the
+  private display still exists. `InputTargetingMode` is `Warn` by default;
+  `Strict` aborts the seat, `Off` skips it. The shared display backend is always
+  a targeting no-op.
 - **Private displays (opt-in).** With `seat_display.backend = Xvfb` or `Xephyr`,
   start spawns and handshakes the server before resource reservation and
   rewrites the launch spec. Stop releases resources and then stops the server.
@@ -603,7 +661,9 @@ fn status(&self) -> Vec<SeatRuntimeStatus>;
   `FakeDeviceNameResolver` drive the real `XrandrOwnershipController` and
   `XInputRouter` without running `xrandr`/`xinput`. `FakeSeatDisplayLauncher`
   simulates ready/timeout/crash/number-exhaustion/missing-binary display starts
-  without opening a socket.
+  without opening a socket. `FakeSeatInputHelper` and `FakeSeatInputTargeter`
+  simulate confirmed grabs, targeting failures, releases, and clears without a
+  helper process or X server.
 
 `ProcessSeatSupervisor::tick` performs child polling and due restarts. It is
 synchronous; a caller with an async runtime runs it from a poll loop. `Drop`
@@ -651,15 +711,25 @@ stops any child still owned by the supervisor.
         "ownership_applied": true,
         "routing_applied": false,
         "input_isolation_applied": true,
+        "input_targeting_applied": true,
         "audio_applied": true,
         "ownership_released": false,
         "routing_released": false,
         "input_isolation_released": false,
+        "input_targeting_released": false,
         "audio_released": false,
         "grabbed_device_count": 2,
         "uinput_devices": [
-          "ozma-seat-host-seat-0-event0",
-          "ozma-seat-host-seat-0-event1"
+          "ozma-seat-host-seat-0-kbd-event0",
+          "ozma-seat-host-seat-0-mouse-event1"
+        ],
+        "targeted_devices": [
+          "ozma-seat-host-seat-0-kbd-event0",
+          "ozma-seat-host-seat-0-mouse-event1"
+        ],
+        "disabled_devices": [
+          "ozma-seat-host-seat-1-kbd-event2",
+          "ozma-seat-host-seat-1-mouse-event3"
         ]
       },
       "display_backend": "xvfb",
@@ -681,13 +751,15 @@ stops any child still owned by the supervisor.
 A failed seat also carries `last_error` and, while a restart is pending,
 `next_restart_in_ms`. Resource apply/release failures add entries such as
 `{"kind":"ownership","action":"release","message":"..."}`,
-`{"kind":"input_isolation","action":"apply","message":"helper error [grab_failed]: ..."}`
+`{"kind":"input_isolation","action":"apply","message":"helper error [grab_failed]: ..."}`,
+`{"kind":"input_targeting","action":"apply","message":"seat input targeting error: ..."}`
 or `{"kind":"audio","action":"apply","message":"pactl is not installed"}` to
 `resources.errors`; the field is omitted entirely when no resource action
 happened. Private display failures add
 `{"kind":"startup_timeout"|"crashed"|"missing_binary"|"number_exhausted"|"unsupported","message":"..."}`
-as `display_error`, and meaningless nested operations add typed
-`display_notes`. All private display fields are omitted when
+as `display_error`. Targeted private displays add
+`input_targeting_failed` / `input_targeting_unavailable` notes when targeting
+did not fully apply. All private display fields are omitted when
 `display_backend` is `shared`. `capability.node_count` always equals
 `capability.seat_count` and the number of seat entries. There is no merged
 super-node.
@@ -874,6 +946,7 @@ Configuration:
 | `--apply-routing` | Apply each seat's xinput/evdev input routing before spawn (default off). |
 | `--input-isolation xinput\|helper` | Input path. `xinput` is the default; `helper` uses privileged `EVIOCGRAB`/uinput isolation. |
 | `--input-helper PATH` | Helper binary for `--input-isolation helper` (default `ozma-seat-input`). |
+| `--input-targeting off\|warn\|strict` | Restrict a private display to the seat's helper uinput devices. `warn` is the default; `strict` prevents the spawn on failure; `off` skips `xinput`. |
 | `--seat-display shared\|xvfb\|xephyr` | Per-seat display backend. `shared` is the default; `xvfb`/`xephyr` start and stop a private X server per seat. |
 | `--seat-display-size WxH` | Private X screen geometry (default `1280x800`). |
 | `--seats-file PATH` | Load/reuse and atomically update persisted seat identities. Never written by `--print-plan`/`--dry-run`. |
@@ -911,6 +984,16 @@ released. On stop/remove/shutdown the helper releases the seat. The local
 helper result is visible in `resources.grabbed_device_count` and
 `resources.uinput_devices`. The default `xinput` path does not start the helper
 or open a device.
+
+With a private `--seat-display xvfb|xephyr` and `--input-isolation helper`,
+`--input-targeting` restricts that display after the helper grab and before the
+node: the seat's own `ozma-seat-...` uinput devices are enabled, other seats'
+helper devices are disabled, and core/XTEST devices are left alone. `warn`
+(default) records a typed `input_targeting` error and continues, `strict`
+refuses to spawn and releases the helper/display, and `off` skips `xinput`.
+`resources.input_targeting_applied`, `targeted_devices`, and
+`disabled_devices` only claim what the real `xinput` commands confirmed.
+Targeting is never applied on the default shared display.
 
 With `--seat-display xvfb` or `xephyr`, the supervisor starts a private X
 server before each seat. A missing `Xvfb` (or `Xephyr` for the nested backend) is
@@ -1068,6 +1151,17 @@ The default suite covers:
   release failure retention and retry, helper crash detection and re-grab
   without respawning the node, cross-seat conflict failure, dry-run no-helper,
   and default isolation off.
+- Input targeting (`tests/input_targeting.rs`): `xinput list` classification,
+  exact disable-other/enable-own argv and `DISPLAY`/`XAUTHORITY` environment,
+  core devices untouched, missing own device failing before any mutation,
+  release re-enable/idempotence, and rollback on disable/enable failure.
+- Input-targeting supervisor integration (`tests/input_targeting_supervisor.rs`):
+  display → helper grab → target → node order, only-own enabled and cross-seat
+  devices disabled, strict failure without spawn plus helper/display rollback,
+  warn failure still spawning with a typed error and a `input_targeting_failed`
+  note, shared-display no-op, stop re-enable, re-apply after helper restart and
+  display restart without a stale claim, earlier-seat rollback, and a typed
+  release failure.
 - Xrandr ownership argv (`--output/--mode/--pos`), apply/release through a fake
   runner, absent-`xrandr` typed errors, non-xrandr kind rejection, duplicate
   output rejection, and multi-seat apply rollback.
@@ -1195,6 +1289,25 @@ Live smoke (2026-11-25): the private-display test passed with
 `running` with `display_ready=true`, and both stopped cleanly; `/tmp/.X11-unix`
 had no `X90`/`X91` sockets and no `Xvfb` process remained. The host had
 `Xvfb`, `Xephyr` absent, `weston` absent, and `xauth`/`xdpyinfo` present.
+
+The real `xinput` targeting path has its own throwaway-display smoke:
+
+```bash
+OZMA_MULTISEAT_REAL_TARGETING=1 \
+  cargo test -p ozma-multiseat --test live_input_targeting_smoke \
+  -- --ignored --nocapture
+```
+
+It starts one private `Xvfb` at `:90`, lists XInput devices with the real
+`xinput`, asks `ProcessSeatInputTargeter` to target an existing device, verifies
+a missing own uinput name is a typed error, and stops the server. It creates no
+evdev/uinput device and never touches the operator's desktop.
+
+Live targeting smoke (2026-11-25): `Xvfb` started at `:90`; `xinput` saw 6
+devices and the targeter enabled `Virtual core pointer`, reported the typed
+`uinput device(s) not visible` error for a missing `ozma-seat-...` name, released
+the targeting, and stopped `:90` cleanly. No `Xvfb` process or `X90` socket
+remained.
 
 Live smoke (2026-11-25): `--print-plan`, `--dry-run`, and the normal supervisor
 path succeeded against ephemeral Xvfb `:99`/`:97` with read-only sysfs input,

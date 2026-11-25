@@ -133,7 +133,7 @@ impl HelperBackend for RealBackend {
             )
             .with_device(&device.path)
         })?;
-        let name = default_uinput_name(seat_id, &device.path);
+        let name = default_uinput_name(seat_id, device.kind, &device.path);
 
         let mut builder = VirtualDeviceBuilder::new()
             .map_err(|error| uinput_error(&device.path, error))?

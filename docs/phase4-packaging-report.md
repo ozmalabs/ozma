@@ -69,20 +69,37 @@ and writes the enable/rollback commands under the `desktop` profile.
 `XAUTHORITY`, one-line `OZMA_MULTISEAT_ARGS` examples for the opt-in
 ownership/routing/audio/private-display/input-isolation modes, and `RUST_LOG`.
 
-### Meeting detection: no unit
+### Meeting detection: on-demand binary, supervised when requested
 
-`ozma-meeting-detect` has no documented service mode. Its only entry point is a
-foreground IPC server bound to `$XDG_RUNTIME_DIR/ozma-meeting-detect.sock`
-(fallback `/tmp/ozma-meeting-detect.sock`), with no socket-path flag, no
-daemon/system mode, and no controller report wiring. Adding a system unit would
-put the socket somewhere clients cannot predict and would conflict with
-`PrivateTmp`. It is therefore installed as an on-demand binary only:
+`ozma-meeting-detect` still has no system unit. Its entry point is a foreground
+IPC server bound to `--socket <path>`, defaulting to
+`$XDG_RUNTIME_DIR/ozma-meeting-detect.sock` (fallback
+`/tmp/ozma-meeting-detect.sock`). It has no daemon/system mode by design: it
+needs the session that owns the calendar files and PipeWire access.
+
+It is installed as an on-demand binary and can be run by hand:
 
 ```bash
-ozma-meeting-detect --interval 5 --ics-path ~/calendar.ics
+ozma-meeting-detect --interval 5 --ics-path ~/calendar.ics --socket /run/user/$UID/ozma-meeting-detect.sock
 ```
 
-Run it in the session that owns the calendar data. This is documented in
+As of `docs/phase4-meeting-detect-report.md`, the supervisor can own that
+lifecycle explicitly:
+
+```bash
+ozma-virtual-node --meeting-detect --status-port 9555
+```
+
+That spawns the detector with an explicit socket, reports `meeting` in
+`/status`, applies a startup timeout and capped restart backoff, and kills the
+child on shutdown. `--meeting-detect-attach` skips the spawn and attaches to an
+existing socket (for a user/session unit). A missing binary or socket is a typed
+`meeting.error`, not a fabricated detection. The controller exposes the report
+at `GET /api/v1/meeting/status` through `OZMA_SUPERVISOR_STATUS_URL`.
+
+Packaging is deliberately unchanged: the installer still places only the
+binary. Deciding whether a system or user unit should own the socket remains
+host policy because of the calendar/session dependency. This is documented in
 `scripts/systemd/README.md` and
 [`multiseat-rust.md`](multiseat-rust.md#meeting-detection-packaging).
 
@@ -167,9 +184,11 @@ its server.
 - A system `ozma-multiseat.service` still needs a reachable X display and cookie
   (`DISPLAY`, `XAUTHORITY`) or a `systemctl --user` unit for a live session.
   This is documented, not automated: choosing a session cookie is host policy.
-- `ozma-meeting-detect` remains unwired to the controller report path (audit
-  §16.3 item 5) and has no unit by design. Closing that needs a product change,
-  which this packaging pass deliberately avoids.
+- `ozma-meeting-detect` now has a supervisor/controller report path (audit
+  §16.3 item 5), but still no unit by design: it needs the session that owns the
+  calendar and PipeWire. The supervisor can spawn it with
+  `--meeting-detect`, or attach with `--meeting-detect-attach`. Choosing a
+  system/user unit remains host policy, so packaging stays on-demand.
 - No product Rust code or controller Python was changed; the one-release Python
   rollback path (`OZMA_DEMO_BACKEND=python`, `demo/run_demo.sh --python`, and the
   Python trees) is untouched.

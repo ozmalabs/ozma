@@ -25,6 +25,9 @@
 //!   protocol, a testable helper state machine with path/duplicate/cross-seat
 //!   validation, and a non-privileged client for the `ozma-seat-input` helper.
 //!   The helper binary, not this library, opens `/dev/input` and `/dev/uinput`.
+//! * [`input_targeting`] restricts a private X display to one seat's
+//!   helper-created uinput devices through `xinput`, with an injectable
+//!   targeter and a bounded real command runner. Shared displays are a no-op.
 //! * [`ownership`] models per-seat display ownership and builds
 //!   `xrandr --output ... --mode ... --pos ...` commands. On one X server this
 //!   is output positioning, not screen isolation.
@@ -69,6 +72,7 @@ pub mod host;
 pub mod hotplug;
 pub mod input;
 pub mod input_isolation;
+pub mod input_targeting;
 pub mod ownership;
 pub mod persistence;
 pub mod planner;
@@ -94,7 +98,7 @@ pub use fake::{
     FakeCommandRunner, FakeDeviceNameResolver, FakeDisplayBackend, FakeEvdevGrabBackend,
     FakeGrabAction, FakeGrabEvent, FakeHelperBackend, FakeHotplugMonitor, FakeInputBackend,
     FakeNodeLauncher, FakeReadinessProbe, FakeSeatAudioRouter, FakeSeatDisplayLauncher,
-    FakeSeatInputHelper, FakeSeatSupervisor,
+    FakeSeatInputHelper, FakeSeatInputTargeter, FakeSeatSupervisor,
 };
 pub use host::HostTopology;
 pub use hotplug::{
@@ -108,11 +112,16 @@ pub use input::{
 };
 pub use input_isolation::{
     decode_request, decode_response, default_uinput_name, encode_request, encode_response,
-    helper_devices, validate_device_path, HelperBackend, HelperBackendKind, HelperClient,
-    HelperClientConfig, HelperDevice, HelperError, HelperErrorCode, HelperRequest, HelperResponse,
-    HelperSeatStatus, InputIsolationAssignment, InputIsolationHelper, InputIsolationRelease,
-    SeatInputHelper, DEVICE_PATH_PREFIX, HELPER_PROGRAM, HELPER_PROTOCOL_VERSION,
-    INPUT_ISOLATION_ROUTER_NAME,
+    helper_devices, is_uinput_name, uinput_kind_token, validate_device_path, HelperBackend,
+    HelperBackendKind, HelperClient, HelperClientConfig, HelperDevice, HelperError,
+    HelperErrorCode, HelperRequest, HelperResponse, HelperSeatStatus, InputIsolationAssignment,
+    InputIsolationHelper, InputIsolationRelease, SeatInputHelper, DEVICE_PATH_PREFIX,
+    HELPER_PROGRAM, HELPER_PROTOCOL_VERSION, INPUT_ISOLATION_ROUTER_NAME, UINPUT_NAME_PREFIX,
+};
+pub use input_targeting::{
+    BoundedProcessCommandRunner, InputTargetingMode, ProcessSeatInputTargeter,
+    SeatInputTargetRequest, SeatInputTargeter, SeatInputTargeting, SeatInputTargetingRelease,
+    DEFAULT_INPUT_TARGET_TIMEOUT, TARGETING_PROGRAM,
 };
 pub use ownership::{
     apply_ownership, DisplayOwnership, DisplayOwnershipController, DisplayOwnershipKind,

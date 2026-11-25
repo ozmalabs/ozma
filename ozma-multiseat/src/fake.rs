@@ -15,9 +15,12 @@ use crate::error::MultiseatError;
 use crate::hotplug::{HotplugEvent, HotplugMonitor};
 use crate::input::{InputBackend, InputDevice};
 use crate::input_isolation::{
-    default_uinput_name, HelperBackend, HelperBackendKind, HelperDevice, HelperError,
-    HelperErrorCode, HelperResponse, HelperSeatStatus, InputIsolationAssignment,
+    default_uinput_name, is_uinput_name, HelperBackend, HelperBackendKind, HelperDevice,
+    HelperError, HelperErrorCode, HelperResponse, HelperSeatStatus, InputIsolationAssignment,
     InputIsolationRelease, SeatInputHelper, HELPER_PROTOCOL_VERSION,
+};
+use crate::input_targeting::{
+    SeatInputTargetRequest, SeatInputTargeter, SeatInputTargeting, SeatInputTargetingRelease,
 };
 use crate::routing::{
     CommandOutput, CommandRunner, DeviceNameResolver, EvdevGrabBackend, EvdevGrabRequest,
@@ -1398,7 +1401,7 @@ impl HelperBackend for FakeHelperBackend {
             );
         }
         let name = if state.next_uinput == 0 {
-            default_uinput_name(seat_id, &device.path)
+            default_uinput_name(seat_id, device.kind, &device.path)
         } else {
             format!("fake-uinput-{}-{}", seat_id, state.next_uinput)
         };
@@ -1650,7 +1653,7 @@ impl SeatInputHelper for FakeSeatInputHelper {
         let grabbed: Vec<String> = devices.iter().map(|device| device.path.clone()).collect();
         let uinput_devices: Vec<String> = devices
             .iter()
-            .map(|device| default_uinput_name(seat_id, &device.path))
+            .map(|device| default_uinput_name(seat_id, device.kind, &device.path))
             .collect();
         state.assignments.insert(
             seat_id.to_owned(),
@@ -1701,5 +1704,222 @@ impl SeatInputHelper for FakeSeatInputHelper {
         state.alive = false;
         state.assignments.clear();
         state.events.push("shutdown".to_owned());
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeInputTargeterState {
+    available: Option<Vec<String>>,
+    requests: Vec<SeatInputTargetRequest>,
+    applied: BTreeMap<String, SeatInputTargeting>,
+    released: Vec<String>,
+    cleared: Vec<String>,
+    events: Vec<String>,
+    fail_next: Option<String>,
+    fail_seat: Option<String>,
+    fail_next_release: Option<String>,
+}
+
+/// Test-only [`SeatInputTargeter`] with the same enable/disable classification
+/// as the real `xinput` targeter. It never starts a process or opens a display.
+#[derive(Clone, Debug, Default)]
+pub struct FakeSeatInputTargeter {
+    state: Arc<Mutex<FakeInputTargeterState>>,
+}
+
+impl FakeSeatInputTargeter {
+    /// A targeter that treats every requested own device as present and finds
+    /// no other-seat devices unless [`Self::with_available_devices`] is used.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Supply the simulated `xinput list` names for the display. Names starting
+    /// with `ozma-seat-` that are not own devices are disabled.
+    pub fn with_available_devices(self, devices: Vec<String>) -> Self {
+        self.state.lock().expect("fake targeter lock").available = Some(devices);
+        self
+    }
+
+    /// Fail the next apply with a typed message.
+    pub fn fail_next(self, message: impl Into<String>) -> Self {
+        self.state.lock().expect("fake targeter lock").fail_next = Some(message.into());
+        self
+    }
+
+    /// Always fail applies for one seat.
+    pub fn fail_seat(self, seat_id: impl Into<String>) -> Self {
+        self.state.lock().expect("fake targeter lock").fail_seat = Some(seat_id.into());
+        self
+    }
+
+    /// Fail the next release with a typed message.
+    pub fn fail_next_release(self, message: impl Into<String>) -> Self {
+        self.state
+            .lock()
+            .expect("fake targeter lock")
+            .fail_next_release = Some(message.into());
+        self
+    }
+
+    /// Every request recorded so far, in order.
+    pub fn requests(&self) -> Vec<SeatInputTargetRequest> {
+        self.state
+            .lock()
+            .expect("fake targeter lock")
+            .requests
+            .clone()
+    }
+
+    /// Number of apply calls.
+    pub fn apply_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("fake targeter lock")
+            .requests
+            .len()
+    }
+
+    /// Seat ids passed to `release`, in order.
+    pub fn releases(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake targeter lock")
+            .released
+            .clone()
+    }
+
+    /// Seat ids passed to `clear`, in order.
+    pub fn clears(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake targeter lock")
+            .cleared
+            .clone()
+    }
+
+    /// Recorded events, in order.
+    pub fn events(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake targeter lock")
+            .events
+            .clone()
+    }
+
+    /// Whether a seat currently has an applied targeting.
+    pub fn has_targeting(&self, seat_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("fake targeter lock")
+            .applied
+            .contains_key(seat_id)
+    }
+}
+
+impl SeatInputTargeter for FakeSeatInputTargeter {
+    fn apply(
+        &mut self,
+        request: &SeatInputTargetRequest,
+    ) -> Result<SeatInputTargeting, MultiseatError> {
+        let mut state = self.state.lock().expect("fake targeter lock");
+        state.requests.push(request.clone());
+        if let Some(message) = state.fail_next.take() {
+            state
+                .events
+                .push(format!("target-failed {}", request.seat_id));
+            return Err(MultiseatError::InputTargeting(message));
+        }
+        if state.fail_seat.as_deref() == Some(request.seat_id.as_str()) {
+            state
+                .events
+                .push(format!("target-failed {}", request.seat_id));
+            return Err(MultiseatError::InputTargeting(format!(
+                "injected targeting failure for {}",
+                request.seat_id
+            )));
+        }
+
+        let available = state
+            .available
+            .clone()
+            .unwrap_or_else(|| request.devices.clone());
+        let own: BTreeSet<String> = request.devices.iter().cloned().collect();
+        let missing: Vec<String> = own
+            .iter()
+            .filter(|name| !available.iter().any(|device| device == *name))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            state
+                .events
+                .push(format!("target-failed {}", request.seat_id));
+            return Err(MultiseatError::InputTargeting(format!(
+                "own uinput device(s) not visible: {}",
+                missing.join(", ")
+            )));
+        }
+
+        let mut enabled: Vec<String> = own.iter().cloned().collect();
+        enabled.sort();
+        let mut disabled: Vec<String> = available
+            .iter()
+            .filter(|name| is_uinput_name(name) && !own.contains(*name))
+            .cloned()
+            .collect();
+        disabled.sort();
+        disabled.dedup();
+
+        let targeting = SeatInputTargeting {
+            seat_id: request.seat_id.clone(),
+            display: request.display.clone(),
+            enabled,
+            disabled,
+        };
+        state
+            .events
+            .push(format!("target {} {}", request.seat_id, request.display));
+        state
+            .applied
+            .insert(request.seat_id.clone(), targeting.clone());
+        Ok(targeting)
+    }
+
+    fn release(&mut self, seat_id: &str) -> Result<SeatInputTargetingRelease, MultiseatError> {
+        let mut state = self.state.lock().expect("fake targeter lock");
+        if let Some(message) = state.fail_next_release.take() {
+            state
+                .events
+                .push(format!("target-release-failed {seat_id}"));
+            return Err(MultiseatError::InputTargeting(message));
+        }
+        let reenabled = state
+            .applied
+            .remove(seat_id)
+            .map(|targeting| targeting.disabled)
+            .unwrap_or_default();
+        state.released.push(seat_id.to_owned());
+        state.events.push(format!("target-release {seat_id}"));
+        Ok(SeatInputTargetingRelease {
+            seat_id: seat_id.to_owned(),
+            reenabled,
+            warnings: Vec::new(),
+        })
+    }
+
+    fn status_for(&self, seat_id: &str) -> Option<SeatInputTargeting> {
+        self.state
+            .lock()
+            .expect("fake targeter lock")
+            .applied
+            .get(seat_id)
+            .cloned()
+    }
+
+    fn clear(&mut self, seat_id: &str) {
+        let mut state = self.state.lock().expect("fake targeter lock");
+        state.applied.remove(seat_id);
+        state.cleared.push(seat_id.to_owned());
+        state.events.push(format!("target-clear {seat_id}"));
     }
 }

@@ -23,6 +23,9 @@ pub enum MeshError {
     #[error("mDNS error: {0}")]
     Mdns(String),
 
+    #[error("Mesh dataplane error: {0}")]
+    Dataplane(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

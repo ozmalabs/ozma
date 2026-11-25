@@ -53,6 +53,7 @@ fn options() -> SupervisorOptions {
         apply_ownership: false,
         apply_routing: false,
         input_isolation: false,
+        input_targeting: Default::default(),
         seat_display: Default::default(),
     }
 }

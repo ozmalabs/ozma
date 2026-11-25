@@ -7,13 +7,16 @@ This change wires the existing `ozma-mesh` crate into `ozma-node` as an
 
 * `ozma-mesh`: a small peer-status API (`MeshManager::peer_statuses`), an honest
   `MeshManager::stop`, and `MeshManager` is now `Sync` (the libmdns responder
-  handles live behind a `Mutex`) so node async traits can call it.
+  handles live behind a `Mutex`) so node async traits can call it. It also owns
+  a typed, injectable Linux dataplane (TUN link, routes, IPv4 forwarding, and
+  opt-in NAT) in [`dataplane`](phase4-mesh-dataplane-report.md).
 * `ozma-node`: new `mesh_service` module, `--mesh*` CLI/env flags, guarded
-  `/api/v1/connect/{status,peers,events}` routes, startup/shutdown wiring.
+  `/api/v1/connect/{status,peers,events}` routes, startup/shutdown wiring, and
+  optional `--mesh-dataplane` lifecycle wiring.
 * `controller/api.py`: node-scoped mesh/Connect passthrough routes that send the
   node bearer token and preserve typed `supported:false` responses.
-* Tests: in-memory fake mesh backend, node route tests, and controller proxy
-  tests.
+* Tests: in-memory fake mesh backend, fake dataplane command/sysfs seams, node
+  route tests, and controller proxy tests.
 
 `docs/parity-matrix.md` and `docs/plan-execution-status.md` were intentionally
 not edited.
@@ -27,6 +30,10 @@ Mesh is off unless `--mesh` / `OZMA_MESH` is supplied. Without it:
 * `GET /api/v1/connect/status` returns HTTP 200 with
   `state:"not-configured"`, `available:false`, and **no** peer count or peer
   list.
+
+The kernel dataplane is a second explicit opt-in (`--mesh-dataplane`). Without
+it no TUN device is created, no route/forwarding/NAT state is touched, and the
+status document has no `dataplane` field.
 
 A Python soft node that does not serve these routes keeps its previous behavior;
 the controller only adds new node-scoped routes and returns the node's plain
@@ -42,6 +49,12 @@ the controller only adds new node-scoped routes and returns the node's plain
 | `--mesh-key-file` | `OZMA_MESH_KEY_FILE` | Base64 X25519 WireGuard private-key file. |
 | `--mesh-kernel` | `OZMA_MESH_KERNEL` | Request kernel WireGuard (root + `wg`). Kernel mode is **not implemented** and reports a typed unsupported state. |
 | `--mesh-peer` | `OZMA_MESH_PEER` | Repeatable JSON `MeshNode` peer object. |
+| `--mesh-dataplane` | `OZMA_MESH_DATAPLANE` | Opt in to the kernel TUN/routing/forwarding dataplane. Requires root, `/dev/net/tun`, and `ip`. |
+| `--mesh-tun` | `OZMA_MESH_TUN` | TUN interface name (default `ozma0`). |
+| `--mesh-mtu` | `OZMA_MESH_MTU` | TUN MTU (default `1420`). |
+| `--mesh-prefix-len` | `OZMA_MESH_PREFIX_LEN` | Mesh prefix length (default `24`). |
+| `--mesh-dataplane-nat` | `OZMA_MESH_DATAPLANE_NAT` | Explicitly opt in to nftables masquerade (requires `nft`). |
+| `--mesh-nat-out` | `OZMA_MESH_NAT_OUT` | NAT egress interface; without it, non-mesh egress is masqueraded. |
 
 The private key is only read from the key file; it is never serialized, logged,
 or included in any status document. `MeshIdentity` contains the public key only.
@@ -71,6 +84,36 @@ Event log:
   typed errors, with monotonic `seq` and Unix-millisecond timestamps.
 * `GET /api/v1/connect/events?limit=N` clamps `N` to the capacity.
 
+### Dataplane lifecycle (opt-in)
+
+When `--mesh-dataplane` is set, `MeshService` starts the dataplane **before**
+the WireGuard manager, so a missing TUN device, root, or `ip` never leaves a
+WireGuard socket bound. A manager start failure tears the dataplane back down.
+`state:"running"` and `available:true` require both the WireGuard manager and
+the dataplane to be running; a failed or still-starting dataplane is reported
+as `failed`/`starting`, never as `running`.
+
+The dataplane status object is separate from peer handshake state:
+
+```json
+"dataplane": {
+  "configured": true,
+  "state": "running",
+  "interface": "ozma0",
+  "address": "10.200.9.1/24",
+  "mtu": 1420,
+  "up": true,
+  "forwarding": true,
+  "routes": ["10.200.9.2/32"],
+  "nat": false
+}
+```
+
+A failure adds a typed `last_error` (`code`/`reason`). Adding a peer and
+programming its route never marks that peer `established`; only a real
+boringtun handshake does. See
+[`phase4-mesh-dataplane-report.md`](phase4-mesh-dataplane-report.md).
+
 Typed prerequisites (`MeshServiceError.code`):
 
 | Code | Meaning |
@@ -85,6 +128,10 @@ Typed prerequisites (`MeshServiceError.code`):
 | `mesh.kernel-unsupported` | Root/`wg` are present but kernel mode is not implemented. |
 | `mesh.peer-invalid` | Configured peer JSON/address is invalid. |
 | `mesh.peer-already-exists` / `mesh.peer-not-found` | Typed peer-table errors. |
+| `mesh.dataplane-unavailable` | `/dev/net/tun`, `ip`, or (for NAT) `nft` is unavailable. |
+| `mesh.dataplane-invalid` | TUN name, address/prefix, MTU, peer route, or NAT table/interface is invalid. |
+| `mesh.dataplane-not-configured` | A dataplane operation was attempted with no configuration. |
+| `mesh.dataplane-command-failed` | `ip`/`nft` exited non-zero; the applied steps are rolled back. |
 | `mesh.start-failed` | Runtime bind/mDNS/start failure. |
 | `mesh.not-running` | Peer operation attempted while stopped. |
 
@@ -109,7 +156,8 @@ Status includes:
   disabled);
 * `enabled`, `state`, `available`, `wireguard` (`userspace-boringtun`,
   `not-configured`, or `unavailable`);
-* optional `identity`, `peer_count`, `peers`, `event_count`, `event_capacity`;
+* optional `identity`, `dataplane`, `peer_count`, `peers`, `event_count`,
+  `event_capacity`;
 * typed `code`/`reason` when unavailable.
 
 Typed 501 body:
@@ -150,8 +198,8 @@ proxied; a test asserts it still returns the Connect account/tier document.
 
 Run for this change:
 
-* `cargo test -p ozma-mesh -p ozma-node --lib` — **440 passed, 3 ignored**
-  (`ozma-node` lib; `ozma-mesh` has no lib tests).
+* `cargo test -p ozma-mesh -p ozma-node --lib` — **514 passed, 4 ignored**
+  (`ozma-mesh`: 12 passed, 1 ignored; `ozma-node`: 502 passed, 3 ignored).
 * `cargo check -p ozma-mesh -p ozma-node --all-targets` — passes (pre-existing
   warnings only).
 * `python3 -m pytest tests/unit/controller/test_mesh_connect_proxy.py -q` —
@@ -162,32 +210,40 @@ Coverage includes:
 
 * fake backend start/stop, peer add/remove/duplicate, tunnel state transitions,
   bounded events, key/root/`wg` typed errors, unsupported status, failed start;
+* fake dataplane command/sysfs seams: exact argv/order, forward/rollback,
+  idempotent stop, NAT opt-in, route add/remove, root/TUN/tool typed errors,
+  address/MTU/interface validation, and a `starting` status seen mid-command;
 * node routes for not-configured (no counts/peers), typed 501, running with real
   `peer_count:0`/`peers:[]`, and peers/events after a real add;
+* node dataplane status for stopped/starting/running/failed, no fake `running`,
+  and peer add/remove programming routes without claiming a handshake;
 * controller token forwarding, status/capability discovery, typed 501
   passthrough, Python-node 404, auth-failure mapping, and unchanged global
   Connect status.
 
-No test requires root, a real WireGuard interface, a network namespace, or a
-real peer.
+No default test requires root, a real WireGuard interface, a real TUN device, a
+network namespace, or a real peer. One live dataplane test is `#[ignore]`d and
+additionally gated by `OZMA_MESH_LIVE=1`.
 
 ## Honest remaining gaps (modelled or unwired)
 
 * **Kernel WireGuard is not implemented.** `--mesh-kernel` only produces typed
   `mesh.root-required`, `mesh.wg-missing`, or `mesh.kernel-unsupported`; all
   traffic uses userspace boringtun.
-* **No root/wg requirement for the default backend.** Userspace boringtun needs
-  neither, so those checks only apply to the requested kernel mode. The node
-  does not create a TUN interface, install routes, or touch nftables/iptables.
+* **No root/wg requirement for the default WireGuard backend.** Userspace
+  boringtun needs neither. Root/TUN/`ip` are required only when
+  `--mesh-dataplane` is explicitly enabled; NAT additionally requires `nft`.
 * **No mDNS browsing in the node service.** `MeshManager` advertises
   `_ozma._udp.local`, but peer discovery is not consumed: peers must be supplied
-  with `--mesh-peer`. The existing `mdns::browse_peers` helper is not wired.
+  with `--mesh-peer` or runtime peer management. The existing
+  `mdns::browse_peers` helper is not wired.
 * **No automatic handshake/peer promotion.** Adding a peer starts idle; there is
   no node route to initiate a handshake or authenticate/authorize peers. A real
   established state requires an external peer to complete a handshake.
-* **No dataplane routing.** `MeshManager` can encapsulate/decapsulate packets,
-  but the node does not connect the plaintext side to a TUN device, forward
-  traffic, or expose mesh IP services.
+* **No dataplane packet pump.** `MeshManager` can encapsulate/decapsulate
+  packets and the optional dataplane creates/routes a TUN link, but no process
+  owns the TUN fd or moves plaintext between the link and boringtun yet. See
+  [`phase4-mesh-dataplane-report.md`](phase4-mesh-dataplane-report.md).
 * **No key generation/persistence/rotation.** The operator supplies a key file;
   the node neither creates one nor persists a generated identity.
 * **No controller cloud relay integration.** This wires node-local mesh state

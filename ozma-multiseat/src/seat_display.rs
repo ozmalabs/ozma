@@ -174,6 +174,12 @@ pub enum SeatDisplayNoteKind {
     /// xinput mapping was requested but has no physical pointer inside the
     /// private X server.
     XinputRoutingUnsupported,
+    /// The private display could not be restricted to the seat's uinput
+    /// devices. Full display input isolation is not claimed.
+    InputTargetingFailed,
+    /// Input targeting was requested for a private display but no targeter or
+    /// targeting policy was configured.
+    InputTargetingUnavailable,
     /// `xauth` was unavailable, so the server used `-ac` on its Unix socket.
     AuthDisabled,
 }
@@ -184,6 +190,8 @@ impl SeatDisplayNoteKind {
         match self {
             Self::OwnershipUnsupported => "ownership_unsupported",
             Self::XinputRoutingUnsupported => "xinput_routing_unsupported",
+            Self::InputTargetingFailed => "input_targeting_failed",
+            Self::InputTargetingUnavailable => "input_targeting_unavailable",
             Self::AuthDisabled => "auth_disabled",
         }
     }

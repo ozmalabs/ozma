@@ -5,12 +5,14 @@
 //! [`ClientMessage`] frames to query state or force a re-scan.
 //!
 //! # Socket path
+//! `--socket <path>` overrides the default
 //! `$XDG_RUNTIME_DIR/ozma-meeting-detect.sock`
-//! (fallback: `/tmp/ozma-meeting-detect.sock`)
+//! (fallback: `/tmp/ozma-meeting-detect.sock`). The supervisor passes an
+//! explicit path so it can own the socket lifecycle.
 //!
 //! # Usage
 //! ```text
-//! ozma-meeting-detect [--interval <secs>] [--ics-path <path>] ...
+//! ozma-meeting-detect [--interval <secs>] [--ics-path <path>] [--socket <path>]
 //! ```
 
 mod ipc;
@@ -41,6 +43,7 @@ fn parse_args() -> Args {
     let mut iter = std::env::args().skip(1).peekable();
     let mut interval: u64 = 5;
     let mut ics_paths: Vec<PathBuf> = Vec::new();
+    let mut socket_override: Option<PathBuf> = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -54,13 +57,20 @@ fn parse_args() -> Args {
                     ics_paths.push(PathBuf::from(v));
                 }
             }
+            "--socket" | "-s" => {
+                if let Some(v) = iter.next() {
+                    socket_override = Some(PathBuf::from(v));
+                }
+            }
             _ => {}
         }
     }
 
-    let socket_path = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(|d| PathBuf::from(d).join("ozma-meeting-detect.sock"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/ozma-meeting-detect.sock"));
+    let socket_path = socket_override.unwrap_or_else(|| {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(|d| PathBuf::from(d).join("ozma-meeting-detect.sock"))
+            .unwrap_or_else(|| PathBuf::from("/tmp/ozma-meeting-detect.sock"))
+    });
 
     Args {
         poll_interval_secs: interval,
@@ -153,7 +163,7 @@ async fn main() {
         poll_interval: Duration::from_secs(args.poll_interval_secs),
         extra_ics_paths: args.extra_ics_paths,
     };
-    let _detector = MeetingDetector::new(config, tx.clone()).spawn();
+    let _detector = MeetingDetector::new(config, tx.clone()).spawn(Arc::clone(&force_scan));
 
     // Graceful shutdown on SIGINT / SIGTERM.
     {

@@ -20,7 +20,9 @@ mod agent;
 mod audio_provisioning;
 mod discovery;
 mod evdev_provisioning;
+mod ipc;
 mod manager;
+mod meeting;
 mod provisioning;
 mod status;
 mod supervisor;
@@ -142,6 +144,46 @@ struct Args {
     /// included in `/status`, `/metrics`, `/health`, or logs.
     #[arg(long, default_value = "", env = "OZMA_NODE_API_TOKEN", hide = true)]
     child_api_token: String,
+
+    /// Opt in to meeting detection and report it in `GET /status`
+    ///
+    /// Off by default. When enabled, the supervisor starts
+    /// `ozma-meeting-detect` and polls its Unix-socket IPC snapshot. A missing
+    /// binary or socket is reported as typed `meeting.error`, never as a
+    /// detected meeting.
+    #[arg(long)]
+    meeting_detect: bool,
+
+    /// Attach to an existing detector socket instead of spawning the binary
+    ///
+    /// Requires --meeting-detect. Useful when the detector is started by a
+    /// session unit that owns the calendar and PipeWire access.
+    #[arg(long, requires = "meeting_detect")]
+    meeting_detect_attach: bool,
+
+    /// Path to the `ozma-meeting-detect` binary
+    #[arg(long, default_value = "ozma-meeting-detect", value_name = "PATH")]
+    meeting_detect_bin: PathBuf,
+
+    /// Detector IPC socket path (defaults to `$XDG_RUNTIME_DIR/ozma-meeting-detect.sock`)
+    #[arg(long, default_value = "", value_name = "PATH")]
+    meeting_detect_socket: String,
+
+    /// How often to poll the detector snapshot, in milliseconds
+    #[arg(long, default_value_t = 2000)]
+    meeting_detect_poll_interval_ms: u64,
+
+    /// Connect/snapshot timeout for the detector, in milliseconds
+    #[arg(long, default_value_t = 3000)]
+    meeting_detect_timeout_ms: u64,
+
+    /// Detector process scan interval in seconds (passed as --interval)
+    #[arg(long, default_value_t = 5)]
+    meeting_detect_interval_secs: u64,
+
+    /// ICS calendar path passed to the detector (repeatable)
+    #[arg(long = "meeting-detect-ics-path", value_name = "PATH")]
+    meeting_detect_ics_paths: Vec<PathBuf>,
 
     /// Opt in to the child `--hls` pipeline (capture → ffmpeg → `/stream/*`)
     ///
@@ -800,6 +842,30 @@ async fn main() -> anyhow::Result<()> {
     // spawning any work.
     mgr.validate()?;
 
+    // Meeting detection is opt-in. The bridge owns the child/socket lifecycle
+    // and publishes a bounded report through `/status`; disabled keeps the
+    // historical document shape (with `meeting.state = "disabled"`).
+    let meeting_socket = {
+        let value = args.meeting_detect_socket.trim();
+        if value.is_empty() {
+            meeting::default_socket_path()
+        } else {
+            PathBuf::from(value)
+        }
+    };
+    let meeting_options = meeting::MeetingDetectOptions {
+        enabled: args.meeting_detect,
+        manage_child: !args.meeting_detect_attach,
+        binary: args.meeting_detect_bin,
+        socket_path: meeting_socket,
+        detector_interval: Duration::from_secs(args.meeting_detect_interval_secs.max(1)),
+        ics_paths: args.meeting_detect_ics_paths,
+        poll_interval: Duration::from_millis(args.meeting_detect_poll_interval_ms.max(100)),
+        request_timeout: Duration::from_millis(args.meeting_detect_timeout_ms.max(100)),
+        ..meeting::MeetingDetectOptions::default()
+    };
+    let (meeting_rx, meeting_task) = meeting::start(meeting_options, mgr.subscribe_shutdown());
+
     // Optional read-only status/metrics listener for the whole supervisor.
     if args.status_port != 0 {
         let listener = status::bind(args.status_port).await?;
@@ -810,8 +876,11 @@ async fn main() -> anyhow::Result<()> {
         );
         let status_mgr = Arc::clone(&mgr);
         let shutdown = mgr.subscribe_shutdown();
+        let meeting_rx = meeting_rx.clone();
         tokio::spawn(async move {
-            if let Err(error) = status::serve(status_mgr, listener, bound_port, shutdown).await {
+            if let Err(error) =
+                status::serve(status_mgr, listener, bound_port, shutdown, meeting_rx).await
+            {
                 tracing::warn!("Supervisor status API stopped: {}", error);
             }
         });
@@ -840,6 +909,16 @@ async fn main() -> anyhow::Result<()> {
     });
 
     mgr.run().await?;
+
+    // `run` returns after the shutdown watch flips; the meeting bridge observes
+    // the same signal. Give it a bounded window to kill its child and publish
+    // `stopped`.
+    if tokio::time::timeout(Duration::from_secs(5), meeting_task)
+        .await
+        .is_err()
+    {
+        warn!("Meeting detector bridge did not stop within 5s");
+    }
     Ok(())
 }
 

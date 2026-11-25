@@ -9,6 +9,7 @@
 //! 4. serve the versioned node API;
 //! 5. run the UAC2 audio bridge when the `audio` capability is present.
 
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -717,6 +718,34 @@ pub struct Args {
     /// Additional mesh peer as a JSON `MeshNode` object. Repeatable.
     #[arg(long = "mesh-peer", env = "OZMA_MESH_PEER", value_name = "JSON")]
     pub mesh_peer: Vec<String>,
+
+    /// Program a kernel mesh dataplane (TUN link, peer routes, IPv4 forwarding).
+    ///
+    /// Off by default. Requires root, `/dev/net/tun`, and `ip`; failure is a
+    /// typed dataplane error and never a fabricated interface.
+    #[arg(long, env = "OZMA_MESH_DATAPLANE")]
+    pub mesh_dataplane: bool,
+
+    /// TUN interface name used by `--mesh-dataplane`.
+    #[arg(long, env = "OZMA_MESH_TUN", default_value = "ozma0")]
+    pub mesh_tun: String,
+
+    /// TUN MTU used by `--mesh-dataplane`.
+    #[arg(long, env = "OZMA_MESH_MTU", default_value_t = 1420)]
+    pub mesh_mtu: u16,
+
+    /// Mesh prefix length used by `--mesh-dataplane`.
+    #[arg(long, env = "OZMA_MESH_PREFIX_LEN", default_value_t = 24)]
+    pub mesh_prefix_len: u8,
+
+    /// Opt in to NAT/masquerade for mesh traffic (`nft` must be available).
+    #[arg(long, env = "OZMA_MESH_DATAPLANE_NAT")]
+    pub mesh_dataplane_nat: bool,
+
+    /// NAT egress interface. Without it, traffic leaving any interface other
+    /// than the mesh TUN is masqueraded.
+    #[arg(long, env = "OZMA_MESH_NAT_OUT", value_name = "IFACE")]
+    pub mesh_nat_out: Option<String>,
 
     /// Report the persisted multiseat plan/status at `GET /api/v1/seats`.
     ///
@@ -3527,6 +3556,53 @@ fn multiseat_display_names(config: &NodeConfig) -> Vec<String> {
 /// Returns `None` when `--mesh` is absent, so a node without mesh config keeps
 /// its previous behavior. A configured-but-unsupported node gets an explicit
 /// typed service instead of an error that would hide the reason.
+/// Build the optional kernel dataplane request from CLI configuration.
+///
+/// Address/peer parsing is intentionally lenient here: invalid values produce
+/// an explicit `DataplaneConfig` so the service preflight reports the typed
+/// `mesh.ip-invalid` / `mesh.dataplane-invalid` state instead of guessing.
+fn build_dataplane_config(
+    args: &Args,
+    peers: &[ozma_mesh::MeshNode],
+) -> Option<ozma_mesh::dataplane::DataplaneConfig> {
+    if !args.mesh_dataplane {
+        return None;
+    }
+
+    let address = args
+        .mesh_ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<Ipv4Addr>().ok())
+        .unwrap_or(Ipv4Addr::UNSPECIFIED);
+    let peer_routes = peers
+        .iter()
+        .map(|peer| {
+            peer.mesh_ip
+                .parse::<Ipv4Addr>()
+                .unwrap_or(Ipv4Addr::UNSPECIFIED)
+        })
+        .collect();
+
+    let mut config = ozma_mesh::dataplane::DataplaneConfig::new(
+        args.mesh_tun.clone(),
+        address,
+        args.mesh_prefix_len,
+        args.mesh_mtu,
+    )
+    .with_peer_routes(peer_routes);
+
+    if args.mesh_dataplane_nat {
+        let mut nat = ozma_mesh::dataplane::NatConfig::new();
+        if let Some(out_interface) = &args.mesh_nat_out {
+            nat = nat.with_out_interface(out_interface.clone());
+        }
+        config = config.with_nat(nat);
+    }
+    Some(config)
+}
+
 fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
     if !args.mesh {
         return None;
@@ -3556,7 +3632,8 @@ fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
         key_file: args.mesh_key_file.clone(),
         requires_root: args.mesh_kernel,
         requires_wg: args.mesh_kernel,
-        peers,
+        peers: peers.clone(),
+        dataplane: build_dataplane_config(args, &peers),
         event_capacity: None,
     };
     let environment = mesh_service::MeshEnvironment::detect();
@@ -4287,5 +4364,57 @@ mod tests {
     fn multiseat_requires_a_seats_file() {
         assert!(Args::try_parse_from(["ozma-node", "--multiseat"]).is_err());
         assert!(Args::try_parse_from(["ozma-node", "--multiseat-plan"]).is_err());
+    }
+
+    #[test]
+    fn mesh_dataplane_is_off_by_default_and_nat_is_opt_in() {
+        let defaults = Args::parse_from(["ozma-node"]);
+        assert!(!defaults.mesh_dataplane);
+        assert!(defaults.mesh_ip.is_none());
+        assert_eq!(defaults.mesh_tun, "ozma0");
+        assert_eq!(defaults.mesh_mtu, 1420);
+        assert_eq!(defaults.mesh_prefix_len, 24);
+        assert!(!defaults.mesh_dataplane_nat);
+        assert!(defaults.mesh_nat_out.is_none());
+        assert!(build_dataplane_config(&defaults, &[]).is_none());
+
+        let args = Args::parse_from([
+            "ozma-node",
+            "--mesh",
+            "--mesh-ip",
+            "10.200.9.1",
+            "--mesh-dataplane",
+            "--mesh-dataplane-nat",
+            "--mesh-nat-out",
+            "eth0",
+            "--mesh-mtu",
+            "1400",
+            "--mesh-prefix-len",
+            "16",
+        ]);
+        let (peer, _key) = ozma_mesh::MeshNode::generate("peer", "10.200.9.2", 51_821);
+        let config = build_dataplane_config(&args, &[peer]).unwrap();
+        assert_eq!(config.interface, "ozma0");
+        assert_eq!(config.address, Ipv4Addr::new(10, 200, 9, 1));
+        assert_eq!(config.prefix_len, 16);
+        assert_eq!(config.mtu, 1400);
+        assert_eq!(config.peer_routes, vec![Ipv4Addr::new(10, 200, 9, 2)]);
+        assert!(config.forwarding);
+        let nat = config.nat.unwrap();
+        assert_eq!(nat.table, "ozma_mesh");
+        assert_eq!(nat.out_interface.as_deref(), Some("eth0"));
+
+        let without_nat = Args::parse_from([
+            "ozma-node",
+            "--mesh",
+            "--mesh-ip",
+            "10.200.9.1",
+            "--mesh-dataplane",
+        ]);
+        let config = build_dataplane_config(&without_nat, &[]).unwrap();
+        assert!(
+            config.nat.is_none(),
+            "NAT must never be implicit when --mesh-dataplane is set"
+        );
     }
 }

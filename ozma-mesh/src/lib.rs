@@ -38,6 +38,7 @@
 //! }
 //! ```
 
+pub mod dataplane;
 pub mod error;
 pub mod keys;
 pub mod manager;
@@ -45,6 +46,10 @@ pub mod node;
 pub mod tunnel;
 
 // Convenience re-exports — `use ozma_mesh::{MeshManager, MeshNode, ...}`.
+pub use dataplane::{
+    CommandRunner, CommandSpec, DataplaneConfig, DataplaneError, DataplaneState, DataplaneStatus,
+    FileOpener, MeshDataplane, NatConfig, Sysfs,
+};
 pub use error::{MeshError, Result};
 pub use manager::{MeshManager, PeerStatus};
 pub use node::{MeshNode, WgPrivateKey, WgPublicKey};

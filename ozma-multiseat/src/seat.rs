@@ -408,6 +408,8 @@ pub enum ResourceKind {
     Routing,
     /// Per-seat privileged input isolation (`EVIOCGRAB` + uinput helper).
     InputIsolation,
+    /// Restricting a private X display to the seat's helper uinput devices.
+    InputTargeting,
     /// Per-seat PipeWire/PulseAudio null sink.
     Audio,
 }
@@ -419,6 +421,7 @@ impl ResourceKind {
             Self::Ownership => "ownership",
             Self::Routing => "routing",
             Self::InputIsolation => "input_isolation",
+            Self::InputTargeting => "input_targeting",
             Self::Audio => "audio",
         }
     }
@@ -476,6 +479,10 @@ pub struct SeatResourceStatus {
     /// uinput devices, and they have not been released.
     #[serde(default)]
     pub input_isolation_applied: bool,
+    /// The seat's private X display was restricted to its own uinput devices
+    /// and that restriction has not been released.
+    #[serde(default)]
+    pub input_targeting_applied: bool,
     /// Ownership was released after being applied (or a previous release was
     /// retried successfully).
     #[serde(default)]
@@ -489,12 +496,21 @@ pub struct SeatResourceStatus {
     /// Input isolation was released after being applied.
     #[serde(default)]
     pub input_isolation_released: bool,
+    /// Private-display input targeting was released after being applied.
+    #[serde(default)]
+    pub input_targeting_released: bool,
     /// Devices the helper confirmed as exclusively grabbed for this seat.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub grabbed_device_count: usize,
     /// uinput device names the helper confirmed for this seat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uinput_devices: Vec<String>,
+    /// The subset of `uinput_devices` enabled on the seat's private display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targeted_devices: Vec<String>,
+    /// Other seats' uinput device names disabled on the private display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_devices: Vec<String>,
     /// Apply/release errors, in occurrence order. Best-effort release failures
     /// are reported here without hiding the seat's lifecycle state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -508,12 +524,16 @@ impl SeatResourceStatus {
             && !self.routing_applied
             && !self.audio_applied
             && !self.input_isolation_applied
+            && !self.input_targeting_applied
             && !self.ownership_released
             && !self.routing_released
             && !self.audio_released
             && !self.input_isolation_released
+            && !self.input_targeting_released
             && self.grabbed_device_count == 0
             && self.uinput_devices.is_empty()
+            && self.targeted_devices.is_empty()
+            && self.disabled_devices.is_empty()
             && self.errors.is_empty()
     }
 

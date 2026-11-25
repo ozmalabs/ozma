@@ -238,7 +238,14 @@ impl MeetingDetector {
     }
 
     /// Spawn the polling loop as a Tokio task and return its handle.
-    pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
+    ///
+    /// `force_scan` lets an IPC client trigger an immediate scan. The detector
+    /// then publishes a snapshot even when nothing changed, so a newly connected
+    /// client always receives current state.
+    pub fn spawn(
+        mut self,
+        force_scan: std::sync::Arc<tokio::sync::Notify>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!(
                 interval_secs = self.config.poll_interval.as_secs(),
@@ -252,6 +259,10 @@ impl MeetingDetector {
             loop {
                 tokio::select! {
                     _ = poll_tick.tick() => self.scan_once(),
+                    _ = force_scan.notified() => {
+                        self.scan_once();
+                        self.broadcast_snapshot();
+                    }
                     _ = heartbeat_tick.tick() => {
                         let _ = self.tx.send(ServerMessage::Heartbeat { ts: Utc::now() });
                     }

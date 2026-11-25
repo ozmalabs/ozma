@@ -24,13 +24,14 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use ozma_multiseat::{
     detect_drm, render_metrics, DrmDetection, EvdevGrabRouter, HelperClient, HelperClientConfig,
-    HostTopology, HotplugDebounce, HotplugOptions, HttpHealthProbe, MultiseatPlan,
-    MultiseatPlanner, MultiseatStatus, OzmaAudioRouter, PlannerOptions, PortProbe,
-    ProcessCommandRunner, ProcessLauncher, ProcessSeatDisplayLauncher, ProcessSeatSupervisor,
-    ReadinessProbe, SeatDisplayBackend, SeatDisplayOptions, SeatDisplaySize, SeatDisplayStatus,
-    SeatProfile, SeatReconciler, SeatResourceStatus, SeatState, SeatStore, SeatSupervisor,
-    SupervisorOptions, SysfsHotplugMonitor, SysfsInputBackend, XInputRouter, XrandrDisplayBackend,
-    XrandrOwnershipController, DEFAULT_DEBOUNCE, DEFAULT_HEALTH_PATH, DEFAULT_NODE_BIN,
+    HostTopology, HotplugDebounce, HotplugOptions, HttpHealthProbe, InputTargetingMode,
+    MultiseatPlan, MultiseatPlanner, MultiseatStatus, OzmaAudioRouter, PlannerOptions, PortProbe,
+    ProcessCommandRunner, ProcessLauncher, ProcessSeatDisplayLauncher, ProcessSeatInputTargeter,
+    ProcessSeatSupervisor, ReadinessProbe, SeatDisplayBackend, SeatDisplayOptions, SeatDisplaySize,
+    SeatDisplayStatus, SeatProfile, SeatReconciler, SeatResourceStatus, SeatState, SeatStore,
+    SeatSupervisor, SupervisorOptions, SysfsHotplugMonitor, SysfsInputBackend, XInputRouter,
+    XrandrDisplayBackend, XrandrOwnershipController, DEFAULT_DEBOUNCE, DEFAULT_HEALTH_PATH,
+    DEFAULT_NODE_BIN,
 };
 
 /// Plan and supervise one `ozma-node` per seat on this host.
@@ -55,7 +56,11 @@ use ozma_multiseat::{
                   default off, a failed apply stops that spawn, and earlier seats are released. \
                   `--input-isolation helper` instead asks the privileged `ozma-seat-input` \
                   helper to EVIOCGRAB each seat's devices and create per-seat uinput devices; \
-                  a missing helper or failed grab stops that spawn. `--seats-file` loads/reuses \
+                  with `--seat-display xvfb|xephyr`, `--input-targeting off|warn|strict` then uses \
+                  `xinput` to restrict the private display to those devices. A missing helper \
+                  or failed grab stops that spawn; a targeting failure warns and continues by \
+                  default, or stops the spawn with `--input-targeting strict`. `--seats-file` \
+                  loads/reuses \
                   and atomically updates persisted seat identities; `--hotplug` reconciles \
                   read-only sysfs display/input events; and `--audio-router` ensures/removes \
                   per-seat null sinks. `--print-plan` and `--dry-run` never run routing, \
@@ -138,6 +143,13 @@ struct Args {
     /// Helper binary used by `--input-isolation helper`.
     #[arg(long, default_value = ozma_multiseat::HELPER_PROGRAM, value_name = "PATH")]
     input_helper: PathBuf,
+
+    /// Private-display input targeting policy for `--input-isolation helper`
+    /// with `--seat-display xvfb|xephyr`: `warn` (default) records a typed
+    /// error and continues, `strict` prevents the seat from spawning, and `off`
+    /// never runs `xinput`.
+    #[arg(long, default_value = "warn", value_name = "off|warn|strict")]
+    input_targeting: String,
 
     /// Machine name used to build seat ids (`<machine>-seat-N`).
     #[arg(long, default_value = "ozma")]
@@ -258,6 +270,7 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
 
     let seat_display_backend: SeatDisplayBackend = args.seat_display.parse()?;
     let seat_display_size: SeatDisplaySize = args.seat_display_size.parse()?;
+    let input_targeting_mode: InputTargetingMode = args.input_targeting.parse()?;
     let seat_display_options = SeatDisplayOptions {
         backend: seat_display_backend,
         size: seat_display_size,
@@ -275,6 +288,7 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
         apply_ownership: args.apply_ownership,
         apply_routing: args.apply_routing,
         input_isolation: args.input_isolation == "helper",
+        input_targeting: input_targeting_mode,
         seat_display: seat_display_options.clone(),
     };
 
@@ -324,6 +338,9 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
                 ..HelperClientConfig::default()
             },
         )));
+        if input_targeting_mode != InputTargetingMode::Off {
+            supervisor = supervisor.with_input_targeter(Box::new(ProcessSeatInputTargeter::new()));
+        }
     }
     if let Some(kind) = args.audio_router.as_deref() {
         let router: Box<dyn ozma_multiseat::SeatAudioRouter> = match kind {
@@ -544,6 +561,12 @@ fn validate(args: &Args) -> Result<(), ozma_multiseat::MultiseatError> {
         return Err(ozma_multiseat::MultiseatError::SeatDisplay(format!(
             "unknown seat display {:?}; expected shared, xvfb, or xephyr",
             args.seat_display
+        )));
+    }
+    if !matches!(args.input_targeting.as_str(), "off" | "warn" | "strict") {
+        return Err(ozma_multiseat::MultiseatError::InputTargeting(format!(
+            "unknown input targeting {:?}; expected off, warn, or strict",
+            args.input_targeting
         )));
     }
     let _: SeatDisplaySize = args.seat_display_size.parse()?;
@@ -819,12 +842,16 @@ fn display_summary(display: &SeatDisplayStatus) -> Option<String> {
 
 fn resource_summary(resources: &SeatResourceStatus) -> String {
     let mut summary = format!(
-        " resources(ownership={} routing={} isolation={} audio={})",
+        " resources(ownership={} routing={} isolation={} targeting={} audio={})",
         resource_state(resources.ownership_applied, resources.ownership_released),
         resource_state(resources.routing_applied, resources.routing_released),
         resource_state(
             resources.input_isolation_applied,
             resources.input_isolation_released
+        ),
+        resource_state(
+            resources.input_targeting_applied,
+            resources.input_targeting_released
         ),
         resource_state(resources.audio_applied, resources.audio_released),
     );
@@ -836,6 +863,21 @@ fn resource_summary(resources: &SeatResourceStatus) -> String {
                 "(none)".to_owned()
             } else {
                 resources.uinput_devices.join(",")
+            }
+        ));
+    }
+    if !resources.targeted_devices.is_empty() || !resources.disabled_devices.is_empty() {
+        summary.push_str(&format!(
+            " targeted={} disabled={}",
+            if resources.targeted_devices.is_empty() {
+                "(none)".to_owned()
+            } else {
+                resources.targeted_devices.join(",")
+            },
+            if resources.disabled_devices.is_empty() {
+                "(none)".to_owned()
+            } else {
+                resources.disabled_devices.join(",")
             }
         ));
     }

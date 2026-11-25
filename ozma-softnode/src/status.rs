@@ -30,6 +30,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::manager::VirtualNodeManager;
+use crate::meeting::MeetingDetectStatus;
 use crate::supervisor::NodePorts;
 
 /// Profile name reported by the supervisor's connection document.
@@ -62,6 +63,10 @@ pub struct SupervisorStatus {
     pub supervisor: SupervisorTotals,
     /// One entry per tracked VM, plus excluded VMs (state `excluded`).
     pub vms: Vec<VmStatus>,
+    /// Opt-in meeting-detection bridge report. Defaults to `disabled`, so a
+    /// controller can distinguish an old/inactive supervisor from a live call.
+    #[serde(default)]
+    pub meeting: MeetingDetectStatus,
 }
 
 impl SupervisorStatus {
@@ -90,6 +95,7 @@ impl SupervisorStatus {
             child_poll_timeout_ms: 0,
             supervisor,
             vms,
+            meeting: MeetingDetectStatus::default(),
         }
     }
 }
@@ -335,10 +341,15 @@ pub struct HealthResponse {
 struct StatusState {
     manager: Arc<VirtualNodeManager>,
     status_port: u16,
+    meeting: watch::Receiver<MeetingDetectStatus>,
 }
 
 /// Build the read-only status router.
-pub fn router(manager: Arc<VirtualNodeManager>, status_port: u16) -> Router {
+pub fn router(
+    manager: Arc<VirtualNodeManager>,
+    status_port: u16,
+    meeting: watch::Receiver<MeetingDetectStatus>,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
@@ -347,6 +358,7 @@ pub fn router(manager: Arc<VirtualNodeManager>, status_port: u16) -> Router {
         .with_state(StatusState {
             manager,
             status_port,
+            meeting,
         })
 }
 
@@ -366,8 +378,9 @@ pub async fn serve(
     listener: TcpListener,
     status_port: u16,
     mut shutdown: watch::Receiver<bool>,
+    meeting: watch::Receiver<MeetingDetectStatus>,
 ) -> anyhow::Result<()> {
-    let app = router(manager, status_port);
+    let app = router(manager, status_port, meeting);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             // A dropped sender also ends the wait; the runtime is shutting
@@ -394,6 +407,7 @@ async fn health(State(state): State<StatusState>) -> Json<HealthResponse> {
 async fn status(State(state): State<StatusState>) -> Json<SupervisorStatus> {
     let mut status = state.manager.status().await;
     status.status_port = state.status_port;
+    status.meeting = state.meeting.borrow().refreshed();
     Json(status)
 }
 
@@ -578,7 +592,9 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::ipc::MeetingPlatform;
     use crate::manager::ManagerOptions;
+    use crate::meeting::{MeetingDetectState, MeetingReport, MeetingState};
     use crate::supervisor::testing::FakeNodeLauncher;
     use crate::vm_info::VMInfo;
 
@@ -609,6 +625,14 @@ mod tests {
             .await
             .expect("response body");
         serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    fn meeting_channel() -> watch::Receiver<MeetingDetectStatus> {
+        meeting_channel_with(MeetingDetectStatus::default())
+    }
+
+    fn meeting_channel_with(status: MeetingDetectStatus) -> watch::Receiver<MeetingDetectStatus> {
+        watch::channel(status).1
     }
 
     fn sample_status() -> SupervisorStatus {
@@ -694,6 +718,8 @@ mod tests {
         assert_eq!(json["supervisor"]["next_http_port"], 7710);
         assert_eq!(json["child_poll_interval_ms"], 0);
         assert_eq!(json["child_poll_timeout_ms"], 0);
+        assert_eq!(json["meeting"]["state"], "disabled");
+        assert_eq!(json["meeting"]["meeting_state"], "unknown");
         assert_eq!(json["vms"].as_array().unwrap().len(), 2);
 
         let vm = &json["vms"][0];
@@ -790,7 +816,7 @@ mod tests {
         let mgr = Arc::new(manager(Arc::clone(&launcher)));
         mgr.sync_for_test(vec![vm("vm-a", "/run/ozma/a.sock")])
             .await;
-        let app = router(Arc::clone(&mgr), 9555);
+        let app = router(Arc::clone(&mgr), 9555, meeting_channel());
 
         let health = app
             .clone()
@@ -872,6 +898,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_exposes_a_real_meeting_but_not_paths_or_attendee_addresses() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let mgr = Arc::new(manager(launcher));
+        mgr.sync_for_test(vec![vm("vm-a", "/run/ozma/a.sock")])
+            .await;
+
+        let meeting = MeetingDetectStatus {
+            enabled: true,
+            state: MeetingDetectState::Running,
+            meeting_state: MeetingState::Active,
+            connected: true,
+            manage_child: false,
+            detector_interval_secs: 5,
+            poll_interval_ms: 2000,
+            last_update_unix_ms: Some(1_700_000_000_000),
+            last_detection_unix_ms: Some(1_700_000_000_000),
+            last_detection: Some(MeetingReport {
+                id: "zoom-1".to_owned(),
+                platform: MeetingPlatform::Zoom,
+                active: true,
+                started_at_unix_ms: 1_700_000_000_000,
+                duration_s: None,
+                title: "Standup".to_owned(),
+                organizer: "host@example.test".to_owned(),
+                attendee_count: 3,
+                has_calendar_metadata: true,
+            }),
+            meetings: vec![MeetingReport {
+                id: "zoom-1".to_owned(),
+                platform: MeetingPlatform::Zoom,
+                active: true,
+                started_at_unix_ms: 1_700_000_000_000,
+                duration_s: None,
+                title: "Standup".to_owned(),
+                organizer: "host@example.test".to_owned(),
+                attendee_count: 3,
+                has_calendar_metadata: true,
+            }],
+            ..MeetingDetectStatus::default()
+        };
+
+        let app = router(Arc::clone(&mgr), 9555, meeting_channel_with(meeting));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let document = body_json(response).await;
+
+        assert_eq!(document["meeting"]["state"], "running");
+        assert_eq!(document["meeting"]["meeting_state"], "active");
+        assert_eq!(document["meeting"]["meetings"][0]["platform"], "zoom");
+        assert_eq!(document["meeting"]["meetings"][0]["title"], "Standup");
+        assert_eq!(document["meeting"]["meetings"][0]["attendee_count"], 3);
+        assert!(
+            document["meeting"]["meetings"][0]
+                .get("attendees")
+                .is_none(),
+            "attendee addresses must not be reported"
+        );
+        assert!(
+            document["meeting"].get("socket_path").is_none(),
+            "detector socket paths must not be reported"
+        );
+    }
+
+    #[tokio::test]
     async fn ephemeral_listener_serves_and_shuts_down() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -881,7 +979,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (stop_tx, stop_rx) = watch::channel(false);
 
-        let task = tokio::spawn(serve(Arc::clone(&mgr), listener, address.port(), stop_rx));
+        let task = tokio::spawn(serve(
+            Arc::clone(&mgr),
+            listener,
+            address.port(),
+            stop_rx,
+            meeting_channel(),
+        ));
 
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream
