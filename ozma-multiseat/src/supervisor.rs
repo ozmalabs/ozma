@@ -31,6 +31,10 @@ use crate::routing::{InputRoutePlan, InputRouter, InputRoutingStrategy, InputTar
 use crate::seat::{
     ResourceAction, ResourceKind, SeatPlan, SeatResourceStatus, SeatRuntimeStatus, SeatState,
 };
+use crate::seat_display::{
+    SeatDisplayError, SeatDisplayHandle, SeatDisplayLauncher, SeatDisplayNote, SeatDisplayNoteKind,
+    SeatDisplayOptions, SeatDisplayRequest, SeatDisplayStatus,
+};
 
 /// Default node binary used by the planner and the process launcher.
 pub const DEFAULT_NODE_BIN: &str = "ozma-node";
@@ -363,6 +367,10 @@ pub struct SupervisorOptions {
     /// input) and a helper that is missing or fails a grab is a typed start
     /// failure, never a silent unisolated spawn.
     pub input_isolation: bool,
+    /// Opt-in per-seat X server strategy. `Shared` (the default) starts
+    /// nothing; `Xvfb`/`Xephyr` start a private display before the node and stop
+    /// it after the node.
+    pub seat_display: SeatDisplayOptions,
 }
 
 impl Default for SupervisorOptions {
@@ -378,6 +386,7 @@ impl Default for SupervisorOptions {
             apply_ownership: false,
             apply_routing: false,
             input_isolation: false,
+            seat_display: SeatDisplayOptions::default(),
         }
     }
 }
@@ -401,6 +410,12 @@ struct ManagedSeat {
     input: Option<InputGroup>,
     input_route: Option<InputRoutePlan>,
     resources: SeatResourceStatus,
+    /// Private X server for this seat, when the backend is nested.
+    display: Option<Box<dyn SeatDisplayHandle>>,
+    /// Status for the private X server (or the shared no-op).
+    display_status: SeatDisplayStatus,
+    /// Shared display used as the Xephyr parent window.
+    parent_display: Option<String>,
     state: SeatState,
     child: Option<Box<dyn ChildHandle>>,
     pid: Option<u32>,
@@ -424,6 +439,9 @@ impl ManagedSeat {
             input: plan.input.clone(),
             input_route: plan.input_route.clone(),
             resources: SeatResourceStatus::default(),
+            display: None,
+            display_status: SeatDisplayStatus::shared(),
+            parent_display: plan_parent_display(plan),
             state: SeatState::Planned,
             child: None,
             pid: None,
@@ -445,7 +463,8 @@ impl ManagedSeat {
         let mut status = SeatRuntimeStatus::new(&self.launch.seat_id, self.state)
             .with_process(self.pid, self.launch.udp_port, self.launch.http_port)
             .with_restarts(self.restarts())
-            .with_resources(self.resources.clone());
+            .with_resources(self.resources.clone())
+            .with_display(self.display_status.clone());
         status.last_error = self.last_error.clone();
         if let Some(next) = self.next_restart {
             status.next_restart_in_ms = Some(
@@ -472,17 +491,25 @@ pub struct ProcessSeatSupervisor {
     evdev_routing: Option<Box<dyn InputRouter>>,
     input_helper: Option<Box<dyn SeatInputHelper>>,
     audio: Option<Box<dyn SeatAudioRouter>>,
+    display_launcher: Option<Box<dyn SeatDisplayLauncher>>,
     seats: BTreeMap<String, ManagedSeat>,
 }
 
 impl ProcessSeatSupervisor {
     /// Production supervisor: real processes and HTTP health probes.
+    ///
+    /// When the seat display backend is `Xvfb` or `Xephyr`, a production
+    /// [`crate::seat_display::ProcessSeatDisplayLauncher`] is installed
+    /// automatically. Tests that inject parts must also inject a display
+    /// launcher with [`Self::with_display_launcher`].
     pub fn new(options: SupervisorOptions) -> Self {
+        let display_launcher = display_launcher_for(&options);
         Self::with_parts(
             options,
             Arc::new(ProcessLauncher),
             Arc::new(HttpHealthProbe::default()),
         )
+        .with_optional_display_launcher(display_launcher)
     }
 
     /// Supervisor with injected launcher and readiness probe.
@@ -500,8 +527,29 @@ impl ProcessSeatSupervisor {
             evdev_routing: None,
             input_helper: None,
             audio: None,
+            display_launcher: None,
             seats: BTreeMap::new(),
         }
+    }
+
+    fn with_optional_display_launcher(
+        mut self,
+        launcher: Option<Box<dyn SeatDisplayLauncher>>,
+    ) -> Self {
+        self.display_launcher = launcher;
+        self
+    }
+
+    /// Install the private-X-server spawner used when
+    /// [`SupervisorOptions::seat_display`] selects `xvfb` or `xephyr`.
+    ///
+    /// Without a launcher, a nested start fails with a typed `Unsupported`
+    /// error before a node is spawned. The CLI installs
+    /// [`crate::seat_display::ProcessSeatDisplayLauncher`]; tests inject
+    /// `FakeSeatDisplayLauncher`.
+    pub fn with_display_launcher(mut self, launcher: Box<dyn SeatDisplayLauncher>) -> Self {
+        self.display_launcher = Some(launcher);
+        self
     }
 
     /// Install the xrandr ownership controller used by
@@ -569,6 +617,206 @@ impl ProcessSeatSupervisor {
     /// Number of tracked seats.
     pub fn seat_count(&self) -> usize {
         self.seats.len()
+    }
+
+    /// Whether this seat currently has a private X server.
+    fn display_is_nested(&self, seat_id: &str) -> bool {
+        self.seats
+            .get(seat_id)
+            .is_some_and(|seat| seat.display_status.display_backend.is_nested())
+    }
+
+    fn push_display_note(&mut self, seat_id: &str, note: SeatDisplayNote) {
+        if let Some(seat) = self.seats.get_mut(seat_id) {
+            seat.display_status.push_note(note);
+        }
+    }
+
+    fn set_display_failure(&mut self, seat_id: &str, error: &MultiseatError) {
+        if let Some(seat) = self.seats.get_mut(seat_id) {
+            seat.display_status.display_ready = false;
+            seat.display_status.display_pid = None;
+            seat.display_status.display_error = Some(SeatDisplayError::from_error(error));
+        }
+    }
+
+    /// Start the seat's private X server if the backend is nested and no ready
+    /// server is already tracked.
+    ///
+    /// The returned handle is only stored after the X11 setup handshake
+    /// succeeds. A timeout or crash terminates and releases the server, so a
+    /// display is never claimed without readiness.
+    fn ensure_seat_display(&mut self, seat_id: &str) -> Result<(), MultiseatError> {
+        let backend = self.options.seat_display.backend;
+        if !backend.is_nested() {
+            if let Some(seat) = self.seats.get_mut(seat_id) {
+                seat.display_status = SeatDisplayStatus::shared();
+            }
+            return Ok(());
+        }
+
+        if self
+            .seats
+            .get(seat_id)
+            .is_some_and(|seat| seat.display.is_some() && seat.display_status.display_ready)
+        {
+            return Ok(());
+        }
+
+        let request = {
+            let Some(seat) = self.seats.get(seat_id) else {
+                return Err(MultiseatError::UnknownSeat(seat_id.to_owned()));
+            };
+            SeatDisplayRequest {
+                seat_id: seat_id.to_owned(),
+                backend,
+                size: self.options.seat_display.size,
+                parent_display: seat
+                    .parent_display
+                    .clone()
+                    .or_else(|| self.options.seat_display.parent_display.clone()),
+            }
+        };
+
+        {
+            let seat = self.seats.get_mut(seat_id).expect("tracked seat");
+            seat.display_status = SeatDisplayStatus::for_backend(backend);
+        }
+
+        let launcher = match self.display_launcher.as_ref() {
+            Some(launcher) => launcher,
+            None => {
+                let error = MultiseatError::Unsupported(format!(
+                    "seat {seat_id} requested the {backend} seat display backend but no display \
+                     launcher is configured"
+                ));
+                self.set_display_failure(seat_id, &error);
+                return Err(error);
+            }
+        };
+
+        let mut handle = match launcher.spawn(&request) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.set_display_failure(seat_id, &error);
+                return Err(error);
+            }
+        };
+
+        let display = handle.display().to_owned();
+        let pid = handle.pid();
+        let auth_disabled = handle.auth_disabled();
+        match self.wait_display_ready(handle.as_mut()) {
+            Ok(()) => {}
+            Err(error) => {
+                let _ = handle.terminate();
+                self.set_display_failure(seat_id, &error);
+                return Err(error);
+            }
+        }
+
+        let mut status = SeatDisplayStatus::for_backend(backend);
+        status.display = Some(display.clone());
+        status.display_pid = pid;
+        status.display_ready = true;
+        if auth_disabled {
+            status.push_note(SeatDisplayNote::new(
+                SeatDisplayNoteKind::AuthDisabled,
+                "xauth was unavailable; the private server uses -ac on its Unix socket with \
+                 -nolisten tcp",
+            ));
+        }
+
+        let size = self.options.seat_display.size;
+        let xauthority = handle.xauthority().map(std::path::Path::to_path_buf);
+        let seat = self.seats.get_mut(seat_id).expect("tracked seat");
+        apply_display_to_launch(&mut seat.launch, &display, xauthority.as_deref(), size);
+        seat.display = Some(handle);
+        seat.display_status = status;
+        Ok(())
+    }
+
+    fn wait_display_ready(&self, handle: &mut dyn SeatDisplayHandle) -> Result<(), MultiseatError> {
+        let display = handle.display().to_owned();
+        let backend = handle.backend();
+        let timeout = self.options.seat_display.ready_timeout;
+        let poll = self.options.seat_display.ready_poll;
+        let deadline = Instant::now() + timeout;
+        let mut detail = "server did not answer the X11 setup handshake".to_owned();
+
+        loop {
+            match handle.try_wait() {
+                Ok(Some(exit)) => {
+                    return Err(MultiseatError::SeatDisplayCrashed {
+                        display,
+                        backend: backend.as_str().to_owned(),
+                        detail: format!("before readiness ({exit})"),
+                    })
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(MultiseatError::SeatDisplay(format!(
+                        "polling {display} during readiness: {error}"
+                    )))
+                }
+            }
+
+            match handle.is_ready() {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => detail = error.to_string(),
+            }
+
+            if Instant::now() >= deadline {
+                return Err(MultiseatError::SeatDisplayStartupTimeout {
+                    display,
+                    timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    detail,
+                });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                continue;
+            }
+            std::thread::sleep(poll.min(remaining));
+        }
+    }
+
+    /// Stop the seat's private X server. The node child must already be gone.
+    fn release_seat_display(&mut self, seat_id: &str) -> Result<(), MultiseatError> {
+        let Some(mut handle) = self
+            .seats
+            .get_mut(seat_id)
+            .and_then(|seat| seat.display.take())
+        else {
+            if let Some(seat) = self.seats.get_mut(seat_id) {
+                seat.display_status.display = None;
+                seat.display_status.display_pid = None;
+                seat.display_status.display_ready = false;
+            }
+            return Ok(());
+        };
+        let display = handle.display().to_owned();
+        match handle.terminate() {
+            Ok(()) => {
+                if let Some(seat) = self.seats.get_mut(seat_id) {
+                    seat.display_status.display = None;
+                    seat.display_status.display_pid = None;
+                    seat.display_status.display_ready = false;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(seat) = self.seats.get_mut(seat_id) {
+                    seat.display = Some(handle);
+                    seat.display_status.display_ready = false;
+                    seat.display_status.display_error = Some(SeatDisplayError::from_error(&error));
+                }
+                Err(MultiseatError::SeatDisplay(format!(
+                    "stopping display {display} for seat {seat_id}: {error}"
+                )))
+            }
+        }
     }
 
     /// Apply both opt-in resources for one seat in deterministic order:
@@ -769,6 +1017,19 @@ impl ProcessSeatSupervisor {
         let Some(ownership) = ownership else {
             return Ok(());
         };
+        if self.display_is_nested(seat_id) {
+            self.push_display_note(
+                seat_id,
+                SeatDisplayNote::new(
+                    SeatDisplayNoteKind::OwnershipUnsupported,
+                    format!(
+                        "xrandr ownership of output {} is not applied: seat {seat_id} draws on a private X root with no physical output",
+                        ownership.output
+                    ),
+                ),
+            );
+            return Ok(());
+        }
 
         let result = match self.ownership.as_mut() {
             Some(controller) => controller.apply(&ownership),
@@ -822,6 +1083,21 @@ impl ProcessSeatSupervisor {
             );
             return Err(error);
         };
+        if route.strategy == InputRoutingStrategy::XInputMapToOutput
+            && self.display_is_nested(seat_id)
+        {
+            self.push_display_note(
+                seat_id,
+                SeatDisplayNote::new(
+                    SeatDisplayNoteKind::XinputRoutingUnsupported,
+                    format!(
+                        "xinput map-to-output for {} is not applied: the private X server has no physical pointer; use --input-isolation helper for exclusive input",
+                        route.display_output
+                    ),
+                ),
+            );
+            return Ok(());
+        }
 
         let target = match InputTarget::new(&route.seat_id, &route.display_output, &route.x_screen)
         {
@@ -1053,6 +1329,20 @@ impl ProcessSeatSupervisor {
         for seat_id in seat_ids {
             self.release_seat_resources(&seat_id);
         }
+
+        // A private X server with no child cannot be in use. Release it in
+        // reverse seat order so a failed start does not leak a display. A seat
+        // that still owns a child keeps its display until `stop`/`Drop`.
+        let mut display_ids: Vec<String> = self
+            .seats
+            .iter()
+            .filter(|(_, seat)| seat.display.is_some() && seat.child.is_none())
+            .map(|(seat_id, _)| seat_id.clone())
+            .collect();
+        display_ids.reverse();
+        for seat_id in display_ids {
+            let _ = self.release_seat_display(&seat_id);
+        }
     }
 
     fn record_resource_error(
@@ -1077,6 +1367,90 @@ impl ProcessSeatSupervisor {
         let seat_ids: Vec<String> = self.seats.keys().cloned().collect();
 
         for seat_id in seat_ids {
+            let mut display_exit = None;
+            let mut display_poll_error = None;
+            {
+                let Some(seat) = self.seats.get_mut(&seat_id) else {
+                    continue;
+                };
+                if let Some(display) = seat.display.as_mut() {
+                    match display.try_wait() {
+                        Ok(Some(exit)) => display_exit = Some(exit),
+                        Ok(None) => {}
+                        Err(error) => display_poll_error = Some(error.to_string()),
+                    }
+                }
+            }
+
+            if display_exit.is_some() || display_poll_error.is_some() {
+                let (display_name, backend) = self
+                    .seats
+                    .get(&seat_id)
+                    .map(|seat| {
+                        (
+                            seat.display_status
+                                .display
+                                .clone()
+                                .unwrap_or_else(|| "(unknown)".to_owned()),
+                            seat.display_status.display_backend,
+                        )
+                    })
+                    .unwrap_or_else(|| ("(unknown)".to_owned(), self.options.seat_display.backend));
+                let detail = match display_exit {
+                    Some(exit) => exit.to_string(),
+                    None => display_poll_error.unwrap_or_else(|| "poll failed".to_owned()),
+                };
+                let error = MultiseatError::SeatDisplayCrashed {
+                    display: display_name.clone(),
+                    backend: backend.as_str().to_owned(),
+                    detail,
+                };
+                let seat = self.seats.get_mut(&seat_id).expect("tracked seat");
+                let mut cleanup_failure = None;
+                let mut display_released = false;
+                if let Some(mut display) = seat.display.take() {
+                    match display.terminate() {
+                        Ok(()) => display_released = true,
+                        Err(cleanup) => {
+                            seat.display = Some(display);
+                            cleanup_failure = Some(format!("stopping display: {cleanup}"));
+                        }
+                    }
+                }
+                if cleanup_failure.is_none() {
+                    if let Some(mut child) = seat.child.take() {
+                        if let Err(cleanup) = child.terminate() {
+                            seat.child = Some(child);
+                            cleanup_failure = Some(format!("stopping node: {cleanup}"));
+                        }
+                    }
+                }
+                seat.display_status.display_ready = false;
+                seat.display_status.display_error = Some(SeatDisplayError::from_error(&error));
+                if let Some(detail) = cleanup_failure {
+                    // Keep every handle so a later stop can retry; do not
+                    // restart over a process that could not be reaped.
+                    if display_released {
+                        seat.display_status.display = None;
+                        seat.display_status.display_pid = None;
+                    }
+                    seat.state = SeatState::Failed;
+                    seat.last_error = Some(format!(
+                        "display for {seat_id} disappeared ({error}); cleanup failed: {detail}"
+                    ));
+                    seat.next_restart = None;
+                    continue;
+                }
+                seat.pid = None;
+                seat.started_at = None;
+                seat.display_status.display = None;
+                seat.display_status.display_pid = None;
+                seat.last_error = Some(format!("display for {seat_id} disappeared: {error}"));
+                seat.message = None;
+                schedule_restart(&self.options, seat, now);
+                continue;
+            }
+
             let mut exit = None;
             let mut poll_error = None;
             {
@@ -1143,6 +1517,16 @@ impl ProcessSeatSupervisor {
                     && seat.next_restart.is_some_and(|at| at <= now)
             });
             if due {
+                // A nested display must be ready before the node can use it.
+                // A failed display spawn backs off without touching resources.
+                if let Err(error) = self.ensure_seat_display(&seat_id) {
+                    let text = error.to_string();
+                    let seat = self.seats.get_mut(&seat_id).expect("tracked seat");
+                    seat.last_error = Some(text);
+                    seat.message = None;
+                    schedule_restart(&self.options, seat, now);
+                    continue;
+                }
                 // A restart re-applies resources only when they were released
                 // by a previous failed attempt; an already-applied resource is
                 // left in place. A failed re-apply is reported and backed off.
@@ -1268,6 +1652,7 @@ impl ProcessSeatSupervisor {
             || status.resources.routing_applied
             || status.resources.input_isolation_applied
             || status.resources.audio_applied
+            || status.display.display.is_some()
         {
             return Ok(status);
         }
@@ -1433,6 +1818,7 @@ impl ProcessSeatSupervisor {
         }
 
         {
+            let backend = self.options.seat_display.backend;
             let seat = self
                 .seats
                 .entry(seat_id.clone())
@@ -1442,6 +1828,7 @@ impl ProcessSeatSupervisor {
             seat.ownership = plan.ownership.clone();
             seat.input = plan.input.clone();
             seat.input_route = plan.input_route.clone();
+            seat.parent_display = plan_parent_display(plan);
             // A fresh start after stop/release begins a new resource cycle;
             // keep applied state when this is a retry of the same reservation.
             if !seat.resources.ownership_applied
@@ -1449,6 +1836,9 @@ impl ProcessSeatSupervisor {
                 && !seat.resources.input_isolation_applied
             {
                 seat.resources = SeatResourceStatus::default();
+            }
+            if seat.display.is_none() {
+                seat.display_status = SeatDisplayStatus::for_backend(backend);
             }
             seat.state = SeatState::Starting;
             seat.next_restart = None;
@@ -1464,11 +1854,25 @@ impl ProcessSeatSupervisor {
                     "dry-run: would launch {} ({})",
                     seat.launch.program, seat.launch.http_port
                 );
+                if backend.is_nested() {
+                    message.push_str(&format!(
+                        "; would start {backend} display {} for the seat",
+                        self.options.seat_display.size
+                    ));
+                }
                 if self.options.apply_ownership && seat.ownership.is_some() {
-                    message.push_str("; would apply xrandr ownership");
+                    if backend.is_nested() {
+                        message.push_str("; xrandr ownership has no physical output to own");
+                    } else {
+                        message.push_str("; would apply xrandr ownership");
+                    }
                 }
                 if self.options.apply_routing && seat.input_route.is_some() {
-                    message.push_str("; would apply input routing");
+                    if backend.is_nested() {
+                        message.push_str("; xinput routing has no physical pointer to map");
+                    } else {
+                        message.push_str("; would apply input routing");
+                    }
                 }
                 if self.options.input_isolation && seat.input.is_some() {
                     message.push_str("; would grab input through the seat-input helper");
@@ -1476,6 +1880,20 @@ impl ProcessSeatSupervisor {
                 seat.message = Some(message);
                 return Ok(seat.status(now));
             }
+        }
+
+        // A private X server starts before any seat resource or node process.
+        // A failure here never claims a display and never spawns the node.
+        if let Err(error) = self.ensure_seat_display(&seat_id) {
+            let text = error.to_string();
+            let seat = self.seats.get_mut(&seat_id).expect("tracked seat");
+            seat.child = None;
+            seat.pid = None;
+            seat.started_at = None;
+            seat.last_error = Some(text);
+            seat.message = None;
+            schedule_restart(&self.options, seat, now);
+            return Err(error);
         }
 
         // Opt-in resources are reserved before the child exists. An apply
@@ -1487,6 +1905,7 @@ impl ProcessSeatSupervisor {
         {
             if let Err(error) = self.apply_seat_resources(&seat_id) {
                 self.release_seat_resources(&seat_id);
+                let _ = self.release_seat_display(&seat_id);
                 self.rollback_applied_resources();
                 let text = error.to_string();
                 let seat = self.seats.get_mut(&seat_id).expect("tracked seat");
@@ -1525,6 +1944,7 @@ impl ProcessSeatSupervisor {
                     .is_some_and(|seat| seat.child.is_some());
                 if !child_retained {
                     self.release_seat_resources(&seat_id);
+                    let _ = self.release_seat_display(&seat_id);
                 }
                 Err(error)
             }
@@ -1580,6 +2000,17 @@ impl SeatSupervisor for ProcessSeatSupervisor {
         // best-effort and remain visible in `resources.errors`.
         self.release_seat_resources(seat_id);
 
+        // The private X server is stopped only after the seat's child is gone
+        // and its display-dependent resource releases have run.
+        if let Err(error) = self.release_seat_display(seat_id) {
+            let text = error.to_string();
+            let seat = self.seats.get_mut(seat_id).expect("tracked seat");
+            seat.state = SeatState::Failed;
+            seat.last_error = Some(text.clone());
+            seat.next_restart = None;
+            return Err(MultiseatError::Supervisor(text));
+        }
+
         let seat = self.seats.get_mut(seat_id).expect("tracked seat");
         seat.pid = None;
         seat.state = SeatState::Stopped;
@@ -1602,6 +2033,66 @@ fn seat_audio_spec(plan: &SeatPlan) -> SeatAudioSpec {
         plan.config.audio_sink.clone(),
         plan.config.profile.defaults().audio_channels,
     )
+}
+
+fn display_launcher_for(options: &SupervisorOptions) -> Option<Box<dyn SeatDisplayLauncher>> {
+    if !options.seat_display.backend.is_nested() {
+        return None;
+    }
+    Some(Box::new(
+        crate::seat_display::ProcessSeatDisplayLauncher::new(options.seat_display.clone()),
+    ))
+}
+
+fn plan_parent_display(plan: &SeatPlan) -> Option<String> {
+    match &plan.config.capture {
+        crate::seat::CapturePlan::X11 { display, .. } => {
+            let display = display.trim();
+            (!display.is_empty()).then(|| display.to_owned())
+        }
+        crate::seat::CapturePlan::PipeWire { .. } => None,
+    }
+}
+
+/// Point the node launch specification at the private display.
+///
+/// `DISPLAY`/`XAUTHORITY` are exported to the child and the X11 capture flags
+/// are rewritten to the private screen at offset zero. A PipeWire seat keeps
+/// its capture target; only the application display changes.
+fn apply_display_to_launch(
+    launch: &mut NodeLaunchSpec,
+    display: &str,
+    xauthority: Option<&std::path::Path>,
+    size: crate::seat_display::SeatDisplaySize,
+) {
+    launch.env.insert("DISPLAY".to_owned(), display.to_owned());
+    match xauthority {
+        Some(path) => {
+            launch
+                .env
+                .insert("XAUTHORITY".to_owned(), path.display().to_string());
+        }
+        None => {
+            launch.env.remove("XAUTHORITY");
+        }
+    }
+    if launch.args.iter().any(|arg| arg == "--x11-display") {
+        set_arg_value(&mut launch.args, "--x11-display", display);
+        set_arg_value(&mut launch.args, "--x11-offset", "0,0");
+        set_arg_value(&mut launch.args, "--x11-width", &size.width.to_string());
+        set_arg_value(&mut launch.args, "--x11-height", &size.height.to_string());
+    }
+}
+
+fn set_arg_value(args: &mut Vec<String>, flag: &str, value: &str) {
+    match args.iter().position(|arg| arg == flag) {
+        Some(index) if index + 1 < args.len() => args[index + 1] = value.to_owned(),
+        Some(_) => args.push(value.to_owned()),
+        None => {
+            args.push(flag.to_owned());
+            args.push(value.to_owned());
+        }
+    }
 }
 
 fn schedule_restart(options: &SupervisorOptions, seat: &mut ManagedSeat, now: Instant) {

@@ -8,7 +8,9 @@ This crate is the model and controller layer of the Python
 bounded copy-on-write write overlay, models ISO/NBD media, includes a bounded
 fixed-newstyle NBD server backed by a regular file, an in-memory image, or a
 copy-on-write overlay, serves the USB mass-storage SCSI/BOT data path over that
-same overlay, and includes a bounded in-process USB/IP daemon/control plane. It
+same overlay, and includes a bounded in-process USB/IP daemon/control plane plus
+a bounded version-`0x0111` USB/IP control-wire server (`OP_REQ_DEVLIST`/
+`OP_REQ_IMPORT`) with an injectable stream transport. It
 sequences FunctionFS from ConfigFS function creation through descriptor writes,
 readiness, and UDC bind/unbind. Default paths do not mount filesystems, open
 `/dev/hidg*`, or write a block device; an explicit `CommandFunctionFsMounter`
@@ -38,6 +40,8 @@ profile.
 | USB/IP model | `UsbIpConfig`, `UsbIpDevice`, `UsbIpState`, `UsbIpAttachment`, `UsbIpAuthorization`/`UsbIpKey`/`UsbIpToken` (host + token allow-lists), `UsbIpPeerGrant`, `UsbIpHotplugLog`/`UsbIpHotplugEvent`, `UsbIpTlsPolicy`/`UsbIpTlsStatus` |
 | USB/IP control | `UsbIpController`, `SubprocessUsbIpController` (`attach_with_token`, peer-side `authorize_peer`/`export_with_token`), bounded hotplug events, argv-only `CommandRunner`; legacy `UsbIpControl`/`SubprocessUsbController` |
 | USB/IP daemon | `UsbIpDaemon`, `UsbIpDaemonConfig`/`UsbIpDaemonState`/`UsbIpDaemonStatus`, bounded `UsbIpConnection`s, injectable `UsbIpKernelBackend` with explicit `NoUsbIpKernel`, export/list/attach/detach/unexport state machine, typed `usbip-kernel-required`, fail-closed TLS |
+| USB/IP wire protocol | `UsbIpOpHeader`/`UsbIpOpCode`/`UsbIpStatus`, `UsbIpDeviceDescriptor`/`UsbIpInterface`, `UsbIpDevListRequest`/`UsbIpDevListReply`, `UsbIpImportRequest`/`UsbIpImportReply`, version `0x0111`, network byte order, fixed-width path/busid, bounded counts, typed truncation/oversize/version/opcode errors |
+| USB/IP control server | `UsbIpServer`/`UsbIpServerHandle`/`UsbIpServerConfig`, injectable `UsbIpTransport`/`UsbIpClock`/`UsbIpCredentialSource`, bound TCP listener or in-memory duplex, `OP_REQ_DEVLIST` from descriptor-registered exports, authorized `OP_REQ_IMPORT` only after a real kernel attach, bounded connections/frames/idle timeout |
 | SCSI mass storage | `MassStorageDevice`, `ScsiCommandBlock`, `ScsiReply`/`ScsiSense`/`ScsiStatus`, `MassStoragePersistPolicy`, `MassStorageOverlayStatus`; BBB dispatch, read-only/CD-ROM rejection, copy-on-write writes through `WriteOverlay`, FLUSH/stop persistence |
 | FAT32 builder | `Fat32ImageBuilder`, `Fat32Node`, `build_fat32_image`, `fat32_image_from_directory`, `parse_fat32_image`, `Fat32Info`/`Fat32Layout` |
 | ISO media | `IsoImage::inspect`, `parse_iso_volume_descriptors`, read-only `MediaFormat::Iso9660` |
@@ -616,12 +620,12 @@ USB/IP TLS is **not available in-process**. `UsbIpConfig::tls =
 UsbIpTlsPolicy::Required` fails closed with the typed
 `usbip-tls-unsupported` error (`UsbIpTlsStatus` reports `available: false` and
 the reason) instead of silently running plaintext. This is a deliberate
-architecture limit, not a missing rustls call: `ozma-usb` drives the external
-`usbip` CLI, does not own the USB/IP control socket, does not implement the
-USB/IP wire protocol, and cannot intercept the kernel `vhci_hcd` data path.
-An external `usbipd`, firewall, TLS terminator, or encrypted tunnel (for
-example WireGuard/stunnel) must protect the wire protocol. No kernel
-`vhci_hcd` lifecycle exists in this crate.
+architecture limit, not a missing rustls call: the optional in-process control
+listener is plaintext, the crate does not implement TLS termination, and it
+cannot intercept the kernel `vhci_hcd` USB/IP data path. An external `usbipd`,
+firewall, TLS terminator, or encrypted tunnel (for example WireGuard/stunnel)
+must protect the wire protocol and the control port. No kernel `vhci_hcd`
+lifecycle exists in this crate.
 
 ### In-process USB/IP daemon state machine
 
@@ -644,12 +648,107 @@ in-process fake backend; a real adapter would drive the existing argv-only
 is never falsely claimed. Operations require `start()`; `stop()` clears tracked
 peer sessions but does not fabricate kernel unexport/detach.
 
-The daemon does not implement the USB/IP wire protocol and does not accept
-sockets in the default path. It is the state/enforcement layer a future node
-route or proxy front-end can call. TLS is exactly the fail-closed
-`UsbIpTlsPolicy` above: `Required` rejects construction, and `UsbIpDaemonStatus`
-reports `tls.available: false` with the external-terminator requirement. No TLS
-is faked.
+The daemon itself is the state/authorization layer: the separate
+`usbip_server` module below accepts sockets and serves the control messages.
+TLS is exactly the fail-closed `UsbIpTlsPolicy` above: `Required` rejects
+construction, and `UsbIpDaemonStatus` reports `tls.available: false` with the
+external-terminator requirement. No TLS is faked.
+
+### USB/IP control wire protocol and server
+
+`usbip_protocol` is a typed codec for the version-`0x0111` control plane. It
+encodes and decodes the packed, network-byte-order kernel records:
+
+| Message | Layout |
+|---|---|
+| `OP_REQ_DEVLIST` (`0x8005`) | 8-byte `op_common` |
+| `OP_REP_DEVLIST` (`0x0005`) | `op_common` + `ndev: u32` + `ndev` device records |
+| `OP_REQ_IMPORT` (`0x8003`) | `op_common` + 32-byte NUL-padded `busid` |
+| `OP_REP_IMPORT` (`0x0003`) | `op_common` + 312-byte device record on success, header only on error |
+
+A `UsbIpDeviceDescriptor` carries `path` (256 bytes), `bus_id` (32 bytes),
+`busnum`/`devnum`/`speed`, `idVendor`/`idProduct`/`bcdDevice`, the device
+class/subclass/protocol triple, configuration value/count, declared
+`bNumInterfaces`, and 4-byte interface class/subclass/protocol records. The
+codec bounds a frame at `USBIP_MAX_FRAME_BYTES`, devices at 256, interfaces at
+32, and requires non-empty printable strings that fit their buffers with a NUL.
+Bad version, unknown opcode, unexpected opcode, unknown status, truncation,
+trailing bytes, oversized counts/strings/frames, and inconsistent reply bodies
+are distinct `UsbIpProtocolError` values surfaced as the stable
+`usbip-protocol` kind. Import replies intentionally contain no interface
+records (the kernel record does not carry them), so decoding preserves the
+declared count with an empty interface list.
+
+`UsbIpDaemon::export_with_descriptor(bus_id, descriptor)` (and its
+peer-authorized sibling) registers the descriptor that
+`OP_REP_DEVLIST` may serve. An export made with the older `export` method is
+listed by `list()` but is **not** advertised on the wire, because the daemon
+will not invent a path, bus/device number, speed, or interface list.
+
+`UsbIpServer` is the bounded listener:
+
+```rust
+use std::sync::Arc;
+use ozma_usb::{
+    UsbIpDaemon, UsbIpDaemonConfig, UsbIpServer, UsbIpServerConfig,
+    UsbIpDeviceDescriptor,
+};
+
+let daemon = Arc::new(
+    UsbIpDaemon::new(UsbIpDaemonConfig::server("127.0.0.1", 3240))?,
+);
+daemon.start()?;
+daemon.export_with_descriptor(
+    "1-1",
+    UsbIpDeviceDescriptor::new("/sys/devices/usb1/1-1", "1-1")
+        .with_ids(0x1d6b, 0x0002)
+        .with_numbers(1, 2)
+        .with_speed(3),
+)?;
+
+let server = UsbIpServer::bind_tcp(
+    (std::net::Ipv4Addr::LOCALHOST, 0),
+    Arc::clone(&daemon),
+    UsbIpServerConfig::default(),
+)?;
+let handle = server.start()?;
+handle.stop();
+# Ok::<(), ozma_usb::UsbError>(())
+```
+
+`serve_session` is the same session loop over any injectable `UsbIpTransport`
+(an in-memory duplex in tests, `TcpStream` in production). `UsbIpServerConfig`
+bounds concurrent sessions, the largest accepted/produced control frame, and
+the idle deadline between frames; blocked reads use a short poll interval so
+`UsbIpServerHandle::stop` interrupts them. Sessions call
+`UsbIpDaemon::accept_connection`, so the daemon connection ceiling and
+host/token/key-fingerprint allow-list apply before any frame is read.
+
+`OP_REQ_IMPORT` first requires an exported, descriptor-registered bus id. It
+then calls the same authorized `UsbIpDaemon::attach` path as the CLI
+controller. A successful `OP_REP_IMPORT` is written only after the injected
+kernel backend returned a real local `vhci` port; the reply then carries the
+312-byte device record including the requested bus id. An unknown or
+unregistered bus id is `usbip-unknown-device` on the wire `ST_NODEV`; a kernel
+attach failure (including the default `NoUsbIpKernel`) is
+`usbip-kernel-required` on the wire `ST_DEV_ERR`. Error replies contain no
+device body, so no bus id, port, or attachment is fabricated. Successful
+export/import transitions still append to the shared bounded
+`UsbIpHotplugLog`.
+
+The wire protocol carries no token or key-fingerprint field. `ozma-usb`
+therefore takes an injectable `UsbIpCredentialSource`; the embedder supplies
+credentials out-of-band (for example a TLS terminator's verified client
+certificate fingerprint or a trusted proxy's token). `UsbIpPresentedCredentials`
+holds them only for the session, has a redacted `Debug`, is not serializable,
+and is never written to a reply, status, or log. The default
+`NoUsbIpCredentials` presents nothing, so a configured token/fingerprint
+requirement fails closed.
+
+This listener is plaintext and control-plane only. It does not implement the
+USB/IP bulk data path; a successful IMPORT records a local `vhci` port only
+when the injected kernel backend actually returned one. TLS remains external as
+described above.
 
 `SubprocessUsbIpController` implements `UsbIpController` with an injected
 `CommandRunner`:
@@ -818,7 +917,8 @@ controller, recording/scripted command runners, synthetic ISO/FAT32/NBD bytes,
 in-memory images/overlays, a fake FunctionFS mounter/clock, and in-memory
 transports. They never create a real gadget, bind a real UDC, run `usbip`,
 mount a filesystem, or write a block device. The NBD listener tests bind
-ephemeral loopback TCP/Unix sockets; the QEMU client tests invoke
+ephemeral loopback TCP/Unix sockets; the USB/IP control tests use an in-memory
+duplex plus one ephemeral loopback TCP listener; the QEMU client tests invoke
 `qemu-img`/`qemu-io` only when present, and the boot test is opt-in.
 
 ```bash
@@ -840,6 +940,8 @@ Relevant suites:
 | `tests/mass_storage_scsi.rs` | SCSI CBW parse/dispatch, write/read-back through the overlay, base immutability, FLUSH/stop persistence + reload, read-only media and SCSI `DATA PROTECT`, typed bounds, malformed/phase errors, overlay exhaustion without partial allocation, read-only FAT32 image byte identity |
 | `tests/mass_storage_loop.rs` | CBW→data→CSW round trips over fake endpoints, write/read/flush, read-only rejection with sense, overlay persistence/reload, transfer bounds, short-transfer assembly, typed stall/I/O failures, stop cleanup, owned file endpoints, FunctionFS loopback endpoint adapter |
 | `tests/usbip_daemon.rs` | authorized/denied attach never reaches the kernel on denial, token/fingerprint enforcement, bounded connections, start/stop, export/detach/unexport cleanup, bounded hotplug log, typed `usbip-kernel-required`, fail-closed TLS, no secrets in status/Debug |
+| `tests/usbip_protocol.rs` | version-`0x0111` header/opcode/status golden bytes, device-record network byte order at kernel offsets, DEVLIST/IMPORT round trips, fixed-width strings, truncated/trailing/oversized/unknown-version/opcode errors, import-reply body rules |
+| `tests/usbip_server.rs` | in-memory duplex DEVLIST empty/populated, descriptor-only advertising, authorized/denied IMPORT, kernel-required and unknown-device error replies with no device body, version/opcode/truncation/frame-ceiling errors, idle timeout, concurrent connection ceiling, hotplug events, loopback TCP with the same codec |
 | `tests/fat32_overlay.rs` | FAT32/raw writes and reads, base immutability, per-block copy-on-write, allocation ceiling and preflight atomicity, commit/reload, checksummed persistence corruption, discard/materialise |
 | `tests/uac2.rs` | UAC2 descriptor/channel/rate/size consistency, microphone/speaker/headset modes, invalid rates/channels/modes, ConfigFS attribute writes, descriptor-only unsupported bridge status |
 | `tests/uac2_bridge.rs` | sample-accurate 44.1/48 kHz packetization, 16/24/32-bit and mono/stereo conversion, no implicit resampling, playback ring drops/backpressure, partial/padded capture packets, flush/stop/restart, typed missing path/endpoint/overflow errors, status never live without data |
@@ -906,17 +1008,20 @@ existing VM; the disposable QEMU is quit over QMP or killed on timeout.
 
 - Real gadget validation on `dummy_hcd` and hardware UDCs; currently only the
   ignored round trip exists, and node tests use a temp root/fake controller.
-- USB/IP has an in-process, bounded control-plane daemon (`UsbIpDaemon`) with
-  start/stop, export/list/attach/detach/unexport, peer connections, peer
-  authorization, and a bounded hotplug log, but still no USB/IP wire protocol,
-  real socket listener, kernel hotplug monitor, or in-process TLS. The
-  host/token/key-fingerprint allow-list is enforced before any kernel call;
-  `attach`/`detach`/`export`/`unexport` require an injected
-  `UsbIpKernelBackend`, and the default `NoUsbIpKernel` returns typed
+- USB/IP now has a typed version-`0x0111` control codec, a bounded plaintext
+  control listener (`UsbIpServer`), and the in-process daemon
+  (`UsbIpDaemon`) with start/stop, export/list/attach/detach/unexport, peer
+  connections, peer authorization, and a bounded hotplug log. It is still a
+  **control-plane** implementation: there is no USB/IP bulk data path (URB
+  submit/retrieve), no server-side `usbip-host` stub, and no kernel hotplug
+  monitor. `OP_REQ_IMPORT` reaches a successful reply only through an injected
+  `UsbIpKernelBackend` that returns a real local `vhci` port; the default
+  `NoUsbIpKernel` (and every fake used in tests) returns typed
   `usbip-kernel-required` instead of faking a `vhci_hcd`/`usbip-host` device.
-  `Required` TLS fails closed; an external `usbipd`/firewall/TLS terminator must
-  protect the wire protocol. A node route exposing the daemon and
-  controller/API pairing remain open.
+  The optional listener is plaintext and has no in-process TLS; an external
+  TLS terminator/tunnel must protect it, and `Required` TLS fails closed. A
+  node route exposing the daemon/server and the client-side import
+  orchestration remain open.
 - The FAT32 builder is a static snapshot, not the Python live `FATSynthesiser`
   (no sector-on-demand reads, inotify rescan, or long-name rescan stability).
   Generated images are read-only. `WriteOverlay` is wired into writable NBD

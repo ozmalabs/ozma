@@ -1100,6 +1100,13 @@ pub struct NodeConfig {
     pub vnc_height: u32,
     /// VNC output frame rate.
     pub vnc_fps: u32,
+    /// Serve the local capture source as an RFB/VNC endpoint.
+    pub vnc_server: bool,
+    /// Explicit RFB bind address. `None` keeps the loopback default; supplying
+    /// any value is the operator opt-in that permits a widened bind.
+    pub vnc_bind: Option<String>,
+    /// RFB listener port; `0` asks the OS for a free port.
+    pub vnc_server_port: u16,
     /// Effective D-Bus console index (`Console_N`).
     pub dbus_console: u32,
     /// Largest D-Bus scanout width accepted.
@@ -1503,6 +1510,23 @@ impl NodeConfig {
         if self.vnc_fps == 0 {
             return Err("--vnc-fps must be greater than zero".to_owned());
         }
+        if !self.vnc_server && (self.vnc_bind.is_some() || self.vnc_server_port != 0) {
+            return Err(
+                "--vnc-bind and --vnc-server-port configure the internal RFB server and require \
+                 --vnc-server"
+                    .to_owned(),
+            );
+        }
+        if self.vnc_server {
+            let raw = self
+                .vnc_bind
+                .as_deref()
+                .unwrap_or(crate::vnc_server::DEFAULT_VNC_BIND)
+                .trim();
+            raw.parse::<std::net::IpAddr>().map_err(|error| {
+                format!("--vnc-bind `{raw}` must be an IP address for the RFB listener: {error}")
+            })?;
+        }
         if self.dbus_width == 0 {
             return Err("--dbus-width must be greater than zero".to_owned());
         }
@@ -1900,6 +1924,9 @@ mod tests {
             vnc_width: ozma_capture::VNC_DEFAULT_WIDTH,
             vnc_height: ozma_capture::VNC_DEFAULT_HEIGHT,
             vnc_fps: ozma_capture::VNC_DEFAULT_FPS,
+            vnc_server: false,
+            vnc_bind: None,
+            vnc_server_port: 0,
             dbus_console: ozma_capture::DBUS_DEFAULT_CONSOLE_INDEX,
             dbus_width: ozma_capture::DBUS_DEFAULT_WIDTH,
             dbus_height: ozma_capture::DBUS_DEFAULT_HEIGHT,
@@ -2275,6 +2302,34 @@ mod tests {
         let mut config = test_config(NodeProfile::Vm);
         config.ffmpeg_bin = PathBuf::new();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn vnc_server_flags_require_enable_and_validate_the_bind_address() {
+        let mut orphan = test_config(NodeProfile::Hardware);
+        orphan.vnc_bind = Some("127.0.0.1".into());
+        let error = orphan.validate().unwrap_err();
+        assert!(error.contains("--vnc-server"), "{error}");
+
+        let mut orphan = test_config(NodeProfile::Hardware);
+        orphan.vnc_server_port = 5900;
+        let error = orphan.validate().unwrap_err();
+        assert!(error.contains("--vnc-server"), "{error}");
+
+        let mut enabled = test_config(NodeProfile::Hardware);
+        enabled.vnc_server = true;
+        enabled.validate().unwrap();
+
+        let mut widened = test_config(NodeProfile::Hardware);
+        widened.vnc_server = true;
+        widened.vnc_bind = Some("0.0.0.0".into());
+        widened.validate().unwrap();
+
+        let mut invalid = test_config(NodeProfile::Hardware);
+        invalid.vnc_server = true;
+        invalid.vnc_bind = Some("not-an-ip".into());
+        let error = invalid.validate().unwrap_err();
+        assert!(error.contains("--vnc-bind"), "{error}");
     }
 
     #[test]

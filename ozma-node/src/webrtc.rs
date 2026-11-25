@@ -133,6 +133,12 @@ pub struct WebRtcConfig {
     pub width: u32,
     /// Frame height advertised to the worker and written to shared memory.
     pub height: u32,
+    /// Scale mismatched capture frames to `width`x`height` instead of failing.
+    ///
+    /// Runtime capture geometry (QMP/VNC) can change after the helper starts.
+    /// Defaults to `false`, so a genuine misconfiguration stays a typed
+    /// [`WebRtcError::FrameDimensions`] instead of being silently rescaled.
+    pub scale_to_fit: bool,
     /// Frame rate for the shared-memory feeder.
     pub fps: u32,
     /// Initial/target H.264 bitrate in kbps.
@@ -856,6 +862,7 @@ impl WebRtcHelper {
         if declared.width > 0
             && declared.height > 0
             && (declared.width != config.width || declared.height != config.height)
+            && !config.scale_to_fit
         {
             return Err(WebRtcError::FrameDimensions {
                 width: declared.width,
@@ -1356,7 +1363,13 @@ async fn run_feeder(
             }
         };
 
-        let bgra = match convert_to_bgra(&frame, expected_format, config.width, config.height) {
+        let bgra = match convert_to_bgra(
+            &frame,
+            expected_format,
+            config.width,
+            config.height,
+            config.scale_to_fit,
+        ) {
             Ok(bgra) => bgra,
             Err(error) => {
                 status.set_failed(error.to_string());
@@ -1405,11 +1418,17 @@ async fn kill_child(child: &Arc<Mutex<Option<Child>>>) {
 }
 
 /// Convert one captured frame into packed BGRA, the worker's expected layout.
+///
+/// When `scale_to_fit` is set, a frame whose geometry differs from the target
+/// is nearest-neighbour rescaled instead of rejected. This keeps a stream alive
+/// across guest modesets while an explicit size mismatch remains a typed error
+/// when the flag is off.
 fn convert_to_bgra(
     frame: &Frame,
     expected_format: PixelFormat,
     width: u32,
     height: u32,
+    scale_to_fit: bool,
 ) -> Result<Vec<u8>, WebRtcError> {
     let actual_format = frame.format().pixel_format;
     if actual_format != expected_format {
@@ -1418,24 +1437,26 @@ fn convert_to_bgra(
             actual: actual_format,
         });
     }
-    if frame.format().width != width || frame.format().height != height {
+    let source_width = frame.format().width;
+    let source_height = frame.format().height;
+    if (source_width != width || source_height != height) && !scale_to_fit {
         return Err(WebRtcError::FrameDimensions {
-            width: frame.format().width,
-            height: frame.format().height,
+            width: source_width,
+            height: source_height,
             expected_width: width,
             expected_height: height,
         });
     }
 
     let data = frame.data();
-    match actual_format {
+    let bgra = match actual_format {
         PixelFormat::Rgb24 => {
-            let expected = byte_len(PixelFormat::Rgb24, width, height)?;
+            let expected = byte_len(PixelFormat::Rgb24, source_width, source_height)?;
             if data.len() != expected {
                 return Err(WebRtcError::FrameSize {
                     format: PixelFormat::Rgb24,
-                    width,
-                    height,
+                    width: source_width,
+                    height: source_height,
                     expected,
                     actual: data.len(),
                 });
@@ -1444,23 +1465,60 @@ fn convert_to_bgra(
             for pixel in data.chunks_exact(3) {
                 bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 0xFF]);
             }
-            Ok(bgra)
+            bgra
         }
         PixelFormat::Bgra => {
-            let expected = byte_len(PixelFormat::Bgra, width, height)?;
+            let expected = byte_len(PixelFormat::Bgra, source_width, source_height)?;
             if data.len() != expected {
                 return Err(WebRtcError::FrameSize {
                     format: PixelFormat::Bgra,
-                    width,
-                    height,
+                    width: source_width,
+                    height: source_height,
                     expected,
                     actual: data.len(),
                 });
             }
-            Ok(data.to_vec())
+            data.to_vec()
         }
-        other => Err(WebRtcError::UnsupportedFormat(other)),
+        other => return Err(WebRtcError::UnsupportedFormat(other)),
+    };
+
+    if source_width == width && source_height == height {
+        return Ok(bgra);
     }
+    Ok(scale_bgra_nearest(
+        &bgra,
+        source_width,
+        source_height,
+        width,
+        height,
+    ))
+}
+
+/// Nearest-neighbour BGRA rescale. Cheap, deterministic, and adequate for a
+/// transition stream; no colour-space or aspect-ratio correction is applied.
+fn scale_bgra_nearest(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+    if source_width == 0 || source_height == 0 || width == 0 || height == 0 {
+        return out;
+    }
+    for y in 0..height {
+        let source_y = (u64::from(y) * u64::from(source_height) / u64::from(height))
+            .min(u64::from(source_height - 1)) as usize;
+        for x in 0..width {
+            let source_x = (u64::from(x) * u64::from(source_width) / u64::from(width))
+                .min(u64::from(source_width - 1)) as usize;
+            let offset = (source_y * source_width as usize + source_x) * 4;
+            out.extend_from_slice(&source[offset..offset + 4]);
+        }
+    }
+    out
 }
 
 fn byte_len(format: PixelFormat, width: u32, height: u32) -> Result<usize, WebRtcError> {
@@ -1906,6 +1964,7 @@ mod tests {
             shm_path: directory.join("frame.bgra"),
             width: 2,
             height: 2,
+            scale_to_fit: false,
             fps: 30,
             bitrate_kbps: 4_000,
             audio_source: None,
@@ -2652,5 +2711,35 @@ mod tests {
         assert_eq!(helper.status().status_name(), "running");
         assert!(helper.status().audio_configured());
         helper.stop().await.expect("helper stops");
+    }
+
+    #[test]
+    fn scale_to_fit_rescales_mismatched_frames_and_off_keeps_the_error() {
+        // 2x2 RGB24: red, green / blue, white.
+        let frame = rgb24_frame(2, 2, vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]);
+
+        let error = convert_to_bgra(&frame, PixelFormat::Rgb24, 4, 4, false)
+            .expect_err("an explicit mismatch stays an error");
+        assert!(matches!(
+            error,
+            WebRtcError::FrameDimensions {
+                width: 2,
+                height: 2,
+                expected_width: 4,
+                expected_height: 4
+            }
+        ));
+
+        let bgra = convert_to_bgra(&frame, PixelFormat::Rgb24, 4, 4, true)
+            .expect("fit mode rescales the frame");
+        assert_eq!(bgra.len(), 4 * 4 * 4);
+        // Nearest-neighbour maps (0,0)->(0,0) and (3,3)->(1,1).
+        assert_eq!(&bgra[0..4], &[0, 0, 255, 0xFF]);
+        let last = (4 * 3 + 3) * 4;
+        assert_eq!(&bgra[last..last + 4], &[255, 255, 255, 0xFF]);
+
+        let same = convert_to_bgra(&frame, PixelFormat::Rgb24, 2, 2, false)
+            .expect("matching dimensions need no scaling");
+        assert_eq!(same.len(), 2 * 2 * 4);
     }
 }

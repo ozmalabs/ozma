@@ -59,6 +59,7 @@ fn options(dry_run: bool) -> SupervisorOptions {
         apply_ownership: false,
         apply_routing: false,
         input_isolation: true,
+        seat_display: Default::default(),
     }
 }
 

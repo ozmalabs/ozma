@@ -140,6 +140,17 @@ pub enum UsbError {
         limit: usize,
     },
 
+    /// A USB/IP control frame was truncated, oversized, or unsupported.
+    #[error("invalid USB/IP control frame: {0}")]
+    UsbIpProtocol(#[from] crate::usbip_protocol::UsbIpProtocolError),
+
+    /// An IMPORT named a bus id that this daemon does not export.
+    #[error("USB/IP device {bus_id:?} is not exported by this daemon")]
+    UsbIpUnknownDevice {
+        /// Requested bus id.
+        bus_id: String,
+    },
+
     /// A `usbip`/NBD response could not be parsed.
     #[error("invalid {protocol} response: {reason}")]
     Protocol {
@@ -441,6 +452,8 @@ impl UsbError {
             Self::UsbIpKernelRequired { .. } => "usbip-kernel-required",
             Self::UsbIpDaemonStopped => "usbip-daemon-stopped",
             Self::UsbIpConnectionLimit { .. } => "usbip-connection-limit",
+            Self::UsbIpProtocol(_) => "usbip-protocol",
+            Self::UsbIpUnknownDevice { .. } => "usbip-unknown-device",
             Self::Protocol { .. } => "protocol-error",
             Self::ConfigFs { .. } => "configfs-io",
             Self::Io { .. } => "io",

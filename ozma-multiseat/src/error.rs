@@ -196,6 +196,56 @@ pub enum MultiseatError {
     /// request, or lost a grab. Isolation is never claimed after this error.
     #[error("seat input isolation error: {0}")]
     InputIsolation(String),
+
+    /// A per-seat display server backend needs an external binary (`Xvfb`,
+    /// `Xephyr`, or `xauth`) that is not installed or not executable.
+    #[error(
+        "seat display backend {backend:?} requires {program:?}, which is unavailable: {reason}"
+    )]
+    SeatDisplayTool {
+        /// Backend that needs the program (`xvfb` or `xephyr`).
+        backend: String,
+        /// Program name or path.
+        program: String,
+        /// Why it could not be used.
+        reason: String,
+    },
+
+    /// Every display number in the configured range is already claimed.
+    #[error("no free X display number in {start}..={end}")]
+    SeatDisplayNumberExhausted {
+        /// First display number considered.
+        start: u32,
+        /// Last display number considered.
+        end: u32,
+    },
+
+    /// A spawned X server never became ready. The display is never reported as
+    /// claimed after this error.
+    #[error("seat display {display} did not become ready within {timeout_ms} ms: {detail}")]
+    SeatDisplayStartupTimeout {
+        /// X display string, for example `:90`.
+        display: String,
+        /// Readiness budget in milliseconds.
+        timeout_ms: u64,
+        /// Last probe detail.
+        detail: String,
+    },
+
+    /// A ready X server exited while its seat was running.
+    #[error("seat display {display} ({backend}) exited: {detail}")]
+    SeatDisplayCrashed {
+        /// X display string, for example `:90`.
+        display: String,
+        /// Backend name.
+        backend: String,
+        /// Exit detail.
+        detail: String,
+    },
+
+    /// Generic per-seat display server failure (spawn, stop, or probe).
+    #[error("seat display error: {0}")]
+    SeatDisplay(String),
 }
 
 impl MultiseatError {

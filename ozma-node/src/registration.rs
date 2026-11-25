@@ -22,8 +22,17 @@ pub const SEAT_ID_ENV: &str = "OZMA_SEAT_ID";
 /// `NotConfigured` is a typed absence, not an empty endpoint string: the fields
 /// are omitted from mDNS and direct registration, and `/api/v1/connection`
 /// reports the omission via [`RegistrationExtras::unsupported_controller_fields`].
-/// The Rust node never starts a VNC server; this only describes an external
-/// QEMU VNC endpoint selected with `--vnc-host`/`--vnc-port`.
+///
+/// The endpoint is either:
+///
+/// * the node's own opt-in RFB listener (`--vnc-server`), whose real bound
+///   host/port is reported only while listening; or
+/// * an external QEMU VNC endpoint selected with `--vnc-host`/`--vnc-port` when
+///   no internal listener is running.
+///
+/// When both are configured the internal listener wins, so the controller
+/// connects to the node rather than to a guest-local endpoint that may not be
+/// reachable from the controller.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum VncRegistration {
@@ -85,15 +94,42 @@ impl RegistrationExtras {
         vnc_port: Option<u16>,
         vm_ip: Option<&str>,
     ) -> Self {
+        Self::resolve_with_served_vnc(seat_id, None, vnc_host, vnc_port, vm_ip)
+    }
+
+    /// Resolve compatibility fields with an optional endpoint served by this
+    /// node's own RFB listener.
+    ///
+    /// The served endpoint wins over an external QEMU VNC host/port when both
+    /// exist: the internal listener is reachable wherever the node is, while
+    /// `--vnc-host` may point at a guest-local address. `served` is supplied
+    /// only after the listener has actually bound, so a configured-but-failed
+    /// VNC server keeps the typed `not-configured` state (or falls back to the
+    /// external endpoint).
+    pub fn resolve_with_served_vnc(
+        seat_id: Option<&str>,
+        served: Option<(&str, u16)>,
+        vnc_host: Option<&str>,
+        vnc_port: Option<u16>,
+        vm_ip: Option<&str>,
+    ) -> Self {
         let seat_id = non_empty(seat_id).map(str::to_owned);
         let vm_ip = non_empty(vm_ip).map(str::to_owned);
-        let vnc = match (non_empty(vnc_host), vnc_port.filter(|port| *port != 0)) {
-            (Some(host), Some(port)) => VncRegistration::Configured {
+        let served = served.and_then(|(host, port)| {
+            some_endpoint(host, port).map(|(host, port)| VncRegistration::Configured {
                 host: host.to_owned(),
                 port,
-            },
-            _ => VncRegistration::NotConfigured,
-        };
+            })
+        });
+        let vnc = served.unwrap_or_else(|| {
+            match some_endpoint(vnc_host.unwrap_or(""), vnc_port.unwrap_or(0)) {
+                Some((host, port)) => VncRegistration::Configured {
+                    host: host.to_owned(),
+                    port,
+                },
+                None => VncRegistration::NotConfigured,
+            }
+        });
 
         let mut unsupported_controller_fields = vec![
             "audio_vban_port".to_owned(),
@@ -150,6 +186,11 @@ pub fn seat_id_from_env() -> Option<String> {
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn some_endpoint<'a>(host: &'a str, port: u16) -> Option<(&'a str, u16)> {
+    let host = host.trim();
+    (!host.is_empty() && port != 0).then_some((host, port))
 }
 
 /// Whether a TXT/registration key looks like a credential.
@@ -423,6 +464,50 @@ mod tests {
                 "vm_guest_ip": "10.0.0.42",
             })
         );
+    }
+
+    #[test]
+    fn served_vnc_endpoint_precedes_the_external_qemu_endpoint() {
+        let extras = RegistrationExtras::resolve_with_served_vnc(
+            None,
+            Some(("192.0.2.44", 49152)),
+            Some("127.0.0.1"),
+            Some(5901),
+            None,
+        );
+        assert_eq!(
+            extras.vnc,
+            VncRegistration::Configured {
+                host: "192.0.2.44".to_owned(),
+                port: 49152,
+            }
+        );
+
+        // Without a running listener the external endpoint is still honest.
+        let external = RegistrationExtras::resolve_with_served_vnc(
+            None,
+            None,
+            Some("127.0.0.1"),
+            Some(5901),
+            None,
+        );
+        assert_eq!(
+            external.vnc,
+            VncRegistration::Configured {
+                host: "127.0.0.1".to_owned(),
+                port: 5901,
+            }
+        );
+
+        // A zero/incomplete served or external pair is never advertised.
+        let none = RegistrationExtras::resolve_with_served_vnc(
+            None,
+            Some(("192.0.2.44", 0)),
+            Some(""),
+            Some(5901),
+            None,
+        );
+        assert_eq!(none.vnc, VncRegistration::NotConfigured);
     }
 
     #[test]

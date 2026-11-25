@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Minimal in-process USB/IP control-plane daemon.
 //!
-//! This is not a USB/IP wire-protocol implementation and it does not fake TLS.
+//! This module is the state/authorization layer, not the wire listener: the
+//! version-`0x0111` control codec and bounded stream server are
+//! [`crate::usbip_protocol`] and [`crate::usbip_server`]. This daemon does not
+//! fake TLS.
 //! It models the safe, testable part a node can own without `vhci_hcd`:
 //! starting a bounded listener state, enforcing the existing host/token/key
 //! authorization, listing/exporting local devices, and tracking peer
@@ -34,6 +37,7 @@ use crate::usbip::{
     UsbIpConfig, UsbIpDevice, UsbIpHotplugEvent, UsbIpHotplugKind, UsbIpHotplugLog, UsbIpPeerGrant,
     UsbIpTlsPolicy, UsbIpTlsStatus, DEFAULT_USBIP_PORT, MAX_USBIP_HOTPLUG_EVENTS,
 };
+use crate::usbip_protocol::UsbIpDeviceDescriptor;
 
 /// Maximum simultaneously tracked USB/IP peers.
 pub const MAX_USBIP_DAEMON_CONNECTIONS: usize = 64;
@@ -256,6 +260,7 @@ pub struct UsbIpDaemonStatus {
 struct DaemonInner {
     state: UsbIpDaemonState,
     exported: Vec<UsbIpDevice>,
+    descriptors: Vec<UsbIpDeviceDescriptor>,
     attached: Vec<UsbIpAttachment>,
     connections: Vec<UsbIpConnection>,
     next_connection: u64,
@@ -298,6 +303,7 @@ impl UsbIpDaemon {
             inner: Mutex::new(DaemonInner {
                 state: UsbIpDaemonState::Stopped,
                 exported: Vec::new(),
+                descriptors: Vec::new(),
                 attached: Vec::new(),
                 connections: Vec::new(),
                 next_connection: 1,
@@ -352,9 +358,41 @@ impl UsbIpDaemon {
         Ok(inner.exported.clone())
     }
 
+    /// Wire-protocol descriptors for the currently exported devices.
+    ///
+    /// Only devices exported through [`Self::export_with_descriptor`] (or
+    /// [`Self::export_with_token_and_descriptor`]) have a descriptor. An
+    /// export without one is deliberately not advertised by
+    /// `OP_REP_DEVLIST`: this daemon never invents a path, bus number, device
+    /// number, speed, or interface list.
+    pub fn device_list(&self) -> Result<Vec<UsbIpDeviceDescriptor>, UsbError> {
+        let inner = self.require_running()?;
+        Ok(inner
+            .descriptors
+            .iter()
+            .filter(|descriptor| {
+                inner
+                    .exported
+                    .iter()
+                    .any(|device| device.bus_id == descriptor.bus_id)
+            })
+            .cloned()
+            .collect())
+    }
+
     /// Export a local device without peer authorization (local administrator).
     pub fn export(&self, bus_id: &str) -> Result<UsbIpDevice, UsbError> {
-        self.export_inner(bus_id, None)
+        self.export_inner(bus_id, None, None)
+    }
+
+    /// Export a local device together with the descriptor served by
+    /// `OP_REP_DEVLIST`.
+    pub fn export_with_descriptor(
+        &self,
+        bus_id: &str,
+        descriptor: UsbIpDeviceDescriptor,
+    ) -> Result<UsbIpDevice, UsbError> {
+        self.export_inner(bus_id, None, Some(descriptor))
     }
 
     /// Export a local device after pairing a peer with host/token/fingerprint.
@@ -367,15 +405,42 @@ impl UsbIpDaemon {
     ) -> Result<UsbIpDevice, UsbError> {
         validate_host(host)?;
         let grant = self.authorize_peer(host, token, key_fingerprint)?;
-        self.export_inner(bus_id, Some(grant))
+        self.export_inner(bus_id, Some(grant), None)
+    }
+
+    /// Peer-authorized export with a wire-protocol descriptor.
+    pub fn export_with_token_and_descriptor(
+        &self,
+        bus_id: &str,
+        host: &str,
+        token: Option<&str>,
+        key_fingerprint: Option<&str>,
+        descriptor: UsbIpDeviceDescriptor,
+    ) -> Result<UsbIpDevice, UsbError> {
+        validate_host(host)?;
+        let grant = self.authorize_peer(host, token, key_fingerprint)?;
+        self.export_inner(bus_id, Some(grant), Some(descriptor))
     }
 
     fn export_inner(
         &self,
         bus_id: &str,
         grant: Option<UsbIpPeerGrant>,
+        descriptor: Option<UsbIpDeviceDescriptor>,
     ) -> Result<UsbIpDevice, UsbError> {
         validate_bus_id(bus_id)?;
+        if let Some(descriptor) = &descriptor {
+            descriptor.validate()?;
+            if descriptor.bus_id != bus_id {
+                return Err(UsbError::InvalidUsbIp {
+                    field: "bus_id",
+                    reason: format!(
+                        "descriptor bus id {:?} does not match exported device {bus_id:?}",
+                        descriptor.bus_id
+                    ),
+                });
+            }
+        }
         let mut inner = self.require_running()?;
         if inner.exported.iter().any(|device| device.bus_id == bus_id) {
             return Err(UsbError::InvalidUsbIp {
@@ -386,6 +451,9 @@ impl UsbIpDaemon {
         self.kernel.export(bus_id)?;
         let device = UsbIpDevice::local(bus_id);
         inner.exported.push(device.clone());
+        if let Some(descriptor) = descriptor {
+            inner.descriptors.push(descriptor);
+        }
         let host = grant.as_ref().map(|grant| grant.host.clone());
         inner
             .hotplug
@@ -400,6 +468,9 @@ impl UsbIpDaemon {
         self.kernel.unexport(bus_id)?;
         let before = inner.exported.len();
         inner.exported.retain(|device| device.bus_id != bus_id);
+        inner
+            .descriptors
+            .retain(|descriptor| descriptor.bus_id != bus_id);
         if inner.exported.len() != before {
             inner
                 .hotplug

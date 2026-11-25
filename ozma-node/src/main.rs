@@ -190,6 +190,23 @@ pub struct Args {
     #[arg(long, env = "OZMA_VNC_FPS", default_value_t = ozma_capture::VNC_DEFAULT_FPS)]
     pub vnc_fps: u32,
 
+    /// Serve this node's first capture source as an RFB 3.8/VNC endpoint.
+    ///
+    /// The server has security type None (no password/TLS); it binds loopback
+    /// by default. Enabling it on a node with no capture source is a warned
+    /// no-listener state, not a fake endpoint.
+    #[arg(long, env = "OZMA_VNC_SERVER")]
+    pub vnc_server: bool,
+
+    /// Bind address for `--vnc-server`. Supplying this flag is the explicit
+    /// opt-in that permits a non-loopback address (`0.0.0.0`, a LAN IP, ...).
+    #[arg(long, env = "OZMA_VNC_BIND")]
+    pub vnc_bind: Option<String>,
+
+    /// TCP port for `--vnc-server` (0 asks the OS for a free port).
+    #[arg(long, env = "OZMA_VNC_SERVER_PORT", default_value_t = 0)]
+    pub vnc_server_port: u16,
+
     /// QEMU D-Bus console index (`Console_N`). Supplying any D-Bus display
     /// flag selects D-Bus capture on a VM node; the effective default is 0.
     #[arg(long, env = "OZMA_DBUS_CONSOLE", value_name = "INDEX")]
@@ -1061,6 +1078,9 @@ async fn run() -> std::process::ExitCode {
         vnc_width: args.vnc_width,
         vnc_height: args.vnc_height,
         vnc_fps: args.vnc_fps,
+        vnc_server: args.vnc_server,
+        vnc_bind: args.vnc_bind.clone(),
+        vnc_server_port: args.vnc_server_port,
         dbus_console: args
             .capture_console
             .or(args.dbus_console)
@@ -1485,6 +1505,64 @@ async fn run() -> std::process::ExitCode {
     }
     info!(sink = sink_kind, "Input sink ready");
 
+    // Resolve the advertised address before the opt-in RFB listener so a
+    // wildcard bind can report a connectable host instead of 0.0.0.0.
+    let local_ip = resolve_local_ip(&args);
+    info!(ip = %local_ip, "Resolved local IP");
+
+    // Opt-in RFB 3.8 server. It binds only when --vnc-server is set *and* the
+    // capture registry has a source to feed it; otherwise registration keeps
+    // the honest typed not-configured state. The endpoint is captured before
+    // the handle is moved to its shutdown task.
+    let vnc_server = match ozma_node::vnc_server::start_if_configured(
+        args.vnc_server,
+        args.vnc_bind.as_deref(),
+        args.vnc_server_port,
+        &capture_registry,
+        input_sink.clone(),
+        &config.name,
+    )
+    .await
+    {
+        Ok(server) => server,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "VNC server not started; /api/v1/connection.registration keeps VNC \
+                 not-configured unless --vnc-host/--vnc-port names an external endpoint"
+            );
+            None
+        }
+    };
+    let served_vnc = vnc_server
+        .as_ref()
+        .map(|server| server.registration_endpoint(&local_ip));
+    if let Some(server) = vnc_server {
+        let (host, port) = served_vnc
+            .clone()
+            .expect("the VNC endpoint was resolved before moving the handle");
+        info!(
+            bind = %server.bound_addr(),
+            advertised_host = %host,
+            advertised_port = port,
+            security = "none",
+            "RFB 3.8 VNC server is serving the first capture source"
+        );
+        let vnc_shutdown = shutdown.clone();
+        background.push((
+            "vnc-server",
+            tokio::spawn(async move {
+                vnc_shutdown.cancelled().await;
+                server.shutdown().await;
+            }),
+        ));
+    } else if args.vnc_server {
+        warn!(
+            "VNC server was requested but no capture source or usable bind was available; \
+             no VNC listener is advertised"
+        );
+    }
+
     let power = build_power(&vm_providers, shared_qmp.clone()).await;
 
     // Audio routing controls an existing PipeWire/PulseAudio graph. `none`
@@ -1655,6 +1733,7 @@ async fn run() -> std::process::ExitCode {
                 shm_path: args.webrtc_shm.clone().unwrap_or_else(default_webrtc_shm),
                 width: args.webrtc_width,
                 height: args.webrtc_height,
+                scale_to_fit: args.webrtc_fit_capture,
                 fps: args.webrtc_fps,
                 bitrate_kbps: args.webrtc_bitrate_kbps,
                 audio_source: audio_source.clone(),
@@ -1878,8 +1957,14 @@ async fn run() -> std::process::ExitCode {
     // registration instead of being sent as an empty endpoint. The same value
     // is reported on `/api/v1/connection.registration` so a controller (or an
     // operator) can distinguish "not available" from "configured empty".
-    let registration_extras = registration::RegistrationExtras::resolve(
+    // Precedence: a listening internal RFB server wins over an external QEMU
+    // VNC host/port, because the controller can reach the node's advertised
+    // address while a guest-local endpoint may be unreachable.
+    let registration_extras = registration::RegistrationExtras::resolve_with_served_vnc(
         registration::seat_id_from_env().as_deref(),
+        served_vnc
+            .as_ref()
+            .map(|(host, port)| (host.as_str(), *port)),
         args.vnc_host.as_deref(),
         args.vnc_port,
         args.vm_guest_ip.as_deref(),
@@ -2425,9 +2510,6 @@ async fn run() -> std::process::ExitCode {
         platform = %capabilities.platform,
         "Ozma node starting"
     );
-
-    let local_ip = resolve_local_ip(&args);
-    info!(ip = %local_ip, "Resolved local IP");
 
     let txt = build_txt(&args, &local_ip, &registration_extras);
 
@@ -3328,6 +3410,26 @@ mod tests {
             (1280, 720, 15)
         );
         assert_eq!(args.ffmpeg_bin, std::path::PathBuf::from("/usr/bin/ffmpeg"));
+    }
+
+    #[test]
+    fn vnc_server_flags_are_opt_in_and_auto_port_by_default() {
+        let defaults = Args::parse_from(["ozma-node"]);
+        assert!(!defaults.vnc_server);
+        assert!(defaults.vnc_bind.is_none());
+        assert_eq!(defaults.vnc_server_port, 0);
+
+        let args = Args::parse_from([
+            "ozma-node",
+            "--vnc-server",
+            "--vnc-bind",
+            "0.0.0.0",
+            "--vnc-server-port",
+            "5900",
+        ]);
+        assert!(args.vnc_server);
+        assert_eq!(args.vnc_bind.as_deref(), Some("0.0.0.0"));
+        assert_eq!(args.vnc_server_port, 5900);
     }
 
     #[test]

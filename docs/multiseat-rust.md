@@ -3,28 +3,30 @@
 Status: **library + real subprocess supervisor + CLI + controller read-only
 grouping + persisted seats/hotplug reconciliation + opt-in
 input-routing/display-ownership/audio execution + opt-in privileged input
-isolation (2026-11-25).**
+isolation + opt-in per-seat X servers (2026-11-25).**
 The crate enumerates display/input topology, plans one desktop seat per output,
 can spawn, health-check, restart, stop, and report one `ozma-node --profile
 desktop` child per seat, and models the opt-in resource layers: `xinput
 map-to-output` input routing with rollback, per-seat `xrandr`
-output/mode/position ownership, per-seat PipeWire/PulseAudio null sinks, and a
+output/mode/position ownership, per-seat PipeWire/PulseAudio null sinks, a
 privileged `ozma-seat-input` helper that performs real `EVIOCGRAB` and per-seat
-uinput creation. The supervisor **applies those resources before spawning and
-releases them on stop/remove/shutdown** when the explicit
+uinput creation, and opt-in `Xvfb`/`Xephyr` private X servers per seat. The
+supervisor **applies those resources before spawning and releases them on
+stop/remove/shutdown** when the explicit
 `--apply-ownership`/`--apply-routing`/`--audio-router`/`--input-isolation
-helper` CLI flags (or the matching `SupervisorOptions`/builder calls) are
-enabled; all default to off, and dry-run still performs no action. The default
-input path remains the xinput strategy; the helper path is never selected
-implicitly. A versioned `seats.json` store (`--seats-file`) preserves seat ids,
-display outputs, input hubs, ports, and audio sinks across replans; a sysfs
+helper`/`--seat-display` CLI flags (or the matching
+`SupervisorOptions`/builder calls) are enabled; all default to off, and dry-run
+still performs no action. The default input path remains the xinput strategy;
+the helper path is never selected implicitly. The default display backend
+remains `shared` (one X root); `xvfb`/`xephyr` start a real private server only
+when requested. A versioned `seats.json` store (`--seats-file`) preserves seat
+ids, display outputs, input hubs, ports, and audio sinks across replans; a sysfs
 hotplug model (`--hotplug`) reconciles add/remove display and input-hub events
 into seat start/stop with debounce. It is **not wired into `ozma-node` or
-`ozma-softnode`**, and it creates no virtual display. The helper grabs physical
-devices only when explicitly requested and confirmed; it is not invoked by the
-default plan, tests, or dry runs. The controller can group the independent
-per-seat node registrations for display, without merging them or taking over
-seat lifecycle.
+`ozma-softnode`**. The helper grabs physical devices only when explicitly
+requested and confirmed; it is not invoked by the default plan, tests, or dry
+runs. The controller can group the independent per-seat node registrations for
+display, without merging them or taking over seat lifecycle.
 
 The Python baseline in [`agent/multiseat`](../agent/multiseat) remains the
 runnable multi-seat implementation. The plan and phase status are in
@@ -100,6 +102,16 @@ Implemented:
   `input_isolation_applied`, `audio_applied`, matching `*_released` flags,
   `grabbed_device_count`, `uinput_devices`, and typed `errors`). The field is
   omitted when no resource action happened, so default status is unchanged.
+- **Opt-in per-seat displays** (`seat_display`): `shared` (default, one X root),
+  `xvfb` (private `Xvfb :N -screen 0 WxHx24 -nolisten tcp` per seat), and
+  `xephyr` (private X server nested as a window in the shared display). The
+  supervisor allocates a free display number, creates a per-display `xauth`
+  cookie (or falls back to `-ac` on the Unix-socket-only listener), completes a
+  real X11 connection setup handshake before exporting `DISPLAY`/`XAUTHORITY`
+  to the child, rewrites X11 capture flags to the private screen, and stops the
+  server after the node on stop/rollback/shutdown. Display state is reported as
+  `display_backend`, `display`, `display_pid`, `display_ready`, typed
+  `display_error`, and typed `display_notes`.
 - **Seat persistence** (`persistence`): a versioned `SeatStore`/`seats.json`
   with explicit seat id, display output, input hub, device paths, UDP/HTTP
   ports, audio sink, and profile. Loads validate ids/displays/ports/sinks and
@@ -135,11 +147,14 @@ Deliberately not implemented yet:
 - Node integration inside `ozma-node`/`ozma-softnode`, controller registration,
   or a Python-agent-compatible manager API. The CLI is the external supervisor.
   The controller grouping above is read-only and does not change this.
-- **True per-seat screen ownership.** The X11 path positions one xrandr output
-  on a single X server. All outputs share one root window and one keyboard
-  focus, so `xrandr` ownership is not screen isolation. Separate X screens,
-  a per-seat X server/compositor, or DRM leasing are still required and are not
-  created here. Wayland compositor seats are modelled only as a kind.
+- **True per-seat screen ownership.** The default X11 path positions one xrandr
+  output on a single X server. All outputs share one root window and one
+  keyboard focus, so `xrandr` ownership is not screen isolation. The opt-in
+  `--seat-display xvfb` (and nested `xephyr`) backend now provides a private X
+  root per seat, but it uses a virtual X server, not a physical output owner:
+  xrandr output ownership is not applied on that root and is reported as a typed
+  `ownership_unsupported` note. DRM leasing, one compositor per physical output,
+  and Wayland compositor seats are still not implemented.
 - **Real exclusive evdev grabs by default.** `EvdevGrabRouter` still models
   `EVIOCGRAB` with an unsupported default backend. The real path is the
   separate opt-in `ozma-seat-input` helper (`--input-isolation helper`);
@@ -151,7 +166,15 @@ Deliberately not implemented yet:
   `--print-plan`/`--dry-run` never execute them. There is no policy engine,
   per-seat retry loop beyond the supervisor's restart path, or automatic
   reconciliation after external X layout changes. Evdev routing still requires
-  an injected backend.
+  an injected backend. With a private display, `xinput map-to-output` has no
+  physical pointer to map and is reported as a typed
+  `xinput_routing_unsupported` note instead of a fake success.
+- **Compositor integration for private displays.** `Xvfb`/`Xephyr` prove real
+  per-seat display isolation for X11 applications, but no window manager,
+  compositor, DRM scanout, physical-output handoff, or per-node compositor
+  launch is managed. The helper's uinput devices are still relayed only to the
+  host input stack; injecting them into the private X server/compositor seat is
+  not wired.
 - **Kernel/compositor seat targeting for the helper's uinput devices.** The
   helper creates and reports per-seat uinput devices and relays physical events,
   but no node/compositor integration yet consumes those names as a seat input
@@ -191,12 +214,13 @@ Deliberately not implemented yet:
 | Seat | `SeatProfile`, `ProfileDefaults`, `SeatConfig`, `SeatPlan`, `CapturePlan`, `NodeCommand`, `SeatPorts`, `SeatState`, `SeatStatus`, `SeatRuntimeStatus` |
 | Input routing | `InputRouter`, `XInputRouter`, `EvdevGrabRouter`, `InputTarget`, `InputAssignment`, `InputRelease`, `InputRoutePlan`, `InputRoutingStrategy`, `assign_seats`, `parse_xinput_list`, `XInputDevice`, `RouteCommand`, `CommandRunner`, `ProcessCommandRunner`, `DeviceNameResolver`, `SysfsDeviceNameResolver`, `EvdevGrabBackend`, `EvdevGrabCommand`, `UnsupportedEvdevGrabBackend` |
 | Display ownership | `DisplayOwnership`, `DisplayOwnershipKind`, `DisplayOwnershipController`, `XrandrOwnershipController`, `apply_ownership` |
+| Seat display | `SeatDisplayBackend`, `SeatDisplayOptions`, `SeatDisplaySize`, `SeatDisplayRequest`, `SeatDisplayHandle`, `SeatDisplayLauncher`, `ProcessSeatDisplayLauncher`, `SeatDisplayPrograms`, `DisplayNumberAllocator`, `SeatDisplayStatus`, `SeatDisplayError`, `SeatDisplayNote`, `SeatDisplayNoteKind`, `probe_x11_display`, `display_server_args` |
 | Plan result | `MultiseatPlan`, `PlanDiagnostic`, `DiagnosticCode` |
 | Supervisor | `SeatSupervisor`, `ProcessSeatSupervisor`, `SupervisorOptions`, `NodeLaunchSpec`, `NodeLauncher`, `ReadinessProbe`, `SeatRuntimeStatus`, `SeatResourceStatus`, `SeatResourceError`, `ResourceKind`, `ResourceAction` |
 | Status | `MultiseatCapability`, `MultiseatStatus`, `render_metrics` |
 | Supervision | `SeatSupervisor`, `ProcessSeatSupervisor`, `SupervisorOptions`, `NodeLaunchSpec`, `NodeLauncher`, `ProcessLauncher`, `ChildHandle`, `ChildExit`, `ReadinessProbe`, `HttpHealthProbe`, `PortProbe`, `restart_delay` |
 | CLI | `ozma-multiseat` binary |
-| Test-only | `fake::FakeDisplayBackend`, `fake::FakeInputBackend`, `fake::FakeSeatSupervisor`, `fake::FakeNodeLauncher`, `fake::FakeReadinessProbe`, `fake::FakeCommandRunner`, `fake::FakeDeviceNameResolver`, `fake::FakeEvdevGrabBackend`, `fake::FakeSeatAudioRouter`, `fake::FakeHotplugMonitor` |
+| Test-only | `fake::FakeDisplayBackend`, `fake::FakeInputBackend`, `fake::FakeSeatSupervisor`, `fake::FakeNodeLauncher`, `fake::FakeReadinessProbe`, `fake::FakeCommandRunner`, `fake::FakeDeviceNameResolver`, `fake::FakeEvdevGrabBackend`, `fake::FakeSeatAudioRouter`, `fake::FakeSeatDisplayLauncher`, `fake::FakeHotplugMonitor` |
 
 `fake` is not selected by detection and never touches `/dev`, sysfs, X11,
 PipeWire, or processes. Production code must choose `XrandrDisplayBackend` /
@@ -410,12 +434,73 @@ rolls back earlier outputs when a later apply fails. Non-xrandr ownership kinds
 (`x_screen`, `separate_server`, `wayland_compositor`) are modelled but return a
 typed `Unsupported` error from the xrandr controller.
 
-**Single X server limitation.** All xrandr outputs share one root window, one
-window manager, and one keyboard focus. Positioning an output and mapping a
-pointer to it is not seat isolation; `ozma-node` still injects into the one X
-server. True ownership requires separate X screens (`:0.0`, `:0.1`), one X
-server/compositor per seat, or DRM leasing. This crate creates none of those and
-claims no Wayland or Windows ownership.
+**Single X server limitation.** On the default backend, all xrandr outputs
+share one root window, one window manager, and one keyboard focus. Positioning
+an output and mapping a pointer to it is not seat isolation; `ozma-node` still
+injects into the one X server. The opt-in `--seat-display xvfb|xephyr` backend
+below starts a private X server per seat, which does isolate the root/focus for
+X11 applications. It is still not DRM leasing or a physical-output/compositor
+seat, and it claims no Wayland or Windows ownership.
+
+## Per-seat X servers (`--seat-display`)
+
+The display backend is selected per supervisor run, not per seat:
+
+| Backend | Behavior |
+|---|---|
+| `shared` (default) | No server is started. Every seat uses the host's one X root; `DISPLAY` comes from the plan. Existing behavior is unchanged. |
+| `xvfb` | Start `Xvfb :N -screen 0 WxHx24 -nolisten tcp` per seat, on a free display number. |
+| `xephyr` | Start `Xephyr :N -screen WxHx24` with `DISPLAY` set to the shared display, so the private X root is a window inside the operator's desktop. If `Xephyr` is unavailable the start fails with a typed `Unsupported` error. |
+
+`SeatDisplayOptions` carries `backend`, `size` (default `1280x800`), the display
+number range (default `90..=199`), readiness timeout/poll, and an optional
+shared parent for Xephyr. `ProcessSeatDisplayLauncher` is the production
+spawner; it is installed automatically by `ProcessSeatSupervisor::new` when the
+backend is nested. `with_parts` (used by tests and the CLI) requires an explicit
+`with_display_launcher(...)`.
+
+Lifecycle and honesty rules:
+
+- **Allocation.** The allocator walks the configured range and skips numbers
+  whose `/tmp/.X11-unix/XN` socket or `/tmp/.XN-lock` file already exists. A
+  released number is reused by the next start. Exhaustion is
+  `SeatDisplayNumberExhausted` (`number_exhausted` in status).
+- **Auth.** When `xauth` is available, the launcher creates a private temporary
+  `Xauthority` with a random `MIT-MAGIC-COOKIE-1` for `:N`, starts the server
+  with `-auth <file>`, and exports `XAUTHORITY` to the child. If `xauth` is
+  missing or fails, the server uses `-ac` and a typed `auth_disabled` note is
+  recorded; the listener is still Unix-socket-only because `-nolisten tcp` is
+  always passed.
+- **Readiness.** A spawned process is not a ready display. The supervisor
+  completes an X11 connection setup handshake against `/tmp/.X11-unix/XN`
+  (with the cookie) and only then stores the handle and reports
+  `display_ready=true`. A server that exits first is `SeatDisplayCrashed`; one
+  that never answers is `SeatDisplayStartupTimeout`. Both terminate and release
+  the number before returning.
+- **Child environment.** `DISPLAY` and (when present) `XAUTHORITY` are exported.
+  X11 capture flags are rewritten to the private display at offset `0,0` with
+  the configured `--seat-display-size`. A PipeWire capture seat keeps its
+  configured target; only the application display changes.
+- **Start order.** Private X server → ownership/routing/helper/audio resources →
+  node child. **Stop order** is node child → resources → private X server. A
+  failed resource apply or node readiness releases the server, and rollback
+  releases servers that have no child.
+- **Crash.** `tick` polls each private server. If it exits while the seat is
+  running, the node is terminated, the server is released, and the seat is
+  scheduled for a bounded restart. The next attempt starts a fresh server and
+  reuses the display number.
+- **Ownership/routing on a private root.** xrandr output ownership and xinput
+  `map-to-output` assume a physical output/pointer in the shared X server.
+  With a nested display they are **not executed**; the seat reports typed
+  `ownership_unsupported` / `xinput_routing_unsupported` notes instead of a
+  fake applied flag. `--input-isolation helper` still runs before the node and
+  is not regressed: the helper grabs the physical devices and creates the
+  per-seat uinput devices even when the display is private.
+- **Status.** Each seat carries `display_backend`, `display`, `display_pid`,
+  `display_ready`, `display_notes`, and a typed `display_error`
+  (`missing_binary`, `number_exhausted`, `startup_timeout`, `crashed`,
+  `unsupported`). All display fields are omitted for the default `shared`
+  backend, so existing status JSON is unchanged.
 
 ## Supervision
 
@@ -450,6 +535,12 @@ fn status(&self) -> Vec<SeatRuntimeStatus>;
   stopped/restarted when isolation cannot be restored. Dry-run never starts the
   helper. When the last confirmed seat is released, the helper is asked to
   release everything and stop; the next start starts it lazily again.
+- **Private displays (opt-in).** With `seat_display.backend = Xvfb` or `Xephyr`,
+  start spawns and handshakes the server before resource reservation and
+  rewrites the launch spec. Stop releases resources and then stops the server.
+  A failed display start never spawns a node; a display crash stops the node and
+  restarts both. Dry-run reports the would-be server without allocating or
+  spawning it. Tests inject `FakeSeatDisplayLauncher`.
 - **Audio (opt-in).** With a `SeatAudioRouter` installed, start ensures the
   seat's `ozma-seat-N` null sink and records the `<sink>.monitor` target before
   spawning; stop/remove/rollback/shutdown unload it. An ensure failure is
@@ -491,7 +582,9 @@ fn status(&self) -> Vec<SeatRuntimeStatus>;
   spawn failures, and records stop requests; `FakeReadinessProbe` can be ready,
   not-ready, delayed, or failing. `FakeCommandRunner` plus
   `FakeDeviceNameResolver` drive the real `XrandrOwnershipController` and
-  `XInputRouter` without running `xrandr`/`xinput`.
+  `XInputRouter` without running `xrandr`/`xinput`. `FakeSeatDisplayLauncher`
+  simulates ready/timeout/crash/number-exhaustion/missing-binary display starts
+  without opening a socket.
 
 `ProcessSeatSupervisor::tick` performs child polling and due restarts. It is
 synchronous; a caller with an async runtime runs it from a poll loop. `Drop`
@@ -549,7 +642,17 @@ stops any child still owned by the supervisor.
           "ozma-seat-host-seat-0-event0",
           "ozma-seat-host-seat-0-event1"
         ]
-      }
+      },
+      "display_backend": "xvfb",
+      "display": ":90",
+      "display_pid": 4240,
+      "display_ready": true,
+      "display_notes": [
+        {
+          "kind": "ownership_unsupported",
+          "message": "xrandr ownership of output HDMI-1 is not applied: ..."
+        }
+      ]
     }
   ],
   "diagnostics": []
@@ -562,8 +665,13 @@ A failed seat also carries `last_error` and, while a restart is pending,
 `{"kind":"input_isolation","action":"apply","message":"helper error [grab_failed]: ..."}`
 or `{"kind":"audio","action":"apply","message":"pactl is not installed"}` to
 `resources.errors`; the field is omitted entirely when no resource action
-happened. `capability.node_count` always equals `capability.seat_count` and the
-number of seat entries. There is no merged super-node.
+happened. Private display failures add
+`{"kind":"startup_timeout"|"crashed"|"missing_binary"|"number_exhausted"|"unsupported","message":"..."}`
+as `display_error`, and meaningless nested operations add typed
+`display_notes`. All private display fields are omitted when
+`display_backend` is `shared`. `capability.node_count` always equals
+`capability.seat_count` and the number of seat entries. There is no merged
+super-node.
 
 `render_metrics` emits a bounded text surface:
 
@@ -629,6 +737,11 @@ ozma-multiseat --display :0 --apply-ownership --apply-routing
 ozma-multiseat --display :0 --input-isolation helper \
   --input-helper /usr/lib/ozma/ozma-seat-input
 
+# Give each seat its own private Xvfb display at 1280x800. The servers are
+# stopped with their seats; a crash restarts both. Xephyr is the nested-window
+# alternative (`--seat-display xephyr`).
+ozma-multiseat --display :0 --seat-display xvfb --seat-display-size 1280x800
+
 # Persist stable seat ids/ports/sinks across replans, reconcile sysfs hotplug,
 # and create/remove per-seat null sinks through PipeWire's pactl API.
 ozma-multiseat --display :0 \
@@ -654,6 +767,8 @@ Configuration:
 | `--apply-routing` | Apply each seat's xinput/evdev input routing before spawn (default off). |
 | `--input-isolation xinput\|helper` | Input path. `xinput` is the default; `helper` uses privileged `EVIOCGRAB`/uinput isolation. |
 | `--input-helper PATH` | Helper binary for `--input-isolation helper` (default `ozma-seat-input`). |
+| `--seat-display shared\|xvfb\|xephyr` | Per-seat display backend. `shared` is the default; `xvfb`/`xephyr` start and stop a private X server per seat. |
+| `--seat-display-size WxH` | Private X screen geometry (default `1280x800`). |
 | `--seats-file PATH` | Load/reuse and atomically update persisted seat identities. Never written by `--print-plan`/`--dry-run`. |
 | `--hotplug` | Poll read-only sysfs DRM/input snapshots, debounce, and start/stop/restart seats. |
 | `--audio-router [pipewire\|pulseaudio]` | Ensure/remove `ozma-seat-N` null sinks around the child lifecycle (default kind `pipewire`). |
@@ -689,6 +804,16 @@ released. On stop/remove/shutdown the helper releases the seat. The local
 helper result is visible in `resources.grabbed_device_count` and
 `resources.uinput_devices`. The default `xinput` path does not start the helper
 or open a device.
+
+With `--seat-display xvfb` or `xephyr`, the supervisor starts a private X
+server before each seat. A missing `Xvfb` (or `Xephyr` for the nested backend) is
+a typed `display_error`; a server that never completes the X11 handshake is a
+typed `startup_timeout` and is never claimed; an exhausted `:90..=199` range is
+`number_exhausted`; a server that exits is `crashed`. Display numbers are
+reused after stop or rollback. Output lists `display(<backend> <display>
+pid=... ready=...)`; JSON carries the same fields. On shutdown all child
+processes are stopped before their servers, and the sockets/processes are gone
+when `stop_all` returns.
 
 `--seats-file` loads a versioned JSON store (a missing file is empty). The CLI
 reuses persisted ids/ports/hubs/sinks for discovered displays, assigns unused
@@ -863,6 +988,24 @@ a temporary fake HTTP node, stops it through `ProcessSeatSupervisor`, and
 asserts both resources were released. It uses the throwaway display only and
 never grabs evdev or injects input.
 
+The private-display smoke is separately gated and needs only `Xvfb`:
+
+```bash
+OZMA_MULTISEAT_REAL_DISPLAY=1 \
+  cargo test -p ozma-multiseat --test live_display_smoke -- --ignored --nocapture
+```
+
+It starts two throwaway seats on the first free numbers at or above `:90`
+(normally `:90`/`:91`), records each fake node's inherited `DISPLAY`, verifies
+the X11 sockets exist, stops both through `ProcessSeatSupervisor`, and checks
+the sockets and X server pids are gone. It never uses the operator's display.
+
+Live smoke (2026-11-25): the private-display test passed with
+`displays=[90, 91]`, recorded `DISPLAY` values `[":90", ":91"]`, both seats
+`running` with `display_ready=true`, and both stopped cleanly; `/tmp/.X11-unix`
+had no `X90`/`X91` sockets and no `Xvfb` process remained. The host had
+`Xvfb`, `Xephyr` absent, `weston` absent, and `xauth`/`xdpyinfo` present.
+
 Live smoke (2026-11-25): `--print-plan`, `--dry-run`, and the normal supervisor
 path succeeded against ephemeral Xvfb `:99`/`:97` with read-only sysfs input,
 producing the exact `ozma-node --profile desktop` argv without spawning a real
@@ -902,10 +1045,13 @@ local status surface. Still required for parity:
    or surface supervisor state. The CLI status document is local and
    read-only.
 2. **True display ownership.** xrandr output positioning exists as a command
-   model/controller, but one X server still shares a root window and keyboard
-   focus. Separate X screens, a per-seat X server/compositor, or DRM leasing
-   are required. Virtual displays still depend on an external Xorg/dummy driver
-   or the future IDD path. There is no Wayland compositor seat path.
+   model/controller, but the shared backend still has one root window and
+   keyboard focus. The opt-in `--seat-display xvfb`/`xephyr` path now provides a
+   real private X root and prepared `DISPLAY`/`XAUTHORITY` for each seat, but it
+   is a virtual X server: physical output ownership/scanout, one compositor or
+   WM per seat, DRM leasing, and Wayland compositor seats are still missing.
+   Nested displays report physical-ownership and xinput mapping as typed notes,
+   not fake success.
 3. **Input routing execution and policy.** `xinput map-to-output` and rollback
    are invoked by the supervisor when `--apply-routing` is enabled, and
    `--input-isolation helper` now provides a real privileged `EVIOCGRAB`/uinput

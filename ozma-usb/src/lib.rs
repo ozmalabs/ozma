@@ -54,6 +54,12 @@
 //!   authorization, hotplug log) with an injectable kernel backend. The default
 //!   [`NoUsbIpKernel`] returns typed `usbip-kernel-required` instead of faking a
 //!   `vhci_hcd`/`usbip-host` device; TLS remains fail-closed and external.
+//! * [`usbip_protocol`] is the typed version-`0x0111` control codec
+//!   (`OP_REQ_DEVLIST`/`OP_REP_DEVLIST`, `OP_REQ_IMPORT`/`OP_REP_IMPORT`,
+//!   device/interface records), and [`UsbIpServer`] serves those messages over
+//!   an injectable stream or a bounded loopback/TCP listener. `OP_REQ_IMPORT`
+//!   succeeds only after the daemon's authorization **and** a real kernel
+//!   attach; otherwise it returns a typed error and no device body.
 //!
 //! No code in this crate uses `unsafe`, mounts a filesystem, opens a block
 //! device, writes a block device, or creates a real USB gadget. The ConfigFS
@@ -119,6 +125,8 @@ pub mod uac2;
 pub mod uac2_bridge;
 pub mod usbip;
 pub mod usbip_daemon;
+pub mod usbip_protocol;
+pub mod usbip_server;
 
 pub use config::{
     is_safe_identifier, HidProtocol, UsbFunction, UsbFunctionKind, UsbGadgetConfig,
@@ -224,4 +232,19 @@ pub use usbip::{
 pub use usbip_daemon::{
     NoUsbIpKernel, UsbIpConnection, UsbIpDaemon, UsbIpDaemonConfig, UsbIpDaemonState,
     UsbIpDaemonStatus, UsbIpKernelBackend, MAX_USBIP_DAEMON_CONNECTIONS,
+};
+pub use usbip_protocol::{
+    UsbIpDevListReply, UsbIpDevListRequest, UsbIpDeviceDescriptor, UsbIpImportReply,
+    UsbIpImportRequest, UsbIpInterface, UsbIpOpCode, UsbIpOpHeader, UsbIpProtocolError,
+    UsbIpStatus, OP_REP_DEVLIST, OP_REP_IMPORT, OP_REQ_DEVLIST, OP_REQ_IMPORT, USBIP_BUSID_BYTES,
+    USBIP_DEVICE_BYTES, USBIP_DEVLIST_HEADER_BYTES, USBIP_IMPORT_REPLY_BYTES,
+    USBIP_IMPORT_REQUEST_BYTES, USBIP_INTERFACE_BYTES, USBIP_MAX_DEVICES, USBIP_MAX_DEVICE_BYTES,
+    USBIP_MAX_FRAME_BYTES, USBIP_MAX_INTERFACES, USBIP_OP_HEADER_BYTES, USBIP_PATH_BYTES,
+    USBIP_PROTOCOL_VERSION,
+};
+pub use usbip_server::{
+    serve_session as serve_usbip_session, NoUsbIpCredentials, UsbIpClock, UsbIpCredentialSource,
+    UsbIpManualClock, UsbIpPresentedCredentials, UsbIpServer, UsbIpServerConfig, UsbIpServerHandle,
+    UsbIpServerStats, UsbIpSessionEnd, UsbIpSessionOutcome, UsbIpSystemClock, UsbIpTransport,
+    USBIP_SERVER_DEFAULT_IDLE_TIMEOUT_MS, USBIP_SERVER_MAX_CONNECTIONS,
 };

@@ -418,8 +418,12 @@ a re-run to confirm them end to end.
    screendump, so the initial implementation still spawned at 640x480. The
    fit path now probes one bounded frame (3 s) before spawning when the
    discovery format is unknown; a failed/timed-out probe keeps the configured
-   size and the helper's own dimension check still fails honestly. A live
-   two-peer re-run against the current binary is required to confirm it.
+   size and the helper's own dimension check still fails honestly. A second
+   re-validation then showed the guest modesetting from 720x400 to 1280x800
+   after startup, so fit mode now also nearest-neighbour scales later frames to
+   the helper size instead of killing the feeder (without the flag a mismatch
+   stays a typed error). A live two-peer re-run against the current binary is
+   required to confirm the full path.
 2. **`demo test` cleanup.** The test subcommand now records a non-zero result
    without tripping `set -e` and always calls `_stop_processes`, including when
    the stack fails to start, so a failing suite no longer leaves nodes, QEMU,
@@ -688,3 +692,248 @@ Cleaned up after the run:
   were left in place, as in the prior report.
 - No product source was edited and nothing was committed. The parallel
   workstream's modified/untracked source files are untouched.
+
+## WebRTC fit recheck (2026-11-25)
+
+Date: 2026-11-25 12:02-12:10 local (01:02-01:10 UTC).
+Checkout: `/home/matt/ozma/ozma`, HEAD
+`16f77911a09e627ae9aa2fe3f5100b1858d0088d`
+(`feat(phase4): FunctionFS SCSI media loop and mesh Connect service`), which
+contains the bounded one-frame probe in `ozma-node/src/main.rs:1711-1749`.
+Node binary: `target/debug/ozma-node` 0.1.0, rebuilt at 12:05:31 local with
+`CARGO_NET_OFFLINE=true cargo build -p ozma-node --bin ozma-node` (exit 0).
+
+Environment was the same local demo setup as the previous re-validation:
+direct-QEMU Alpine 3.21.3 VMs from `demo/start_vms.sh`, QMP sockets
+`/tmp/ozma-vm{1,2}.qmp`, controller 7380, nodes 7382/7383, VNC 5901/5922. A
+fresh controller venv at `/tmp/opencode/webrtc-fit-recheck-venv` was created
+with system site packages and the missing pure-Python/ABI3 packages installed
+**offline from the local uv cache** (`uv pip install --offline --no-deps`).
+No network install, no system package, no sudo. The checkout moved during the
+run (`ozma-multiseat` edits by a parallel workstream); no source was edited by
+this validation.
+
+### Result summary
+
+| Check | Result | Evidence |
+|---|---|---|
+| Build current `ozma-node` | **PASS** | `cargo build` exit 0; `ozma-node 0.1.0` |
+| Literal `demo/run_demo.sh --webrtc` emits the fit line on both nodes | **PASS** | `fitting WebRTC helper to the capture frame size configured=640x480 capture=720x400` on vm1 and vm2 |
+| Helper argv uses the probed head size, not 640x480 | **PASS (but wrong head)** | helper argv `--width 720 --height 400`; the guest later settles at 1280x800 |
+| `/api/v1/connection.webrtc` = `running` on both demo nodes | **FAIL** | both `"webrtc":"failed"` |
+| `webrtc_error` absent on both demo nodes | **FAIL** | `frame dimensions 1280x800 do not match the WebRTC helper's 720x400` |
+| Two real peers on the literal `--webrtc` demo | **FAIL** | both peers HTTP 503 `webrtc-unavailable`, 0 buffers |
+| Controller `/api/v1/streams/<id>/webrtc` proxy on literal demo | **FAIL (proxy healthy)** | same typed 503 body, not a proxy 404/502 |
+| Snapshot / HLS / input on literal demo | **PASS** | JPEG 1280x800, H.264 1280x800 segments, QMP key/type ok |
+| Fit when the first observed frame is the settled head | **PASS** | Run C: `capture=1280x800`, helper `1280x800`, both `webrtc=running` |
+| Two real peers with the fitted 1280x800 helper (Run C) | **PASS** | 2 concurrent GStreamer peers, `connected` / ICE `completed`, I420 1280x800@30 |
+| Controller proxy peer with the fitted helper (Run C) | **PASS** | third peer via `/api/v1/streams/vm1.../webrtc`, `connected` / ICE `completed` |
+| Console switching | **SKIP (typed)** | single-head demo, `display_outputs=[]`, `display/select index=2` → typed 404 `not_found` |
+| `demo/run_demo.sh test` runs and cleans up | **PASS** | 73 passed / 3 failed (unchanged Connect drift), stack and QEMU stopped automatically |
+
+### Run A: literal `--webrtc` still ends at the wrong geometry
+
+Command:
+
+```bash
+export PYTHON=/tmp/opencode/webrtc-fit-recheck-venv/bin/python
+export OZMA_NODE_BIN=/home/matt/ozma/ozma/target/debug/ozma-node
+export PATH=/tmp/opencode/nosudo:$PATH
+setsid bash demo/run_demo.sh --webrtc \
+  > /tmp/opencode/webrtc-fit-recheck-artifacts/demo-webrtc-start.log 2>&1 &
+```
+
+The new probe does run. Both nodes logged (01:05:42Z / 12:05:42 local):
+
+```text
+INFO ozma_node: fitting WebRTC helper to the capture frame size
+  configured=640x480 capture=720x400
+INFO ozma_node: WebRTC helper started
+  width=720 height=400 fps=30
+```
+
+`ps` confirmed the helper argv matched: `--width 720 --height 400`. The
+screendump at node start is the early VGA mode (720x400); once the Alpine
+guest switches the framebuffer, capture is 1280x800. The helper is not re-fitted
+when the capture geometry changes, so it stays at 720x400 for the node's life:
+
+```text
+GET /api/v1/connection (7382/7383)
+  "webrtc":"failed"
+  "webrtc_error":"frame dimensions 1280x800 do not match the WebRTC helper's 720x400"
+```
+
+A genuine GStreamer peer per node (`scripts/gate2/webrtc-client.py`,
+`--duration 8`) failed with exit 1 and zero media:
+
+```text
+vm1: HTTP 503 from http://127.0.0.1:7382/webrtc/offer:
+     {"code":"webrtc-unavailable","error":"frame dimensions 1280x800 do not
+      match the WebRTC helper's 720x400", ...}
+     connection_state=unknown ice_connection_state=unknown
+     0 video buffers
+vm2: same typed 503 from :7383, connection_state=unknown, 0 buffers
+```
+
+The controller proxy is healthy and returns the node's typed error unchanged:
+
+```text
+POST http://localhost:7380/api/v1/streams/vm1._ozma._udp.local./webrtc
+  → HTTP 503 {"code":"webrtc-unavailable",
+              "error":"frame dimensions 1280x800 do not match the WebRTC
+                       helper's 720x400", ...}
+```
+
+So the specific previous bug ("fit runs before the first screendump and stays
+640x480") is fixed, but the default demo still fails because the first frame is
+a transient boot mode, not the final head size.
+
+### Run B: explicit 1280x800 (isolation control)
+
+Nodes and controller were stopped while the same QEMU VMs kept running.
+The demo was restarted with `--no-vms` and explicit matching dimensions:
+
+```bash
+export OZMA_WEBRTC_WIDTH=1280 OZMA_WEBRTC_HEIGHT=800
+setsid bash demo/run_demo.sh --webrtc --no-vms \
+  > /tmp/opencode/webrtc-fit-recheck-artifacts/demo-webrtc-1280x800.log 2>&1 &
+```
+
+Both nodes reported `"webrtc":"running"`, `webrtc_error=null`, and helpers at
+`width=1280 height=800`. Two concurrent peers and one proxy peer all connected:
+
+```text
+vm1 direct:  connected, ICE completed, 237 buffers, 364,032,000 bytes,
+             I420 1280x800 progressive 30/1
+vm2 direct:  connected, ICE completed, 238 buffers, 365,568,000 bytes,
+             I420 1280x800 progressive 30/1
+vm1 proxy:   connected, ICE completed, 240 buffers, 368,640,000 bytes,
+             I420 1280x800 progressive 30/1
+```
+
+### Run C: fitted helper when the first observed frame is the head
+
+To test the fit path without an explicit size override, the VMs were started,
+allowed to settle for 20 s, and the demo was then started with `--no-vms` and
+no `OZMA_WEBRTC_WIDTH/HEIGHT`:
+
+```bash
+bash demo/start_vms.sh
+sleep 20
+setsid bash demo/run_demo.sh --webrtc --no-vms \
+  > /tmp/opencode/webrtc-fit-recheck-artifacts/demo-webrtc-runC-settled.log 2>&1 &
+```
+
+Both nodes fitted to the real head and started running helpers (01:09:05Z):
+
+```text
+INFO ozma_node: fitting WebRTC helper to the capture frame size
+  configured=640x480 capture=1280x800
+INFO ozma_node: WebRTC helper started width=1280 height=800 fps=30
+```
+
+Helpers: `--width 1280 --height 800`, distinct PIDs parented by each node, one
+Unix socket and one 4,096,000-byte shm each. Peers:
+
+```text
+vm1 direct:  connected, ICE completed, 237 buffers, 364,032,000 bytes,
+             I420 1280x800 progressive 30/1, exit 0
+vm2 direct:  connected, ICE completed, 241 buffers, 370,176,000 bytes,
+             I420 1280x800 progressive 30/1, exit 0
+vm1 proxy:   connected, ICE completed, 240 buffers, 368,640,000 bytes,
+             I420 1280x800 progressive 30/1, exit 0
+```
+
+This isolates the remaining defect: the fit mechanism itself works; the
+default demo simply probes during the guest's boot-time mode change.
+
+### Snapshot, HLS, input, console
+
+On Run A, Run B, and Run C nodes:
+
+- `GET /display/snapshot` 200 `image/jpeg`, decoded **1280x800**
+  (~96 KB); controller `/api/v1/streams/<id>/snapshot` matched.
+- Local HLS playlist 200; segments 200, `ffprobe` reported `h264,1280,800`.
+  Controller HLS proxy returned 200 `application/vnd.apple.mpegurl`; proxied
+  snapshot decoded 1280x800.
+- `/input/key {"keycode":30,...}` → `{"ok":true,"sink":"qmp"}` and
+  `/input/type {"text":"ab"}` → `{"ok":true,"events":4}` on both nodes.
+- `POST /display/select {"index":2}` → typed 404 `not_found` with
+  `available:[]` (single-head demo; not a regression).
+
+No capture/snapshot/HLS geometry regression. The only wrong geometry is the
+helper's 720x400 in the literal `--webrtc` start.
+
+### `demo test` cleanup
+
+Command (no `--webrtc`), same venv/binary environment:
+
+```bash
+setsid bash demo/run_demo.sh test \
+  > /tmp/opencode/webrtc-fit-recheck-artifacts/demo-test.log 2>&1 &
+```
+
+Result: exit 1 from the unchanged controller-only Connect assertions:
+
+```text
+FAIL  AI setups used: 0
+FAIL  noise_cancellation blocked on free tier
+FAIL  reason mentions upgrade:
+73 passed, 3 failed, 0 skipped
+SOME TESTS FAILED
+```
+
+The cleanup fix worked without manual intervention:
+
+```text
+Stopping Ozma demo...
+  killed PID 1771546 (ozma-ctrl)
+  killed PID 1771541 (ozma-sn1)
+  killed PID 1771544 (ozma-sn2)
+Stopping VMs...
+  killed PID 1771518
+  killed PID 1771520
+Done.
+```
+
+Post-run checks found no `ozma-node`, controller, QEMU, helper, or HLS ffmpeg
+processes; no listeners on 7332/7333, 7380, 7382/7383, 5901/5922; and no demo
+pidfiles or QMP sockets. Cleanup is **PASS**.
+
+### Remaining WebRTC gaps after the fit recheck
+
+1. **The probe captures a transient boot frame, not a stable head.** The QMP
+   head is 720x400 during early guest boot and 1280x800 once Alpine switches
+   the framebuffer. Probing one frame therefore fits 720x400 and the helper is
+   never re-fitted when the capture grows, so the literal `--webrtc` demo still
+   reports `failed` with a typed 503. A complete fix should wait for a stable
+   size, re-fit/restart on a capture-format change, or defer helper start until
+   after boot; alternatively the demo should start nodes after the VM settles.
+   Not applied here.
+2. **Geometry is still not exposed on the status API.**
+   `/api/v1/connection` reports only `webrtc: running|failed` plus
+   `webrtc_error`; width/height/fps are visible only in the node log, helper
+   argv, and peer caps.
+3. **WebRTC audio remains unconfigured** (`webrtc_audio_configured=false`,
+   `webrtc_audio_source=null`); peers negotiated video only. This matches the
+   documented scope, not a regression.
+4. **No native WebRTC.** The external GStreamer/Python helper is still
+   required.
+5. **The checkout moved during validation.** The binary was built from
+   `16f7791` at 12:05:31; a parallel workstream edited `ozma-multiseat` while
+   the run proceeded. This does not touch the WebRTC/capture path.
+6. **Controller test drift is unchanged** (the 3 Connect failures above), and
+   is unrelated to the Rust node or WebRTC.
+
+### Artifacts and cleanup
+
+Artifacts were written to `/tmp/opencode/webrtc-fit-recheck-artifacts/` (start
+and stop logs, connection JSON, offer/peer logs and report JSON, snapshot
+JPEGs, HLS playlists/segments, and `demo-test.log`) and removed during final
+cleanup. The temporary controller venv and `demo/logs/` were removed. Run-created
+controller state (`moonlight_data/`, `msp_data/`, `scan_data/`,
+`static/captures/`, `wg_keys.json`, `wg_state.json`, `connect_cache.json`) was
+removed. Pre-existing untracked `controller/mesh_network.json` and
+`nodes_meta.json` were left in place, as were the parallel workstream's
+modified/untracked sources. No product source was edited and nothing was
+committed.

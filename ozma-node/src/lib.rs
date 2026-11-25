@@ -32,6 +32,7 @@ pub mod thermal;
 pub mod transport;
 pub mod usb_audio;
 pub mod usb_uac2;
+pub mod vnc_server;
 pub mod webrtc;
 
 pub use backend::SessionBackend;

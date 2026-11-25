@@ -1,0 +1,1177 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Per-seat display server backends.
+//!
+//! The default backend is [`SeatDisplayBackend::Shared`]: every seat draws on
+//! the host's one X root, and ownership/routing only move outputs. The opt-in
+//! [`SeatDisplayBackend::Xvfb`] backend starts a private `Xvfb` server per seat
+//! and exports its `DISPLAY` (plus an `XAUTHORITY` cookie when `xauth` is
+//! installed). [`SeatDisplayBackend::Xephyr`] is the nested-window variant: a
+//! private X server whose root is a window inside the shared display.
+//!
+//! Readiness is a real X11 connection setup handshake against the server's Unix
+//! socket. A display is never reported ready because a process was spawned; the
+//! server must answer the protocol handshake. Missing binaries, an exhausted
+//! display-number range, startup timeouts, and crashes have typed errors.
+//!
+//! Nothing here touches the operator's desktop. `Xvfb` listens only on its
+//! Unix socket (`-nolisten tcp`); the cookie is scoped to that display. When
+//! `xauth` is unavailable the server falls back to `-ac` on the same
+//! Unix-socket-only listener, and the handle reports `auth_disabled()` so the
+//! supervisor can record an honest note.
+
+use std::collections::BTreeSet;
+use std::fmt;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::MultiseatError;
+
+/// First display number considered by the default allocator.
+pub const DEFAULT_DISPLAY_NUMBER_START: u32 = 90;
+/// Last display number considered by the default allocator.
+pub const DEFAULT_DISPLAY_NUMBER_END: u32 = 199;
+/// Default nested display size.
+pub const DEFAULT_SEAT_DISPLAY_WIDTH: u32 = 1280;
+/// Default nested display height.
+pub const DEFAULT_SEAT_DISPLAY_HEIGHT: u32 = 800;
+/// Default budget for a spawned X server to answer the X11 handshake.
+pub const DEFAULT_DISPLAY_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default interval between X11 handshake probes.
+pub const DEFAULT_DISPLAY_READY_POLL: Duration = Duration::from_millis(100);
+/// How long an X server gets to exit after SIGTERM before it is killed.
+pub const DISPLAY_TERMINATE_GRACE: Duration = Duration::from_secs(5);
+
+/// Which X server strategy a seat uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeatDisplayBackend {
+    /// Current behavior: one shared X root for every seat.
+    #[default]
+    Shared,
+    /// One private `Xvfb` server per seat.
+    Xvfb,
+    /// One private `Xephyr` server nested inside the shared display.
+    Xephyr,
+}
+
+impl SeatDisplayBackend {
+    /// Stable wire/status name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Xvfb => "xvfb",
+            Self::Xephyr => "xephyr",
+        }
+    }
+
+    /// Whether this backend starts a private X server.
+    pub fn is_nested(self) -> bool {
+        !matches!(self, Self::Shared)
+    }
+}
+
+impl fmt::Display for SeatDisplayBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SeatDisplayBackend {
+    type Err = MultiseatError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "shared" => Ok(Self::Shared),
+            "xvfb" => Ok(Self::Xvfb),
+            "xephyr" => Ok(Self::Xephyr),
+            other => Err(MultiseatError::SeatDisplay(format!(
+                "unknown seat display backend {other:?}; expected shared, xvfb, or xephyr"
+            ))),
+        }
+    }
+}
+
+/// Geometry of the private X screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatDisplaySize {
+    /// Screen width in pixels.
+    pub width: u32,
+    /// Screen height in pixels.
+    pub height: u32,
+}
+
+impl Default for SeatDisplaySize {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_SEAT_DISPLAY_WIDTH,
+            height: DEFAULT_SEAT_DISPLAY_HEIGHT,
+        }
+    }
+}
+
+impl SeatDisplaySize {
+    /// Build a validated size.
+    pub fn new(width: u32, height: u32) -> Result<Self, MultiseatError> {
+        if width == 0 || height == 0 {
+            return Err(MultiseatError::SeatDisplay(format!(
+                "seat display size must be greater than zero, got {width}x{height}"
+            )));
+        }
+        Ok(Self { width, height })
+    }
+
+    /// `WxH`.
+    pub fn as_str(self) -> String {
+        format!("{}x{}", self.width, self.height)
+    }
+
+    /// Depth-24 X screen geometry, for example `1280x800x24`.
+    pub fn x_screen(self) -> String {
+        format!("{}x{}x24", self.width, self.height)
+    }
+}
+
+impl fmt::Display for SeatDisplaySize {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}x{}", self.width, self.height)
+    }
+}
+
+impl FromStr for SeatDisplaySize {
+    type Err = MultiseatError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let trimmed = value.trim();
+        let (width, height) = trimmed.split_once('x').ok_or_else(|| {
+            MultiseatError::SeatDisplay(format!(
+                "invalid seat display size {trimmed:?}; expected WxH, for example 1280x800"
+            ))
+        })?;
+        let width = width.parse::<u32>().map_err(|_| {
+            MultiseatError::SeatDisplay(format!("invalid seat display width {width:?}"))
+        })?;
+        let height = height.parse::<u32>().map_err(|_| {
+            MultiseatError::SeatDisplay(format!("invalid seat display height {height:?}"))
+        })?;
+        Self::new(width, height)
+    }
+}
+
+/// Kind of a typed display status note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeatDisplayNoteKind {
+    /// xrandr ownership was requested but has no meaning on a private X root.
+    OwnershipUnsupported,
+    /// xinput mapping was requested but has no physical pointer inside the
+    /// private X server.
+    XinputRoutingUnsupported,
+    /// `xauth` was unavailable, so the server used `-ac` on its Unix socket.
+    AuthDisabled,
+}
+
+impl SeatDisplayNoteKind {
+    /// Stable wire/status name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnershipUnsupported => "ownership_unsupported",
+            Self::XinputRoutingUnsupported => "xinput_routing_unsupported",
+            Self::AuthDisabled => "auth_disabled",
+        }
+    }
+}
+
+/// One honest limitation note attached to a private display.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatDisplayNote {
+    /// Note kind.
+    pub kind: SeatDisplayNoteKind,
+    /// Operator-facing detail.
+    pub message: String,
+}
+
+impl SeatDisplayNote {
+    /// Build a note.
+    pub fn new(kind: SeatDisplayNoteKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+/// Typed display failure reported in status.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatDisplayError {
+    /// Stable error kind (`missing_binary`, `number_exhausted`,
+    /// `startup_timeout`, `crashed`, `unsupported`, `error`).
+    pub kind: String,
+    /// Full typed error message.
+    pub message: String,
+}
+
+impl SeatDisplayError {
+    /// Build from a typed error.
+    pub fn from_error(error: &MultiseatError) -> Self {
+        Self {
+            kind: display_error_kind(error).to_owned(),
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Per-seat private display state, flattened into seat status.
+///
+/// The whole flat surface is omitted while the backend is `shared`, so status
+/// JSON for the default backend stays byte-for-byte compatible with earlier
+/// releases.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatDisplayStatus {
+    /// Backend in use. Omitted for the default `shared` backend.
+    #[serde(
+        rename = "display_backend",
+        default,
+        skip_serializing_if = "is_shared_backend"
+    )]
+    pub display_backend: SeatDisplayBackend,
+    /// Private X display string, for example `:90`.
+    #[serde(rename = "display", default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+    /// Private X server pid.
+    #[serde(
+        rename = "display_pid",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub display_pid: Option<u32>,
+    /// Whether the X11 handshake succeeded and the server is still alive.
+    #[serde(rename = "display_ready", default, skip_serializing_if = "is_false")]
+    pub display_ready: bool,
+    /// Typed limitations for this display.
+    #[serde(
+        rename = "display_notes",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub display_notes: Vec<SeatDisplayNote>,
+    /// Most recent typed display failure.
+    #[serde(
+        rename = "display_error",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub display_error: Option<SeatDisplayError>,
+}
+
+fn is_shared_backend(backend: &SeatDisplayBackend) -> bool {
+    *backend == SeatDisplayBackend::Shared
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl SeatDisplayStatus {
+    /// A shared-display no-op status.
+    pub fn shared() -> Self {
+        Self::default()
+    }
+
+    /// Configure the requested backend before a private server exists.
+    pub fn for_backend(backend: SeatDisplayBackend) -> Self {
+        Self {
+            display_backend: backend,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the private server has a live pid and a successful handshake.
+    pub fn is_ready(&self) -> bool {
+        self.display_ready && self.display.is_some()
+    }
+
+    /// Add one typed note, deduplicating identical entries.
+    pub fn push_note(&mut self, note: SeatDisplayNote) {
+        if !self
+            .display_notes
+            .iter()
+            .any(|existing| existing.kind == note.kind && existing.message == note.message)
+        {
+            self.display_notes.push(note);
+        }
+    }
+}
+
+/// Supervisor configuration for per-seat display servers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeatDisplayOptions {
+    /// Backend selection. `Shared` is the default and starts nothing.
+    pub backend: SeatDisplayBackend,
+    /// Private X screen size.
+    pub size: SeatDisplaySize,
+    /// First display number considered.
+    pub number_start: u32,
+    /// Last display number considered.
+    pub number_end: u32,
+    /// Budget for the spawned server to answer the X11 handshake.
+    pub ready_timeout: Duration,
+    /// Interval between handshake probes.
+    pub ready_poll: Duration,
+    /// Shared display used as the parent for `Xephyr`. `None` uses the seat's
+    /// planned X11 capture display.
+    pub parent_display: Option<String>,
+}
+
+impl Default for SeatDisplayOptions {
+    fn default() -> Self {
+        Self {
+            backend: SeatDisplayBackend::Shared,
+            size: SeatDisplaySize::default(),
+            number_start: DEFAULT_DISPLAY_NUMBER_START,
+            number_end: DEFAULT_DISPLAY_NUMBER_END,
+            ready_timeout: DEFAULT_DISPLAY_READY_TIMEOUT,
+            ready_poll: DEFAULT_DISPLAY_READY_POLL,
+            parent_display: None,
+        }
+    }
+}
+
+impl SeatDisplayOptions {
+    /// Options for one backend with default geometry and number range.
+    pub fn for_backend(backend: SeatDisplayBackend) -> Self {
+        Self {
+            backend,
+            ..Self::default()
+        }
+    }
+}
+
+/// One request to start a private X server for a seat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeatDisplayRequest {
+    /// Seat that will own the display.
+    pub seat_id: String,
+    /// Backend to start.
+    pub backend: SeatDisplayBackend,
+    /// Private X screen size.
+    pub size: SeatDisplaySize,
+    /// Shared display used as the outer window for `Xephyr`.
+    pub parent_display: Option<String>,
+}
+
+/// Exit information for a private X server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayExit {
+    /// Whether the server exited successfully.
+    pub success: bool,
+    /// Exit code, or `None` when it was terminated by a signal.
+    pub code: Option<i32>,
+}
+
+impl fmt::Display for DisplayExit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.code {
+            Some(code) => write!(formatter, "exit code {code}"),
+            None => formatter.write_str(if self.success { "success" } else { "signal" }),
+        }
+    }
+}
+
+/// A started private X server.
+///
+/// `is_ready` performs a real X11 connection setup handshake. `terminate` is
+/// idempotent, waits for the server to exit, and releases the display number.
+pub trait SeatDisplayHandle: Send {
+    /// Backend that was started.
+    fn backend(&self) -> SeatDisplayBackend;
+    /// X display string, for example `:90`.
+    fn display(&self) -> &str;
+    /// Numeric display number.
+    fn display_number(&self) -> u32;
+    /// Server process id.
+    fn pid(&self) -> Option<u32>;
+    /// Cookie file exported to the seat's applications, when auth is enabled.
+    fn xauthority(&self) -> Option<&Path>;
+    /// Whether the server was started with `-ac` because `xauth` was absent or
+    /// failed. The listener is still Unix-socket-only.
+    fn auth_disabled(&self) -> bool;
+    /// Perform one X11 setup probe.
+    fn is_ready(&self) -> Result<bool, MultiseatError>;
+    /// Non-blocking exit check.
+    fn try_wait(&mut self) -> std::io::Result<Option<DisplayExit>>;
+    /// Stop the server, wait for it, and release its display number.
+    fn terminate(&mut self) -> Result<(), MultiseatError>;
+}
+
+/// Spawn/stop seam for private X servers. Tests inject a fake.
+pub trait SeatDisplayLauncher: Send + Sync {
+    /// Spawn and allocate a display for one seat.
+    fn spawn(
+        &self,
+        request: &SeatDisplayRequest,
+    ) -> Result<Box<dyn SeatDisplayHandle>, MultiseatError>;
+}
+
+/// Programs used by [`ProcessSeatDisplayLauncher`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeatDisplayPrograms {
+    /// `Xvfb` binary name or path.
+    pub xvfb: PathBuf,
+    /// `Xephyr` binary name or path.
+    pub xephyr: PathBuf,
+    /// `xauth` binary name or path.
+    pub xauth: PathBuf,
+}
+
+impl Default for SeatDisplayPrograms {
+    fn default() -> Self {
+        Self {
+            xvfb: PathBuf::from("Xvfb"),
+            xephyr: PathBuf::from("Xephyr"),
+            xauth: PathBuf::from("xauth"),
+        }
+    }
+}
+
+/// Allocates and reuses X display numbers.
+///
+/// A number is never handed out twice while a display is alive. The production
+/// allocator also skips numbers whose `/tmp/.X11-unix/XN` socket or
+/// `/tmp/.XN-lock` file already exists, so it cannot steal an unrelated
+/// server. [`Self::without_host_check`] is for deterministic tests.
+#[derive(Clone, Debug)]
+pub struct DisplayNumberAllocator {
+    start: u32,
+    end: u32,
+    in_use: BTreeSet<u32>,
+    busy: BTreeSet<u32>,
+    check_host: bool,
+}
+
+impl DisplayNumberAllocator {
+    /// Allocate from `start..=end`, checking the host's X sockets.
+    pub fn new(start: u32, end: u32) -> Self {
+        Self {
+            start,
+            end: end.max(start),
+            in_use: BTreeSet::new(),
+            busy: BTreeSet::new(),
+            check_host: true,
+        }
+    }
+
+    /// Allocate from `start..=end` without inspecting `/tmp`. Tests use this so
+    /// host sockets cannot make an assertion flaky.
+    pub fn without_host_check(start: u32, end: u32) -> Self {
+        Self {
+            check_host: false,
+            ..Self::new(start, end)
+        }
+    }
+
+    /// Mark numbers that must be treated as already taken.
+    pub fn with_busy<I>(mut self, numbers: I) -> Self
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        self.busy.extend(numbers);
+        self
+    }
+
+    /// Configured range.
+    pub fn range(&self) -> (u32, u32) {
+        (self.start, self.end)
+    }
+
+    /// Numbers currently allocated by this allocator.
+    pub fn in_use(&self) -> Vec<u32> {
+        self.in_use.iter().copied().collect()
+    }
+
+    /// Allocate the first free number. Numbers are reused after release.
+    pub fn allocate(&mut self) -> Result<u32, MultiseatError> {
+        for number in self.start..=self.end {
+            if self.in_use.contains(&number)
+                || self.busy.contains(&number)
+                || (self.check_host && host_display_in_use(number))
+            {
+                continue;
+            }
+            self.in_use.insert(number);
+            return Ok(number);
+        }
+        Err(MultiseatError::SeatDisplayNumberExhausted {
+            start: self.start,
+            end: self.end,
+        })
+    }
+
+    /// Release a number for reuse. Unknown numbers are ignored.
+    pub fn release(&mut self, number: u32) {
+        self.in_use.remove(&number);
+    }
+}
+
+fn host_display_in_use(number: u32) -> bool {
+    let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
+    let lock = PathBuf::from(format!("/tmp/.X{number}-lock"));
+    socket.exists() || lock.exists()
+}
+
+/// X11 display string for a number.
+pub fn display_name(number: u32) -> String {
+    format!(":{number}")
+}
+
+/// Parse the numeric part of a local X display string.
+pub fn parse_display_number(display: &str) -> Option<u32> {
+    display
+        .trim()
+        .strip_prefix(':')?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Production launcher for `Xvfb` and `Xephyr`.
+#[derive(Clone, Debug)]
+pub struct ProcessSeatDisplayLauncher {
+    options: SeatDisplayOptions,
+    programs: SeatDisplayPrograms,
+    allocator: Arc<Mutex<DisplayNumberAllocator>>,
+}
+
+impl ProcessSeatDisplayLauncher {
+    /// Build a launcher with the default programs and configured number range.
+    pub fn new(options: SeatDisplayOptions) -> Self {
+        let allocator = DisplayNumberAllocator::new(options.number_start, options.number_end);
+        Self {
+            options,
+            programs: SeatDisplayPrograms::default(),
+            allocator: Arc::new(Mutex::new(allocator)),
+        }
+    }
+
+    /// Override the external programs. Missing-binary tests point at a
+    /// nonexistent path; production keeps the defaults.
+    pub fn with_programs(mut self, programs: SeatDisplayPrograms) -> Self {
+        self.programs = programs;
+        self
+    }
+
+    /// Configured options.
+    pub fn options(&self) -> &SeatDisplayOptions {
+        &self.options
+    }
+
+    /// Allocated display numbers, for diagnostics.
+    pub fn in_use(&self) -> Vec<u32> {
+        self.allocator
+            .lock()
+            .expect("display allocator lock")
+            .in_use()
+    }
+}
+
+impl SeatDisplayLauncher for ProcessSeatDisplayLauncher {
+    fn spawn(
+        &self,
+        request: &SeatDisplayRequest,
+    ) -> Result<Box<dyn SeatDisplayHandle>, MultiseatError> {
+        let (program, backend_name) = match request.backend {
+            SeatDisplayBackend::Shared => {
+                return Err(MultiseatError::Unsupported(
+                    "the shared display backend does not spawn an X server".to_owned(),
+                ))
+            }
+            SeatDisplayBackend::Xvfb => (self.programs.xvfb.clone(), "xvfb"),
+            SeatDisplayBackend::Xephyr => (self.programs.xephyr.clone(), "xephyr"),
+        };
+
+        let program = match resolve_program(&program) {
+            Some(program) => program,
+            None => {
+                let error = MultiseatError::SeatDisplayTool {
+                    backend: backend_name.to_owned(),
+                    program: program.display().to_string(),
+                    reason: "not found on PATH or not executable".to_owned(),
+                };
+                // Xephyr is the optional nested backend: report it as typed
+                // unsupported rather than pretending a nested window exists.
+                return if request.backend == SeatDisplayBackend::Xephyr {
+                    Err(MultiseatError::Unsupported(format!(
+                        "seat display backend xephyr requires Xephyr, which is unavailable: {error}"
+                    )))
+                } else {
+                    Err(error)
+                };
+            }
+        };
+
+        let parent = match request.backend {
+            SeatDisplayBackend::Xephyr => {
+                let parent = request
+                    .parent_display
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|display| !display.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| self.options.parent_display.clone())
+                    .ok_or_else(|| {
+                        MultiseatError::Unsupported(
+                            "seat display backend xephyr needs a parent X display for its nested \
+                             window"
+                                .to_owned(),
+                        )
+                    })?;
+                Some(parent)
+            }
+            _ => None,
+        };
+
+        let number = self
+            .allocator
+            .lock()
+            .expect("display allocator lock")
+            .allocate()?;
+        let display = display_name(number);
+
+        let mut auth = match create_xauthority(&self.programs.xauth, &display) {
+            Ok(auth) => auth,
+            Err(_) => None,
+        };
+        let auth_disabled = auth.is_none();
+
+        let args = display_server_args(
+            request.backend,
+            &display,
+            request.size,
+            auth.as_ref().map(|auth| auth.file.as_path()),
+            &request.seat_id,
+        );
+
+        let mut command = Command::new(&program);
+        command
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if let Some(parent) = parent.as_deref() {
+            command.env("DISPLAY", parent);
+        }
+
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                release_number(&self.allocator, number);
+                if let Some(mut auth) = auth.take() {
+                    auth.remove();
+                }
+                return Err(map_spawn_error(request.backend, &program, &display, error));
+            }
+        };
+
+        let cookie = auth.as_ref().map(|auth| auth.cookie.clone());
+        let xauthority = auth.as_ref().map(|auth| auth.file.clone());
+        Ok(Box::new(ProcessDisplayHandle {
+            child,
+            backend: request.backend,
+            display,
+            number,
+            xauthority,
+            cookie,
+            auth,
+            auth_disabled,
+            allocator: Arc::clone(&self.allocator),
+            terminated: false,
+            released: false,
+        }))
+    }
+}
+
+fn map_spawn_error(
+    backend: SeatDisplayBackend,
+    program: &Path,
+    display: &str,
+    error: std::io::Error,
+) -> MultiseatError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => MultiseatError::SeatDisplayTool {
+            backend: backend.as_str().to_owned(),
+            program: program.display().to_string(),
+            reason: "not found on PATH or not executable".to_owned(),
+        },
+        _ => MultiseatError::SeatDisplay(format!(
+            "failed to spawn {} for display {display}: {error}",
+            program.display()
+        )),
+    }
+}
+
+struct ProcessDisplayHandle {
+    child: Child,
+    backend: SeatDisplayBackend,
+    display: String,
+    number: u32,
+    xauthority: Option<PathBuf>,
+    cookie: Option<Vec<u8>>,
+    auth: Option<Xauthority>,
+    auth_disabled: bool,
+    allocator: Arc<Mutex<DisplayNumberAllocator>>,
+    terminated: bool,
+    released: bool,
+}
+
+impl SeatDisplayHandle for ProcessDisplayHandle {
+    fn backend(&self) -> SeatDisplayBackend {
+        self.backend
+    }
+
+    fn display(&self) -> &str {
+        &self.display
+    }
+
+    fn display_number(&self) -> u32 {
+        self.number
+    }
+
+    fn pid(&self) -> Option<u32> {
+        Some(self.child.id())
+    }
+
+    fn xauthority(&self) -> Option<&Path> {
+        self.xauthority.as_deref()
+    }
+
+    fn auth_disabled(&self) -> bool {
+        self.auth_disabled
+    }
+
+    fn is_ready(&self) -> Result<bool, MultiseatError> {
+        probe_x11_display(
+            &self.display,
+            self.cookie.as_deref(),
+            Duration::from_millis(500),
+        )
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<DisplayExit>> {
+        self.child.try_wait().map(|status| {
+            status.map(|status| DisplayExit {
+                success: status.success(),
+                code: status.code(),
+            })
+        })
+    }
+
+    fn terminate(&mut self) -> Result<(), MultiseatError> {
+        if !self.terminated {
+            self.terminated = true;
+            if self
+                .child
+                .try_wait()
+                .map_err(|error| MultiseatError::SeatDisplay(format!("polling X server: {error}")))?
+                .is_none()
+            {
+                #[cfg(unix)]
+                {
+                    let pid = self.child.id();
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGTERM,
+                    );
+                    let deadline = Instant::now() + DISPLAY_TERMINATE_GRACE;
+                    loop {
+                        match self.child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) => {}
+                            Err(error) => {
+                                return Err(MultiseatError::SeatDisplay(format!(
+                                    "polling X server for shutdown: {error}"
+                                )))
+                            }
+                        }
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                }
+                if self
+                    .child
+                    .try_wait()
+                    .map_err(|error| {
+                        MultiseatError::SeatDisplay(format!("polling X server: {error}"))
+                    })?
+                    .is_none()
+                {
+                    self.child.kill().map_err(|error| {
+                        MultiseatError::SeatDisplay(format!("killing X server: {error}"))
+                    })?;
+                    self.child.wait().map_err(|error| {
+                        MultiseatError::SeatDisplay(format!("reaping X server: {error}"))
+                    })?;
+                }
+            }
+        }
+        self.release_resources();
+        Ok(())
+    }
+}
+
+impl ProcessDisplayHandle {
+    fn release_resources(&mut self) {
+        if !self.released {
+            self.released = true;
+            release_number(&self.allocator, self.number);
+        }
+        if let Some(mut auth) = self.auth.take() {
+            auth.remove();
+        }
+    }
+}
+
+impl Drop for ProcessDisplayHandle {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
+}
+
+fn release_number(allocator: &Arc<Mutex<DisplayNumberAllocator>>, number: u32) {
+    allocator
+        .lock()
+        .expect("display allocator lock")
+        .release(number);
+}
+
+struct Xauthority {
+    dir: PathBuf,
+    file: PathBuf,
+    cookie: Vec<u8>,
+}
+
+impl Xauthority {
+    fn remove(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+static AUTH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn create_xauthority(xauth: &Path, display: &str) -> Result<Option<Xauthority>, MultiseatError> {
+    let Some(xauth_program) = resolve_program(xauth) else {
+        return Ok(None);
+    };
+    let cookie = random_cookie();
+    let hex = hex_encode(&cookie);
+    let sequence = AUTH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "ozma-seat-display-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).map_err(|error| {
+        MultiseatError::SeatDisplay(format!(
+            "creating Xauthority directory {}: {error}",
+            dir.display()
+        ))
+    })?;
+    restrict_directory(&dir);
+    let file = dir.join("Xauthority");
+    let output = Command::new(&xauth_program)
+        .arg("-f")
+        .arg(&file)
+        .arg("add")
+        .arg(display)
+        .arg("MIT-MAGIC-COOKIE-1")
+        .arg(&hex)
+        .stdin(Stdio::null())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => Ok(Some(Xauthority { dir, file, cookie })),
+        Ok(output) => {
+            let _ = fs::remove_dir_all(&dir);
+            Err(MultiseatError::SeatDisplay(format!(
+                "xauth add failed for display {display} (status {}): {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&dir);
+            Err(MultiseatError::SeatDisplay(format!(
+                "running xauth for display {display}: {error}"
+            )))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn restrict_directory(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn restrict_directory(_path: &Path) {}
+
+fn random_cookie() -> Vec<u8> {
+    let mut bytes = [0u8; 16];
+    if let Ok(mut file) = File::open("/dev/urandom") {
+        if file.read_exact(&mut bytes).is_ok() {
+            return bytes.to_vec();
+        }
+    }
+    // Deterministic fallback still gives 16 distinct bytes per call; this path
+    // only runs when /dev/urandom is unavailable.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let pid = u128::from(std::process::id());
+    let sequence = u128::from(AUTH_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let mut value = now ^ (pid << 64) ^ (sequence << 96);
+    for byte in &mut bytes {
+        *byte = (value & 0xff) as u8;
+        value = value.rotate_right(8) ^ (value >> 3);
+    }
+    bytes.to_vec()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Resolve a program on `PATH`, or return `None` when it is not executable.
+pub fn resolve_program(program: &Path) -> Option<PathBuf> {
+    if program.as_os_str().is_empty() {
+        return None;
+    }
+    if program.components().count() > 1 || program.is_absolute() {
+        return is_executable(program).then(|| program.to_path_buf());
+    }
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(program);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Probe an X server by completing the X11 connection setup handshake.
+///
+/// A successful return proves the server answered with `Success` and is ready
+/// to accept clients. A missing socket or refused connection is `Ok(false)`;
+/// a protocol/auth rejection is a typed error.
+#[cfg(unix)]
+pub fn probe_x11_display(
+    display: &str,
+    cookie: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<bool, MultiseatError> {
+    use std::os::unix::net::UnixStream;
+
+    let Some(number) = parse_display_number(display) else {
+        return Err(MultiseatError::SeatDisplay(format!(
+            "cannot probe {display:?}: expected a local :N display"
+        )));
+    };
+    let socket = format!("/tmp/.X11-unix/X{number}");
+    let mut stream = match UnixStream::connect(&socket) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(false)
+        }
+        Err(error) => {
+            return Err(MultiseatError::SeatDisplay(format!(
+                "connecting to {socket}: {error}"
+            )))
+        }
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let request = x11_setup_request(cookie);
+    if let Err(error) = stream.write_all(&request) {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            return Ok(false);
+        }
+        return Err(MultiseatError::SeatDisplay(format!(
+            "writing X11 setup to {display}: {error}"
+        )));
+    }
+
+    let mut head = [0u8; 8];
+    match read_exact_with_timeout(&mut stream, &mut head) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return Ok(false)
+        }
+        Err(error) => {
+            return Err(MultiseatError::SeatDisplay(format!(
+                "reading X11 setup reply from {display}: {error}"
+            )))
+        }
+    }
+
+    if head[0] == 1 {
+        return Ok(true);
+    }
+    let reason_len = usize::from(head[1]);
+    let mut reason = vec![0u8; reason_len];
+    if reason_len > 0 {
+        let _ = read_exact_with_timeout(&mut stream, &mut reason);
+    }
+    let reason = String::from_utf8_lossy(&reason);
+    Err(MultiseatError::SeatDisplay(format!(
+        "X server {display} rejected the setup handshake: {}",
+        reason.trim()
+    )))
+}
+
+fn read_exact_with_timeout(stream: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<()> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match stream.read(&mut buffer[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "X server closed the connection",
+                ))
+            }
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Build the X11 connection setup request for a local client.
+pub fn x11_setup_request(cookie: Option<&[u8]>) -> Vec<u8> {
+    const AUTH_NAME: &[u8] = b"MIT-MAGIC-COOKIE-1";
+    let (name, data): (&[u8], &[u8]) = match cookie {
+        Some(cookie) => (AUTH_NAME, cookie),
+        None => (&[], &[]),
+    };
+
+    let mut request = Vec::with_capacity(12 + name.len() + data.len() + 6);
+    request.push(b'l'); // little-endian
+    request.push(0);
+    request.extend_from_slice(&11u16.to_le_bytes()); // protocol major
+    request.extend_from_slice(&0u16.to_le_bytes()); // protocol minor
+    request.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    request.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    request.extend_from_slice(&[0, 0]); // unused
+    request.extend_from_slice(name);
+    while request.len() % 4 != 0 {
+        request.push(0);
+    }
+    request.extend_from_slice(data);
+    while request.len() % 4 != 0 {
+        request.push(0);
+    }
+    request
+}
+
+/// Non-Unix hosts have no X11 Unix socket; the process backend is unsupported.
+#[cfg(not(unix))]
+pub fn probe_x11_display(
+    _display: &str,
+    _cookie: Option<&[u8]>,
+    _timeout: Duration,
+) -> Result<bool, MultiseatError> {
+    Err(MultiseatError::Unsupported(
+        "per-seat X servers require a Unix host".to_owned(),
+    ))
+}
+
+/// Build the argv for one private X server. Pure and used by tests.
+pub fn display_server_args(
+    backend: SeatDisplayBackend,
+    display: &str,
+    size: SeatDisplaySize,
+    auth_file: Option<&Path>,
+    seat_id: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        display.to_owned(),
+        "-screen".to_owned(),
+        "0".to_owned(),
+        size.x_screen(),
+    ];
+    if backend == SeatDisplayBackend::Xephyr {
+        args.push("-title".to_owned());
+        args.push(format!("ozma-{seat_id}"));
+    }
+    args.push("-nolisten".to_owned());
+    args.push("tcp".to_owned());
+    match auth_file {
+        Some(file) => {
+            args.push("-auth".to_owned());
+            args.push(file.display().to_string());
+        }
+        None => args.push("-ac".to_owned()),
+    }
+    args
+}
+
+/// Map a typed display error into a stable status kind.
+pub fn display_error_kind(error: &MultiseatError) -> &'static str {
+    match error {
+        MultiseatError::SeatDisplayTool { .. } => "missing_binary",
+        MultiseatError::SeatDisplayNumberExhausted { .. } => "number_exhausted",
+        MultiseatError::SeatDisplayStartupTimeout { .. } => "startup_timeout",
+        MultiseatError::SeatDisplayCrashed { .. } => "crashed",
+        MultiseatError::Unsupported(_) => "unsupported",
+        _ => "error",
+    }
+}

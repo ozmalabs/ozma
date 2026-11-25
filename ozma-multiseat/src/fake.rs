@@ -24,6 +24,9 @@ use crate::routing::{
     RouteCommand,
 };
 use crate::seat::{SeatPlan, SeatRuntimeStatus, SeatState};
+use crate::seat_display::{
+    DisplayExit, SeatDisplayBackend, SeatDisplayHandle, SeatDisplayLauncher, SeatDisplayRequest,
+};
 use crate::supervisor::{
     ChildExit, ChildHandle, NodeLaunchSpec, NodeLauncher, ReadinessProbe, SeatSupervisor,
 };
@@ -492,6 +495,337 @@ impl ReadinessProbe for FakeReadinessProbe {
             return Err(MultiseatError::Supervisor(reason.clone()));
         }
         Ok(state.calls > state.not_ready_calls)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum FakeDisplayFailure {
+    MissingBinary,
+    Unsupported(String),
+}
+
+#[derive(Debug, Default)]
+struct FakeDisplayState {
+    next_pid: u32,
+    next_number: u32,
+    free_numbers: BTreeSet<u32>,
+    exhaust_numbers: bool,
+    spawns: Vec<SeatDisplayRequest>,
+    display_by_seat: BTreeMap<String, (String, u32)>,
+    latest_pid: BTreeMap<String, u32>,
+    pid_number: BTreeMap<u32, u32>,
+    running: BTreeMap<u32, bool>,
+    stops: Vec<String>,
+    released: Vec<u32>,
+    ready_after: BTreeMap<String, usize>,
+    polls: BTreeMap<String, usize>,
+    never_ready: BTreeSet<String>,
+    crash_on_start: BTreeSet<String>,
+    fail_spawn: BTreeMap<String, FakeDisplayFailure>,
+    auth_disabled: bool,
+}
+
+/// Test-only private-X-server spawner.
+///
+/// It allocates a display number, records the request, and lets a test simulate
+/// a healthy server, a readiness timeout, an immediate crash, a crash after
+/// readiness, or a typed spawn failure. It never executes a process or opens a
+/// socket.
+#[derive(Clone, Debug, Default)]
+pub struct FakeSeatDisplayLauncher {
+    state: Arc<Mutex<FakeDisplayState>>,
+}
+
+impl FakeSeatDisplayLauncher {
+    /// A launcher that starts at `:90` and becomes ready on the first probe.
+    pub fn new() -> Self {
+        Self::with_start_number(90)
+    }
+
+    /// A launcher whose first allocated display number is `start`.
+    pub fn with_start_number(start: u32) -> Self {
+        let launcher = Self::default();
+        launcher
+            .state
+            .lock()
+            .expect("fake display lock")
+            .next_number = start;
+        launcher
+    }
+
+    /// Never answer the readiness handshake for `seat_id`.
+    pub fn never_ready(&self, seat_id: impl Into<String>) {
+        self.state
+            .lock()
+            .expect("fake display lock")
+            .never_ready
+            .insert(seat_id.into());
+    }
+
+    /// Become ready only after `polls` unsuccessful probes.
+    pub fn ready_after(&self, seat_id: impl Into<String>, polls: usize) {
+        self.state
+            .lock()
+            .expect("fake display lock")
+            .ready_after
+            .insert(seat_id.into(), polls);
+    }
+
+    /// Exit before the first readiness probe succeeds.
+    pub fn crash_on_start(&self, seat_id: impl Into<String>) {
+        self.state
+            .lock()
+            .expect("fake display lock")
+            .crash_on_start
+            .insert(seat_id.into());
+    }
+
+    /// Simulate the running display for `seat_id` exiting.
+    pub fn crash(&self, seat_id: &str) {
+        let mut state = self.state.lock().expect("fake display lock");
+        if let Some(pid) = state.latest_pid.get(seat_id).copied() {
+            state.running.insert(pid, false);
+        }
+    }
+
+    /// Fail the next spawn for `seat_id` with a typed missing-binary error.
+    pub fn fail_spawn_missing_binary(&self, seat_id: impl Into<String>) {
+        self.state
+            .lock()
+            .expect("fake display lock")
+            .fail_spawn
+            .insert(seat_id.into(), FakeDisplayFailure::MissingBinary);
+    }
+
+    /// Fail the next spawn for `seat_id` with a typed unsupported error.
+    pub fn fail_spawn_unsupported(&self, seat_id: impl Into<String>, reason: impl Into<String>) {
+        self.state
+            .lock()
+            .expect("fake display lock")
+            .fail_spawn
+            .insert(
+                seat_id.into(),
+                FakeDisplayFailure::Unsupported(reason.into()),
+            );
+    }
+
+    /// Make every allocation report display-number exhaustion.
+    pub fn exhaust_numbers(&self) {
+        self.state
+            .lock()
+            .expect("fake display lock")
+            .exhaust_numbers = true;
+    }
+
+    /// Report `-ac` instead of an auth cookie for subsequently spawned servers.
+    pub fn with_auth_disabled(&self) {
+        self.state.lock().expect("fake display lock").auth_disabled = true;
+    }
+
+    /// Spawn requests recorded so far.
+    pub fn spawns(&self) -> Vec<SeatDisplayRequest> {
+        self.state.lock().expect("fake display lock").spawns.clone()
+    }
+
+    /// Number of display spawn attempts.
+    pub fn spawn_count(&self) -> usize {
+        self.state.lock().expect("fake display lock").spawns.len()
+    }
+
+    /// Display string assigned to a seat.
+    pub fn display_for(&self, seat_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .expect("fake display lock")
+            .display_by_seat
+            .get(seat_id)
+            .map(|(display, _)| display.clone())
+    }
+
+    /// Display number assigned to a seat.
+    pub fn number_for(&self, seat_id: &str) -> Option<u32> {
+        self.state
+            .lock()
+            .expect("fake display lock")
+            .display_by_seat
+            .get(seat_id)
+            .map(|(_, number)| *number)
+    }
+
+    /// Latest display pid for a seat.
+    pub fn pid_for(&self, seat_id: &str) -> Option<u32> {
+        self.state
+            .lock()
+            .expect("fake display lock")
+            .latest_pid
+            .get(seat_id)
+            .copied()
+    }
+
+    /// Whether the latest display for a seat is still running.
+    pub fn active(&self, seat_id: &str) -> bool {
+        let state = self.state.lock().expect("fake display lock");
+        state
+            .latest_pid
+            .get(seat_id)
+            .and_then(|pid| state.running.get(pid))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Display strings passed to `terminate`, in order.
+    pub fn stops(&self) -> Vec<String> {
+        self.state.lock().expect("fake display lock").stops.clone()
+    }
+
+    /// Display numbers released by `terminate`, in order.
+    pub fn released_numbers(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .expect("fake display lock")
+            .released
+            .clone()
+    }
+}
+
+impl SeatDisplayLauncher for FakeSeatDisplayLauncher {
+    fn spawn(
+        &self,
+        request: &SeatDisplayRequest,
+    ) -> Result<Box<dyn SeatDisplayHandle>, MultiseatError> {
+        let mut state = self.state.lock().expect("fake display lock");
+        if let Some(failure) = state.fail_spawn.remove(&request.seat_id) {
+            return match failure {
+                FakeDisplayFailure::MissingBinary => Err(MultiseatError::SeatDisplayTool {
+                    backend: request.backend.as_str().to_owned(),
+                    program: format!("fake-{}", request.backend.as_str()),
+                    reason: "injected missing binary".to_owned(),
+                }),
+                FakeDisplayFailure::Unsupported(reason) => Err(MultiseatError::Unsupported(reason)),
+            };
+        }
+        if state.exhaust_numbers {
+            return Err(MultiseatError::SeatDisplayNumberExhausted { start: 90, end: 90 });
+        }
+        let number = match state.free_numbers.iter().next().copied() {
+            Some(number) => {
+                state.free_numbers.remove(&number);
+                number
+            }
+            None => {
+                let number = state.next_number;
+                state.next_number = state.next_number.saturating_add(1);
+                number
+            }
+        };
+        let display = format!(":{number}");
+        state.next_pid = state.next_pid.saturating_add(1);
+        let pid = state.next_pid;
+        state.spawns.push(request.clone());
+        state
+            .display_by_seat
+            .insert(request.seat_id.clone(), (display.clone(), number));
+        state.latest_pid.insert(request.seat_id.clone(), pid);
+        state.pid_number.insert(pid, number);
+        let starts_alive = !state.crash_on_start.contains(&request.seat_id);
+        state.running.insert(pid, starts_alive);
+        let auth_disabled = state.auth_disabled;
+        drop(state);
+
+        Ok(Box::new(FakeDisplayHandle {
+            pid,
+            number,
+            display,
+            seat_id: request.seat_id.clone(),
+            backend: request.backend,
+            auth_disabled,
+            state: Arc::clone(&self.state),
+        }))
+    }
+}
+
+struct FakeDisplayHandle {
+    pid: u32,
+    number: u32,
+    display: String,
+    seat_id: String,
+    backend: SeatDisplayBackend,
+    auth_disabled: bool,
+    state: Arc<Mutex<FakeDisplayState>>,
+}
+
+impl SeatDisplayHandle for FakeDisplayHandle {
+    fn backend(&self) -> SeatDisplayBackend {
+        self.backend
+    }
+
+    fn display(&self) -> &str {
+        &self.display
+    }
+
+    fn display_number(&self) -> u32 {
+        self.number
+    }
+
+    fn pid(&self) -> Option<u32> {
+        Some(self.pid)
+    }
+
+    fn xauthority(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    fn auth_disabled(&self) -> bool {
+        self.auth_disabled
+    }
+
+    fn is_ready(&self) -> Result<bool, MultiseatError> {
+        let mut state = self.state.lock().expect("fake display lock");
+        if !state.running.get(&self.pid).copied().unwrap_or(false) {
+            return Ok(false);
+        }
+        let polls = state.polls.entry(self.seat_id.clone()).or_insert(0);
+        *polls = polls.saturating_add(1);
+        let polls = *polls;
+        if state.never_ready.contains(&self.seat_id) {
+            return Ok(false);
+        }
+        let threshold = state.ready_after.get(&self.seat_id).copied().unwrap_or(0);
+        Ok(polls > threshold)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<DisplayExit>> {
+        let running = self
+            .state
+            .lock()
+            .expect("fake display lock")
+            .running
+            .get(&self.pid)
+            .copied()
+            .unwrap_or(false);
+        Ok(if running {
+            None
+        } else {
+            Some(DisplayExit {
+                success: false,
+                code: Some(1),
+            })
+        })
+    }
+
+    fn terminate(&mut self) -> Result<(), MultiseatError> {
+        let mut state = self.state.lock().expect("fake display lock");
+        if state.running.insert(self.pid, false).unwrap_or(false) {
+            state.stops.push(self.display.clone());
+        }
+        let number = state
+            .pid_number
+            .get(&self.pid)
+            .copied()
+            .unwrap_or(self.number);
+        state.free_numbers.insert(number);
+        state.released.push(number);
+        Ok(())
     }
 }
 

@@ -12,6 +12,7 @@ use crate::error::MultiseatError;
 use crate::input::InputGroup;
 use crate::ownership::DisplayOwnership;
 use crate::routing::InputRoutePlan;
+use crate::seat_display::SeatDisplayStatus;
 
 /// The built-in per-seat profiles from the Python baseline.
 ///
@@ -361,6 +362,7 @@ impl SeatPlan {
             last_error: None,
             next_restart_in_ms: None,
             resources: SeatResourceStatus::default(),
+            display: SeatDisplayStatus::shared(),
             message,
         }
     }
@@ -568,6 +570,10 @@ pub struct SeatRuntimeStatus {
     /// Applied/released ownership and routing state, with typed errors.
     #[serde(default, skip_serializing_if = "SeatResourceStatus::is_empty")]
     pub resources: SeatResourceStatus,
+    /// Private per-seat X server state. Flattened into the status document and
+    /// omitted entirely for the default `shared` backend.
+    #[serde(default, flatten)]
+    pub display: SeatDisplayStatus,
     /// Optional operator-facing message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -586,6 +592,7 @@ impl SeatRuntimeStatus {
             last_error: None,
             next_restart_in_ms: None,
             resources: SeatResourceStatus::default(),
+            display: SeatDisplayStatus::shared(),
             message: None,
         }
     }
@@ -625,6 +632,12 @@ impl SeatRuntimeStatus {
     /// Attach applied/released resource state.
     pub fn with_resources(mut self, resources: SeatResourceStatus) -> Self {
         self.resources = resources;
+        self
+    }
+
+    /// Attach private display server state.
+    pub fn with_display(mut self, display: SeatDisplayStatus) -> Self {
+        self.display = display;
         self
     }
 }
@@ -676,6 +689,10 @@ pub struct SeatStatus {
     /// Applied/released ownership and routing state, with typed errors.
     #[serde(default, skip_serializing_if = "SeatResourceStatus::is_empty")]
     pub resources: SeatResourceStatus,
+    /// Private per-seat X server state. Flattened into status and omitted for
+    /// the default `shared` backend.
+    #[serde(default, flatten)]
+    pub display: SeatDisplayStatus,
     /// Optional state message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,

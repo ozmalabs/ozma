@@ -26,9 +26,10 @@ use ozma_multiseat::{
     detect_drm, render_metrics, DrmDetection, EvdevGrabRouter, HelperClient, HelperClientConfig,
     HostTopology, HotplugDebounce, HotplugOptions, HttpHealthProbe, MultiseatPlan,
     MultiseatPlanner, MultiseatStatus, OzmaAudioRouter, PlannerOptions, PortProbe,
-    ProcessCommandRunner, ProcessLauncher, ProcessSeatSupervisor, ReadinessProbe, SeatProfile,
-    SeatReconciler, SeatResourceStatus, SeatState, SeatStore, SeatSupervisor, SupervisorOptions,
-    SysfsHotplugMonitor, SysfsInputBackend, XInputRouter, XrandrDisplayBackend,
+    ProcessCommandRunner, ProcessLauncher, ProcessSeatDisplayLauncher, ProcessSeatSupervisor,
+    ReadinessProbe, SeatDisplayBackend, SeatDisplayOptions, SeatDisplaySize, SeatDisplayStatus,
+    SeatProfile, SeatReconciler, SeatResourceStatus, SeatState, SeatStore, SeatSupervisor,
+    SupervisorOptions, SysfsHotplugMonitor, SysfsInputBackend, XInputRouter, XrandrDisplayBackend,
     XrandrOwnershipController, DEFAULT_DEBOUNCE, DEFAULT_HEALTH_PATH, DEFAULT_NODE_BIN,
 };
 
@@ -122,6 +123,17 @@ struct Args {
     /// `helper` (privileged `ozma-seat-input` EVIOCGRAB/uinput isolation).
     #[arg(long, default_value = "xinput", value_name = "xinput|helper")]
     input_isolation: String,
+
+    /// Per-seat display: `shared` (default, one X root), `xvfb` (private Xvfb
+    /// server per seat), or `xephyr` (private Xephyr nested in the shared
+    /// display). Nested backends are opt-in and stopped with the seat.
+    #[arg(long, default_value = "shared", value_name = "shared|xvfb|xephyr")]
+    seat_display: String,
+
+    /// Private X screen size for `--seat-display xvfb|xephyr`, for example
+    /// `1280x800`.
+    #[arg(long, default_value = "1280x800", value_name = "WxH")]
+    seat_display_size: String,
 
     /// Helper binary used by `--input-isolation helper`.
     #[arg(long, default_value = ozma_multiseat::HELPER_PROGRAM, value_name = "PATH")]
@@ -244,6 +256,14 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
         return Ok(());
     }
 
+    let seat_display_backend: SeatDisplayBackend = args.seat_display.parse()?;
+    let seat_display_size: SeatDisplaySize = args.seat_display_size.parse()?;
+    let seat_display_options = SeatDisplayOptions {
+        backend: seat_display_backend,
+        size: seat_display_size,
+        ..SeatDisplayOptions::default()
+    };
+
     let options = SupervisorOptions {
         node_bin: Some(args.node_bin.to_string_lossy().into_owned()),
         readiness_timeout: Duration::from_millis(args.readiness_timeout_ms),
@@ -255,6 +275,7 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
         apply_ownership: args.apply_ownership,
         apply_routing: args.apply_routing,
         input_isolation: args.input_isolation == "helper",
+        seat_display: seat_display_options.clone(),
     };
 
     if args.dry_run {
@@ -278,6 +299,11 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
     };
     let mut supervisor =
         ProcessSeatSupervisor::with_parts(options, Arc::new(ProcessLauncher), probe);
+    if seat_display_options.backend.is_nested() {
+        supervisor = supervisor.with_display_launcher(Box::new(ProcessSeatDisplayLauncher::new(
+            seat_display_options,
+        )));
+    }
     if args.apply_ownership {
         supervisor = supervisor.with_ownership_controller(Box::new(
             XrandrOwnershipController::new(Box::new(ProcessCommandRunner)),
@@ -329,7 +355,11 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
             }
             Err(error) => {
                 eprintln!("seat {} failed to start: {error}", seat.config.id);
-                if args.apply_ownership || args.apply_routing || args.input_isolation == "helper" {
+                if args.apply_ownership
+                    || args.apply_routing
+                    || args.input_isolation == "helper"
+                    || args.seat_display != "shared"
+                {
                     // The supervisor already released every applied resource
                     // when the later seat could not be reserved. Stop any
                     // children started by this plan so the CLI does not leave
@@ -510,6 +540,13 @@ fn validate(args: &Args) -> Result<(), ozma_multiseat::MultiseatError> {
             args.input_isolation
         )));
     }
+    if !matches!(args.seat_display.as_str(), "shared" | "xvfb" | "xephyr") {
+        return Err(ozma_multiseat::MultiseatError::SeatDisplay(format!(
+            "unknown seat display {:?}; expected shared, xvfb, or xephyr",
+            args.seat_display
+        )));
+    }
+    let _: SeatDisplaySize = args.seat_display_size.parse()?;
     if args.input_isolation == "helper" && args.apply_routing {
         return Err(ozma_multiseat::MultiseatError::Supervisor(
             "--input-isolation helper and --apply-routing are mutually exclusive; the helper \
@@ -732,6 +769,9 @@ fn print_status(args: &Args, status: &ozma_multiseat::SeatRuntimeStatus) {
     if !status.resources.is_empty() {
         line.push_str(&resource_summary(&status.resources));
     }
+    if let Some(display) = display_summary(&status.display) {
+        line.push_str(&display);
+    }
     if let Some(message) = &status.message {
         line.push_str(&format!(" ({message})"));
     }
@@ -746,6 +786,35 @@ fn resource_state(applied: bool, released: bool) -> &'static str {
     } else {
         "none"
     }
+}
+
+fn display_summary(display: &SeatDisplayStatus) -> Option<String> {
+    if display.display_backend == SeatDisplayBackend::Shared {
+        return None;
+    }
+    let mut summary = format!(" display({}", display.display_backend.as_str());
+    if let Some(name) = &display.display {
+        summary.push_str(&format!(" {name}"));
+    }
+    if let Some(pid) = display.display_pid {
+        summary.push_str(&format!(" pid={pid}"));
+    }
+    summary.push_str(&format!(
+        " ready={}",
+        if display.display_ready {
+            "true"
+        } else {
+            "false"
+        }
+    ));
+    if let Some(error) = &display.display_error {
+        summary.push_str(&format!(" error[{}]={}", error.kind, error.message));
+    }
+    for note in &display.display_notes {
+        summary.push_str(&format!(" note[{}]={}", note.kind.as_str(), note.message));
+    }
+    summary.push(')');
+    Some(summary)
 }
 
 fn resource_summary(resources: &SeatResourceStatus) -> String {
@@ -818,6 +887,9 @@ fn print_status_document(args: &Args, status: &MultiseatStatus) {
         }
         if !seat.resources.is_empty() {
             line.push_str(&resource_summary(&seat.resources));
+        }
+        if let Some(display) = display_summary(&seat.display) {
+            line.push_str(&display);
         }
         if let Some(message) = &seat.message {
             line.push_str(&format!(" ({message})"));

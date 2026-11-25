@@ -7,15 +7,17 @@
 //! local exportable devices, and currently imported devices.
 //!
 //! The controller is argv-only and delegates every operation to an injected
-//! [`CommandRunner`]. It never loads `vhci_hcd`, starts a daemon, opens a
-//! socket, or implements the USB/IP wire protocol. Host/token allow-lists and
-//! key-fingerprint pairing are enforced before `usbip attach` and before a
-//! peer-authorized export; tokens and fingerprints are compared in constant
-//! time and are never retained in grants or emitted in errors. TLS is **not**
-//! terminated in-process (`UsbIpTlsPolicy::Required` fails closed) because this
-//! crate does not own the USB/IP control socket; an external `usbipd`,
-//! firewall, or TLS terminator must protect the wire protocol. Export, attach,
-//! and detach transitions are recorded in a bounded [`UsbIpHotplugLog`].
+//! [`CommandRunner`]. It never loads `vhci_hcd`, starts a daemon, or touches the
+//! kernel USB/IP data path. Host/token allow-lists and key-fingerprint pairing
+//! are enforced before `usbip attach` and before a peer-authorized export;
+//! tokens and fingerprints are compared in constant time and are never
+//! retained in grants or emitted in errors. The separate
+//! [`crate::usbip_server`] module implements the version-`0x0111` control
+//! messages over an injectable stream, but TLS is **not** terminated in-process
+//! (`UsbIpTlsPolicy::Required` fails closed) because this crate does not own a
+//! TLS implementation; an external `usbipd`, firewall, or TLS terminator must
+//! protect any plaintext USB/IP listener. Export, attach, and detach
+//! transitions are recorded in a bounded [`UsbIpHotplugLog`].
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard};
@@ -36,10 +38,11 @@ pub const MAX_USBIP_HOTPLUG_EVENTS: usize = 64;
 
 /// Whether USB/IP transport encryption is required.
 ///
-/// `ozma-usb` drives the external `usbip` CLI and never owns a USB/IP socket,
-/// so it cannot terminate TLS for the USB/IP wire protocol. `Required` fails
-/// closed with [`UsbError::UsbIpTlsUnsupported`] rather than silently running
-/// plaintext; `Disabled` leaves TLS to an external `usbipd`/terminator.
+/// `ozma-usb` can drive the external `usbip` CLI and its optional in-process
+/// control listener is plaintext, so it cannot terminate TLS for the USB/IP
+/// wire protocol. `Required` fails closed with
+/// [`UsbError::UsbIpTlsUnsupported`] rather than silently running plaintext;
+/// `Disabled` leaves TLS to an external `usbipd`/terminator/tunnel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsbIpTlsPolicy {
@@ -67,11 +70,12 @@ impl UsbIpTlsStatus {
         Self {
             policy,
             available: false,
-            reason: "ozma-usb delegates USB/IP to the external usbip/usbipd tools \
-                     and does not own the control socket or the kernel vhci data path, \
-                     so it cannot wrap the USB/IP wire protocol in TLS. Run usbipd \
-                     behind a TLS terminator or tunnel (for example WireGuard or stunnel) \
-                     and keep the USB/IP port on a trusted network."
+            reason: "ozma-usb's optional USB/IP control listener is plaintext and \
+                     delegates TLS and the kernel USB/IP data path externally: it does not \
+                     terminate TLS in-process and does not implement the high-throughput \
+                     USB/IP data transfer. Run the listener behind a TLS terminator or tunnel \
+                     (for example WireGuard or stunnel) and keep the USB/IP port on a trusted \
+                     network."
                 .to_owned(),
         }
     }

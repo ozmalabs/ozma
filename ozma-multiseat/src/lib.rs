@@ -28,9 +28,16 @@
 //! * [`ownership`] models per-seat display ownership and builds
 //!   `xrandr --output ... --mode ... --pos ...` commands. On one X server this
 //!   is output positioning, not screen isolation.
+//! * [`seat_display`] is the opt-in per-seat X server backend: `shared`
+//!   (default), private `Xvfb`, or nested `Xephyr`, with free display-number
+//!   allocation, an `xauth` cookie, a real X11 readiness handshake, and typed
+//!   missing-binary/exhaustion/timeout/crash errors. A private server starts
+//!   before the seat and stops after it; meaningless xrandr/xinput operations
+//!   on a private root are reported as typed notes.
 //! * [`supervisor`] starts, health-checks, restarts, stops, and reports real
 //!   `ozma-node --profile desktop` children. [`fake`] contains the test-only
-//!   launcher, readiness probe, backends, command runner, and grab fake.
+//!   launcher, readiness probe, backends, command runner, display spawner, and
+//!   grab fake.
 //! * [`persistence`] is a versioned, atomically written seat store. It keeps
 //!   explicit ids/displays/hubs/ports/audio sinks stable across replans and
 //!   retains missing displays without resurrecting them.
@@ -67,6 +74,7 @@ pub mod persistence;
 pub mod planner;
 pub mod routing;
 pub mod seat;
+pub mod seat_display;
 pub mod status;
 pub mod supervisor;
 
@@ -85,8 +93,8 @@ pub use error::MultiseatError;
 pub use fake::{
     FakeCommandRunner, FakeDeviceNameResolver, FakeDisplayBackend, FakeEvdevGrabBackend,
     FakeGrabAction, FakeGrabEvent, FakeHelperBackend, FakeHotplugMonitor, FakeInputBackend,
-    FakeNodeLauncher, FakeReadinessProbe, FakeSeatAudioRouter, FakeSeatInputHelper,
-    FakeSeatSupervisor,
+    FakeNodeLauncher, FakeReadinessProbe, FakeSeatAudioRouter, FakeSeatDisplayLauncher,
+    FakeSeatInputHelper, FakeSeatSupervisor,
 };
 pub use host::HostTopology;
 pub use hotplug::{
@@ -131,6 +139,16 @@ pub use seat::{
     CapturePlan, DiagnosticCode, MultiseatPlan, NodeCommand, PlanDiagnostic, ProfileDefaults,
     ResourceAction, ResourceKind, SeatConfig, SeatPlan, SeatPorts, SeatProfile, SeatResourceError,
     SeatResourceStatus, SeatRuntimeStatus, SeatState, SeatStatus,
+};
+pub use seat_display::{
+    display_error_kind, display_name, display_server_args, parse_display_number, probe_x11_display,
+    resolve_program, x11_setup_request, DisplayExit, DisplayNumberAllocator,
+    ProcessSeatDisplayLauncher, SeatDisplayBackend, SeatDisplayError, SeatDisplayHandle,
+    SeatDisplayLauncher, SeatDisplayNote, SeatDisplayNoteKind, SeatDisplayOptions,
+    SeatDisplayPrograms, SeatDisplayRequest, SeatDisplaySize, SeatDisplayStatus,
+    DEFAULT_DISPLAY_NUMBER_END, DEFAULT_DISPLAY_NUMBER_START, DEFAULT_DISPLAY_READY_POLL,
+    DEFAULT_DISPLAY_READY_TIMEOUT, DEFAULT_SEAT_DISPLAY_HEIGHT, DEFAULT_SEAT_DISPLAY_WIDTH,
+    DISPLAY_TERMINATE_GRACE,
 };
 pub use status::{render_metrics, MultiseatCapability, MultiseatStatus};
 pub use supervisor::{
