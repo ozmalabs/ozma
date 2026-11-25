@@ -1174,4 +1174,3 @@ passed; risk is controller macro/automation behaviour, not the Rust node) and
 created the rollback tag **`rust-cutover-0.1.0-python-rollback`** on
 `6b881a1` for the one-release overlap. **Python-tree deletion remains NO-GO**:
 the §9 criteria and the Python-only parity providers are unchanged.
-
