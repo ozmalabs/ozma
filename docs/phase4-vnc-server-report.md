@@ -4,22 +4,24 @@ Status: implemented and tested in `ozma-node`. The node can serve its own
 opt-in RFB 3.8 endpoint for the controller's VNC consumers instead of only
 registering an external QEMU VNC endpoint. Standard RFB VNC password
 authentication (security type 2) is now available. The server offers **ZRLE**
-(encoding 16), **Hextile** (5), and **ZLib** (6) when the client advertises
-them, keeping **Raw** as the always-valid fallback, and answers the **Cursor**
-pseudo-encoding with a typed empty cursor. **The transport is still plain TCP:
-VNC authentication is not encryption and there is no TLS. ZRLE and ZLib are
-compression, not encryption.** No commit was made.
+(encoding 16), **Tight** (7), **Hextile** (5), and **ZLib** (6) when the
+client advertises them, keeping **Raw** as the always-valid fallback, and
+answers the **Cursor** pseudo-encoding with a typed empty cursor. **The
+transport is still plain TCP: VNC authentication is not encryption and there
+is no TLS. ZRLE, ZLib, and Tight are compression, not encryption.** No commit
+was made.
 
 ## Scope
 
 Added:
 
 - `ozma-node/src/vnc_server.rs` — a bound RFB listener, handshake, optional
-  RFB security type 2 (DES challenge/response), Raw, Hextile, ZLib, and ZRLE
-  framebuffer encoders, Cursor pseudo-encoding, client-message parser, input
-  adapter, and per-listener counters.
-- `ozma-node/Cargo.toml` — the `flate2` dependency for the per-client ZRLE and
-  ZLib zlib streams (already present in `Cargo.lock` through the image stack).
+  RFB security type 2 (DES challenge/response), Raw, Hextile, ZLib, Tight, and
+  ZRLE framebuffer encoders, Cursor pseudo-encoding, client-message parser,
+  input adapter, and per-listener counters.
+- `ozma-node/Cargo.toml` — the `flate2` dependency for the per-client ZRLE,
+  ZLib, and Tight zlib streams (already present in `Cargo.lock` through the
+  image stack).
 - `ozma-node/src/main.rs` — `--vnc-server`, `--vnc-bind`,
   `--vnc-server-port`, `--vnc-password-file`, `--vnc-allow-unauthenticated`,
   `--vnc-max-clients`, and `--vnc-idle-timeout-seconds`, startup/shutdown
@@ -127,7 +129,7 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
 | Type | Message | Behavior |
 |---|---|---|
 | `0` | `SetPixelFormat` | Accepts 32-bit true-colour with 8 bits per channel and either RGB (r16/g8/b0) or BGR (r0/g8/b16) shifts, little- or big-endian. Any other format closes the connection; RFB has no per-message error, and continuing would send pixels in a format the client did not request. |
-| `2` | `SetEncodings` | Parsed with a 1024-entry bound. Every supported entry is kept in the client's stated order: Raw (0), Hextile (5), ZLib (6), and ZRLE (16). The first usable entry is used; if it fails during encoding only that encoding is disabled and the next listed encoding (or Raw) is used. Unsupported entries (Tight, JPEG, H.264, ...) are ignored, and an empty or all-unsupported list falls back to Raw. The Cursor pseudo-encoding (-239) is remembered. |
+| `2` | `SetEncodings` | Parsed with a 1024-entry bound. Every supported entry is kept in the client's stated order: Raw (0), Hextile (5), ZLib (6), Tight (7), and ZRLE (16). The first usable entry is used; if it fails during encoding only that encoding is disabled and the next listed encoding (or Raw) is used. Unsupported entries (JPEG, H.264, ...) are ignored, and an empty or all-unsupported list falls back to Raw. The Cursor pseudo-encoding (-239) is remembered. |
 | `3` | `FramebufferUpdateRequest` | Full (`incremental=0`) or incremental (`incremental=1`), with bounded rectangle clipping. Multiple pending requests are merged into at most eight rectangles. |
 | `4` | `KeyEvent` | Keysym → USB HID usage, forwarded to the shared `InputSink`. Unknown keysyms are counted and dropped rather than guessed. |
 | `5` | `PointerEvent` | Absolute pointer position (scaled to the sink's 0..=32767 report space) plus button/wheel transitions. |
@@ -137,8 +139,10 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
 ### Framebuffer updates
 
 - Each update is `FramebufferUpdate` + one or more rectangles. Rectangles use
-  Raw (0), Hextile (5), ZLib (6), or ZRLE (16) according to the client's
-  `SetEncodings` preference order.
+  Raw (0), Hextile (5), ZLib (6), Tight (7), or ZRLE (16) according to the
+  client's `SetEncodings` preference order. A wide Tight rectangle is split
+  into several bounded wire rectangles, so one request can yield more than one
+  rectangle.
 - Raw rectangles carry 32-bit pixels in the client's negotiated channel order.
   RGB24 and BGRA capture sources are encoded directly; no color conversion
   library or fake intermediate format is used.
@@ -159,9 +163,9 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
   fall back to Raw, and only that encoding is disabled for the rest of the
   connection. If the client advertised another supported encoding, later
   updates use it; otherwise they stay on Raw.
-- ZRLE and ZLib keep **separate** per-client zlib streams. A ZRLE failure does
-  not reset or disable ZLib, and switching between them never mixes stream
-  state.
+- ZRLE, ZLib, and Tight keep **separate** per-client zlib streams. A failure
+  in one does not reset or disable the others, and switching between them never
+  mixes stream state.
 - Raw is always legal in RFB, so a client that advertised only a compressed
   encoding still receives a valid Raw rectangle when compression fails.
 
@@ -232,6 +236,46 @@ encodings. It is never sent to a client that did not advertise it.
   the connection, because the partially written zlib stream cannot be trusted.
   The ZLib stream and the client's next preferred encoding remain usable. Raw
   is always legal in RFB, so the client stream stays valid.
+
+### Tight
+
+Tight (7) is used only when the client listed it before the other usable
+encodings. It is never sent to a client that did not advertise it. The
+implementation covers the subset TightVNC clients need for 32-bit true-colour
+sessions:
+
+- **BasicCompression** on zlib stream 0, continued across rectangles and
+  updates and sync-flushed after every rectangle. Each compressed payload uses
+  Tight's one-, two-, or three-byte compact length (22 bits); a filtered
+  payload smaller than 12 bytes is sent uncompressed, as the format requires.
+- **FillCompression** for a rectangle whose pixels are one colour: a single
+  `TPIXEL` after the `0x80` control byte and no zlib data.
+- **PaletteFilter** for rectangles with at most 256 colours. The palette size
+  byte stores `count - 1`, followed by the palette entries; two colours use
+  one bit per pixel, MSB first and row-aligned, and three or more use one byte
+  per pixel. The palette header is uncompressed and only the index data goes
+  through the zlib stream. The encoder chooses the filter whose pre-compression
+  size is smaller; otherwise it uses the **CopyFilter**.
+- `TPIXEL` is three bytes in R, G, B order when the client chose 32-bit
+  true-colour with depth 24 and 8-bit channels — independent of the shift order
+  and endianness — and a full four-byte `PIXEL` for depth 32. Both RGB and BGR
+  client formats are encoded from the same source pixels.
+- **Bounds:** TightVNC decoders cap a rectangle at 2048 pixels wide, so a wider
+  request is split into multiple rectangles. Each wire rectangle is also capped
+  at 1,000,000 pixels, which keeps the uncompressed payload at 4,000,000 bytes
+  and the compressed payload inside the 4,194,303-byte compact-length limit even
+  for incompressible data. Rectangle buffers, the palette lookup, and the
+  per-client stream are all bounded by those limits; nothing grows with frame
+  count.
+- If a Tight encode fails (invalid geometry, compact-length bound, or zlib
+  error), the whole requested rectangle is emitted as Raw and Tight is disabled
+  for the rest of the connection, because the partially written zlib stream
+  cannot be trusted. The ZRLE and ZLib streams remain usable. Raw is always
+  legal in RFB, so the client stream stays valid.
+- **Not implemented:** JPEG sub-encoding (no JPEG encoder in the node), the
+  gradient filter, `BasicCompression Without Zlib`, and the extra zlib streams
+  1–3. Those are not advertised or emitted. JPEG quality-level and compression-
+  level pseudo-encodings in `SetEncodings` are ignored rather than misread.
 
 ### Cursor pseudo-encoding
 
@@ -314,16 +358,16 @@ encodings. It is never sent to a client that did not advertise it.
 
 ### Automated
 
-`cargo test -p ozma-node --lib vnc` — **49 passed, 0 failed** for the RFB,
-config, and registration coverage. The wider `ozma-node` lib suite is
-**552 passed, 0 failed, 4 ignored**; the ignored tests are pre-existing opt-in
-WebRTC/GStreamer live tests.
+`cargo test -p ozma-node --lib vnc` — **54 passed, 0 failed** for the RFB,
+config, and registration coverage. The wider `ozma-node` lib suite was not
+re-run for this Tight pass; the previous full run was **552 passed, 0 failed,
+4 ignored**, and the ignored tests are pre-existing opt-in WebRTC/GStreamer
+live tests.
 
-Because the main working tree contained unrelated in-progress changes that do
-not compile (`ozma-mesh` references a missing `discovery` module), validation
-ran in a detached worktree at the same HEAD with only
-`ozma-node/src/vnc_server.rs` replaced. No product change was made outside that
-file and this report.
+This pass ran in the main working tree: `cargo check -p ozma-node
+--all-targets` completed successfully despite the unrelated in-progress
+changes in other crates. No product change was made outside
+`ozma-node/src/vnc_server.rs` and this report.
 
 New encoding tests in `ozma-node/src/vnc_server.rs`:
 
@@ -344,19 +388,41 @@ New encoding tests in `ozma-node/src/vnc_server.rs`:
   two ZLib rectangles, switches to ZRLE, then returns to ZLib; both decoders
   keep their own stream state and every rectangle decodes to the expected
   framebuffer.
+- `tight_copy_palette_and_fill_decode_in_rgb_and_bgr` — a test-side Tight
+  decoder (FillCompression, CopyFilter, PaletteFilter with 2-colour 1-bit and
+  8-colour byte-per-pixel packing) decodes copy, palette-2, palette-8, and fill
+  rectangles in RGB little-endian, BGR little-endian, BGR big-endian, and
+  depth-32 RGB. One encoder/decoder pair processes three successive rectangles
+  per case, proving the per-client Tight zlib stream continues correctly.
+- `tight_frames_decode_over_the_wire_in_rgb_and_bgr` — copy-filter and
+  palette-filter Tight rectangles cross a real RFB connection and decode from
+  the wire in RGB, BGR, BGR big-endian, and depth-32 formats; each format sends
+  two updates on the same connection and decoder.
+- `tight_and_zlib_use_independent_persistent_streams` — a live connection
+  alternates Tight and ZLib rectangles; each decoder keeps its own stream and
+  every rectangle decodes to the expected framebuffer.
+- `tight_sub_rects_respect_the_width_and_area_bounds` — widths 1, 2048, 2049,
+  4096, and 65535 split into pieces that all stay within 2048 pixels wide and
+  1,000,000 pixels, and the pieces cover exactly the requested area.
+- `tight_wire_rectangle_splitting_stays_within_bounds` — a solid 4100x600
+  frame is encoded as multiple Tight rect headers/payloads, each within the
+  width and area limits, each a FillCompression payload, with total coverage
+  equal to the frame.
 - `encoding_preference_honours_all_supported_codecs_in_client_order` — every
   single supported encoding is used as advertised; Raw/ZRLE, Hextile/ZLib,
-  Hextile/ZRLE, and ZLib/ZRLE pairs follow the client's order; an unsupported
-  Tight entry is ignored; all-unsupported and empty lists fall back to Raw.
+  Hextile/ZRLE, ZLib/ZRLE, and every Tight pairing follow the client's order;
+  an unsupported entry is ignored; all-unsupported and empty lists fall back to
+  Raw.
 - `encoding_selection_skips_only_disabled_encodings` — disabling Hextile selects
-  the next listed ZLib (and then ZRLE), not Raw, and Raw remains available.
+  the next listed ZLib (then Tight, then ZRLE), not Raw, and Raw remains
+  available.
 - `compressed_encoding_failure_falls_back_to_raw_and_disables_only_that_encoding`
-  — a frame the encoders cannot read forces ZRLE, Hextile, and ZLib errors;
-  each update is emitted as Raw, reports that one failed encoding, and a
-  selection with no usable stream still produces Raw without a new failure.
+  — a frame the encoders cannot read forces ZRLE, Hextile, ZLib, and Tight
+  errors; each update is emitted as Raw, reports that one failed encoding, and
+  a selection with no usable stream still produces Raw without a new failure.
 - `hextile_and_zlib_bounds_are_rejected_before_writing` — zero-sized and
-  out-of-frame Hextile/ZLib rectangles return `InvalidInput` without appending
-  bytes or touching a zlib stream.
+  out-of-frame Hextile/ZLib/Tight rectangles return `InvalidInput` without
+  appending bytes or touching a zlib stream.
 - `zrle_decodes_the_known_framebuffer_in_rgb_and_bgr_formats` — a test-side
   ZRLE decoder (Raw, solid, packed palette, plain RLE, palette RLE, CPIXEL
   reassembly) decodes a 256x64 pattern in RGB little-endian, BGR little-endian,
@@ -480,26 +546,63 @@ The external probe connected twice:
   4-byte length prefix, sync flush, and raw-pixel payload all matched.
 
 This is live wire evidence for Hextile and ZLib selection and decoding, not
-just the in-process decoders. It does not claim a live run for Tight, JPEG, or
-H.264, which remain unimplemented.
+just the in-process decoders. It does not claim a live run for JPEG or H.264,
+which remain unimplemented.
 
 Earlier in this pass, the `asyncvnc` client advertised only ZLib before ZLib
 support existed and therefore received Raw. That historical result is no longer
 representative: the same client would now receive ZLib.
 
+### Live Tight smoke (2026-11-25)
+
+The same fake-source node command was used at `127.0.0.1:15999` with a
+1280x720 synthetic ramp.
+
+TigerVNC 1.16.2 under Xvfb was started with
+`-AutoSelect=0 -PreferredEncoding=Tight`. It advertised 27 encodings with
+**Tight first**:
+
+```text
+VNC client encoding preferences applied client=1 count=27 order=[Tight, Zrle, Hextile, Raw] cursor=true
+```
+
+The viewer decoded frames for the full 10 s test window with no protocol,
+zlib, or decode error before the test timeout stopped it. Because Tight was the
+first advertised usable encoding, the server selected it.
+
+An external Python stdlib RFB probe then advertised **only** Tight (7) and
+sent a full 1280x720 update request. It received exactly:
+
+```text
+ServerInit 1280x720 bpp=32 depth=24 big_endian=0 true_colour=1
+FramebufferUpdate rectangles 1
+rect 0: x=0 y=0 1280x720 encoding=7 control=0x00
+  compact length 19864; decompressed 2764800 bytes
+chosen encodings [7]
+decoded pixels 921600 expected 921600
+TIGHT_PROBE_OK
+```
+
+`control=0x00` is BasicCompression on zlib stream 0 with the CopyFilter, and
+19864 needs the three-byte compact length form. The decompressed size is
+exactly `1280 * 720 * 3` (`TPIXEL` is three RGB bytes for depth 24), and the
+probe consumed one rectangle covering all 921,600 pixels. This is live wire
+evidence for Tight basic compression, the compact length, the per-client zlib
+stream, and the copy filter. Fill and palette filters are covered by the
+in-process decoder tests.
+
 ### Commands
 
 ```sh
 cargo test -p ozma-node --lib vnc
-cargo test -p ozma-node --lib
 cargo check -p ozma-node --all-targets
 rustfmt --edition 2021 --check ozma-node/src/vnc_server.rs
 ```
 
-All passed: **49 vnc tests**, **552 lib tests (4 ignored)**, check clean (one
-pre-existing `unused_mut` warning in `controller_compat.rs`), rustfmt exit 0.
-The commands were run in a detached HEAD worktree because unrelated
-in-progress `ozma-mesh` edits in the main tree do not compile.
+All passed: **54 vnc tests**, check clean (only pre-existing warnings from
+other crates such as unused imports in `ozma-pipewire` and `unused_mut` in
+`controller_compat.rs`), rustfmt exit 0. The commands ran in the main working
+tree. The wider `ozma-node` lib suite was not re-run for this Tight pass.
 
 ## Remaining VNC gaps
 
@@ -517,11 +620,16 @@ in-progress `ozma-mesh` edits in the main tree do not compile.
   networks.
 - **No password rotation while running.** The file is read once at startup; a
   changed password requires a node restart.
-- **No Tight, JPEG, or H.264.** Raw (0), Hextile (5), ZLib (6), and ZRLE (16)
-  are implemented. A client that advertises only an unimplemented encoding
-  still gets Raw, as RFB permits, and the server honours the client's order
-  across all four supported encodings. An encode failure disables only the
-  failing encoding for that connection and falls back to Raw for that update.
+- **Tight is a subset.** Raw (0), Hextile (5), ZLib (6), Tight (7), and ZRLE
+  (16) are implemented. Tight supports basic zlib compression with the fill,
+  copy, and 2..=256-colour palette filters on one per-client stream. It does
+  **not** implement JPEG sub-encoding, the gradient filter,
+  BasicCompression Without Zlib, extra zlib streams 1–3, or JPEG quality /
+  compression-level pseudo-encodings. A client that advertises only an
+  unimplemented encoding still gets Raw, as RFB permits, and the server honours
+  the client's order across all five supported encodings. An encode failure
+  disables only the failing encoding for that connection and falls back to Raw
+  for that update.
 - **Cursor is always the empty shape.** There is no cursor-shape source in the
   capture pipeline, so the node tells a requesting client that there is no
   local cursor. It does not inspect QMP/QEMU cursor state or synthesize a
@@ -532,8 +640,8 @@ in-progress `ozma-mesh` edits in the main tree do not compile.
   reconnect and node restart.
 - **Only packed RGB24/BGRA capture sources.** YUYV, NV12, P010, and compressed
   sources are refused at startup; this server does not convert pixel layouts.
-  Raw, Hextile, ZLib, and ZRLE still send only 32-bit true-colour client
-  formats (depth 24/32).
+  Raw, Hextile, ZLib, Tight, and ZRLE still send only 32-bit true-colour client
+  formats (depth 24/32). Tight uses its 3-byte TPIXEL form at depth 24.
 - **No frame-rate pacing in the server.** The capture pump runs at the source's
   own pace even when no viewer is connected; the snapshot is overwritten rather
   than queued.

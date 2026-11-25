@@ -9,6 +9,11 @@ supervisor path, WebRTC, seat registration, and several controller features if
 > **Refresh (2026-11-25):** a post-P0 evidence run at `437468a` is in §16. It
 > revises the matrix, blockers, deletion status, and go/no-go. Deletion is
 > still **NO-GO**; the one-release overlap is **GO conditional**.
+>
+> **Refresh 2 (2026-11-25):** a second evidence run at `28ffd69` is in §17,
+> after privileged install, container gate, systemd/udev runtime, real
+> `dummy_hcd` USB, live mesh, real Xorg seats, DRM leases, and VNC/OCR evidence.
+> Deletion remains **NO-GO**; the overlap remains **GO conditional**.
 
 - Audit date: 2026-11-25 (Australia/Sydney)
 - Audit baseline: `4b3b875c861a33ddacf7f641248ec99198dd6f47`
@@ -926,3 +931,230 @@ nodes with three concurrent peers; OCR returned readable Alpine console text at
 plus two environment-induced macro/automation timeouts. The container gate is
 still blocked by a stale cached image missing `libxdo` (rebuild needs network
 `apt-get`), and the privileged install remains unrun. Deletion remains **NO-GO**.
+
+## 17. Refresh 2 (2026-11-25)
+
+This section supersedes §16 for the current go/no-go. §16 remains the record of
+the `437468a` run.
+
+- Refresh baseline: `28ffd6986c7c09844982d12096c39a4035281567`
+  (`feat(phase4): VNC Hextile/ZLib, mesh discovery, systemd runtime`), **13
+  commits after `437468a`**.
+- Evidence was taken in a detached worktree at
+  `/tmp/opencode/ozma-refresh2-28ffd69`, verified `git status --porcelain`
+  empty before the run. Two test-generated untracked files
+  (`nodes_meta.json`, `controller/mesh_network.json`) appeared during the
+  controller suite and were removed; no tracked file changed and the committed
+  `Cargo.lock` was not rewritten. The primary checkout was not used because it
+  holds unrelated display/AIDA64 work.
+- Read-only with respect to product code: no Python or Rust source changed, no
+  deletion, no commit or tag. Repository writes are this section and the two
+  short pointers in §17.6. `docs/parity-matrix.md` and
+  `docs/plan-execution-status.md` were **not** edited.
+
+### 17.1 Evidence run
+
+Exact commands (from the detached worktree unless noted):
+
+```bash
+git worktree add --detach /tmp/opencode/ozma-refresh2-28ffd69 28ffd6986c7c09844982d12096c39a4035281567
+cd /tmp/opencode/ozma-refresh2-28ffd69
+CARGO_TARGET_DIR=/home/matt/ozma/ozma-audit-refresh2-target \
+    cargo metadata --locked --offline --format-version 1
+CARGO_TARGET_DIR=/home/matt/ozma/ozma-audit-refresh2-target \
+    cargo test --workspace --no-fail-fast
+CARGO_TARGET_DIR=/home/matt/ozma/ozma-audit-refresh2-target \
+    cargo check --workspace --all-targets
+OZMA_CLEAN_HOST_TARGET=/home/matt/ozma/ozma-audit-refresh2-target \
+    scripts/clean-host/run.sh --host
+/tmp/opencode/refresh2-venv/bin/python -m pytest \
+    tests/unit/controller/test_meeting_status_proxy.py \
+    tests/unit/controller/test_screen_ocr.py \
+    tests/unit/controller/test_seats.py \
+    tests/unit/controller/test_mesh_connect_proxy.py \
+    tests/unit/controller/test_discovery_fields.py \
+    tests/unit/controller/test_node_api_token_direct.py \
+    tests/unit/controller/test_node_api_token_proxy.py \
+    tests/unit/controller/test_node_token_store.py \
+    tests/unit/controller/test_dashboard_node_token_ui.py \
+    tests/unit/controller/test_screen_reader.py -q
+/tmp/opencode/refresh2-venv/bin/python -m pytest tests/unit/controller -q
+bash scripts/systemd/verify-units.sh
+bash scripts/verify-system-install.sh
+```
+
+Controller pytest used a disposable venv (`/tmp/opencode/refresh2-venv`) with
+offline `uv pip install -r controller/requirements.txt`. Missing pure-Python
+packages came from the local uv cache; `fontTools` was absent from the cache
+and was copied from the host's global Python 3.14 site-packages (pure Python,
+no network). No sudo or global package install was used.
+
+| Check | Result | Exact evidence |
+|---|---|---|
+| `cargo metadata --locked --offline` | **PASS** | exit 0; 3,358,318-byte JSON; lock not rewritten (the §16.7 `abef162` fix holds). |
+| `cargo test --workspace --no-fail-fast` | **PASS** | **2738 passed, 0 failed, 51 ignored** across **206** result blocks; finished `test` profile in 2m 52s. `ozma-node` lib **557 passed / 4 ignored**; bin 20; parity **22**; `ozma-virtual-node` **139**; `ozma-multiseat` lib 30; all `ozma-usb`, `ozma-mesh`, `ozma-audio`, `ozma-capture` suites green. No `FAILED`, panic, or compile error. |
+| `cargo check --workspace --all-targets` | **PASS** | exit 0 in 34.07 s. One `ozma-node` lib warning: pre-existing `unused_mut` at `ozma-node/src/controller_compat.rs:4803`; other crates carry pre-existing warnings only. |
+| `scripts/clean-host/run.sh --host` | **PASS** | `RESULT: PASS`; harness **22 passed, 0 failed, 0 skipped**; dependency report **17 passed / 0 failed / 2 skipped** (`apparmor_parser`, `shellcheck` absent); `ozma-node --lib` **557 passed / 4 ignored**; `ozma-softnode` **139 passed**; `install-rust.sh --dry-run` covered multiseat + meeting-detect and wrote nothing; `systemd-analyze verify`; synthetic desktop `/health` `ok:true`. |
+| `scripts/systemd/verify-units.sh` | **PASS** | **8/8**: `PASS system` and `PASS user` for `ozma-node@`, `ozma-node-vm@`, `ozma-virtual-node`, `ozma-multiseat`. |
+| `scripts/verify-system-install.sh` (normal user) | **PASS** | **82 passed, 0 failed, 1 skipped** (`apparmor_parser` absent); `RESULT: PASS`. |
+| Focused controller pytest (10 files: meeting proxy, screen OCR/reader, seats, mesh proxy, discovery, node token direct/proxy/store, dashboard token UI) | **PASS** | **185 passed, 2 skipped, 0 failed**, 82.64 s, 1 deprecation warning. |
+| Full controller pytest `tests/unit/controller` | **PASS** | **2813 passed, 20 skipped, 1 xfailed, 0 failed**, 108.34 s. |
+| `scripts/clean-host/run.sh --container --full` | **NOT RERUN at this HEAD** | Last PASS at `08393e7`: rootless Podman, container harness 20/0/1 skip, workspace 2469/0/42, image digest `sha256:c39f7af3…571a64`. A first image build still needs network `apt-get`; this task forbids it. |
+| Default live demo / `demo test` | **NOT RERUN at this HEAD** | Default-Rust live demo PASS at `7b9c0a1` and `e40e62c` (HLS, snapshot, QMP input, WebRTC, VNC, `/video`). Latest `demo test` is **70 passed / 5 failed** (3 controller-only Connect assertions + F19/F20 environment timeouts). |
+| Privileged fresh-host install | **PASS on a dirty tree, not this HEAD** | Debug install at `5ae55e7` + uncommitted work; release build/install at `8b951af` + uncommitted work; `verify-system-install.sh` 82/0/1, `verify-units.sh` 8/8, no unit enabled/started. |
+| Systemd/udev runtime | **PASS (fake source)** | Packaged `ozma-node@vm.service` at `4547cd4` + uncommitted work: `/health`, `/snapshot`, `/video`, HLS, bearer 401, SIGTERM stop, no leftovers. No real QMP/V4L2/USB/gadget data. |
+| Live demo HEAD cleanliness | **PASS** | Worktree clean before/after; test artifacts removed; no commit/tag. |
+
+Environment note: the clean-host run recompiled into the same 29 GB target on
+`/home` (no `/tmp` exhaustion). No sudo, network install, global package, or
+Python-tree deletion was used.
+
+### 17.2 Revised evidence matrix
+
+Status vocabulary is unchanged: **Done** = a checked-in test or live run on the
+named baseline asserts it; **Partial** = implemented but missing a consumer,
+live/frozen validation, or provider; **Gap** = no Rust path.
+
+| §9 area | Evidence (baseline) | Now | Still not proven / remaining |
+|---|---|---|---|
+| Privileged fresh-host install (P0 3) | Debug `5ae55e7`+uncommitted; release `8b951af`+uncommitted | **Done (capability)** | Baseline is a dirty tree, not a frozen tag; AppArmor parser absent (skip). |
+| Container gate (P0 2) | `08393e7` rootless Podman, `--container --full` | **Done at `08393e7`** | Not rerun at `28ffd69`; first build needs network. |
+| Release binaries | `8b951af` release build 105 s; 4 binaries + WebRTC helper installed to both layouts | **Done** | Not rebuilt/installed at `28ffd69`; not at a frozen tag. |
+| Systemd/udev runtime | `4547cd4`+uncommitted packaged unit + real udev/tmpfiles/modules | **Partial** | Fake capture/recording input only; no real QMP/V4L2/PipeWire/USB; `ozma-virtual-node` supervisor path not live-run. |
+| USB / `dummy_hcd` | Mass storage, node `--usb-gadget`, FunctionFS (62 CBW/62 CSW), USB/IP `vhci_hcd` all PASS | **Partial (strong)** | UAC2 kernel-blocked (`dummy_hcd` has no ISO); no real UDC; PD/emulation and real HID gadget absent; transient `-121` URBs. |
+| Mesh dataplane/discovery | Two-netns encrypted ping/UDP, TUN/routes/forwarding, teardown; mDNS discovery + key trust + route reconciliation | **Partial (strong)** | No Connect cloud/CA relay, kernel WireGuard is typed unsupported, no key rotation, no production multi-hop; discovery run still needed operator trust config. |
+| Xorg seats | Real Xorg `:90`/`:91` + libinput; `EVIOCGRAB`+uinput targeting; keys reached only their seat | **Partial** | No DRM scanout/compositor/window manager, no session/cgroup/namespace, no config generation, node does not consume the private display/input session. |
+| DRM leases | vkms live lease: lessee fd, `GET_LEASE`, exec inheritance, duplicate error, revoke, re-acquire | **Partial** | Lease-only; no compositor/scanout/plane selection; node receives `OZMA_DRM_*` but has no KMS consumer; default vkms is logind-mastered. |
+| VNC / OCR | RFB 3.8, VncAuth, Raw/Hextile/ZLib/ZRLE, asyncvnc + TigerVNC; controller OCR tesseract 0.82, 235 regions | **Done (opt-in)** | Plaintext TCP, no TLS/VeNCrypt; no Tight/JPEG/H.264; no desktop resize/continuous updates; one source; one shared input sink. |
+| Default live demo | `7b9c0a1` and `e40e62c` default Rust live PASS | **Partial at this HEAD** | Not rerun at `28ffd69`; `demo test` still fails. |
+| RPA | `/rpa/type`, `/rpa/key`, `/rpa/screenshot`, `/rpa/ocr` implemented | **Partial** | `/rpa/screen`, `/rpa/click`, `/rpa/wait_for_text`, `/rpa/script`, `/rpa/enter_bios`, `/rpa/set_boot_usb` remain typed 501. |
+| Desktop compat | `/display/geometry`, `/clipboard`, `/wallpaper` with real tools and read-back | **Partial** | `/audio/nodes`, `/audio/sweep`, `/ui/windows`, `/backup/*`, room correction, app monitor, chassis DB, tray, Windows/macOS absent. |
+| Meeting detection | Detector → supervisor `/status.meeting` → controller `/api/v1/meeting/status` | **Done (opt-in)** | No system unit by design; live calendar/PipeWire detection not rerun here. |
+| Packaging | `ozma-multiseat` + `ozma-meeting-detect` installed (binaries, unit, env example) | **Done** | No `rust-cutover-<version>-python-rollback` tag. |
+| CI/build/release | Rust-first blocking Rust gate; Python legacy optional/non-blocking | **Partial** | `ci.yml` ruff/py_compile, `build.yml` legacy wheels/PyInstaller, `release.yml`, dev scripts, `demo --python`, proxmox plugin, tests still reference the trees. |
+| Python-only breadth | — | **Gap/typed 501** | Hyper-V, VBAN, v4l2loopback `capture_device`, USB PD/emulation, GPIO power, serial/RGB/current, sensors/phone/self-management, backup/storage, native WebRTC, Wayland/compositor, Windows/macOS. |
+
+### 17.3 Remaining blockers
+
+**P0 — blocks deletion; most also block an unconditional overlap tag**
+
+1. **No frozen, tagged baseline for the new evidence.** The privileged install,
+   release install, systemd/udev runtime, USB hardware, mesh live, Xorg seat,
+   DRM lease, and VNC evidence were collected on dirty trees or commits at or
+   before `4547cd4`. Only the unit/workspace/pytest/host checks above are at
+   `28ffd69`. Freeze and tag first, then rerun the live/privileged gates.
+2. **`demo test` is still red.** Latest is 70 passed / 5 failed (three
+   controller-only Connect assertions plus environment-induced F19/F20). The §9
+   common gate says `bash demo/run_demo.sh test` must pass with the Rust backend;
+   a waiver is not recorded.
+3. **No one-release overlap release or rollback tag.** Only
+   `rust-cutover-preview-*` tags exist (latest preview `4547cd4`, not `28ffd69`);
+   none is `rust-cutover-<version>-python-rollback`.
+4. **Python-only providers still back parity rows.** `/backup/*`,
+   `/ui/windows`, `/serial/*`, `/rgb/*`, `/current`, RPA script/BIOS/click/wait/
+   screen, Hyper-V, VBAN, v4l2loopback `capture_device`, USB PD/emulation, GPIO
+   power, sensors/phone/self-management, room correction, app monitor, tray,
+   storage/backup, and Windows/macOS have no Rust provider (many are honest 501s
+   or no route). No product decision records these as dropped.
+5. **Runtime/CI/build/test references remain.** `ci.yml` ruff and py_compile
+   (advisory/optional), `build.yml` legacy softnode/agent wheels and PyInstaller
+   jobs, `release.yml`, `dev/*` scripts, `demo/run_demo.sh --python`,
+   `scripts/gate2/qemu-preflight.sh` helper fallback, `tests/conftest.py:16`,
+   **28 test files** that import the trees, the proxmox plugin, and README
+   references.
+6. **Container gate is not proven at this HEAD.** It passed at `08393e7`; the
+   only blocker to rerunning is the network `apt-get` image build.
+7. **`ozma-virtual-node` systemd supervisor path is not live-tested.** Child
+   argv parity is code/test complete and a direct packaged `ozma-node@vm`
+   service ran, but the supervisor service itself has not supervised real VMs
+   under systemd.
+
+**P1 — required before claiming Phase 4 complete, not all block the overlap**
+
+- Native WebRTC (still the Python GStreamer helper), helper→browser trickle,
+  audio quality/sync, and controller-port decision.
+- Real UAC2 hardware (real UDC/host, ISO/stall/hotplug) and USB PD/emulation/
+  real HID gadget; USB/IP ISO.
+- Wayland/compositor support and a node-owned seat lifecycle; DRM scanout and
+  plane selection; physical output handoff; per-seat session/cgroup/namespaces.
+- Mesh Connect cloud/CA, kernel WireGuard, key rotation, multi-hop routing.
+- VNC TLS/VeNCrypt, Tight/JPEG, resize/continuous updates, multi-source.
+- RPA script/BIOS/click/wait/screen; desktop audio graph/sweep, backup/storage,
+  hardware inventory, room correction, app monitor, tray; Windows/macOS.
+- CI formatting/clippy are still advisory; legacy Python CI jobs remain.
+
+### 17.4 Deletion criteria status
+
+Common gate (§9):
+
+| Criterion | Status now |
+|---|---|
+| `cargo test --workspace` | **Satisfied** — 2738 passed / 0 failed / 51 ignored at `28ffd69`. |
+| `pytest tests/unit/controller -q` | **Satisfied** — 2813 passed / 20 skipped / 1 xfailed / 0 failed at `28ffd69`. |
+| `clean-host --host` (20/20 or better) | **Satisfied** — 22/22; node lib 557, softnode 139. |
+| `clean-host --container --full` | **Outstanding at this HEAD** — PASS at `08393e7`, not rerun at `28ffd69` (network image build). |
+| Default demo uses Rust and passes live | **Outstanding at this HEAD** — PASS at `7b9c0a1`/`e40e62c`; not rerun at `28ffd69`. |
+| `demo test` with Rust backend | **FAIL** — 70/5 latest; controller Connect + environment failures. |
+| Install dry-run/staged + privileged fresh-host install | **Satisfied in capability** — dry-run at HEAD, privileged debug/release installs on dirty trees; no frozen-tag run. |
+| `verify-system-install.sh` / `verify-units.sh` | **Satisfied** — 82/0/1 and 8/8 at `28ffd69`. |
+| `git grep` no runtime/CI/build/Dockerfile/test reference | **Outstanding** — CI, build/release, dev scripts, demo `--python`, tests/conftest, 28 test files, proxmox plugin, README. |
+| One-release overlap shipped + rollback tag | **Outstanding** — no rollback tag, no overlap release. |
+| No parity row whose only provider is the deleted tree | **Outstanding** — the Python-only list in §17.3 P0 4 remains, with no recorded drop decision. |
+
+Per tree:
+
+- **`softnode/` — not ready.** Closed since §16: helper relocation, child argv
+  parity (including UAC2/VNC/multiseat/mesh), real VNC server + registration,
+  FunctionFS/SCSI + USB/IP kernel path + UAC2 software bridge, live mesh
+  dataplane/discovery, meeting-detection wiring, real Xorg/DRM seat support.
+  Outstanding: live `ozma-virtual-node` systemd supervisor run; GPU passthrough
+  argv; libvirt PCI/power metadata; real UDC/UAC2, PD/emulation, HID gadget;
+  Hyper-V, VBAN, v4l2loopback `capture_device`; `softnode/install/install.sh`
+  still present; `tests/conftest.py`, 28 test files, CI/build/dev references.
+- **`node/` — not ready.** Closed: hardware core routes, typed 501s, real RPA
+  subset, `/video`, desktop controls, real `dummy_hcd` mass-storage/FunctionFS/
+  USB-IP data path. Outstanding: real providers for backup/UI-windows/serial/
+  RGB/current, RPA script/BIOS/click/wait/screen, sensors/phone/self-management,
+  PD/emulation, GPIO power, board matrix, HID gadget hardware, `node/usb_hid_*`
+  crates, CI/tests.
+- **`agent/` — not ready.** Closed: desktop geometry/clipboard/wallpaper,
+  `seat_id` + read-only seat report + packaging, per-seat Xorg/libinput and
+  EVIOCGRAB/uinput isolation, DRM lease handoff, Rust-default installer.
+  Outstanding: node-owned seat lifecycle and DRM/compositor consumer;
+  `/audio/nodes`, `/audio/sweep`, `/ui/windows`, `/backup/*` real behavior; room
+  correction, app monitor, chassis DB, tray, storage/backup, Windows/macOS;
+  `ozma-agent` crate and legacy release/PyInstaller retirement; `agent/*.rs`
+  prototypes (`display_geometry.rs`, `hardware_info.rs`, `hid_injector.rs`,
+  `pipewire_audio.rs`); agent tests/conftest.
+- **`src/`** — absent; no new prototype. Keep it that way.
+
+### 17.5 Go / no-go
+
+- **(a) One-release overlap: GO conditional.** The Rust path is now safe to
+  ship alongside Python: default Rust demo is live-proven, the lock is clean,
+  the privileged release install/verify gates and the container gate have
+  passed, and systemd/udev/VNC/RPA/seat work has real evidence. **Conditions
+  before tagging:** freeze `28ffd69` (or successor), rerun the default Rust demo
+  and `demo test` on that commit, repair or explicitly waive the five known
+  `demo test` failures, rerun `--container --full` on the freeze commit or
+  record a time-bounded environmental waiver, and create the
+  `rust-cutover-<version>-python-rollback` tag with the evidence bundle. Until
+  then the overlap is not taggable.
+- **(b) Python tree deletion: NO-GO.** §9 is not met: `demo test` fails, the
+  required rollback tag and overlap release do not exist, the container gate
+  and live demo were not rerun at the freeze HEAD, the new privileged/systemd/
+  live evidence is not on a frozen tag, Python-only providers still back parity
+  rows with no recorded drop decision, and CI/build/dev/test references to
+  `softnode/`, `node/`, and `agent/` remain. The Python controller may remain
+  under Gate 4a/4b; that does not relax these node-tree criteria. **No tree was
+  deleted.**
+
+### 17.6 Pointers
+
+- [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md) — status header
+  points at this Refresh 2 and keeps deletion **NO-GO**.
+- [`clean-host.md`](clean-host.md) — current-state paragraph points at this
+  Refresh 2 and the `28ffd69` host/verify counts.
+- [`parity-matrix.md`](parity-matrix.md) and
+  [`plan-execution-status.md`](plan-execution-status.md) are intentionally **not**
+  edited here; the orchestrator updates them.

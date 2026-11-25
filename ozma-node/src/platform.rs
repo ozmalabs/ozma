@@ -682,6 +682,7 @@ mod tests {
             qmp_socket: None,
             qmp_input_socket: None,
             libvirt_domain: None,
+            libvirt_uri: None,
             qmp_connect_timeout: std::time::Duration::from_millis(3_000),
             qmp_command_timeout: std::time::Duration::from_millis(5_000),
             vnc_host: None,

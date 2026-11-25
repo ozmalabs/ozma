@@ -21,15 +21,18 @@
 //!   copied into the last published snapshot; a slow client gets the newest
 //!   frame, and intermediate frames are counted as coalesced, never queued
 //!   without bound.
-//! * Four pixel encodings are available: Raw (always valid in RFB), ZRLE
-//!   (16), Hextile (5), and ZLib (6), selected from the client's
-//!   `SetEncodings` preference order. ZRLE and ZLib each use their own
+//! * Five pixel encodings are available: Raw (always valid in RFB), ZRLE
+//!   (16), Hextile (5), ZLib (6), and Tight (7), selected from the client's
+//!   `SetEncodings` preference order. ZRLE, ZLib, and Tight each use their own
 //!   per-client zlib stream; Hextile uses the standard 16x16 tiles and its
 //!   Raw, BackgroundColour, ForegroundColour, AnySubrects, and
-//!   SubrectsColoured sub-encodings. The server never sends an encoding the
-//!   client did not advertise, falls back to Raw if an encode fails, disables
-//!   only the failing encoding for the rest of the connection, and never
-//!   claims Tight or another codec it does not implement.
+//!   SubrectsColoured sub-encodings. Tight sends basic zlib compression with
+//!   the Fill sub-encoding for solid rectangles and the Palette filter for
+//!   rectangles with at most 256 colours; it does not claim JPEG or gradient
+//!   compression. The server never sends an encoding the client did not
+//!   advertise, falls back to Raw if an encode fails, disables only the
+//!   failing encoding for the rest of the connection, and never claims a codec
+//!   it does not implement.
 //! * A client may request the Cursor pseudo-encoding (-239). Because this
 //!   server has no cursor-shape source, it sends a typed 0x0 empty cursor
 //!   once per connection; it never fabricates a visible pointer shape.
@@ -117,6 +120,8 @@ pub const ENCODING_RAW: i32 = 0;
 pub const ENCODING_HEXTILE: i32 = 5;
 /// RFB ZLib encoding number (RFC 6143 section 7.7.7).
 pub const ENCODING_ZLIB: i32 = 6;
+/// RFB Tight encoding number (TightVNC extension).
+pub const ENCODING_TIGHT: i32 = 7;
 /// RFB ZRLE encoding number (RFC 6143 section 7.7.6).
 pub const ENCODING_ZRLE: i32 = 16;
 /// RFB Cursor pseudo-encoding number (RFC 6143 section 7.8.1).
@@ -147,6 +152,26 @@ const MAX_ZRLE_RECT_BYTES: usize = MAX_FRAME_BYTES + 8 * 1024 * 1024;
 /// the same uncompressed rectangle as Raw, so the same headroom over a
 /// four-byte-per-pixel frame is enough for deflate's stored-data overhead.
 const MAX_ZLIB_RECT_BYTES: usize = MAX_FRAME_BYTES + 8 * 1024 * 1024;
+/// Tight rectangles wider than this must be split: TightVNC decoders size
+/// their row buffers from this 2048-pixel limit.
+const TIGHT_MAX_WIDTH: usize = 2048;
+/// Largest pixel area encoded as one Tight wire rectangle. At four bytes per
+/// TPIXEL this keeps the uncompressed payload at 4,000,000 bytes, so even
+/// incompressible deflate output stays below [`TIGHT_MAX_RECT_BYTES`].
+const TIGHT_MAX_PIXELS: usize = 1_000_000;
+/// Largest Tight payload representable by the compact 22-bit length field
+/// (one, two, or three bytes).
+const TIGHT_MAX_RECT_BYTES: usize = 0x003f_ffff;
+/// Tight compression-control byte: FillCompression (all pixels one colour).
+const TIGHT_FILL: u8 = 0x80;
+/// Tight compression-control bit: an explicit filter-id byte follows.
+const TIGHT_EXPLICIT_FILTER: u8 = 0x40;
+/// Tight filter id: palette (indexed colour) filter.
+const TIGHT_FILTER_PALETTE: u8 = 1;
+/// Tight sends filtered data below this size without zlib compression.
+const TIGHT_MIN_TO_COMPRESS: usize = 12;
+/// Largest palette Tight emits; the palette size byte stores `len - 1`.
+const TIGHT_MAX_PALETTE: usize = 256;
 /// How long a viewer may take to complete the handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long one framebuffer update write may block before the viewer is closed.
@@ -841,7 +866,7 @@ pub async fn start(
         loopback = bound_addr.ip().is_loopback(),
         security = if auth_enabled { "vnc-auth" } else { "none" },
         encrypted = false,
-        encoding = "raw,hextile,zlib,zrle",
+        encoding = "raw,hextile,zlib,tight,zrle",
         "RFB 3.8 VNC server listening (transport is plain TCP; VNC auth is not encryption)"
     );
 
@@ -1122,6 +1147,7 @@ enum UpdateEncoding {
     Raw,
     Hextile,
     ZLib,
+    Tight,
     Zrle,
 }
 
@@ -1131,6 +1157,7 @@ enum UpdateEncoding {
 struct DisabledEncodings {
     hextile: bool,
     zlib: bool,
+    tight: bool,
     zrle: bool,
 }
 
@@ -1140,6 +1167,7 @@ impl DisabledEncodings {
             UpdateEncoding::Raw => false,
             UpdateEncoding::Hextile => self.hextile,
             UpdateEncoding::ZLib => self.zlib,
+            UpdateEncoding::Tight => self.tight,
             UpdateEncoding::Zrle => self.zrle,
         }
     }
@@ -1149,6 +1177,7 @@ impl DisabledEncodings {
             UpdateEncoding::Raw => {}
             UpdateEncoding::Hextile => self.hextile = true,
             UpdateEncoding::ZLib => self.zlib = true,
+            UpdateEncoding::Tight => self.tight = true,
             UpdateEncoding::Zrle => self.zrle = true,
         }
     }
@@ -1159,7 +1188,7 @@ impl DisabledEncodings {
 /// An empty list (or a list with no supported entry) selects Raw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ClientEncodingState {
-    order: [UpdateEncoding; 4],
+    order: [UpdateEncoding; 5],
     count: usize,
     cursor: bool,
 }
@@ -1167,7 +1196,7 @@ struct ClientEncodingState {
 impl Default for ClientEncodingState {
     fn default() -> Self {
         Self {
-            order: [UpdateEncoding::Raw; 4],
+            order: [UpdateEncoding::Raw; 5],
             count: 0,
             cursor: false,
         }
@@ -1247,6 +1276,27 @@ impl ClientPixelFormat {
         };
         let start = usize::from(self.big_endian);
         out.extend_from_slice(&bytes[start..start + 3]);
+    }
+
+    /// Tight's TPIXEL is a full PIXEL unless the client chose 32-bit
+    /// true-colour with depth 24 and 8-bit channels; then it is three bytes in
+    /// R, G, B order, independent of shift order and endianness.
+    fn tight_pixel_len(&self) -> usize {
+        if self.depth == 24 {
+            3
+        } else {
+            4
+        }
+    }
+
+    fn push_tight_pixel(&self, value: u32, out: &mut Vec<u8>) {
+        if self.tight_pixel_len() == 3 {
+            out.push(((value >> self.red_shift) & 0xff) as u8);
+            out.push(((value >> self.green_shift) & 0xff) as u8);
+            out.push(((value >> self.blue_shift) & 0xff) as u8);
+        } else {
+            self.push_pixel(value, out);
+        }
     }
 }
 
@@ -1911,6 +1961,7 @@ async fn read_set_encodings(
             ENCODING_RAW => state.push(UpdateEncoding::Raw),
             ENCODING_HEXTILE => state.push(UpdateEncoding::Hextile),
             ENCODING_ZLIB => state.push(UpdateEncoding::ZLib),
+            ENCODING_TIGHT => state.push(UpdateEncoding::Tight),
             ENCODING_ZRLE => state.push(UpdateEncoding::Zrle),
             ENCODING_CURSOR => state.cursor = true,
             _ => {}
@@ -2105,11 +2156,13 @@ async fn client_write_loop(
     let mut pending: Option<PendingUpdate> = None;
     let mut last_sent_generation = 0u64;
     // One zlib stream per client per compressed encoding, continuing across
-    // rectangles and updates. ZRLE and ZLib are independent streams. If an
-    // encode fails its stream state is untrustworthy, so only that encoding is
-    // disabled for the rest of the connection and the next preference is used.
+    // rectangles and updates. ZRLE, ZLib, and Tight are independent streams.
+    // If an encode fails its stream state is untrustworthy, so only that
+    // encoding is disabled for the rest of the connection and the next
+    // preference is used.
     let mut zrle = ZlibEncoder::new(Vec::new(), Compression::default());
     let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+    let mut tight = ZlibEncoder::new(Vec::new(), Compression::default());
     let mut disabled = DisabledEncodings::default();
     let mut cursor_sent = false;
 
@@ -2140,6 +2193,11 @@ async fn client_write_loop(
                 } else {
                     None
                 };
+                let tight_stream = if preferred == UpdateEncoding::Tight {
+                    Some(&mut tight)
+                } else {
+                    None
+                };
                 let built = build_update(
                     &frame,
                     pixel,
@@ -2147,6 +2205,7 @@ async fn client_write_loop(
                     preferred,
                     zrle_stream,
                     zlib_stream,
+                    tight_stream,
                     cursor_pending,
                 );
                 if let Some(failed) = built.failed_encoding {
@@ -2157,6 +2216,8 @@ async fn client_write_loop(
                         zrle = ZlibEncoder::new(Vec::new(), Compression::default());
                     } else if failed == UpdateEncoding::ZLib {
                         zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+                    } else if failed == UpdateEncoding::Tight {
+                        tight = ZlibEncoder::new(Vec::new(), Compression::default());
                     }
                 }
                 match tokio::time::timeout(write_timeout, write.write_all(&built.bytes)).await {
@@ -2241,6 +2302,7 @@ fn build_update(
     preferred: UpdateEncoding,
     mut zrle: Option<&mut ZlibEncoder<Vec<u8>>>,
     mut zlib: Option<&mut ZlibEncoder<Vec<u8>>>,
+    mut tight: Option<&mut ZlibEncoder<Vec<u8>>>,
     send_cursor: bool,
 ) -> BuiltUpdate {
     let non_empty = clip_rects(rects, frame.format.width, frame.format.height);
@@ -2248,6 +2310,9 @@ fn build_update(
     let mut payload_bytes = 0usize;
     let mut failed_encoding: Option<UpdateEncoding> = None;
     let mut hextile = Vec::new();
+    // Tight may split one requested rectangle into several wire rectangles so
+    // no rectangle exceeds the width/area bounds. Count what is actually sent.
+    let mut wire_rects = 0usize;
 
     for rect in &non_empty {
         // Until an encoder fails, use the client's first usable preference.
@@ -2264,6 +2329,7 @@ fn build_update(
                                 body.extend_from_slice(&(data.len() as u32).to_be_bytes());
                                 body.extend_from_slice(&data);
                                 payload_bytes += data.len();
+                                wire_rects += 1;
                                 continue;
                             }
                             Err(error) => {
@@ -2283,6 +2349,7 @@ fn build_update(
                             push_rect_header(&mut body, *rect, ENCODING_HEXTILE);
                             payload_bytes += hextile.len();
                             body.extend_from_slice(&hextile);
+                            wire_rects += 1;
                             continue;
                         }
                         Err(error) => {
@@ -2302,6 +2369,7 @@ fn build_update(
                                 body.extend_from_slice(&(data.len() as u32).to_be_bytes());
                                 payload_bytes += data.len();
                                 body.extend_from_slice(&data);
+                                wire_rects += 1;
                                 continue;
                             }
                             Err(error) => {
@@ -2314,15 +2382,35 @@ fn build_update(
                         }
                     }
                 }
+                UpdateEncoding::Tight => {
+                    if let Some(stream) = tight.as_deref_mut() {
+                        let mark = body.len();
+                        match encode_tight_rect(frame, pixel, *rect, stream, &mut body) {
+                            Ok(count) => {
+                                payload_bytes += body.len() - mark;
+                                wire_rects += count;
+                                continue;
+                            }
+                            Err(error) => {
+                                debug!(
+                                    error = %error,
+                                    "Tight rectangle encode failed; falling back to Raw"
+                                );
+                                failed_encoding = Some(UpdateEncoding::Tight);
+                            }
+                        }
+                    }
+                }
             }
         }
 
         push_rect_header(&mut body, *rect, ENCODING_RAW);
         payload_bytes += usize::from(rect.width) * usize::from(rect.height) * 4;
         encode_raw_rect(frame, pixel, *rect, &mut body);
+        wire_rects += 1;
     }
 
-    let rect_count = non_empty.len() + usize::from(send_cursor);
+    let rect_count = wire_rects + usize::from(send_cursor);
     let mut bytes = Vec::with_capacity(4 + rect_count * 12 + body.len());
     bytes.push(0); // FramebufferUpdate
     bytes.push(0); // padding
@@ -2700,6 +2788,257 @@ fn encode_zlib_rect(
         ));
     }
     Ok(data)
+}
+
+/// Encode one requested rectangle as Tight encoding (encoding 7).
+///
+/// A requested rectangle can become several wire rectangles: TightVNC decoders
+/// cap a rectangle at 2048 pixels wide, and [`TIGHT_MAX_PIXELS`] keeps each
+/// rectangle's uncompressed payload small enough that its compressed length
+/// always fits Tight's 22-bit compact length field. Headers and payloads are
+/// appended to `out`; on any error `out` is restored to its original length so
+/// the caller can emit the whole requested rectangle as Raw instead.
+fn encode_tight_rect(
+    frame: &FrameSnapshot,
+    pixel: ClientPixelFormat,
+    rect: Rect,
+    encoder: &mut ZlibEncoder<Vec<u8>>,
+    out: &mut Vec<u8>,
+) -> io::Result<usize> {
+    let width = usize::from(rect.width);
+    let height = usize::from(rect.height);
+    if width == 0 || height == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Tight rectangle is empty",
+        ));
+    }
+    let left = usize::from(rect.x);
+    let top = usize::from(rect.y);
+    if left + width > frame.format.width as usize || top + height > frame.format.height as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Tight rectangle exceeds the captured frame",
+        ));
+    }
+
+    let start = out.len();
+    let mut scratch = TightScratch::default();
+    let mut payload = Vec::new();
+    let mut count = 0usize;
+    for sub_rect in tight_sub_rects(rect) {
+        if let Err(error) =
+            encode_tight_sub_rect(frame, pixel, sub_rect, encoder, &mut scratch, &mut payload)
+        {
+            out.truncate(start);
+            return Err(error);
+        }
+        push_rect_header(out, sub_rect, ENCODING_TIGHT);
+        out.extend_from_slice(&payload);
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Split one requested rectangle into Tight wire rectangles. TightVNC decoders
+/// cap rectangle width at [`TIGHT_MAX_WIDTH`]; the area cap bounds each
+/// rectangle's compressed payload, including incompressible copy-filter data.
+fn tight_sub_rects(rect: Rect) -> Vec<Rect> {
+    let width = usize::from(rect.width);
+    let height = usize::from(rect.height);
+    let mut rects = Vec::new();
+    if width == 0 || height == 0 {
+        return rects;
+    }
+    let columns = (width + TIGHT_MAX_WIDTH - 1) / TIGHT_MAX_WIDTH;
+    for column in 0..columns {
+        let x_offset = column * TIGHT_MAX_WIDTH;
+        let sub_width = TIGHT_MAX_WIDTH.min(width - x_offset);
+        let rows_per_rect = (TIGHT_MAX_PIXELS / sub_width).max(1);
+        for y_offset in (0..height).step_by(rows_per_rect) {
+            let sub_height = rows_per_rect.min(height - y_offset);
+            rects.push(Rect {
+                x: rect.x + x_offset as u16,
+                y: rect.y + y_offset as u16,
+                width: sub_width as u16,
+                height: sub_height as u16,
+            });
+        }
+    }
+    rects
+}
+
+/// Reusable per-rectangle buffers for Tight encoding. The rectangle area is
+/// bounded by [`TIGHT_MAX_PIXELS`], so these never grow without bound.
+#[derive(Default)]
+struct TightScratch {
+    values: Vec<u32>,
+    palette: Vec<u32>,
+    lookup: HashMap<u32, u8>,
+    filtered: Vec<u8>,
+}
+
+/// Encode one Tight wire rectangle (control byte plus optional palette plus
+/// filtered pixel data). The caller has already bounded width and area.
+fn encode_tight_sub_rect(
+    frame: &FrameSnapshot,
+    pixel: ClientPixelFormat,
+    rect: Rect,
+    encoder: &mut ZlibEncoder<Vec<u8>>,
+    scratch: &mut TightScratch,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    out.clear();
+    let width = usize::from(rect.width);
+    let height = usize::from(rect.height);
+    let area = width * height;
+    if width == 0 || height == 0 || width > TIGHT_MAX_WIDTH || area > TIGHT_MAX_PIXELS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Tight rectangle exceeds the encoder bounds",
+        ));
+    }
+    let left = usize::from(rect.x);
+    let top = usize::from(rect.y);
+
+    let TightScratch {
+        values,
+        palette,
+        lookup,
+        filtered,
+    } = scratch;
+    values.clear();
+    values.reserve(area);
+    palette.clear();
+    lookup.clear();
+    filtered.clear();
+
+    for row in 0..height {
+        for column in 0..width {
+            let (red, green, blue) = source_rgb(frame, left + column, top + row)?;
+            values.push(pixel.pixel_value(red, green, blue));
+        }
+    }
+
+    // FillCompression: a single TPIXEL applies to the whole rectangle.
+    let first = values[0];
+    if values.iter().all(|value| *value == first) {
+        out.push(TIGHT_FILL);
+        pixel.push_tight_pixel(first, out);
+        return Ok(());
+    }
+
+    // Collect at most 256 colours in first-seen order. More than 256 disables
+    // the palette filter; copy filtering remains available.
+    let mut too_many_colours = false;
+    for &value in values.iter() {
+        if lookup.contains_key(&value) {
+            continue;
+        }
+        if palette.len() == TIGHT_MAX_PALETTE {
+            too_many_colours = true;
+            break;
+        }
+        lookup.insert(value, palette.len() as u8);
+        palette.push(value);
+    }
+
+    let tpixel = pixel.tight_pixel_len();
+    let copy_size = area * tpixel;
+    let palette_size = (!too_many_colours).then(|| {
+        let index_size = if palette.len() <= 2 {
+            ((width + 7) / 8) * height
+        } else {
+            area
+        };
+        index_size + palette.len() * tpixel
+    });
+    let use_palette = palette_size.is_some_and(|size| size < copy_size);
+
+    if use_palette {
+        if palette.len() <= 2 {
+            // Two colours use one bit per pixel, MSB first, row aligned.
+            filtered.reserve(((width + 7) / 8) * height);
+            for row in 0..height {
+                let mut byte = 0u8;
+                let mut used = 0usize;
+                for column in 0..width {
+                    let index = lookup[&values[row * width + column]];
+                    byte = (byte << 1) | (index & 1);
+                    used += 1;
+                    if used == 8 {
+                        filtered.push(byte);
+                        byte = 0;
+                        used = 0;
+                    }
+                }
+                if used != 0 {
+                    filtered.push(byte << (8 - used));
+                }
+            }
+        } else {
+            // Three or more colours use one byte per pixel.
+            filtered.reserve(area);
+            for &value in values.iter() {
+                filtered.push(lookup[&value]);
+            }
+        }
+        out.push(TIGHT_EXPLICIT_FILTER);
+        out.push(TIGHT_FILTER_PALETTE);
+        out.push((palette.len() - 1) as u8);
+        for &value in palette.iter() {
+            pixel.push_tight_pixel(value, out);
+        }
+    } else {
+        // BasicCompression, zlib stream 0, CopyFilter (no filter-id byte).
+        out.push(0);
+        filtered.reserve(copy_size);
+        for &value in values.iter() {
+            pixel.push_tight_pixel(value, filtered);
+        }
+    }
+
+    // Tiny filtered payloads are sent verbatim; TightVNC decoders switch on
+    // the uncompressed size and expect no compact length in that case.
+    if filtered.len() < TIGHT_MIN_TO_COMPRESS {
+        out.extend_from_slice(filtered);
+        return Ok(());
+    }
+
+    encoder.write_all(filtered)?;
+    encoder.flush()?;
+    let compressed = std::mem::take(encoder.get_mut());
+    if compressed.len() > TIGHT_MAX_RECT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Tight rectangle exceeded the compact-length bound",
+        ));
+    }
+    push_tight_length(compressed.len(), out)?;
+    out.extend_from_slice(&compressed);
+    Ok(())
+}
+
+/// Append a Tight compact length: one byte for 0..=127, two for 128..=16383,
+/// and three for 16384..=4194303 (22 bits).
+fn push_tight_length(length: usize, out: &mut Vec<u8>) -> io::Result<()> {
+    if length == 0 || length > TIGHT_MAX_RECT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Tight payload length is not encodable",
+        ));
+    }
+    if length < 0x80 {
+        out.push(length as u8);
+    } else if length < 0x4000 {
+        out.push(0x80 | (length & 0x7f) as u8);
+        out.push((length >> 7) as u8);
+    } else {
+        out.push(0x80 | (length & 0x7f) as u8);
+        out.push(0x80 | ((length >> 7) & 0x7f) as u8);
+        out.push((length >> 14) as u8);
+    }
+    Ok(())
 }
 
 /// Encode one ZRLE rectangle into the client's persistent zlib stream.
@@ -3498,6 +3837,37 @@ mod tests {
         pixels
     }
 
+    /// More than 256 distinct colours, so Tight falls back to the copy filter
+    /// and its payload goes through the per-client zlib stream.
+    fn tight_copy_pixels(width: usize, height: usize) -> Vec<(u8, u8, u8)> {
+        (0..width * height)
+            .map(|index| {
+                (
+                    (index % 251) as u8,
+                    ((index * 3) % 253) as u8,
+                    ((index * 7) % 255) as u8,
+                )
+            })
+            .collect()
+    }
+
+    /// A rectangle with a fixed small palette, so Tight can use the palette
+    /// filter. `colours == 2` exercises one-bit packing; more colours exercise
+    /// one byte per pixel.
+    fn tight_palette_pixels(
+        width: usize,
+        height: usize,
+        colours: &[(u8, u8, u8)],
+    ) -> Vec<(u8, u8, u8)> {
+        (0..width * height)
+            .map(|index| {
+                let x = index % width;
+                let y = index / width;
+                colours[(x / 8 + y / 8 * 3) % colours.len()]
+            })
+            .collect()
+    }
+
     fn frame_from_pixels(width: usize, height: usize, pixels: &[(u8, u8, u8)]) -> FrameSnapshot {
         let mut data = Vec::with_capacity(width * height * 3);
         for &(red, green, blue) in pixels {
@@ -3690,6 +4060,13 @@ mod tests {
     }
 
     async fn read_update(stream: &mut TcpStream) -> Vec<WireRect> {
+        read_update_with_pixel(stream, ClientPixelFormat::default()).await
+    }
+
+    async fn read_update_with_pixel(
+        stream: &mut TcpStream,
+        pixel: ClientPixelFormat,
+    ) -> Vec<WireRect> {
         let mut header = [0u8; 4];
         read_exact(stream, &mut header).await;
         assert_eq!(header[0], 0, "expected FramebufferUpdate");
@@ -3726,6 +4103,7 @@ mod tests {
                     read_exact(stream, &mut data).await;
                     data
                 }
+                ENCODING_TIGHT => read_tight_payload(stream, width, height, pixel).await,
                 ENCODING_HEXTILE => read_hextile_payload(stream, width, height).await,
                 ENCODING_CURSOR => Vec::new(),
                 other => panic!("unexpected encoding {other}"),
@@ -3788,9 +4166,101 @@ mod tests {
         data
     }
 
+    /// Read exactly one Tight rectangle's bytes from the wire. The payload has
+    /// no outer length; its size is implied by the control byte, filter,
+    /// palette size, and compact length, so the reader mirrors the decoder.
+    async fn read_tight_payload(
+        stream: &mut TcpStream,
+        width: u16,
+        height: u16,
+        pixel: ClientPixelFormat,
+    ) -> Vec<u8> {
+        let width = usize::from(width);
+        let height = usize::from(height);
+        let tpixel = pixel.tight_pixel_len();
+        let mut data = Vec::new();
+        let mut byte = [0u8; 1];
+
+        read_exact(stream, &mut byte).await;
+        let control = byte[0];
+        data.push(control);
+        assert_eq!(control & 0x0f, 0, "server must not set zlib reset bits");
+        let high = control >> 4;
+
+        if high == 8 {
+            let mut fill = vec![0u8; tpixel];
+            read_exact(stream, &mut fill).await;
+            data.extend_from_slice(&fill);
+            return data;
+        }
+        assert!(
+            high == 0 || high == 4,
+            "unexpected Tight compression-control {control:#04x}"
+        );
+
+        let mut palette_size = 0usize;
+        if control & TIGHT_EXPLICIT_FILTER != 0 {
+            read_exact(stream, &mut byte).await;
+            let filter = byte[0];
+            data.push(filter);
+            if filter == TIGHT_FILTER_PALETTE {
+                read_exact(stream, &mut byte).await;
+                palette_size = usize::from(byte[0]) + 1;
+                data.push(byte[0]);
+                let mut palette = vec![0u8; palette_size * tpixel];
+                read_exact(stream, &mut palette).await;
+                data.extend_from_slice(&palette);
+            } else {
+                assert_eq!(filter, 0, "unexpected Tight filter {filter}");
+            }
+        }
+
+        let row_size = if palette_size != 0 {
+            if palette_size <= 2 {
+                (width + 7) / 8
+            } else {
+                width
+            }
+        } else {
+            width * tpixel
+        };
+        let data_size = height * row_size;
+        if data_size < TIGHT_MIN_TO_COMPRESS {
+            let mut raw = vec![0u8; data_size];
+            read_exact(stream, &mut raw).await;
+            data.extend_from_slice(&raw);
+        } else {
+            let mut length_bytes = Vec::new();
+            loop {
+                read_exact(stream, &mut byte).await;
+                length_bytes.push(byte[0]);
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+                assert!(length_bytes.len() < 3, "Tight compact length is too long");
+            }
+            let length = match length_bytes.len() {
+                1 => usize::from(length_bytes[0] & 0x7f),
+                2 => {
+                    usize::from(length_bytes[0] & 0x7f) | (usize::from(length_bytes[1] & 0x7f) << 7)
+                }
+                _ => {
+                    usize::from(length_bytes[0] & 0x7f)
+                        | (usize::from(length_bytes[1] & 0x7f) << 7)
+                        | (usize::from(length_bytes[2]) << 14)
+                }
+            };
+            data.extend_from_slice(&length_bytes);
+            let mut compressed = vec![0u8; length];
+            read_exact(stream, &mut compressed).await;
+            data.extend_from_slice(&compressed);
+        }
+        data
+    }
+
     /// Test-side decoder for a client's persistent zlib stream. The same
-    /// wrapper is usable for both ZRLE and ZLib; they must be separate decoder
-    /// instances just as the server keeps separate encoder streams.
+    /// wrapper is usable for ZRLE, ZLib, and Tight; they must be separate
+    /// decoder instances just as the server keeps separate encoder streams.
     struct TestZlibDecoder {
         decompress: flate2::Decompress,
     }
@@ -3990,6 +4460,120 @@ mod tests {
         }
         assert_eq!(position, bytes.len(), "trailing ZLib pixel bytes");
         pixels
+    }
+
+    fn decode_tight_pixel(bytes: &[u8], position: &mut usize, pixel: ClientPixelFormat) -> u32 {
+        if pixel.tight_pixel_len() == 3 {
+            let red = bytes[*position];
+            let green = bytes[*position + 1];
+            let blue = bytes[*position + 2];
+            *position += 3;
+            pixel.pixel_value(red, green, blue)
+        } else {
+            decode_pixel(bytes, position, pixel.big_endian)
+        }
+    }
+
+    fn decode_tight_compact_length(bytes: &[u8], position: &mut usize) -> usize {
+        let first = bytes[*position];
+        *position += 1;
+        let mut length = usize::from(first & 0x7f);
+        if first & 0x80 != 0 {
+            let second = bytes[*position];
+            *position += 1;
+            length |= usize::from(second & 0x7f) << 7;
+            if second & 0x80 != 0 {
+                let third = bytes[*position];
+                *position += 1;
+                length |= usize::from(third) << 14;
+            }
+        }
+        length
+    }
+
+    /// Test-side decoder for one Tight rectangle (FillCompression, basic
+    /// CopyFilter, and PaletteFilter). `decoder` is the client's persistent
+    /// Tight zlib stream and must be shared across successive rectangles.
+    fn decode_tight(
+        decoder: &mut TestZlibDecoder,
+        data: &[u8],
+        width: usize,
+        height: usize,
+        pixel: ClientPixelFormat,
+    ) -> (Vec<(u8, u8, u8)>, u8) {
+        let tpixel = pixel.tight_pixel_len();
+        let mut position = 0usize;
+        let control = data[position];
+        position += 1;
+        assert_eq!(control & 0x0f, 0, "server must not set zlib reset bits");
+        let mut pixels = vec![(0u8, 0u8, 0u8); width * height];
+
+        if control == TIGHT_FILL {
+            let value = decode_tight_pixel(data, &mut position, pixel);
+            pixels.fill(decode_rgb(value, pixel));
+            assert_eq!(position, data.len(), "trailing Tight fill bytes");
+            return (pixels, control);
+        }
+
+        assert_eq!(control & 0x80, 0, "expected basic Tight compression");
+        let mut palette = Vec::new();
+        if control & TIGHT_EXPLICIT_FILTER != 0 {
+            let filter = data[position];
+            position += 1;
+            assert_eq!(filter, TIGHT_FILTER_PALETTE, "unexpected Tight filter");
+            let palette_size = usize::from(data[position]) + 1;
+            position += 1;
+            palette.reserve(palette_size);
+            for _ in 0..palette_size {
+                palette.push(decode_tight_pixel(data, &mut position, pixel));
+            }
+        }
+
+        let row_size = if palette.is_empty() {
+            width * tpixel
+        } else if palette.len() <= 2 {
+            (width + 7) / 8
+        } else {
+            width
+        };
+        let data_size = height * row_size;
+        let filtered = if data_size < TIGHT_MIN_TO_COMPRESS {
+            let raw = data[position..position + data_size].to_vec();
+            position += data_size;
+            raw
+        } else {
+            let length = decode_tight_compact_length(data, &mut position);
+            assert!(length <= TIGHT_MAX_RECT_BYTES);
+            let compressed = &data[position..position + length];
+            position += length;
+            decoder.inflate(compressed)
+        };
+        assert_eq!(position, data.len(), "trailing Tight rectangle bytes");
+        assert_eq!(filtered.len(), data_size, "wrong Tight filtered data size");
+
+        if palette.is_empty() {
+            let mut source = 0usize;
+            for slot in pixels.iter_mut() {
+                *slot = decode_rgb(decode_tight_pixel(&filtered, &mut source, pixel), pixel);
+            }
+        } else if palette.len() <= 2 {
+            for row in 0..height {
+                for column in 0..width {
+                    let byte = filtered[row * row_size + column / 8];
+                    let index = (byte >> (7 - (column % 8))) & 1;
+                    pixels[row * width + column] = decode_rgb(palette[usize::from(index)], pixel);
+                }
+            }
+        } else {
+            for row in 0..height {
+                for column in 0..width {
+                    let index = usize::from(filtered[row * width + column]);
+                    assert!(index < palette.len(), "palette index out of range");
+                    pixels[row * width + column] = decode_rgb(palette[index], pixel);
+                }
+            }
+        }
+        (pixels, control)
     }
 
     fn decode_hextile(
@@ -4961,6 +5545,7 @@ mod tests {
             (&[ENCODING_RAW], ENCODING_RAW),
             (&[ENCODING_HEXTILE], ENCODING_HEXTILE),
             (&[ENCODING_ZLIB], ENCODING_ZLIB),
+            (&[ENCODING_TIGHT], ENCODING_TIGHT),
             // The client's order decides between every supported pair.
             (&[ENCODING_RAW, ENCODING_ZRLE], ENCODING_RAW),
             (&[ENCODING_ZRLE, ENCODING_RAW], ENCODING_ZRLE),
@@ -4968,16 +5553,32 @@ mod tests {
             (&[ENCODING_ZLIB, ENCODING_HEXTILE], ENCODING_ZLIB),
             (&[ENCODING_HEXTILE, ENCODING_ZRLE], ENCODING_HEXTILE),
             (&[ENCODING_ZLIB, ENCODING_ZRLE], ENCODING_ZLIB),
+            (&[ENCODING_TIGHT, ENCODING_RAW], ENCODING_TIGHT),
+            (&[ENCODING_RAW, ENCODING_TIGHT], ENCODING_RAW),
+            (&[ENCODING_TIGHT, ENCODING_ZRLE], ENCODING_TIGHT),
+            (&[ENCODING_ZRLE, ENCODING_TIGHT], ENCODING_ZRLE),
+            (&[ENCODING_ZLIB, ENCODING_TIGHT], ENCODING_ZLIB),
+            (&[ENCODING_TIGHT, ENCODING_ZLIB], ENCODING_TIGHT),
             (
                 &[ENCODING_ZRLE, ENCODING_HEXTILE, ENCODING_ZLIB, ENCODING_RAW],
                 ENCODING_ZRLE,
             ),
-            // An unsupported encoding (Tight, 7) is ignored without disturbing
-            // the supported entries around it.
-            (&[7, ENCODING_ZLIB], ENCODING_ZLIB),
-            (&[ENCODING_HEXTILE, 7, ENCODING_RAW], ENCODING_HEXTILE),
+            (
+                &[
+                    ENCODING_TIGHT,
+                    ENCODING_ZRLE,
+                    ENCODING_HEXTILE,
+                    ENCODING_ZLIB,
+                    ENCODING_RAW,
+                ],
+                ENCODING_TIGHT,
+            ),
+            // An unsupported encoding is ignored without disturbing the
+            // supported entries around it.
+            (&[987654, ENCODING_ZLIB], ENCODING_ZLIB),
+            (&[ENCODING_HEXTILE, 987654, ENCODING_RAW], ENCODING_HEXTILE),
             // An all-unsupported or empty list falls back to Raw.
-            (&[7], ENCODING_RAW),
+            (&[987654], ENCODING_RAW),
             (&[], ENCODING_RAW),
         ];
         for (encodings, expected) in cases {
@@ -5165,6 +5766,188 @@ mod tests {
                 zlib.get_ref().is_empty(),
                 "invalid ZLib geometry touched the stream"
             );
+
+            let mut tight = ZlibEncoder::new(Vec::new(), Compression::default());
+            let mut tight_out = Vec::new();
+            let error = encode_tight_rect(&frame, pixel, rect, &mut tight, &mut tight_out)
+                .expect_err("invalid Tight rectangle must fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(tight_out.is_empty(), "invalid Tight geometry wrote bytes");
+            assert!(
+                tight.get_ref().is_empty(),
+                "invalid Tight geometry touched the stream"
+            );
+        }
+    }
+
+    #[test]
+    fn tight_sub_rects_respect_the_width_and_area_bounds() {
+        for rect in [
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            Rect {
+                x: 7,
+                y: 9,
+                width: TIGHT_MAX_WIDTH as u16,
+                height: 5,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                width: (TIGHT_MAX_WIDTH + 1) as u16,
+                height: 5,
+            },
+            Rect {
+                x: 1,
+                y: 2,
+                width: 4096,
+                height: 2300,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                width: u16::MAX,
+                height: 3,
+            },
+        ] {
+            let pieces = tight_sub_rects(rect);
+            assert!(!pieces.is_empty(), "a non-empty rectangle must split");
+            let mut covered = 0usize;
+            for piece in &pieces {
+                assert!(piece.width as usize <= TIGHT_MAX_WIDTH);
+                assert!(
+                    piece.width as usize * piece.height as usize <= TIGHT_MAX_PIXELS,
+                    "piece {:?} exceeds the Tight area bound",
+                    piece
+                );
+                assert!(piece.width > 0 && piece.height > 0);
+                assert!(piece.x >= rect.x && piece.y >= rect.y);
+                assert!(
+                    u32::from(piece.x) + u32::from(piece.width)
+                        <= u32::from(rect.x) + u32::from(rect.width)
+                );
+                assert!(
+                    u32::from(piece.y) + u32::from(piece.height)
+                        <= u32::from(rect.y) + u32::from(rect.height)
+                );
+                covered += piece.width as usize * piece.height as usize;
+            }
+            assert_eq!(covered, rect.width as usize * rect.height as usize);
+        }
+    }
+
+    #[test]
+    fn tight_wire_rectangle_splitting_stays_within_bounds() {
+        // A solid 4100x600 frame is wider than the 2048-pixel Tight limit, so
+        // the encoder must split it. Each wire rectangle is a FillCompression
+        // payload of one TPIXEL, which this test parses independently.
+        let width = 4100usize;
+        let height = 600usize;
+        let pixels = vec![(12u8, 34u8, 56u8); width * height];
+        let frame = frame_from_pixels(width, height, &pixels);
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        let mut out = Vec::new();
+        let count = encode_tight_rect(
+            &frame,
+            pixel,
+            Rect {
+                x: 0,
+                y: 0,
+                width: width as u16,
+                height: height as u16,
+            },
+            &mut encoder,
+            &mut out,
+        )
+        .expect("Tight encode");
+        assert!(count > 1, "a 4100-pixel-wide rectangle must be split");
+
+        let mut position = 0usize;
+        let mut covered = 0usize;
+        for _ in 0..count {
+            let header = &out[position..position + 12];
+            position += 12;
+            let rect_width = u16::from_be_bytes([header[4], header[5]]) as usize;
+            let rect_height = u16::from_be_bytes([header[6], header[7]]) as usize;
+            assert_eq!(
+                i32::from_be_bytes([header[8], header[9], header[10], header[11]]),
+                ENCODING_TIGHT
+            );
+            assert!(rect_width <= TIGHT_MAX_WIDTH);
+            assert!(rect_width * rect_height <= TIGHT_MAX_PIXELS);
+            assert_eq!(out[position], TIGHT_FILL);
+            position += 1 + pixel.tight_pixel_len();
+            covered += rect_width * rect_height;
+        }
+        assert_eq!(position, out.len(), "trailing Tight bytes");
+        assert_eq!(covered, width * height);
+    }
+
+    #[test]
+    fn tight_copy_palette_and_fill_decode_in_rgb_and_bgr() {
+        let colours = [
+            (10u8, 20u8, 30u8),
+            (200, 30, 40),
+            (30, 200, 60),
+            (220, 220, 10),
+            (40, 40, 40),
+            (200, 10, 200),
+            (10, 200, 200),
+            (120, 120, 240),
+        ];
+        let cases: Vec<(&str, Vec<(u8, u8, u8)>, u8)> = vec![
+            ("copy", tight_copy_pixels(64, 32), 0),
+            (
+                "palette2",
+                tight_palette_pixels(64, 32, &colours[..2]),
+                TIGHT_EXPLICIT_FILTER,
+            ),
+            (
+                "palette8",
+                tight_palette_pixels(64, 32, &colours),
+                TIGHT_EXPLICIT_FILTER,
+            ),
+            ("fill", vec![(9u8, 8u8, 7u8); 64 * 32], TIGHT_FILL),
+        ];
+
+        for (depth, big_endian, red_shift, green_shift, blue_shift) in [
+            (24, false, 16, 8, 0), // RGB little-endian, 3-byte TPIXEL
+            (24, false, 0, 8, 16), // BGR little-endian, 3-byte TPIXEL
+            (24, true, 0, 8, 16),  // BGR big-endian, 3-byte TPIXEL
+            (32, true, 16, 8, 0),  // depth 32 forces a 4-byte PIXEL
+        ] {
+            let pixel = client_pixel_format(depth, big_endian, red_shift, green_shift, blue_shift);
+            for (name, pixels, expected_control) in &cases {
+                let frame = frame_from_pixels(64, 32, pixels);
+                let rect = Rect {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 32,
+                };
+                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                let mut decoder = TestZlibDecoder::new();
+                for round in 0..3 {
+                    let mut encoded = Vec::new();
+                    let count = encode_tight_rect(&frame, pixel, rect, &mut encoder, &mut encoded)
+                        .expect("Tight encode");
+                    assert_eq!(count, 1);
+                    // encode_tight_rect writes a 12-byte rectangle header too;
+                    // the decoder consumes only the encoding payload.
+                    let (decoded, control) =
+                        decode_tight(&mut decoder, &encoded[12..], 64, 32, pixel);
+                    assert_eq!(decoded, *pixels, "{name} round {round} decoded wrong");
+                    assert_eq!(
+                        control, *expected_control,
+                        "{name} used an unexpected Tight compression/filter"
+                    );
+                }
+            }
         }
     }
 
@@ -5231,6 +6014,7 @@ mod tests {
             UpdateEncoding::Zrle,
             Some(&mut zrle),
             None,
+            None,
             false,
         );
         assert_eq!(built.failed_encoding, Some(UpdateEncoding::Zrle));
@@ -5242,6 +6026,7 @@ mod tests {
             pixel,
             &rects,
             UpdateEncoding::Hextile,
+            None,
             None,
             None,
             false,
@@ -5257,9 +6042,24 @@ mod tests {
             UpdateEncoding::ZLib,
             None,
             Some(&mut zlib),
+            None,
             false,
         );
         assert_eq!(built.failed_encoding, Some(UpdateEncoding::ZLib));
+        assert_eq!(first_rect_encoding(&built.bytes), ENCODING_RAW);
+
+        let mut tight = ZlibEncoder::new(Vec::new(), Compression::default());
+        let built = build_update(
+            &frame,
+            pixel,
+            &rects,
+            UpdateEncoding::Tight,
+            None,
+            None,
+            Some(&mut tight),
+            false,
+        );
+        assert_eq!(built.failed_encoding, Some(UpdateEncoding::Tight));
         assert_eq!(first_rect_encoding(&built.bytes), ENCODING_RAW);
 
         // A selection with no usable stream (the encoder was already disabled)
@@ -5269,6 +6069,7 @@ mod tests {
             pixel,
             &rects,
             UpdateEncoding::Zrle,
+            None,
             None,
             None,
             false,
@@ -5287,17 +6088,21 @@ mod tests {
 
         state.push(UpdateEncoding::Hextile);
         state.push(UpdateEncoding::ZLib);
+        state.push(UpdateEncoding::Tight);
         state.push(UpdateEncoding::Zrle);
         // Duplicates and extra entries do not change or overflow the order.
         state.push(UpdateEncoding::Hextile);
-        assert_eq!(state.count, 3);
+        assert_eq!(state.count, 4);
 
         let mut disabled = DisabledEncodings::default();
         assert_eq!(state.select(disabled), UpdateEncoding::Hextile);
         disabled.disable(UpdateEncoding::Hextile);
         assert_eq!(state.select(disabled), UpdateEncoding::ZLib);
-        assert!(!disabled.is_disabled(UpdateEncoding::Zrle));
+        assert!(!disabled.is_disabled(UpdateEncoding::Tight));
         disabled.disable(UpdateEncoding::ZLib);
+        assert_eq!(state.select(disabled), UpdateEncoding::Tight);
+        assert!(!disabled.is_disabled(UpdateEncoding::Zrle));
+        disabled.disable(UpdateEncoding::Tight);
         assert_eq!(state.select(disabled), UpdateEncoding::Zrle);
         disabled.disable(UpdateEncoding::Zrle);
         assert_eq!(state.select(disabled), UpdateEncoding::Raw);
@@ -5380,6 +6185,105 @@ mod tests {
             let rects = read_update(&mut client).await;
             assert_eq!(rects[0].encoding, ENCODING_ZLIB);
             let decoded = decode_zlib_rect(&mut zlib_decoder, &rects[0].data, 64, 32, pixel);
+            assert_eq!(decoded, expected);
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tight_frames_decode_over_the_wire_in_rgb_and_bgr() {
+        let colours = [
+            (10u8, 20u8, 30u8),
+            (200, 30, 40),
+            (30, 200, 60),
+            (220, 220, 10),
+        ];
+        let sources = [
+            ("copy", tight_copy_pixels(64, 32), 0),
+            (
+                "palette",
+                tight_palette_pixels(64, 32, &colours),
+                TIGHT_EXPLICIT_FILTER,
+            ),
+        ];
+
+        for (name, expected, expected_control) in sources {
+            let server = start_server(
+                Box::new(FixedPixelSource::new(64, 32, expected.clone())),
+                Arc::new(FakeInputSink::new()),
+                1,
+            )
+            .await;
+            let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+            handshake_client(&mut client).await;
+            let mut decoder = TestZlibDecoder::new();
+
+            for pixel in [
+                client_pixel_format(24, false, 16, 8, 0),
+                client_pixel_format(24, false, 0, 8, 16),
+                client_pixel_format(24, true, 0, 8, 16),
+                client_pixel_format(32, false, 16, 8, 0),
+            ] {
+                set_pixel_format(&mut client, pixel).await;
+                set_encodings(&mut client, &[ENCODING_TIGHT]).await;
+                // Two updates reuse the one per-client Tight zlib stream.
+                for _ in 0..2 {
+                    request_update(&mut client, false, 64, 32).await;
+                    let rects = read_update_with_pixel(&mut client, pixel).await;
+                    assert_eq!(rects.len(), 1);
+                    assert_eq!(rects[0].encoding, ENCODING_TIGHT);
+                    let (decoded, control) =
+                        decode_tight(&mut decoder, &rects[0].data, 64, 32, pixel);
+                    assert_eq!(decoded, expected, "{name} decoded wrong over the wire");
+                    assert_eq!(control, expected_control, "{name} used the wrong filter");
+                }
+            }
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tight_and_zlib_use_independent_persistent_streams() {
+        let expected = tight_copy_pixels(64, 32);
+        let server = start_server(
+            Box::new(FixedPixelSource::new(64, 32, expected.clone())),
+            Arc::new(FakeInputSink::new()),
+            1,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        let mut tight_decoder = TestZlibDecoder::new();
+        let mut zlib_decoder = TestZlibDecoder::new();
+
+        for pixel in [
+            client_pixel_format(24, false, 16, 8, 0),
+            client_pixel_format(24, false, 0, 8, 16),
+        ] {
+            set_pixel_format(&mut client, pixel).await;
+            set_encodings(&mut client, &[ENCODING_TIGHT]).await;
+            for _ in 0..2 {
+                request_update(&mut client, false, 64, 32).await;
+                let rects = read_update_with_pixel(&mut client, pixel).await;
+                assert_eq!(rects[0].encoding, ENCODING_TIGHT);
+                let (decoded, _) = decode_tight(&mut tight_decoder, &rects[0].data, 64, 32, pixel);
+                assert_eq!(decoded, expected);
+            }
+
+            // ZLib has its own stream and must not disturb Tight's history.
+            set_encodings(&mut client, &[ENCODING_ZLIB]).await;
+            request_update(&mut client, false, 64, 32).await;
+            let rects = read_update_with_pixel(&mut client, pixel).await;
+            assert_eq!(rects[0].encoding, ENCODING_ZLIB);
+            let decoded = decode_zlib_rect(&mut zlib_decoder, &rects[0].data, 64, 32, pixel);
+            assert_eq!(decoded, expected);
+
+            // Returning to Tight continues the original Tight stream.
+            set_encodings(&mut client, &[ENCODING_TIGHT]).await;
+            request_update(&mut client, false, 64, 32).await;
+            let rects = read_update_with_pixel(&mut client, pixel).await;
+            assert_eq!(rects[0].encoding, ENCODING_TIGHT);
+            let (decoded, _) = decode_tight(&mut tight_decoder, &rects[0].data, 64, 32, pixel);
             assert_eq!(decoded, expected);
         }
         server.shutdown().await;

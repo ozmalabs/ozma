@@ -178,6 +178,53 @@ impl FromStr for PowerState {
     }
 }
 
+/// Outcome of a power action when the backend can read the state back.
+///
+/// [`PowerOutcome::pending`] is used for requests that were accepted but have
+/// not changed the domain yet, such as an ACPI shutdown the guest has not
+/// handled. `state` is always a backend readback; it is never inferred from the
+/// action name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PowerOutcome {
+    /// State observed after the request, when the backend can read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<PowerState>,
+    /// True when the request was accepted but has not taken effect yet.
+    pub pending: bool,
+    /// Machine-readable reason when pending (`acpi-requested`) or completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl PowerOutcome {
+    /// The backend accepted the action but has no state readback.
+    pub fn accepted() -> Self {
+        Self {
+            state: None,
+            pending: false,
+            reason: None,
+        }
+    }
+
+    /// The action completed and `state` is the observed backend state.
+    pub fn completed(state: PowerState) -> Self {
+        Self {
+            state: Some(state),
+            pending: false,
+            reason: None,
+        }
+    }
+
+    /// The action was accepted but `state` shows it has not taken effect yet.
+    pub fn pending(state: PowerState, reason: impl Into<String>) -> Self {
+        Self {
+            state: Some(state),
+            pending: true,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
 /// The closed set of stable power states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

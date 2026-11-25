@@ -19,7 +19,7 @@ use ozma_audio::{
     AudioRouter, PipeWireAudioRouter, PulseAudioAudioRouter, RouterConfig, TokioCommandRunner,
 };
 use ozma_input::SinkKind;
-use ozma_power::{LibvirtPower, PowerBackend, QmpPower};
+use ozma_power::{LibvirtPower, PowerBackend, QmpPower, UnavailablePower};
 use ozma_protocol::NodeId;
 use ozma_qmp::SharedQmpClient;
 use ozma_thermal::ThermalStatus;
@@ -159,6 +159,11 @@ pub struct Args {
     /// libvirt domain name used for VM power control.
     #[arg(long, env = "OZMA_LIBVIRT_DOMAIN")]
     pub libvirt_domain: Option<String>,
+
+    /// libvirt connection URI passed to `virsh --connect` (for example
+    /// `qemu:///system`). Omit to use virsh's own default connection.
+    #[arg(long, env = "OZMA_LIBVIRT_URI", value_name = "URI")]
+    pub libvirt_uri: Option<String>,
 
     /// QMP connect/greeting timeout in milliseconds (must be non-zero).
     #[arg(
@@ -1364,6 +1369,7 @@ async fn run() -> std::process::ExitCode {
             .libvirt_domain
             .as_ref()
             .map(|domain| domain.trim().to_owned()),
+        libvirt_uri: args.libvirt_uri.as_ref().map(|uri| uri.trim().to_owned()),
         qmp_connect_timeout: std::time::Duration::from_millis(args.qmp_connect_timeout_ms),
         qmp_command_timeout: std::time::Duration::from_millis(args.qmp_command_timeout_ms),
         vnc_host: args.vnc_host.clone(),
@@ -3699,18 +3705,30 @@ async fn build_power(
                 return None;
             };
             let mut power = LibvirtPower::new(domain);
+            if let Some(uri) = vm.libvirt_uri.as_deref() {
+                power = power.with_uri(uri);
+            }
             match power.connect().await {
                 Ok(()) => {
-                    info!(domain, "libvirt power backend connected");
+                    info!(
+                        domain,
+                        uri = vm.libvirt_uri.as_deref().unwrap_or("<virsh-default>"),
+                        "libvirt power backend connected"
+                    );
                     Some(shared_power(power))
                 }
                 Err(error) => {
+                    // Keep the backend attached so /power/state and actions
+                    // report the real reason (missing domain, missing virsh, or
+                    // a failed connection) instead of silently not-configured.
                     warn!(
                         domain,
+                        uri = vm.libvirt_uri.as_deref().unwrap_or("<virsh-default>"),
+                        kind = error.kind(),
                         error = %error,
-                        "libvirt power backend unavailable; /power/* will report not-configured"
+                        "libvirt power backend unavailable; /power/* will report the retained error"
                     );
-                    None
+                    Some(shared_power(UnavailablePower::new("libvirt", &error)))
                 }
             }
         }
@@ -4173,6 +4191,22 @@ mod tests {
             Args::try_parse_from(["ozma-node", "--keyboard-layout", "dvorak"]).is_err(),
             "unknown layouts must fail rather than guess"
         );
+    }
+
+    #[test]
+    fn libvirt_uri_flag_parses_and_is_optional() {
+        let defaults = Args::parse_from(["ozma-node"]);
+        assert_eq!(defaults.libvirt_uri, None);
+
+        let args = Args::parse_from([
+            "ozma-node",
+            "--libvirt-domain",
+            "vm1",
+            "--libvirt-uri",
+            "qemu:///system",
+        ]);
+        assert_eq!(args.libvirt_domain.as_deref(), Some("vm1"));
+        assert_eq!(args.libvirt_uri.as_deref(), Some("qemu:///system"));
     }
 
     #[test]

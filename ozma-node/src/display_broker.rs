@@ -247,6 +247,8 @@ impl ConsoleBroker {
                 width: output.width,
                 height: output.height,
                 pixel_format: None,
+                capability_max_width: None,
+                capability_max_height: None,
                 snapshot_available: false,
                 snapshot_encoding: "jpeg",
                 dimensions_source: if output.width > 0 && output.height > 0 {
@@ -265,7 +267,7 @@ impl ConsoleBroker {
 
         let control = self.control_for(console).await?;
         let mut info = control.info().await;
-        if (info.width == 0 || info.dimensions_source == "capability-max")
+        if (info.width == 0 || info.dimensions_source == "unknown")
             && output.width > 0
             && output.height > 0
         {

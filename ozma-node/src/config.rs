@@ -542,6 +542,8 @@ pub struct VmProviderConfig {
     pub qmp_input_socket: Option<PathBuf>,
     /// libvirt domain name for power control.
     pub libvirt_domain: Option<String>,
+    /// libvirt connection URI passed to `virsh --connect`.
+    pub libvirt_uri: Option<String>,
     /// QMP connect/handshake timeout.
     pub connect_timeout: Duration,
     /// QMP command timeout.
@@ -572,6 +574,7 @@ impl VmProviderConfig {
             qmp_socket: config.qmp_socket.clone(),
             qmp_input_socket: config.qmp_input_socket.clone(),
             libvirt_domain: config.libvirt_domain.clone(),
+            libvirt_uri: config.libvirt_uri.clone(),
             connect_timeout: config.qmp_connect_timeout,
             command_timeout: config.qmp_command_timeout,
             capture,
@@ -1087,6 +1090,8 @@ pub struct NodeConfig {
     pub qmp_input_socket: Option<PathBuf>,
     /// libvirt domain name used for power control.
     pub libvirt_domain: Option<String>,
+    /// libvirt connection URI passed to `virsh --connect` (`--libvirt-uri`).
+    pub libvirt_uri: Option<String>,
     /// QMP connect/handshake timeout.
     pub qmp_connect_timeout: Duration,
     /// QMP command timeout.
@@ -1712,6 +1717,14 @@ impl NodeConfig {
                 return Err("--libvirt-domain must not be empty".to_owned());
             }
         }
+        if let Some(uri) = &self.libvirt_uri {
+            if uri.trim().is_empty() {
+                return Err("--libvirt-uri must not be empty".to_owned());
+            }
+            if uri.chars().any(char::is_whitespace) || uri.chars().any(char::is_control) {
+                return Err("--libvirt-uri must not contain whitespace".to_owned());
+            }
+        }
         if self.qmp_connect_timeout.is_zero() {
             return Err("--qmp-connect-timeout-ms must be greater than zero".to_owned());
         }
@@ -2143,6 +2156,7 @@ mod tests {
             qmp_socket: None,
             qmp_input_socket: None,
             libvirt_domain: None,
+            libvirt_uri: None,
             qmp_connect_timeout: Duration::from_millis(DEFAULT_QMP_CONNECT_TIMEOUT_MS),
             qmp_command_timeout: Duration::from_millis(DEFAULT_QMP_COMMAND_TIMEOUT_MS),
             vnc_host: None,
@@ -2296,6 +2310,18 @@ mod tests {
         let resolved = config.vm_providers().unwrap();
         assert_eq!(resolved.capture, None);
         assert_eq!(resolved.power, Some(PowerProvider::Libvirt));
+        assert_eq!(resolved.libvirt_uri, None);
+    }
+
+    #[test]
+    fn libvirt_uri_is_carried_into_the_vm_provider_config() {
+        let mut config = test_config(NodeProfile::Vm);
+        config.libvirt_domain = Some("windows-gpu".into());
+        config.libvirt_uri = Some("qemu:///system".into());
+
+        let resolved = config.vm_providers().unwrap();
+        assert_eq!(resolved.power, Some(PowerProvider::Libvirt));
+        assert_eq!(resolved.libvirt_uri.as_deref(), Some("qemu:///system"));
     }
 
     #[test]
@@ -2432,6 +2458,14 @@ mod tests {
 
         let mut config = test_config(NodeProfile::Vm);
         config.libvirt_domain = Some("  ".into());
+        assert!(config.validate().is_err());
+
+        let mut config = test_config(NodeProfile::Vm);
+        config.libvirt_uri = Some("   ".into());
+        assert!(config.validate().is_err());
+
+        let mut config = test_config(NodeProfile::Vm);
+        config.libvirt_uri = Some("qemu:///system extra".into());
         assert!(config.validate().is_err());
 
         let mut config = test_config(NodeProfile::Vm);

@@ -64,6 +64,35 @@ pub enum PowerError {
         stderr: String,
     },
 
+    /// `virsh` reached libvirt but the configured domain does not exist.
+    ///
+    /// This is distinct from [`PowerError::MissingCommand`] (no `virsh`
+    /// executable) and [`PowerError::CommandFailed`] (a connection or other
+    /// libvirt failure), so an operator can tell a typo in `--libvirt-domain`
+    /// from a broken libvirt connection.
+    #[error("libvirt domain {domain:?} was not found: {stderr}")]
+    DomainNotFound {
+        /// Configured domain name.
+        domain: String,
+        /// Captured `virsh` standard error.
+        stderr: String,
+    },
+
+    /// A backend was configured but could not be connected at startup.
+    ///
+    /// The original machine-readable [`PowerError::kind`] is retained in
+    /// `kind` so `/power/state` and actions can report the real reason instead
+    /// of degrading to `not-configured`.
+    #[error("{backend} power backend is unavailable: {reason}")]
+    Unavailable {
+        /// Backend name (`libvirt`, `qmp`).
+        backend: &'static str,
+        /// Original error kind (`domain-not-found`, `missing-command`, ...).
+        kind: &'static str,
+        /// Human-readable original failure.
+        reason: String,
+    },
+
     /// A QMP operation failed.
     #[error("QMP power operation failed: {0}")]
     Qmp(#[source] QmpError),
@@ -88,6 +117,8 @@ impl PowerError {
             Self::MissingCommand { .. } => "missing-command",
             Self::Spawn { .. } => "spawn",
             Self::CommandFailed { .. } => "command-failed",
+            Self::DomainNotFound { .. } => "domain-not-found",
+            Self::Unavailable { kind, .. } => kind,
             Self::Qmp(error) => match error {
                 QmpError::Command { .. } => "qmp-command",
                 QmpError::ConnectionClosed => "qmp-closed",
@@ -97,6 +128,13 @@ impl PowerError {
             },
             Self::InvalidState(_) => "invalid-state",
         }
+    }
+
+    /// True when this error represents a backend that could not be connected at
+    /// startup. Such a failure should be reported as an unavailable backend
+    /// (HTTP 503) rather than a transient operation failure (HTTP 502).
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable { .. })
     }
 }
 

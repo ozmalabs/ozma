@@ -41,20 +41,30 @@ pub struct DisplayInfo {
     pub source_id: Option<String>,
     /// Human-readable source name.
     pub source_name: Option<String>,
-    /// Last captured width, or the source's advertised maximum before the
-    /// first snapshot.
+    /// Last captured width. `0` until a real frame has been observed; the
+    /// advertised capability limit is exposed separately in
+    /// `capability_max_width`.
     pub width: u32,
-    /// Last captured height, or the source's advertised maximum before the
-    /// first snapshot.
+    /// Last captured height. `0` until a real frame has been observed; the
+    /// advertised capability limit is exposed separately in
+    /// `capability_max_height`.
     pub height: u32,
     /// Last captured pixel format, or the first advertised format.
     pub pixel_format: Option<String>,
+    /// Widest frame the selected source advertises, when known. This is a
+    /// capability, never the current frame size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_max_width: Option<u32>,
+    /// Tallest frame the selected source advertises, when known. This is a
+    /// capability, never the current frame size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_max_height: Option<u32>,
     /// Whether a source exists that the snapshot route can try to open.
     pub snapshot_available: bool,
     /// Always `jpeg`; the controller expects a JPEG body.
     pub snapshot_encoding: &'static str,
-    /// Where `width`/`height` came from: `last-frame`, `capability-max`, or
-    /// `none`.
+    /// Where `width`/`height` came from: `last-frame`, `display-output`, or
+    /// `unknown`/`none` when no frame has been observed.
     pub dimensions_source: &'static str,
     /// Most recent snapshot failure, kept honest instead of implying success.
     pub last_error: Option<String>,
@@ -489,6 +499,8 @@ impl SnapshotControl {
                         width: last.format.width,
                         height: last.format.height,
                         pixel_format: Some(last.format.pixel_format.as_str().to_owned()),
+                        capability_max_width: Some(capability.max_width),
+                        capability_max_height: Some(capability.max_height),
                         snapshot_available: true,
                         snapshot_encoding: "jpeg",
                         dimensions_source: "last-frame",
@@ -499,14 +511,20 @@ impl SnapshotControl {
                 } else {
                     DisplayInfo {
                         ok: true,
-                        width: capability.max_width,
-                        height: capability.max_height,
+                        // No frame has been captured yet, so the current frame
+                        // geometry is genuinely unknown. The capability limit
+                        // is reported separately and must not masquerade as a
+                        // real frame size.
+                        width: 0,
+                        height: 0,
                         pixel_format: capability.formats.first().cloned(),
+                        capability_max_width: Some(capability.max_width),
+                        capability_max_height: Some(capability.max_height),
                         source_id: Some(capability.id),
                         source_name: Some(capability.name),
                         snapshot_available: true,
                         snapshot_encoding: "jpeg",
-                        dimensions_source: "capability-max",
+                        dimensions_source: "unknown",
                         last_error: cached.last_error,
                         console: None,
                         active: false,
@@ -520,6 +538,8 @@ impl SnapshotControl {
                 width: 0,
                 height: 0,
                 pixel_format: None,
+                capability_max_width: None,
+                capability_max_height: None,
                 snapshot_available: false,
                 snapshot_encoding: "jpeg",
                 dimensions_source: "none",
@@ -534,6 +554,8 @@ impl SnapshotControl {
                 width: 0,
                 height: 0,
                 pixel_format: None,
+                capability_max_width: None,
+                capability_max_height: None,
                 snapshot_available: false,
                 snapshot_encoding: "jpeg",
                 dimensions_source: "none",
@@ -548,6 +570,8 @@ impl SnapshotControl {
                 width: 0,
                 height: 0,
                 pixel_format: None,
+                capability_max_width: None,
+                capability_max_height: None,
                 snapshot_available: false,
                 snapshot_encoding: "jpeg",
                 dimensions_source: "none",
@@ -757,6 +781,33 @@ mod tests {
         assert_eq!(info.pixel_format.as_deref(), Some("rgb24"));
         assert_eq!(info.dimensions_source, "last-frame");
         assert!(info.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn info_before_the_first_frame_does_not_report_capability_max_as_frame_size() {
+        let control = SnapshotControl::new(fake_registry());
+
+        let info = control.info().await;
+        assert!(info.ok);
+        assert!(info.snapshot_available);
+        assert_eq!(
+            (info.width, info.height),
+            (0, 0),
+            "current frame geometry is unknown before the first frame"
+        );
+        assert_eq!(info.dimensions_source, "unknown");
+        assert_eq!(info.capability_max_width, Some(320));
+        assert_eq!(info.capability_max_height, Some(240));
+        assert_eq!(info.source_id.as_deref(), Some("fake0"));
+
+        let snapshot = control.capture().await.expect("snapshot");
+        assert_eq!((snapshot.format.width, snapshot.format.height), (320, 240));
+
+        let info = control.info().await;
+        assert_eq!((info.width, info.height), (320, 240));
+        assert_eq!(info.dimensions_source, "last-frame");
+        assert_eq!(info.capability_max_width, Some(320));
+        assert_eq!(info.capability_max_height, Some(240));
     }
 
     #[tokio::test]

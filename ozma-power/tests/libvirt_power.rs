@@ -6,11 +6,12 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ozma_power::{
-    CommandOutput, CommandRunner, LibvirtPower, PowerBackend, PowerError, TokioCommandRunner,
-    DEFAULT_LIBVIRT_URI,
+    CommandOutput, CommandRunner, LibvirtPower, PowerBackend, PowerError, PowerOutcome, PowerState,
+    TokioCommandRunner, UnavailablePower, DEFAULT_LIBVIRT_URI,
 };
 
 #[derive(Debug, Clone)]
@@ -231,8 +232,15 @@ async fn cont_does_not_start_when_virsh_is_missing() {
 
 #[tokio::test]
 async fn power_actions_use_exact_virsh_argv() {
-    let (mut power, fake) =
-        connected(vec![output("running"), output(""), output(""), output("")]).await;
+    let (mut power, fake) = connected(vec![
+        output("running"),  // connect probe
+        output("running"),  // shutdown pre-read
+        output(""),         // shutdown
+        output("shut off"), // shutdown readback
+        output(""),         // reset
+        output(""),         // destroy
+    ])
+    .await;
 
     power.system_powerdown().await.unwrap();
     power.system_reset().await.unwrap();
@@ -242,7 +250,9 @@ async fn power_actions_use_exact_virsh_argv() {
         fake.calls(),
         vec![
             argv(&["virsh", "domstate", "test-vm"]),
+            argv(&["virsh", "domstate", "test-vm"]),
             argv(&["virsh", "shutdown", "test-vm"]),
+            argv(&["virsh", "domstate", "test-vm"]),
             argv(&["virsh", "reset", "test-vm"]),
             argv(&["virsh", "destroy", "test-vm"]),
         ]
@@ -270,6 +280,7 @@ async fn pause_and_resume_use_virsh_suspend_and_resume() {
 #[tokio::test]
 async fn non_zero_exit_is_a_typed_command_failure() {
     let (mut power, _fake) = connected(vec![
+        output("running"),
         output("running"),
         Reply::Failure {
             status: 2,
@@ -432,10 +443,248 @@ async fn defaults_match_the_python_backend() {
     let mut power = LibvirtPower::new("test-vm").with_runner(Box::new(fake));
 
     assert_eq!(power.domain(), "test-vm");
-    assert_eq!(power.uri(), DEFAULT_LIBVIRT_URI);
+    assert_eq!(power.uri(), None);
+    assert_eq!(DEFAULT_LIBVIRT_URI, "qemu:///session");
     assert!(!power.is_connected());
     power.connect().await.unwrap();
     assert!(power.is_connected());
+}
+
+#[tokio::test]
+async fn configured_uri_is_passed_to_state_and_every_lifecycle_action() {
+    let fake = FakeRunner::new(vec![
+        output("running"),               // connect
+        output("running"),               // state
+        output(""),                      // suspend
+        output(""),                      // resume
+        failure("domain is not paused"), // cont: resume attempt
+        output(""),                      // cont: start fallback
+        output(""),                      // reset
+        output(""),                      // destroy
+    ]);
+    let mut power = LibvirtPower::new("test-vm")
+        .with_uri("qemu:///system")
+        .with_runner(Box::new(fake.clone()));
+    power.connect().await.unwrap();
+
+    power.query_status().await.unwrap();
+    power.pause().await.unwrap();
+    power.resume().await.unwrap();
+    power.cont().await.unwrap();
+    power.system_reset().await.unwrap();
+    power.stop().await.unwrap();
+
+    assert_eq!(
+        fake.calls(),
+        vec![
+            argv(&[
+                "virsh",
+                "--connect",
+                "qemu:///system",
+                "domstate",
+                "test-vm"
+            ]),
+            argv(&[
+                "virsh",
+                "--connect",
+                "qemu:///system",
+                "domstate",
+                "test-vm"
+            ]),
+            argv(&["virsh", "--connect", "qemu:///system", "suspend", "test-vm"]),
+            argv(&["virsh", "--connect", "qemu:///system", "resume", "test-vm"]),
+            argv(&["virsh", "--connect", "qemu:///system", "resume", "test-vm"]),
+            argv(&["virsh", "--connect", "qemu:///system", "start", "test-vm"]),
+            argv(&["virsh", "--connect", "qemu:///system", "reset", "test-vm"]),
+            argv(&["virsh", "--connect", "qemu:///system", "destroy", "test-vm"]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn missing_domain_is_typed_and_distinct_from_a_connection_failure() {
+    let fake = FakeRunner::new(vec![failure(
+        "error: failed to get domain 'test-vm'\nerror: Domain not found: no domain with matching name 'test-vm'",
+    )]);
+    let mut power = LibvirtPower::new("test-vm").with_runner(Box::new(fake));
+
+    let error = power.connect().await.unwrap_err();
+    match &error {
+        PowerError::DomainNotFound { domain, stderr } => {
+            assert_eq!(domain, "test-vm");
+            assert!(stderr.contains("failed to get domain"));
+        }
+        other => panic!("expected DomainNotFound, got {other:?}"),
+    }
+    assert_eq!(error.kind(), "domain-not-found");
+
+    let fake = FakeRunner::new(vec![failure(
+        "error: failed to connect to the hypervisor\nerror: Failed to connect socket to '/run/user/0/libvirt/virtqemud-sock': No such file or directory",
+    )]);
+    let mut power = LibvirtPower::new("test-vm").with_runner(Box::new(fake));
+    let error = power.connect().await.unwrap_err();
+    assert!(matches!(error, PowerError::CommandFailed { .. }));
+    assert_eq!(error.kind(), "command-failed");
+    assert!(!error.to_string().contains("was not found"));
+}
+
+#[tokio::test]
+async fn unavailable_power_replays_the_original_typed_reason() {
+    let original = PowerError::DomainNotFound {
+        domain: "typo-vm".to_string(),
+        stderr: "error: failed to get domain 'typo-vm'".to_string(),
+    };
+    let mut power = UnavailablePower::new("libvirt", &original);
+
+    for result in [
+        power.query_status().await.map(|_| ()),
+        power.cont().await,
+        power.pause().await,
+        power.resume().await,
+        power.system_powerdown().await,
+        power.system_reset().await,
+        power.stop().await,
+    ] {
+        let error = result.unwrap_err();
+        assert!(error.is_unavailable());
+        assert_eq!(error.kind(), "domain-not-found");
+        assert!(error.to_string().contains("typo-vm"), "{error}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ACPI shutdown readback
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn acpi_shutdown_reports_completed_when_domstate_is_off() {
+    let fake = FakeRunner::new(vec![
+        output("running"),  // connect
+        output("running"),  // pre-request read
+        output(""),         // shutdown request
+        output("shut off"), // readback
+    ]);
+    let mut power = LibvirtPower::new("test-vm")
+        .with_uri("qemu:///system")
+        .with_runner(Box::new(fake.clone()));
+    power.connect().await.unwrap();
+
+    let outcome = power.system_powerdown_outcome().await.unwrap();
+    assert_eq!(outcome, PowerOutcome::completed(PowerState::shutoff()));
+    assert!(!outcome.pending);
+    assert_eq!(
+        outcome.state.as_ref().map(PowerState::as_str),
+        Some("shutoff")
+    );
+    assert_eq!(outcome.reason, None);
+
+    assert_eq!(
+        fake.calls(),
+        vec![
+            argv(&[
+                "virsh",
+                "--connect",
+                "qemu:///system",
+                "domstate",
+                "test-vm"
+            ]),
+            argv(&[
+                "virsh",
+                "--connect",
+                "qemu:///system",
+                "domstate",
+                "test-vm"
+            ]),
+            argv(&[
+                "virsh",
+                "--connect",
+                "qemu:///system",
+                "shutdown",
+                "test-vm"
+            ]),
+            argv(&[
+                "virsh",
+                "--connect",
+                "qemu:///system",
+                "domstate",
+                "test-vm"
+            ]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn acpi_shutdown_still_running_is_explicitly_pending() {
+    #[derive(Debug, Default)]
+    struct State {
+        calls: Vec<Vec<String>>,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct AlwaysRunning(Arc<Mutex<State>>);
+
+    #[async_trait]
+    impl CommandRunner for AlwaysRunning {
+        async fn run(&self, argv: &[String]) -> Result<CommandOutput, PowerError> {
+            self.0.lock().unwrap().calls.push(argv.to_vec());
+            Ok(CommandOutput::success("running\n"))
+        }
+    }
+
+    let runner = AlwaysRunning::default();
+    let calls = Arc::clone(&runner.0);
+    let mut power = LibvirtPower::new("test-vm")
+        .with_runner(Box::new(runner))
+        .with_shutdown_timeout(Duration::from_millis(25))
+        .with_shutdown_poll_interval(Duration::from_millis(5));
+    power.connect().await.unwrap();
+
+    let outcome = power.system_powerdown_outcome().await.unwrap();
+    assert!(outcome.pending);
+    assert_eq!(outcome.reason.as_deref(), Some("acpi-requested"));
+    assert_eq!(
+        outcome.state.as_ref().map(PowerState::as_str),
+        Some("running")
+    );
+
+    let recorded = calls.lock().unwrap().calls.clone();
+    assert!(
+        recorded
+            .iter()
+            .any(|invocation| invocation == &argv(&["virsh", "shutdown", "test-vm"])),
+        "the ACPI request must still be sent: {recorded:?}"
+    );
+    assert!(
+        recorded
+            .iter()
+            .filter(|invocation| invocation[1] == "domstate")
+            .count()
+            >= 2,
+        "at least the pre-read and one readback poll are expected: {recorded:?}"
+    );
+    assert!(
+        recorded
+            .iter()
+            .all(|invocation| !invocation.iter().any(|part| part == "destroy")),
+        "ACPI shutdown must not force the domain off: {recorded:?}"
+    );
+}
+
+#[tokio::test]
+async fn acpi_shutdown_on_an_already_off_domain_skips_the_request() {
+    let (mut power, fake) = connected(vec![output("shut off"), output("shut off")]).await;
+
+    let outcome = power.system_powerdown_outcome().await.unwrap();
+    assert_eq!(outcome, PowerOutcome::completed(PowerState::shutoff()));
+    assert!(!outcome.pending);
+    assert_eq!(
+        fake.calls(),
+        vec![
+            argv(&["virsh", "domstate", "test-vm"]),
+            argv(&["virsh", "domstate", "test-vm"]),
+        ],
+        "an already-off domain must not receive a second shutdown request"
+    );
 }
 
 // ---------------------------------------------------------------------------

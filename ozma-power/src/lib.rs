@@ -59,6 +59,7 @@ mod libvirt;
 mod qmp;
 mod runner;
 mod state;
+mod unavailable;
 
 use async_trait::async_trait;
 
@@ -67,7 +68,8 @@ pub use error::PowerError;
 pub use libvirt::{LibvirtPower, DEFAULT_LIBVIRT_URI};
 pub use qmp::QmpPower;
 pub use runner::{CommandOutput, CommandRunner, TokioCommandRunner};
-pub use state::{PowerState, PowerStatus};
+pub use state::{PowerOutcome, PowerState, PowerStatus};
+pub use unavailable::UnavailablePower;
 
 /// VM power control shared by every backend.
 ///
@@ -106,6 +108,19 @@ pub trait PowerBackend: Send + Sync {
     /// running until the guest handles it. Use [`PowerBackend::stop`] for a
     /// hard power-off.
     async fn system_powerdown(&mut self) -> Result<(), PowerError>;
+
+    /// Request an orderly ACPI shutdown and report what the backend observed.
+    ///
+    /// Backends that can read the domain state back should override this so a
+    /// request the guest has not handled yet is reported as
+    /// [`PowerOutcome::pending`] instead of implying the VM is off. The default
+    /// implementation preserves backends with no readback: it calls
+    /// [`PowerBackend::system_powerdown`] and returns
+    /// [`PowerOutcome::accepted`].
+    async fn system_powerdown_outcome(&mut self) -> Result<PowerOutcome, PowerError> {
+        self.system_powerdown().await?;
+        Ok(PowerOutcome::accepted())
+    }
 
     /// Reset the VM.
     async fn system_reset(&mut self) -> Result<(), PowerError>;

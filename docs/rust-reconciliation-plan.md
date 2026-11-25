@@ -9,9 +9,13 @@ validation, the remaining device/audio provisioning, multi-VM breadth, and
 Phases 4–5 remain plans.** The 2026-11-25 read-only cutover audit is in
 [`phase4-cutover-audit.md`](phase4-cutover-audit.md); it finds Phase 4
 incomplete and lists the exact blockers, per-tree deletion criteria, rollback
-tags, and staged plan. A 2026-11-25 refresh at `437468a` (§16 of that document)
-keeps deletion **NO-GO** and makes the one-release overlap **GO conditional**
-after the lockfile and remaining validation gates. See
+tags, and staged plan. Refresh 2 at `28ffd69` (§17 of that document) records the
+privileged-install, container, systemd/udev, `dummy_hcd` USB, live mesh, Xorg
+seat, DRM lease, and VNC/OCR evidence: the lockfile P0 is closed, but deletion
+remains **NO-GO** because `demo test` is still red, no rollback tag/overlap
+release exists, Python-only providers and tree references remain, and the live
+gates were not rerun at the freeze HEAD. The one-release overlap is **GO
+conditional** on those pre-tag checks. See
 [`plan-execution-status.md`](plan-execution-status.md) and
 [`parity-matrix.md`](parity-matrix.md) for the evidence and remaining gaps.
 Scope: the Python `softnode/`, `node/`, and `agent/` processes are replaced by the

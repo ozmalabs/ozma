@@ -13,9 +13,13 @@ The 2026-11-25 refresh at `437468a` passed the host harness, workspace tests, an
 controller pytest. On 2026-11-25 the container gate also passed:
 `scripts/clean-host/run.sh --container --full` at `08393e7` reported
 2469 passed / 0 failed / 42 ignored (see
-[`phase4-container-gate-report.md`](phase4-container-gate-report.md)). See
-[`phase4-cutover-audit.md`](phase4-cutover-audit.md) §16 for the current
-go/no-go.
+[`phase4-container-gate-report.md`](phase4-container-gate-report.md)). Refresh
+2 at `28ffd69` reran the host gate (**22 passed / 0 failed**, node lib 557,
+`ozma-softnode` 139), `verify-units.sh` (8/8), and
+`verify-system-install.sh` (82 passed / 0 failed / 1 skipped). The container,
+default-demo, and `demo test` gates were not rerun there. See
+[`phase4-cutover-audit.md`](phase4-cutover-audit.md) §17 for the current
+go/no-go: deletion **NO-GO**, overlap **GO conditional**.
 
 This page is the operational companion to
 [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md) Phase 4 and

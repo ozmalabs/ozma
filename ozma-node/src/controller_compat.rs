@@ -4294,7 +4294,17 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
                 }
                 Err(error) => {
                     warn!(error = %error, "Power state query failed for /api/v1/connection");
-                    serde_json::json!({"status": "unknown", "available": false})
+                    let status = if error.is_unavailable() {
+                        "unavailable"
+                    } else {
+                        "unknown"
+                    };
+                    serde_json::json!({
+                        "status": status,
+                        "available": false,
+                        "code": error.kind(),
+                        "error": error.to_string(),
+                    })
                 }
             }
         }
@@ -4612,6 +4622,8 @@ fn unavailable_display_info(last_error: Option<String>) -> DisplayInfo {
         width: 0,
         height: 0,
         pixel_format: None,
+        capability_max_width: None,
+        capability_max_height: None,
         snapshot_available: false,
         snapshot_encoding: "jpeg",
         dimensions_source: "none",
@@ -5756,10 +5768,22 @@ async fn power_state(State(state): State<ConnectionState>) -> axum::response::Re
         .into_response(),
         Err(error) => {
             warn!(error = %error, "Power state query failed");
+            let status = if error.is_unavailable() {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                axum::http::StatusCode::BAD_GATEWAY
+            };
+            // A backend that failed to connect at startup is reported as an
+            // unavailable state with the retained reason, never `not-configured`.
+            let state = if error.is_unavailable() {
+                "unavailable"
+            } else {
+                "unknown"
+            };
             (
-                axum::http::StatusCode::BAD_GATEWAY,
+                status,
                 Json(serde_json::json!({
-                    "status": "unknown",
+                    "status": state,
                     "available": false,
                     "code": error.kind(),
                     "error": error.to_string(),
@@ -5802,20 +5826,61 @@ async fn power_action(
 
     let mut backend = power.lock().await;
     let result = match action {
-        PowerAction::Start => backend.cont().await,
-        PowerAction::Shutdown => backend.system_powerdown().await,
-        PowerAction::Reset => backend.system_reset().await,
-        PowerAction::Pause => backend.pause().await,
-        PowerAction::Resume => backend.resume().await,
-        PowerAction::Stop => backend.stop().await,
+        PowerAction::Start => backend
+            .cont()
+            .await
+            .map(|_| ozma_power::PowerOutcome::accepted()),
+        PowerAction::Shutdown => backend.system_powerdown_outcome().await,
+        PowerAction::Reset => backend
+            .system_reset()
+            .await
+            .map(|_| ozma_power::PowerOutcome::accepted()),
+        PowerAction::Pause => backend
+            .pause()
+            .await
+            .map(|_| ozma_power::PowerOutcome::accepted()),
+        PowerAction::Resume => backend
+            .resume()
+            .await
+            .map(|_| ozma_power::PowerOutcome::accepted()),
+        PowerAction::Stop => backend
+            .stop()
+            .await
+            .map(|_| ozma_power::PowerOutcome::accepted()),
     };
 
     match result {
-        Ok(()) => Json(serde_json::json!({"ok": true, "action": action.as_str()})).into_response(),
+        Ok(outcome) => {
+            // An accepted-but-not-yet-applied ACPI request (the guest is still
+            // running) is a 202 with `pending: true` and the real observed
+            // state, never a fabricated "off".
+            let status = if outcome.pending {
+                axum::http::StatusCode::ACCEPTED
+            } else {
+                axum::http::StatusCode::OK
+            };
+            let mut body = serde_json::json!({
+                "ok": true,
+                "action": action.as_str(),
+                "pending": outcome.pending,
+            });
+            if let Some(state) = &outcome.state {
+                body["status"] = serde_json::Value::String(state.status.clone());
+            }
+            if let Some(reason) = &outcome.reason {
+                body["reason"] = serde_json::Value::String(reason.clone());
+            }
+            (status, Json(body)).into_response()
+        }
         Err(error) => {
             warn!(action = %action, error = %error, "Power action failed");
+            let status = if error.is_unavailable() {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                axum::http::StatusCode::BAD_GATEWAY
+            };
             (
-                axum::http::StatusCode::BAD_GATEWAY,
+                status,
                 Json(serde_json::json!({
                     "ok": false,
                     "action": action.as_str(),
@@ -7537,7 +7602,7 @@ mod tests {
     use ozma_capture::{CaptureRegistry, FakeCaptureProvider};
     use ozma_input::{FakeInputSink, InputSink, RecordingSink};
     use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError, PixelFormat};
-    use ozma_power::{PowerBackend, PowerError, PowerState};
+    use ozma_power::{PowerBackend, PowerError, PowerOutcome, PowerState, UnavailablePower};
     use ozma_usb::{
         BulkTransportFault, ConfigFsUsbController, FakeFunctionFsMounter, FakeUsbGadgetController,
         FunctionFsHandoff, MassStorageDevice, MassStorageImage, MemoryBulkTransport, OverlayConfig,
@@ -7653,6 +7718,40 @@ mod tests {
 
         async fn stop(&mut self) -> Result<(), PowerError> {
             Err(PowerError::Qmp(ozma_qmp::QmpError::ConnectionClosed))
+        }
+    }
+
+    /// A backend that accepts ACPI shutdown but reports the guest still running,
+    /// as libvirt does when the guest ignores the request.
+    struct PendingOffPower;
+
+    #[async_trait]
+    impl PowerBackend for PendingOffPower {
+        async fn query_status(&mut self) -> Result<PowerState, PowerError> {
+            Ok(PowerState::running())
+        }
+
+        async fn cont(&mut self) -> Result<(), PowerError> {
+            Ok(())
+        }
+
+        async fn system_powerdown(&mut self) -> Result<(), PowerError> {
+            Ok(())
+        }
+
+        async fn system_powerdown_outcome(&mut self) -> Result<PowerOutcome, PowerError> {
+            Ok(PowerOutcome::pending(
+                PowerState::running(),
+                "acpi-requested",
+            ))
+        }
+
+        async fn system_reset(&mut self) -> Result<(), PowerError> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<(), PowerError> {
+            Ok(())
         }
     }
 
@@ -8976,6 +9075,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn display_info_before_the_first_frame_reports_unknown_frame_geometry() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_snapshot(Some(SnapshotControl::new(
+            CaptureRegistry::new().with(FakeCaptureProvider::new()),
+        )));
+        let app = public_router(state);
+
+        let (status, info) = get_json(&app, "/display/info").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["snapshot_available"], true);
+        assert_eq!(info["width"], 0);
+        assert_eq!(info["height"], 0);
+        assert_eq!(info["dimensions_source"], "unknown");
+        assert_eq!(info["capability_max_width"], 320);
+        assert_eq!(info["capability_max_height"], 240);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/display/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (status, info) = get_json(&app, "/display/info").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["width"], 320);
+        assert_eq!(info["height"], 240);
+        assert_eq!(info["dimensions_source"], "last-frame");
+        assert_eq!(info["capability_max_width"], 320);
+        assert_eq!(info["capability_max_height"], 240);
+    }
+
+    #[tokio::test]
     async fn display_snapshot_returns_a_real_jpeg_with_no_store() {
         let state = ConnectionState::new(
             ConnectionInfo::new(
@@ -10163,6 +10310,78 @@ mod tests {
         assert_eq!(json["status"], "unknown");
         assert_eq!(json["available"], false);
         assert_eq!(json["code"], "qmp-closed");
+    }
+
+    #[tokio::test]
+    async fn power_state_reports_a_retained_startup_failure_as_unavailable() {
+        let error = PowerError::DomainNotFound {
+            domain: "typo-vm".to_string(),
+            stderr: "error: failed to get domain 'typo-vm'".to_string(),
+        };
+        let power: SharedPower = Arc::new(tokio::sync::Mutex::new(Box::new(UnavailablePower::new(
+            "libvirt", &error,
+        ))
+            as Box<dyn PowerBackend>));
+        let app = power_router(vm_state(Some(power)));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/power/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json = json_body(response).await;
+        assert_eq!(json["status"], "unavailable");
+        assert_eq!(json["available"], false);
+        assert_eq!(json["code"], "domain-not-found");
+        assert!(json["error"].as_str().unwrap().contains("typo-vm"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/power/off")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json = json_body(response).await;
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["code"], "domain-not-found");
+        assert!(json["error"].as_str().unwrap().contains("typo-vm"));
+    }
+
+    #[tokio::test]
+    async fn power_off_reports_a_pending_acpi_request_as_202() {
+        let power: SharedPower = Arc::new(tokio::sync::Mutex::new(
+            Box::new(PendingOffPower) as Box<dyn PowerBackend>
+        ));
+        let app = power_router(vm_state(Some(power)));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/power/off")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let json = json_body(response).await;
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["action"], "off");
+        assert_eq!(json["pending"], true);
+        assert_eq!(json["reason"], "acpi-requested");
+        assert_eq!(json["status"], "running");
     }
 
     #[tokio::test]
