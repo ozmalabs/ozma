@@ -1,0 +1,15 @@
+[package]
+name = "ozma-thermal"
+version = "0.1.0"
+edition = "2021"
+description = "Thermal zones, fan curves, anti-cycling control, and fan noise estimation."
+license = "AGPL-3.0-only"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

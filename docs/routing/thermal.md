@@ -1,6 +1,17 @@
 # Thermal and Power Management
 
-**Status:** Draft
+**Status:** Draft specification; the Rust node has a first implementation of
+thermal zones, fan curves, anti-cycling control, and fan-noise estimation.
+
+**Implementation:** `ozma-thermal` provides the policy model, fan-curve engine,
+anti-cycling guards (hysteresis, minimum dwell, ramp rate), fan dBA estimation,
+and a Linux hwmon backend. `ozma-node` loads an optional JSON policy, exposes
+`GET /thermal`, `/api/v1/thermal/status`, `/zones`, `/fans`, and `/profiles`,
+and samples hwmon read-only by default. PWM writes require both
+`--thermal-control` and a policy; the original automatic hwmon mode is restored
+on shutdown. Critical temperature always overrides noise caps, duty caps, dwell,
+and ramp limiting.
+
 **RFC 2119 Conformance:** The key words "MUST", "MUST NOT", "REQUIRED", "SHALL",
 "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in
 this document are to be interpreted as described in [RFC 2119](https://www.ietf.org/rfc/rfc2119.txt).

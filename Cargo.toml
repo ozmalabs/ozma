@@ -38,6 +38,7 @@ members = [
     "ozma-pipewire",
     "ozma-usb",
     "ozma-multiseat",
+    "ozma-thermal",
     "ozma-hardware",
 ]
 

@@ -6,12 +6,14 @@
 //! **top-level numeric** values. This module therefore returns a flat JSON
 //! object whose numeric keys are the ones the controller already understands
 //! (`cpu_usage`, `ram_used`, `ram_total`, `disk_used`, `disk_total`,
-//! `net_rx_rate`, `net_tx_rate`, `uptime`).
+//! `net_rx_rate`, `net_tx_rate`, `uptime`, plus `cpu_temp`, `gpu_temp`, and
+//! `fan_rpm` when hwmon exposes them).
 //!
 //! Collection is deliberately small: a fixed set of procfs files, each read
-//! through a 256 KiB cap, plus one `statvfs` call. There is no subprocess,
-//! network probe, or unbounded read. A metric that cannot be measured is
-//! omitted and named in `unavailable`; it is never reported as a fake zero.
+//! through a 256 KiB cap, one `statvfs` call, and read-only hwmon sysfs. There is
+//! no subprocess, network probe, or unbounded read. A metric that cannot be
+//! measured is omitted and named in `unavailable`; it is never reported as a
+//! fake zero.
 //! Non-numeric metadata (`available`, `scope`, `notes`, ...) is ignored by the
 //! controller's numeric batch update and exists so a human can see what the
 //! document does and does not claim.
@@ -22,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use ozma_thermal::HwmonInventory;
 use serde_json::{Map, Number, Value};
 
 /// Largest single procfs read accepted, in bytes.
@@ -69,6 +72,7 @@ struct MemoryTotals {
 struct MetricsPaths {
     proc_root: PathBuf,
     disk_path: PathBuf,
+    hwmon_root: PathBuf,
 }
 
 impl MetricsPaths {
@@ -76,6 +80,7 @@ impl MetricsPaths {
         Self {
             proc_root: PathBuf::from("/proc"),
             disk_path: PathBuf::from("/"),
+            hwmon_root: PathBuf::from(ozma_thermal::DEFAULT_HWMON_ROOT),
         }
     }
 }
@@ -190,10 +195,32 @@ impl AgentMetricsSampler {
             None => unavailable.push("uptime".to_owned()),
         }
 
+        let (cpu_temp, gpu_temp, fan_rpm) = thermal_metrics(&paths.hwmon_root);
+        if let Some(value) = cpu_temp {
+            metrics.insert("cpu_temp".to_owned(), number(round2(value)));
+        }
+        if let Some(value) = gpu_temp {
+            metrics.insert("gpu_temp".to_owned(), number(round2(value)));
+        }
+        if let Some(value) = fan_rpm {
+            metrics.insert("fan_rpm".to_owned(), Value::from(value));
+        }
+        if cpu_temp.is_some() || gpu_temp.is_some() || fan_rpm.is_some() {
+            notes.push("thermal values come from hwmon".to_owned());
+        }
+
         // Metrics this node does not measure at all. Listing them keeps the
         // document honest about why the dashboard has no value.
-        for missing in ["cpu_temp", "gpu_usage", "gpu_temp", "fan_rpm", "power_draw"] {
-            unavailable.push(missing.to_owned());
+        for (name, present) in [
+            ("cpu_temp", cpu_temp.is_some()),
+            ("gpu_usage", false),
+            ("gpu_temp", gpu_temp.is_some()),
+            ("fan_rpm", fan_rpm.is_some()),
+            ("power_draw", false),
+        ] {
+            if !present {
+                unavailable.push(name.to_owned());
+            }
         }
 
         let available = !metrics.is_empty();
@@ -222,6 +249,43 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Best-effort thermal metrics from hwmon.
+///
+/// Returns `(cpu_temp_c, gpu_temp_c, max_fan_rpm)`. A missing hwmon tree is
+/// normal on VMs/servers and yields `None` values rather than fake zeroes.
+fn thermal_metrics(root: &Path) -> (Option<f64>, Option<f64>, Option<u32>) {
+    let Ok(inventory) = HwmonInventory::discover(root) else {
+        return (None, None, None);
+    };
+    let sensors = inventory.read_sensors().unwrap_or_default();
+    let fans = inventory.read_fans().unwrap_or_default();
+
+    let cpu = max_matching_temp(
+        &sensors,
+        &[
+            "cpu", "core", "package", "tdie", "tctl", "k10temp", "coretemp",
+        ],
+    );
+    let gpu = max_matching_temp(&sensors, &["gpu", "amdgpu", "nvidia", "nouveau", "radeon"]);
+    let fan_rpm = fans.iter().filter_map(|fan| fan.rpm).max();
+    (cpu, gpu, fan_rpm)
+}
+
+fn max_matching_temp(sensors: &[ozma_thermal::SensorReading], needles: &[&str]) -> Option<f64> {
+    sensors
+        .iter()
+        .filter(|sensor| {
+            let id = sensor.id.to_ascii_lowercase();
+            let name = sensor.name.to_ascii_lowercase();
+            needles
+                .iter()
+                .any(|needle| id.contains(needle) || name.contains(needle))
+        })
+        .map(|sensor| sensor.temp_c)
+        .filter(|value| value.is_finite())
+        .max_by(|left, right| left.total_cmp(right))
 }
 
 fn read_bounded(path: &Path) -> std::io::Result<String> {
@@ -475,6 +539,7 @@ mod tests {
         let paths = MetricsPaths {
             proc_root: root.join("proc"),
             disk_path: root.clone(),
+            hwmon_root: root.join("hwmon"),
         };
         let sampler = AgentMetricsSampler::default();
 
@@ -520,6 +585,44 @@ mod tests {
     }
 
     #[test]
+    fn thermal_metrics_come_from_hwmon_when_available() {
+        let root = std::env::temp_dir().join(format!(
+            "ozma-agent-metrics-thermal-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let coretemp = root.join("hwmon/hwmon0");
+        let amdgpu = root.join("hwmon/hwmon1");
+        fs::create_dir_all(&coretemp).unwrap();
+        fs::create_dir_all(&amdgpu).unwrap();
+        fs::write(coretemp.join("name"), "coretemp\n").unwrap();
+        fs::write(coretemp.join("temp1_input"), "55000\n").unwrap();
+        fs::write(coretemp.join("fan1_input"), "1200\n").unwrap();
+        fs::write(amdgpu.join("name"), "amdgpu\n").unwrap();
+        fs::write(amdgpu.join("temp1_input"), "70000\n").unwrap();
+
+        let paths = MetricsPaths {
+            proc_root: root.join("proc-does-not-exist"),
+            disk_path: root.join("disk-does-not-exist"),
+            hwmon_root: root.join("hwmon"),
+        };
+        let document = AgentMetricsSampler::default().collect_with(&paths, "thermal-node");
+
+        assert_eq!(document["cpu_temp"], 55.0);
+        assert_eq!(document["gpu_temp"], 70.0);
+        assert_eq!(document["fan_rpm"], 1200);
+        let unavailable = document["unavailable"].as_array().unwrap();
+        for key in ["cpu_temp", "gpu_temp", "fan_rpm"] {
+            assert!(
+                !unavailable.iter().any(|value| value == key),
+                "{key} must not be unavailable"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn labels_missing_sources_instead_of_reporting_zero() {
         let root = std::env::temp_dir().join(format!(
             "ozma-agent-metrics-missing-{}-{}",
@@ -529,6 +632,7 @@ mod tests {
         let paths = MetricsPaths {
             proc_root: root.join("proc-does-not-exist"),
             disk_path: root.join("disk-does-not-exist"),
+            hwmon_root: root.join("hwmon-does-not-exist"),
         };
         let document = AgentMetricsSampler::default().collect_with(&paths, "missing-node");
 

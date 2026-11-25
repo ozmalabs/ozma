@@ -1,0 +1,116 @@
+{
+  "poll_interval_secs": 5,
+  "min_dwell_secs": 30,
+  "max_sensor_age_secs": 15,
+  "failsafe_duty_percent": 70,
+  "fans": [
+    {
+      "id": "hwmon:it87:pwm1",
+      "name": "CPU fan",
+      "count": 1,
+      "min_rpm": 400,
+      "max_rpm": 1600,
+      "noise_at_idle_dba": 16.0,
+      "noise_dba": 30.0,
+      "noise_points": [
+        { "rpm": 400, "dba": 16.0 },
+        { "rpm": 800, "dba": 22.0 },
+        { "rpm": 1200, "dba": 27.0 },
+        { "rpm": 1600, "dba": 30.0 }
+      ],
+      "location": "cpu",
+      "controllable": true
+    },
+    {
+      "id": "hwmon:it87:pwm2",
+      "name": "Case exhaust",
+      "count": 2,
+      "min_rpm": 300,
+      "max_rpm": 1200,
+      "noise_at_idle_dba": 14.0,
+      "noise_dba": 26.0,
+      "location": "case",
+      "controllable": true
+    }
+  ],
+  "zones": [
+    {
+      "id": "cpu",
+      "name": "CPU / VRM",
+      "sensor_ids": ["hwmon:coretemp:temp1"],
+      "fan_ids": ["hwmon:it87:pwm1", "hwmon:it87:pwm2"],
+      "curve_id": "cpu_balanced",
+      "limits": {
+        "safe_c": 80.0,
+        "warning_c": 88.0,
+        "critical_c": 95.0,
+        "shutdown_c": 105.0
+      }
+    },
+    {
+      "id": "gpu",
+      "name": "GPU",
+      "sensor_ids": ["hwmon:amdgpu:temp1"],
+      "fan_ids": ["hwmon:it87:pwm2"],
+      "curve_id": "gpu_balanced",
+      "limits": {
+        "safe_c": 80.0,
+        "warning_c": 88.0,
+        "critical_c": 95.0
+      }
+    }
+  ],
+  "curves": [
+    {
+      "id": "cpu_balanced",
+      "name": "Balanced",
+      "zone": "cpu",
+      "sensor_ids": ["hwmon:coretemp:temp1"],
+      "sensor_mode": "max",
+      "points": [
+        { "temp_c": 30.0, "duty_percent": 20.0 },
+        { "temp_c": 50.0, "duty_percent": 30.0 },
+        { "temp_c": 65.0, "duty_percent": 50.0 },
+        { "temp_c": 80.0, "duty_percent": 80.0 },
+        { "temp_c": 88.0, "duty_percent": 100.0 }
+      ],
+      "hysteresis_c": 3.0,
+      "ramp_rate_percent_per_sec": 8.0,
+      "min_duty_percent": 20.0,
+      "max_duty_percent": 100.0,
+      "noise_cap": {
+        "comfort_dba": 28.0,
+        "warning_dba": 40.0
+      },
+      "critical_override": {
+        "threshold_c": 95.0,
+        "action": "max_speed"
+      }
+    },
+    {
+      "id": "gpu_balanced",
+      "name": "GPU Balanced",
+      "zone": "gpu",
+      "sensor_ids": ["hwmon:amdgpu:temp1"],
+      "sensor_mode": "max",
+      "points": [
+        { "temp_c": 35.0, "duty_percent": 20.0 },
+        { "temp_c": 60.0, "duty_percent": 40.0 },
+        { "temp_c": 78.0, "duty_percent": 75.0 },
+        { "temp_c": 88.0, "duty_percent": 100.0 }
+      ],
+      "hysteresis_c": 3.0,
+      "ramp_rate_percent_per_sec": 10.0,
+      "min_duty_percent": 20.0,
+      "max_duty_percent": 100.0,
+      "noise_cap": {
+        "comfort_dba": 30.0,
+        "warning_dba": 42.0
+      },
+      "critical_override": {
+        "threshold_c": 95.0,
+        "action": "max_speed"
+      }
+    }
+  ]
+}

@@ -27,6 +27,7 @@ pub mod rtsp_runtime;
 pub mod scene_replay;
 pub mod shutdown;
 pub mod software;
+pub mod thermal;
 pub mod transport;
 pub mod usb_audio;
 pub mod webrtc;

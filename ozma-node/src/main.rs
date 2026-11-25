@@ -20,6 +20,7 @@ use ozma_input::SinkKind;
 use ozma_power::{LibvirtPower, PowerBackend, QmpPower};
 use ozma_protocol::NodeId;
 use ozma_qmp::SharedQmpClient;
+use ozma_thermal::ThermalStatus;
 use ozma_usb::{
     ConfigFsUsbController, FunctionFsConfig, FunctionFsDaemonSpec, MassStorageImage, UsbError,
     UsbFunction, UsbGadgetConfig, UsbGadgetController,
@@ -483,6 +484,29 @@ pub struct Args {
     /// Heartbeat interval in seconds (default 30).
     #[arg(long, default_value_t = 30)]
     pub heartbeat_interval: u64,
+
+    /// Thermal policy JSON (fan curves, zones, fan specs, safe limits).
+    ///
+    /// Without a policy the node exposes read-only temperatures and fan speeds.
+    /// Fan control also requires `--thermal-control`.
+    #[arg(long, env = "OZMA_THERMAL_CONFIG", value_name = "PATH")]
+    pub thermal_config: Option<std::path::PathBuf>,
+
+    /// Allow PWM fan writes. Off by default; control also requires a policy.
+    #[arg(long, env = "OZMA_THERMAL_CONTROL")]
+    pub thermal_control: bool,
+
+    /// Thermal sensor/control poll interval in seconds.
+    #[arg(long, env = "OZMA_THERMAL_INTERVAL", default_value_t = 5)]
+    pub thermal_interval: u64,
+
+    /// sysfs hwmon root (default `/sys/class/hwmon`; overridable for tests).
+    #[arg(
+        long,
+        env = "OZMA_THERMAL_HWMON_ROOT",
+        default_value = ozma_thermal::DEFAULT_HWMON_ROOT
+    )]
+    pub thermal_hwmon_root: String,
 
     /// Replay a trusted local browser scene fixture in scene-capable sessions.
     #[arg(long)]
@@ -1947,10 +1971,38 @@ async fn run() -> std::process::ExitCode {
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with
     // `--api-token`. See `controller_compat::{compat_router, public_router}`.
+    let thermal_options = ozma_node::thermal::ThermalOptions {
+        policy_path: args.thermal_config.clone(),
+        control: args.thermal_control,
+        interval_secs: args.thermal_interval,
+        hwmon_root: std::path::PathBuf::from(&args.thermal_hwmon_root),
+    };
+    let thermal_policy = args.thermal_config.as_deref().and_then(|path| {
+        match ozma_node::thermal::load_policy(path) {
+            Ok(policy) => Some(Arc::new(policy)),
+            Err(error) => {
+                error!(error = %error, "thermal policy could not be loaded");
+                None
+            }
+        }
+    });
+    let thermal_status = Arc::new(RwLock::new(ThermalStatus::default()));
+    let thermal_router = ozma_node::thermal::router(thermal_status.clone(), thermal_policy);
     let hardware_router = ozma_node::hardware::router(ozma_node::hardware::HardwareState::new());
-    let compat_router =
-        controller_compat::compat_router(compat_state.clone()).merge(hardware_router);
+    let compat_router = controller_compat::compat_router(compat_state.clone())
+        .merge(thermal_router)
+        .merge(hardware_router);
     let public_compat_router = controller_compat::public_router(compat_state);
+
+    // Thermal sampling runs read-only unless a policy and --thermal-control are
+    // both present. It restores the original hwmon automatic mode on shutdown.
+    let thermal_shutdown = shutdown.clone();
+    background.push((
+        "thermal",
+        tokio::spawn(async move {
+            ozma_node::thermal::run(thermal_options, thermal_status, thermal_shutdown).await;
+        }),
+    ));
 
     // Idle console sources must not stay open forever when no snapshot is
     // requested. The timer uses the same shutdown token as the other tasks.
