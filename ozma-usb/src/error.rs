@@ -120,6 +120,26 @@ pub enum UsbError {
         reason: String,
     },
 
+    /// An operation needs the kernel `vhci_hcd`/`usbip-host` data path.
+    #[error("USB/IP {operation} requires the kernel vhci_hcd/usbip-host path: {reason}")]
+    UsbIpKernelRequired {
+        /// Operation that needs the kernel (`attach`, `detach`, `export`, ...).
+        operation: &'static str,
+        /// Explicit reason/remediation.
+        reason: String,
+    },
+
+    /// The in-process USB/IP daemon has not been started.
+    #[error("USB/IP daemon is not running")]
+    UsbIpDaemonStopped,
+
+    /// The in-process USB/IP daemon is at its bounded connection limit.
+    #[error("USB/IP daemon connection limit of {limit} reached")]
+    UsbIpConnectionLimit {
+        /// Configured limit.
+        limit: usize,
+    },
+
     /// A `usbip`/NBD response could not be parsed.
     #[error("invalid {protocol} response: {reason}")]
     Protocol {
@@ -385,6 +405,9 @@ impl UsbError {
             Self::UsbIpDisabled => "usbip-disabled",
             Self::UsbIpUnauthorized { .. } => "usbip-unauthorized",
             Self::UsbIpTlsUnsupported { .. } => "usbip-tls-unsupported",
+            Self::UsbIpKernelRequired { .. } => "usbip-kernel-required",
+            Self::UsbIpDaemonStopped => "usbip-daemon-stopped",
+            Self::UsbIpConnectionLimit { .. } => "usbip-connection-limit",
             Self::Protocol { .. } => "protocol-error",
             Self::ConfigFs { .. } => "configfs-io",
             Self::Io { .. } => "io",

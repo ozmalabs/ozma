@@ -92,6 +92,7 @@ controller; `ozma-node` has no registration field for those yet.
 | `--webrtc-socket-dir <dir>` | `--webrtc-socket <dir>/<vm>.sock` | Per VM, so children cannot collide. |
 | `--webrtc-shm-dir <dir>` | `--webrtc-shm <dir>/<vm>.shm` | Per VM. |
 | `--webrtc-width/-height/-fps/-bitrate-kbps` | same | |
+| `--webrtc-fit-capture` | `--webrtc-fit-capture` | Uses each VM's runtime capture size; needed for QMP/VNC heads. |
 | `--webrtc-audio-from-sink` | `--webrtc-audio-source <sink>.monitor` | Only when a per-VM audio sink exists. |
 | `--webrtc-audio-backend <auto\|pulse\|pipewire>` | `--webrtc-audio-backend <value>` | |
 | `--webrtc-stun <uri>` | `--webrtc-stun <uri>` | |

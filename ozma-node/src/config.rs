@@ -1223,6 +1223,16 @@ pub struct NodeConfig {
     pub usb_vendor: bool,
     /// Optional absolute FunctionFS daemon path (`--usb-vendor-daemon`).
     pub usb_vendor_daemon: Option<PathBuf>,
+    /// Start the UAC2 isochronous ↔ host-audio bridge (`--usb-uac2-bridge`).
+    ///
+    /// Requires `--usb-uac2`, a bound UAC2 gadget with its ALSA card present,
+    /// and usable host audio devices. Without this flag the UAC2 function is
+    /// descriptor-only and `/usb` reports a typed `unsupported` bridge.
+    pub usb_uac2_bridge: bool,
+    /// Host playback device receiving host→device UAC2 PCM.
+    pub usb_uac2_sink_device: String,
+    /// Host capture device feeding device→host UAC2 PCM.
+    pub usb_uac2_source_device: String,
 }
 
 impl NodeConfig {
@@ -1623,6 +1633,15 @@ impl NodeConfig {
         if (self.usb_uac2 || self.usb_vendor) && !self.usb_gadget {
             return Err("--usb-uac2/--usb-vendor require --usb-gadget".to_owned());
         }
+        if self.usb_uac2_bridge && !self.usb_uac2 {
+            return Err("--usb-uac2-bridge requires --usb-uac2".to_owned());
+        }
+        if self.usb_uac2_bridge && self.usb_uac2_sink_device.trim().is_empty() {
+            return Err("--usb-uac2-sink-device must not be empty".to_owned());
+        }
+        if self.usb_uac2_bridge && self.usb_uac2_source_device.trim().is_empty() {
+            return Err("--usb-uac2-source-device must not be empty".to_owned());
+        }
         if self.usb_vendor_daemon.is_some() && !self.usb_vendor {
             return Err("--usb-vendor-daemon requires --usb-vendor".to_owned());
         }
@@ -1934,6 +1953,9 @@ mod tests {
             usb_uac2: false,
             usb_vendor: false,
             usb_vendor_daemon: None,
+            usb_uac2_bridge: false,
+            usb_uac2_sink_device: "default".to_owned(),
+            usb_uac2_source_device: "default".to_owned(),
         }
     }
 

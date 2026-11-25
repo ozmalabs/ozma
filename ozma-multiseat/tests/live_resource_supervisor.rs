@@ -133,6 +133,7 @@ fn live_supervisor_applies_and_releases_ownership_and_routing() {
             dry_run: false,
             apply_ownership: true,
             apply_routing: true,
+            input_isolation: false,
         },
         std::sync::Arc::new(ProcessLauncher),
         std::sync::Arc::new(HttpHealthProbe::default()),

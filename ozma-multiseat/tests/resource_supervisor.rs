@@ -180,6 +180,7 @@ fn options(dry_run: bool, apply_ownership: bool, apply_routing: bool) -> Supervi
         dry_run,
         apply_ownership,
         apply_routing,
+        input_isolation: false,
     }
 }
 

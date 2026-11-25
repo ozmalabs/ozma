@@ -14,6 +14,8 @@ thiserror = "1"
 tokio = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+evdev = "0.12"
+libc = { workspace = true }
 nix = { version = "0.30", features = ["signal"] }
 
 [dev-dependencies]

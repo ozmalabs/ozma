@@ -227,6 +227,303 @@ impl FunctionFsLifecyclePhase {
     }
 }
 
+/// Device-level FunctionFS state, driven by descriptor writes and the
+/// `usb_functionfs_event` stream.
+///
+/// This is stricter and more precise than [`FunctionFsLifecyclePhase`], which
+/// describes the ConfigFS/mount sequence. A daemon only reaches
+/// [`FunctionFsDeviceState::Running`] after at least one endpoint transfer has
+/// completed; an enable event alone is [`FunctionFsDeviceState::Enabled`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionFsDeviceState {
+    /// No descriptors have been written and no event has been observed.
+    #[default]
+    Unconfigured,
+    /// The descriptor blob and string table were accepted by `ep0`.
+    DescriptorsBound,
+    /// The daemon has an `ep0` event stream it can service.
+    Ep0Ready,
+    /// The UDC/host enabled the function; endpoints are open.
+    Enabled,
+    /// At least one endpoint transfer completed after enable.
+    Running,
+    /// The host disabled the function; endpoints are closed.
+    Disabled,
+    /// The function was unbound from its UDC/configuration.
+    Unbound,
+}
+
+impl FunctionFsDeviceState {
+    /// Stable lower-case name used in JSON and API responses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unconfigured => "unconfigured",
+            Self::DescriptorsBound => "descriptors_bound",
+            Self::Ep0Ready => "ep0_ready",
+            Self::Enabled => "enabled",
+            Self::Running => "running",
+            Self::Disabled => "disabled",
+            Self::Unbound => "unbound",
+        }
+    }
+}
+
+/// Observable device state plus explicit UDC/readiness predicates.
+///
+/// `running` is never inferred from descriptors, a mount, a bind, or an enable
+/// event: it requires an endpoint transfer counted by
+/// [`FunctionFsStateMachine::record_endpoint_event`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionFsDeviceStatus {
+    /// Current device state.
+    pub state: FunctionFsDeviceState,
+    /// Descriptor blob and strings were accepted.
+    pub descriptors_bound: bool,
+    /// The daemon can service the `ep0` event stream.
+    pub ep0_ready: bool,
+    /// ConfigFS currently has a UDC written.
+    pub udc_bound: bool,
+    /// Function enabled (or enabled and running).
+    pub enabled: bool,
+    /// Endpoint traffic has been observed.
+    pub running: bool,
+    /// Successful endpoint transfers observed.
+    pub endpoint_events: u64,
+}
+
+impl FunctionFsDeviceStatus {
+    /// Whether a UDC may be written now.
+    pub fn udc_bind_ready(&self) -> bool {
+        self.ep0_ready && !self.udc_bound
+    }
+
+    /// Whether the UDC attribute may be cleared now.
+    pub fn udc_unbind_ready(&self) -> bool {
+        self.udc_bound
+    }
+}
+
+/// A small, testable FunctionFS state machine.
+///
+/// Transitions are explicit and reject out-of-order kernel events with
+/// [`UsbError::InvalidFunctionFsState`]. The machine performs no I/O; the
+/// daemon core and [`FunctionFsLifecycle`] feed it descriptor-write, bind,
+/// enable, endpoint-transfer, disable, and unbind observations.
+#[derive(Clone, Debug, Default)]
+pub struct FunctionFsStateMachine {
+    state: FunctionFsDeviceState,
+    descriptors_bound: bool,
+    ep0_ready: bool,
+    udc_bound: bool,
+    endpoint_events: u64,
+}
+
+impl FunctionFsStateMachine {
+    /// A fresh, unconfigured machine.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Current state.
+    pub fn state(&self) -> FunctionFsDeviceState {
+        self.state
+    }
+
+    /// Snapshot for status surfaces.
+    pub fn status(&self) -> FunctionFsDeviceStatus {
+        FunctionFsDeviceStatus {
+            state: self.state,
+            descriptors_bound: self.descriptors_bound,
+            ep0_ready: self.ep0_ready,
+            udc_bound: self.udc_bound,
+            enabled: matches!(
+                self.state,
+                FunctionFsDeviceState::Enabled | FunctionFsDeviceState::Running
+            ),
+            running: self.state == FunctionFsDeviceState::Running,
+            endpoint_events: self.endpoint_events,
+        }
+    }
+
+    /// Whether descriptors/strings were bound to `ep0`.
+    pub fn descriptors_bound(&self) -> bool {
+        self.descriptors_bound
+    }
+
+    /// Whether the `ep0` event stream is ready.
+    pub fn ep0_ready(&self) -> bool {
+        self.ep0_ready
+    }
+
+    /// Whether ConfigFS currently has a UDC written.
+    pub fn udc_bound(&self) -> bool {
+        self.udc_bound
+    }
+
+    /// Whether the function is enabled.
+    pub fn is_enabled(&self) -> bool {
+        matches!(
+            self.state,
+            FunctionFsDeviceState::Enabled | FunctionFsDeviceState::Running
+        )
+    }
+
+    /// Whether endpoint traffic has been observed.
+    pub fn is_running(&self) -> bool {
+        self.state == FunctionFsDeviceState::Running
+    }
+
+    /// Whether writing a UDC is allowed (descriptors + ep0, not already bound).
+    pub fn udc_bind_ready(&self) -> bool {
+        self.ep0_ready && !self.udc_bound
+    }
+
+    /// Whether clearing the UDC attribute is allowed.
+    pub fn udc_unbind_ready(&self) -> bool {
+        self.udc_bound
+    }
+
+    /// Record that the descriptor blob and string table were accepted.
+    pub fn bind_descriptors(&mut self) -> Result<(), UsbError> {
+        if !matches!(
+            self.state,
+            FunctionFsDeviceState::Unconfigured
+                | FunctionFsDeviceState::Unbound
+                | FunctionFsDeviceState::DescriptorsBound
+        ) {
+            return Err(invalid_state(format!(
+                "descriptors cannot be bound in state {}",
+                self.state.as_str()
+            )));
+        }
+        self.descriptors_bound = true;
+        self.ep0_ready = false;
+        self.udc_bound = false;
+        self.state = FunctionFsDeviceState::DescriptorsBound;
+        Ok(())
+    }
+
+    /// Record that the daemon can service the `ep0` event stream.
+    pub fn mark_ep0_ready(&mut self) -> Result<(), UsbError> {
+        if !self.descriptors_bound {
+            return Err(invalid_state(
+                "ep0 cannot become ready before descriptors are bound",
+            ));
+        }
+        if !matches!(
+            self.state,
+            FunctionFsDeviceState::DescriptorsBound
+                | FunctionFsDeviceState::Ep0Ready
+                | FunctionFsDeviceState::Unbound
+                | FunctionFsDeviceState::Disabled
+        ) {
+            return Err(invalid_state(format!(
+                "ep0 readiness cannot be recorded in state {}",
+                self.state.as_str()
+            )));
+        }
+        self.ep0_ready = true;
+        self.udc_bound = false;
+        self.state = FunctionFsDeviceState::Ep0Ready;
+        Ok(())
+    }
+
+    /// Record a UDC bind. Only valid once `ep0` is ready and no UDC is bound.
+    pub fn bind_udc(&mut self) -> Result<(), UsbError> {
+        if !self.ep0_ready {
+            return Err(invalid_state("a UDC cannot be bound before ep0 readiness"));
+        }
+        if self.udc_bound {
+            return Err(invalid_state("a UDC is already bound"));
+        }
+        self.udc_bound = true;
+        if matches!(
+            self.state,
+            FunctionFsDeviceState::Unbound
+                | FunctionFsDeviceState::Disabled
+                | FunctionFsDeviceState::DescriptorsBound
+        ) {
+            self.state = FunctionFsDeviceState::Ep0Ready;
+        }
+        Ok(())
+    }
+
+    /// Record a FunctionFS `ENABLE` event.
+    pub fn enable(&mut self) -> Result<(), UsbError> {
+        if !self.ep0_ready {
+            return Err(invalid_state(
+                "the function cannot be enabled before ep0 readiness",
+            ));
+        }
+        if !matches!(
+            self.state,
+            FunctionFsDeviceState::Ep0Ready
+                | FunctionFsDeviceState::Disabled
+                | FunctionFsDeviceState::Unbound
+                | FunctionFsDeviceState::Enabled
+                | FunctionFsDeviceState::Running
+        ) {
+            return Err(invalid_state(format!(
+                "the function cannot be enabled in state {}",
+                self.state.as_str()
+            )));
+        }
+        if matches!(
+            self.state,
+            FunctionFsDeviceState::Enabled | FunctionFsDeviceState::Running
+        ) {
+            return Ok(());
+        }
+        self.state = FunctionFsDeviceState::Enabled;
+        Ok(())
+    }
+
+    /// Record a completed endpoint transfer.
+    ///
+    /// This is the only transition to [`FunctionFsDeviceState::Running`].
+    pub fn record_endpoint_event(&mut self) -> Result<(), UsbError> {
+        if !self.is_enabled() {
+            return Err(invalid_state(format!(
+                "endpoint traffic requires an enabled function; state is {}",
+                self.state.as_str()
+            )));
+        }
+        self.endpoint_events = self.endpoint_events.saturating_add(1);
+        self.state = FunctionFsDeviceState::Running;
+        Ok(())
+    }
+
+    /// Record a FunctionFS `DISABLE` event.
+    pub fn disable(&mut self) -> Result<(), UsbError> {
+        if !self.is_enabled() {
+            return Err(invalid_state(format!(
+                "the function cannot be disabled in state {}",
+                self.state.as_str()
+            )));
+        }
+        self.state = FunctionFsDeviceState::Disabled;
+        Ok(())
+    }
+
+    /// Record a FunctionFS `UNBIND` event or a cleared UDC attribute.
+    pub fn record_unbind(&mut self) -> Result<(), UsbError> {
+        if !self.descriptors_bound {
+            return Err(invalid_state(
+                "an unbound function never had bound descriptors",
+            ));
+        }
+        self.udc_bound = false;
+        self.state = FunctionFsDeviceState::Unbound;
+        Ok(())
+    }
+
+    /// Clear everything (lifecycle cleanup/reset).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Observable lifecycle status. Paths are supplied for local diagnostics; the
 /// node can omit them at its API boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,8 +550,32 @@ pub struct FunctionFsLifecycleStatus {
     pub ep0_written: bool,
     /// Whether the string table was written by this lifecycle.
     pub strings_written: bool,
+    /// Device-level state driven by descriptor writes and daemon events.
+    #[serde(default)]
+    pub device: FunctionFsDeviceStatus,
     /// Marker/daemon readiness and descriptor summary.
     pub function_fs: FunctionFsStatus,
+}
+
+impl FunctionFsLifecycleStatus {
+    /// Whether endpoint traffic has actually been observed.
+    ///
+    /// The ConfigFS lifecycle helper never opens data endpoints, so this is
+    /// always `false` here unless a daemon explicitly shares its state; a bind
+    /// or readiness marker is never enough to claim `running`.
+    pub fn running(&self) -> bool {
+        self.device.running
+    }
+
+    /// Whether a UDC write is currently allowed.
+    pub fn udc_bind_ready(&self) -> bool {
+        self.device.udc_bind_ready()
+    }
+
+    /// Whether the UDC attribute can be cleared.
+    pub fn udc_unbind_ready(&self) -> bool {
+        self.device.udc_unbind_ready()
+    }
 }
 
 /// Injectable FunctionFS mount implementation.
@@ -558,6 +879,7 @@ pub struct FunctionFsLifecycle {
     mounted_by_us: bool,
     ep0_written: bool,
     strings_written: bool,
+    device: FunctionFsStateMachine,
 }
 
 impl std::fmt::Debug for FunctionFsLifecycle {
@@ -566,6 +888,7 @@ impl std::fmt::Debug for FunctionFsLifecycle {
             .debug_struct("FunctionFsLifecycle")
             .field("config", &self.config)
             .field("phase", &self.phase)
+            .field("state", &self.device.state())
             .field(
                 "mounter",
                 &self.mounter.as_ref().map(|mounter| mounter.name()),
@@ -592,6 +915,7 @@ impl FunctionFsLifecycle {
             mounted_by_us: false,
             ep0_written: false,
             strings_written: false,
+            device: FunctionFsStateMachine::new(),
         })
     }
 
@@ -617,6 +941,20 @@ impl FunctionFsLifecycle {
         self.phase
     }
 
+    /// Device-level state machine snapshot.
+    pub fn device_status(&self) -> FunctionFsDeviceStatus {
+        self.device.status()
+    }
+
+    /// Whether endpoint traffic has been observed by this lifecycle.
+    ///
+    /// The lifecycle helper never opens data endpoints, so this is always
+    /// `false`; use [`FunctionFsDaemonCore`](crate::FunctionFsDaemonCore) for
+    /// live endpoint state.
+    pub fn is_running(&self) -> bool {
+        self.device.is_running()
+    }
+
     /// Expected/actual mountpoint.
     pub fn mountpoint(&self) -> PathBuf {
         self.config.expected_mountpoint()
@@ -639,6 +977,7 @@ impl FunctionFsLifecycle {
             )));
         }
         self.config.validate()?;
+        self.device.reset();
         let gadget = self.gadget_config();
         gadget.validate()?;
         self.controller.create_gadget(&gadget)?;
@@ -736,6 +1075,7 @@ impl FunctionFsLifecycle {
         }
         let descriptors = self.config.function.ep0_descriptors()?;
         FunctionFsMount::new(self.mountpoint()).write_descriptors(&descriptors)?;
+        self.device.bind_descriptors()?;
         self.ep0_written = true;
         self.strings_written = true;
         if matches!(
@@ -774,6 +1114,7 @@ impl FunctionFsLifecycle {
             });
         }
         if self.config.function.readiness().is_ready() {
+            self.device.mark_ep0_ready()?;
             self.phase = FunctionFsLifecyclePhase::Ready;
             return Ok(self.status());
         }
@@ -792,6 +1133,7 @@ impl FunctionFsLifecycle {
             let remaining = timeout_ms - elapsed;
             self.clock.sleep(poll.min(remaining));
             if self.config.function.readiness().is_ready() {
+                self.device.mark_ep0_ready()?;
                 self.phase = FunctionFsLifecyclePhase::Ready;
                 return Ok(self.status());
             }
@@ -811,8 +1153,15 @@ impl FunctionFsLifecycle {
                 self.phase.as_str()
             )));
         }
+        if !self.device.udc_bind_ready() {
+            return Err(invalid_state(format!(
+                "bind requires ep0 readiness without an existing UDC; device state is {}",
+                self.device.state().as_str()
+            )));
+        }
         match self.controller.bind(&self.config.gadget, &self.config.udc) {
             Ok(_) => {
+                self.device.bind_udc()?;
                 self.phase = FunctionFsLifecyclePhase::Bound;
                 Ok(self.status())
             }
@@ -826,7 +1175,20 @@ impl FunctionFsLifecycle {
 
     /// Clear the UDC binding while keeping the function and mount in place.
     pub fn unbind(&mut self) -> Result<FunctionFsLifecycleStatus, UsbError> {
+        let bound = self
+            .controller
+            .status(&self.config.gadget)
+            .map(|status| status.bound)
+            .unwrap_or(false);
+        if !bound && !self.device.udc_bound() {
+            return Err(invalid_state(
+                "unbind requires a bound UDC; no UDC attribute is set",
+            ));
+        }
         self.controller.unbind(&self.config.gadget)?;
+        if self.device.udc_bound() {
+            self.device.record_unbind()?;
+        }
         if self.phase == FunctionFsLifecyclePhase::Bound {
             self.phase = FunctionFsLifecyclePhase::Ready;
         }
@@ -858,6 +1220,7 @@ impl FunctionFsLifecycle {
         self.mounted_by_us = false;
         self.ep0_written = false;
         self.strings_written = false;
+        self.device.reset();
         self.phase = FunctionFsLifecyclePhase::TornDown;
         match first_error {
             Some(error) => Err(error),
@@ -874,6 +1237,10 @@ impl FunctionFsLifecycle {
             .status(&self.config.gadget)
             .map(|status| status.bound)
             .unwrap_or(false);
+        let mut device = self.device.status();
+        if bound {
+            device.udc_bound = true;
+        }
         FunctionFsLifecycleStatus {
             phase: self.phase,
             gadget: self.config.gadget.clone(),
@@ -886,6 +1253,7 @@ impl FunctionFsLifecycle {
             mounted: self.mounted,
             ep0_written: self.ep0_written,
             strings_written: self.strings_written,
+            device,
             function_fs: self.config.function.status(),
         }
     }
@@ -902,6 +1270,7 @@ impl FunctionFsLifecycle {
         self.mounted_by_us = false;
         self.ep0_written = false;
         self.strings_written = false;
+        self.device.reset();
     }
 
     fn gadget_config(&self) -> UsbGadgetConfig {

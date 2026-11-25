@@ -14,6 +14,11 @@ use crate::display::{DisplayBackend, DisplayOutput};
 use crate::error::MultiseatError;
 use crate::hotplug::{HotplugEvent, HotplugMonitor};
 use crate::input::{InputBackend, InputDevice};
+use crate::input_isolation::{
+    default_uinput_name, HelperBackend, HelperBackendKind, HelperDevice, HelperError,
+    HelperErrorCode, HelperResponse, HelperSeatStatus, InputIsolationAssignment,
+    InputIsolationRelease, SeatInputHelper, HELPER_PROTOCOL_VERSION,
+};
 use crate::routing::{
     CommandOutput, CommandRunner, DeviceNameResolver, EvdevGrabBackend, EvdevGrabRequest,
     RouteCommand,
@@ -913,5 +918,454 @@ impl HotplugMonitor for FakeHotplugMonitor {
             return Err(MultiseatError::Hotplug(message));
         }
         Ok(state.pending.drain(..).collect())
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeHelperBackendState {
+    grabbed: BTreeSet<String>,
+    uinputs: BTreeMap<String, String>,
+    events: Vec<String>,
+    fail_paths: BTreeSet<String>,
+    fail_next_grab: Option<String>,
+    fail_uinput: Option<String>,
+    fail_release: Option<String>,
+    next_uinput: usize,
+}
+
+/// In-memory ioctl/uinput backend for the helper state machine.
+///
+/// It records every grab/uinput/relay action and never opens `/dev/input` or
+/// `/dev/uinput`. Failures are injectable per path.
+#[derive(Clone, Debug, Default)]
+pub struct FakeHelperBackend {
+    state: Arc<Mutex<FakeHelperBackendState>>,
+}
+
+impl FakeHelperBackend {
+    /// An empty backend.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Always fail grabs for one path.
+    pub fn fail_device(self, path: impl Into<String>) -> Self {
+        self.state
+            .lock()
+            .expect("fake helper backend lock")
+            .fail_paths
+            .insert(path.into());
+        self
+    }
+
+    /// Fail the next grab with a typed message.
+    pub fn fail_next_grab(self, message: impl Into<String>) -> Self {
+        self.state
+            .lock()
+            .expect("fake helper backend lock")
+            .fail_next_grab = Some(message.into());
+        self
+    }
+
+    /// Fail uinput creation for one path.
+    pub fn fail_uinput(self, path: impl Into<String>) -> Self {
+        self.state
+            .lock()
+            .expect("fake helper backend lock")
+            .fail_uinput = Some(path.into());
+        self
+    }
+
+    /// Fail the next release.
+    pub fn fail_next_release(self, message: impl Into<String>) -> Self {
+        self.state
+            .lock()
+            .expect("fake helper backend lock")
+            .fail_release = Some(message.into());
+        self
+    }
+
+    /// Currently grabbed paths, sorted.
+    pub fn grabbed(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake helper backend lock")
+            .grabbed
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Created uinput names, sorted by name.
+    pub fn uinput_names(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake helper backend lock")
+            .uinputs
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Recorded backend events, in order.
+    pub fn events(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake helper backend lock")
+            .events
+            .clone()
+    }
+}
+
+impl HelperBackend for FakeHelperBackend {
+    fn backend_kind(&self) -> HelperBackendKind {
+        HelperBackendKind::Fake
+    }
+
+    fn grab(&mut self, device: &HelperDevice) -> Result<(), HelperError> {
+        let mut state = self.state.lock().expect("fake helper backend lock");
+        if let Some(message) = state.fail_next_grab.take() {
+            return Err(HelperError::new(HelperErrorCode::GrabFailed, message));
+        }
+        if state.fail_paths.contains(&device.path) {
+            return Err(
+                HelperError::new(HelperErrorCode::GrabFailed, "injected grab failure")
+                    .with_device(&device.path),
+            );
+        }
+        if !state.grabbed.insert(device.path.clone()) {
+            return Err(HelperError::new(
+                HelperErrorCode::CrossSeatConflict,
+                format!("{} is already grabbed", device.path),
+            ));
+        }
+        state.events.push(format!("grab {}", device.path));
+        Ok(())
+    }
+
+    fn ungrab(&mut self, path: &str) -> Result<(), HelperError> {
+        let mut state = self.state.lock().expect("fake helper backend lock");
+        state.grabbed.remove(path);
+        state.events.push(format!("ungrab {path}"));
+        Ok(())
+    }
+
+    fn create_uinput(
+        &mut self,
+        seat_id: &str,
+        device: &HelperDevice,
+    ) -> Result<String, HelperError> {
+        let mut state = self.state.lock().expect("fake helper backend lock");
+        if state.fail_uinput.as_deref() == Some(device.path.as_str()) {
+            state.fail_uinput = None;
+            return Err(
+                HelperError::new(HelperErrorCode::UinputFailed, "injected uinput failure")
+                    .with_device(&device.path),
+            );
+        }
+        let name = if state.next_uinput == 0 {
+            default_uinput_name(seat_id, &device.path)
+        } else {
+            format!("fake-uinput-{}-{}", seat_id, state.next_uinput)
+        };
+        state.next_uinput += 1;
+        state.uinputs.insert(name.clone(), device.path.clone());
+        state
+            .events
+            .push(format!("uinput {} -> {}", name, device.path));
+        Ok(name)
+    }
+
+    fn start_relay(&mut self, device: &HelperDevice, uinput_name: &str) -> Result<(), HelperError> {
+        let mut state = self.state.lock().expect("fake helper backend lock");
+        if !state.grabbed.contains(&device.path) {
+            return Err(
+                HelperError::new(HelperErrorCode::Backend, "relay without grab")
+                    .with_device(&device.path),
+            );
+        }
+        state
+            .events
+            .push(format!("relay {} -> {}", device.path, uinput_name));
+        Ok(())
+    }
+
+    fn stop_relay(&mut self, path: &str) -> Result<(), HelperError> {
+        let mut state = self.state.lock().expect("fake helper backend lock");
+        if let Some(message) = state.fail_release.take() {
+            return Err(
+                HelperError::new(HelperErrorCode::Backend, message).with_device(path.to_owned())
+            );
+        }
+        state.grabbed.remove(path);
+        state.events.push(format!("stop-relay {path}"));
+        Ok(())
+    }
+
+    fn destroy_uinput(&mut self, name: &str) -> Result<(), HelperError> {
+        let mut state = self.state.lock().expect("fake helper backend lock");
+        state.uinputs.remove(name);
+        state.events.push(format!("destroy-uinput {name}"));
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct FakeSeatInputHelperState {
+    alive: bool,
+    starts: usize,
+    crashes: usize,
+    assignments: BTreeMap<String, HelperSeatStatus>,
+    events: Vec<String>,
+    fail_next_grab: Option<String>,
+    fail_seat: Option<String>,
+    fail_release: Option<String>,
+    fail_ready: Option<String>,
+    enforce_conflicts: bool,
+}
+
+/// Test-only [`SeatInputHelper`] with the same conflict rules as the real
+/// helper. It never starts a process or touches a device.
+#[derive(Clone, Debug)]
+pub struct FakeSeatInputHelper {
+    state: Arc<Mutex<FakeSeatInputHelperState>>,
+}
+
+impl Default for FakeSeatInputHelper {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(FakeSeatInputHelperState {
+                enforce_conflicts: true,
+                ..FakeSeatInputHelperState::default()
+            })),
+        }
+    }
+}
+
+impl FakeSeatInputHelper {
+    /// A dead helper that starts on the first `ensure_ready`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fail the next grab with a typed message.
+    pub fn fail_next_grab(self, message: impl Into<String>) -> Self {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .fail_next_grab = Some(message.into());
+        self
+    }
+
+    /// Always fail grabs for one seat.
+    pub fn fail_seat(self, seat_id: impl Into<String>) -> Self {
+        self.state.lock().expect("fake seat input lock").fail_seat = Some(seat_id.into());
+        self
+    }
+
+    /// Fail the next release with a typed message.
+    pub fn fail_next_release(self, message: impl Into<String>) -> Self {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .fail_release = Some(message.into());
+        self
+    }
+
+    /// Fail readiness/restart with a typed message.
+    pub fn fail_ready(self, message: impl Into<String>) -> Self {
+        self.state.lock().expect("fake seat input lock").fail_ready = Some(message.into());
+        self
+    }
+
+    /// Simulate a helper crash: the process is gone and the kernel dropped its
+    /// grabs. A later `ensure_ready` starts a fresh process.
+    pub fn crash(&self) {
+        let mut state = self.state.lock().expect("fake seat input lock");
+        state.alive = false;
+        state.crashes += 1;
+        state.assignments.clear();
+        state.events.push("crash".to_owned());
+    }
+
+    /// Number of helper starts, including the initial one.
+    pub fn start_count(&self) -> usize {
+        self.state.lock().expect("fake seat input lock").starts
+    }
+
+    /// Number of simulated crashes.
+    pub fn crash_count(&self) -> usize {
+        self.state.lock().expect("fake seat input lock").crashes
+    }
+
+    /// Grabbed paths for one seat.
+    pub fn grabbed(&self, seat_id: &str) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .assignments
+            .get(seat_id)
+            .map(|seat| seat.grabbed.clone())
+            .unwrap_or_default()
+    }
+
+    /// uinput names for one seat.
+    pub fn uinput_devices(&self, seat_id: &str) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .assignments
+            .get(seat_id)
+            .map(|seat| seat.uinput_devices.clone())
+            .unwrap_or_default()
+    }
+
+    /// Recorded client-visible events, in order.
+    pub fn events(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .events
+            .clone()
+    }
+
+    /// Whether a seat currently has a confirmed assignment.
+    pub fn has_assignment(&self, seat_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("fake seat input lock")
+            .assignments
+            .contains_key(seat_id)
+    }
+}
+
+impl SeatInputHelper for FakeSeatInputHelper {
+    fn ensure_ready(&mut self) -> Result<HelperResponse, MultiseatError> {
+        let mut state = self.state.lock().expect("fake seat input lock");
+        if let Some(message) = state.fail_ready.take() {
+            state.events.push("ready-failed".to_owned());
+            return Err(MultiseatError::InputIsolation(message));
+        }
+        if !state.alive {
+            state.alive = true;
+            state.starts += 1;
+            let starts = state.starts;
+            state.events.push(format!("start {starts}"));
+        }
+        Ok(HelperResponse::Ready {
+            protocol: HELPER_PROTOCOL_VERSION,
+            helper: "fake-seat-input".to_owned(),
+            backend: HelperBackendKind::Fake,
+            pid: 0,
+        })
+    }
+
+    fn grab(
+        &mut self,
+        seat_id: &str,
+        devices: &[HelperDevice],
+    ) -> Result<InputIsolationAssignment, MultiseatError> {
+        self.ensure_ready()?;
+        let mut state = self.state.lock().expect("fake seat input lock");
+        if let Some(message) = state.fail_next_grab.take() {
+            state.events.push(format!("grab-failed {seat_id}"));
+            return Err(MultiseatError::InputIsolation(message));
+        }
+        if state.fail_seat.as_deref() == Some(seat_id) {
+            state.events.push(format!("grab-failed {seat_id}"));
+            return Err(MultiseatError::InputIsolation(format!(
+                "injected grab failure for {seat_id}"
+            )));
+        }
+        if let Some(existing) = state.assignments.get(seat_id) {
+            let same = existing.grabbed.len() == devices.len()
+                && devices
+                    .iter()
+                    .all(|device| existing.grabbed.iter().any(|path| path == &device.path));
+            if same {
+                return Ok(InputIsolationAssignment {
+                    seat_id: seat_id.to_owned(),
+                    grabbed: existing.grabbed.clone(),
+                    uinput_devices: existing.uinput_devices.clone(),
+                });
+            }
+            return Err(MultiseatError::InputIsolation(format!(
+                "seat {seat_id} already owns a different device set"
+            )));
+        }
+        if state.enforce_conflicts {
+            let mut conflict = None;
+            for (other, assignment) in &state.assignments {
+                for device in devices {
+                    if assignment.grabbed.contains(&device.path) {
+                        conflict = Some((other.clone(), device.path.clone()));
+                        break;
+                    }
+                }
+                if conflict.is_some() {
+                    break;
+                }
+            }
+            if let Some((other, path)) = conflict {
+                state.events.push(format!("conflict {seat_id} {path}"));
+                return Err(MultiseatError::InputIsolation(format!(
+                    "device {path} is already grabbed for seat {other}"
+                )));
+            }
+        }
+        let grabbed: Vec<String> = devices.iter().map(|device| device.path.clone()).collect();
+        let uinput_devices: Vec<String> = devices
+            .iter()
+            .map(|device| default_uinput_name(seat_id, &device.path))
+            .collect();
+        state.assignments.insert(
+            seat_id.to_owned(),
+            HelperSeatStatus {
+                seat_id: seat_id.to_owned(),
+                grabbed: grabbed.clone(),
+                uinput_devices: uinput_devices.clone(),
+            },
+        );
+        state
+            .events
+            .push(format!("grab {seat_id} {}", grabbed.join(",")));
+        Ok(InputIsolationAssignment {
+            seat_id: seat_id.to_owned(),
+            grabbed,
+            uinput_devices,
+        })
+    }
+
+    fn release(&mut self, seat_id: &str) -> Result<InputIsolationRelease, MultiseatError> {
+        let mut state = self.state.lock().expect("fake seat input lock");
+        if let Some(message) = state.fail_release.take() {
+            state.events.push(format!("release-failed {seat_id}"));
+            return Err(MultiseatError::InputIsolation(message));
+        }
+        let released = state
+            .assignments
+            .remove(seat_id)
+            .map(|seat| seat.grabbed)
+            .unwrap_or_default();
+        state.events.push(format!("release {seat_id}"));
+        Ok(InputIsolationRelease {
+            seat_id: seat_id.to_owned(),
+            released,
+        })
+    }
+
+    fn seat_status(&mut self, seat_id: &str) -> Result<Option<HelperSeatStatus>, MultiseatError> {
+        let state = self.state.lock().expect("fake seat input lock");
+        if !state.alive {
+            return Ok(None);
+        }
+        Ok(state.assignments.get(seat_id).cloned())
+    }
+
+    fn shutdown(&mut self) {
+        let mut state = self.state.lock().expect("fake seat input lock");
+        state.alive = false;
+        state.assignments.clear();
+        state.events.push("shutdown".to_owned());
     }
 }

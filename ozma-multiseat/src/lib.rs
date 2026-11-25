@@ -21,6 +21,10 @@
 //!   command construction/execution through an injected runner, sysfs evdev
 //!   name resolution, seat assignment/rollback, and an exclusive-`EVIOCGRAB`
 //!   model with per-seat uinput environment.
+//! * [`input_isolation`] is the real per-seat grab path: a typed line/JSON
+//!   protocol, a testable helper state machine with path/duplicate/cross-seat
+//!   validation, and a non-privileged client for the `ozma-seat-input` helper.
+//!   The helper binary, not this library, opens `/dev/input` and `/dev/uinput`.
 //! * [`ownership`] models per-seat display ownership and builds
 //!   `xrandr --output ... --mode ... --pos ...` commands. On one X server this
 //!   is output positioning, not screen isolation.
@@ -35,12 +39,14 @@
 //! * [`audio`] is the synchronous per-seat null-sink seam over
 //!   [`ozma_audio::AudioRouter`]; it is only invoked when a router is installed.
 //!
-//! The crate performs no input injection, opens no evdev node, creates no
+//! The library performs no input injection, opens no evdev node, creates no
 //! virtual display, and allocates no PipeWire sink by default. Routing,
-//! ownership, and audio commands are only executed through explicitly injected
-//! runners/controllers; the default evdev grab backend returns a typed
-//! unsupported error. It contains no `unsafe` code (the Unix SIGTERM helper is
-//! the safe `nix` API).
+//! ownership, isolation, and audio commands are only executed through
+//! explicitly injected runners/controllers/helpers; the default evdev grab
+//! backend returns a typed unsupported error. The library contains no `unsafe`
+//! code (the Unix SIGTERM helper is the safe `nix` API); only the
+//! `ozma-seat-input` binary's `ioctl` module uses `unsafe`, to set a grabbed fd
+//! non-blocking.
 //!
 //! Test fakes in [`fake`] never touch the host. Production code must not select
 //! them from detection.
@@ -55,6 +61,7 @@ pub mod fake;
 pub mod host;
 pub mod hotplug;
 pub mod input;
+pub mod input_isolation;
 pub mod ownership;
 pub mod persistence;
 pub mod planner;
@@ -77,8 +84,9 @@ pub use drm::{
 pub use error::MultiseatError;
 pub use fake::{
     FakeCommandRunner, FakeDeviceNameResolver, FakeDisplayBackend, FakeEvdevGrabBackend,
-    FakeGrabAction, FakeGrabEvent, FakeHotplugMonitor, FakeInputBackend, FakeNodeLauncher,
-    FakeReadinessProbe, FakeSeatAudioRouter, FakeSeatSupervisor,
+    FakeGrabAction, FakeGrabEvent, FakeHelperBackend, FakeHotplugMonitor, FakeInputBackend,
+    FakeNodeLauncher, FakeReadinessProbe, FakeSeatAudioRouter, FakeSeatInputHelper,
+    FakeSeatSupervisor,
 };
 pub use host::HostTopology;
 pub use hotplug::{
@@ -89,6 +97,14 @@ pub use input::{
     classify_capabilities, group_inputs, usb_hub_path_from_sysfs, InputBackend, InputDevice,
     InputDeviceKind, InputGroup, SysfsInputBackend, DEFAULT_INPUT_DEV_ROOT,
     DEFAULT_SYSFS_INPUT_ROOT, INTERNAL_HUB,
+};
+pub use input_isolation::{
+    decode_request, decode_response, default_uinput_name, encode_request, encode_response,
+    helper_devices, validate_device_path, HelperBackend, HelperBackendKind, HelperClient,
+    HelperClientConfig, HelperDevice, HelperError, HelperErrorCode, HelperRequest, HelperResponse,
+    HelperSeatStatus, InputIsolationAssignment, InputIsolationHelper, InputIsolationRelease,
+    SeatInputHelper, DEVICE_PATH_PREFIX, HELPER_PROGRAM, HELPER_PROTOCOL_VERSION,
+    INPUT_ISOLATION_ROUTER_NAME,
 };
 pub use ownership::{
     apply_ownership, DisplayOwnership, DisplayOwnershipController, DisplayOwnershipKind,

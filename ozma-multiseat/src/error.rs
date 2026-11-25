@@ -191,6 +191,11 @@ pub enum MultiseatError {
     /// A hotplug poll or topology reconciliation failed.
     #[error("hotplug reconciliation error: {0}")]
     Hotplug(String),
+
+    /// The privileged seat-input helper could not be started, refused a
+    /// request, or lost a grab. Isolation is never claimed after this error.
+    #[error("seat input isolation error: {0}")]
+    InputIsolation(String),
 }
 
 impl MultiseatError {

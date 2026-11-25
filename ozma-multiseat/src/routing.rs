@@ -20,9 +20,9 @@
 //! ever runs `xinput`, opens `/dev/input`, or grabs a device.
 //!
 //! This crate contains `#![forbid(unsafe_code)]`, so the real `EVIOCGRAB`
-//! ioctl (request value [`EVIOCGRAB_REQUEST`]) is intentionally represented as
-//! a model. A privileged helper or a future isolated backend can implement
-//! [`EvdevGrabBackend`] without changing the routing API.
+//! ioctl (request value [`EVIOCGRAB_REQUEST`]) is not issued from this module.
+//! The opt-in `ozma-seat-input` helper (`crate::input_isolation`) performs the
+//! real grab/uinput work; [`EvdevGrabBackend`] remains the model/test seam.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::MultiseatError;
 use crate::input::InputGroup;
+use crate::input_isolation::INPUT_ISOLATION_ROUTER_NAME;
 
 /// Default `xinput` program name.
 pub const XINPUT_PROGRAM: &str = "xinput";
@@ -806,15 +807,15 @@ pub struct UnsupportedEvdevGrabBackend;
 impl EvdevGrabBackend for UnsupportedEvdevGrabBackend {
     fn grab(&mut self, request: &EvdevGrabRequest) -> Result<(), MultiseatError> {
         Err(MultiseatError::Unsupported(format!(
-            "exclusive EVIOCGRAB for {} on seat {} needs a privileged helper; \
-             this crate only models the request",
+            "exclusive EVIOCGRAB for {} on seat {} needs the opt-in ozma-seat-input \
+             helper; EvdevGrabRouter only models the request",
             request.device, request.seat_id
         )))
     }
 
     fn ungrab(&mut self, request: &EvdevGrabRequest) -> Result<(), MultiseatError> {
         Err(MultiseatError::Unsupported(format!(
-            "releasing EVIOCGRAB for {} on seat {} needs a privileged helper",
+            "releasing EVIOCGRAB for {} on seat {} needs the opt-in ozma-seat-input helper",
             request.device, request.seat_id
         )))
     }
@@ -971,8 +972,9 @@ impl InputRouter for EvdevGrabRouter {
 /// Planned input routing for one seat.
 ///
 /// This is intent, not a live assignment: device names and XInput ids are
-/// resolved at assignment time. `grab_exclusive` stays `false` because this
-/// crate never issues a real grab.
+/// resolved at assignment time. `grab_exclusive` stays `false` for xinput and
+/// modelled evdev plans; [`InputRoutingStrategy::InputIsolation`] means the
+/// supervisor will ask the privileged helper for a confirmed grab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputRoutingStrategy {
@@ -980,6 +982,8 @@ pub enum InputRoutingStrategy {
     XInputMapToOutput,
     /// Modelled exclusive evdev grab.
     EvdevGrab,
+    /// Confirmed grab by the privileged `ozma-seat-input` helper.
+    InputIsolation,
 }
 
 impl InputRoutingStrategy {
@@ -988,6 +992,7 @@ impl InputRoutingStrategy {
         match self {
             Self::XInputMapToOutput => XINPUT_ROUTER_NAME,
             Self::EvdevGrab => EVDEV_ROUTER_NAME,
+            Self::InputIsolation => INPUT_ISOLATION_ROUTER_NAME,
         }
     }
 }
@@ -1011,7 +1016,8 @@ pub struct InputRoutePlan {
     /// Every evdev path that could be grabbed exclusively.
     #[serde(default)]
     pub exclusive_devices: Vec<String>,
-    /// Always `false` in this crate; a real grab needs an injected backend.
+    /// Whether this plan expects an exclusive grab. `true` for modelled
+    /// evdev and confirmed helper isolation; the helper still has to confirm.
     #[serde(default)]
     pub grab_exclusive: bool,
     /// Environment additions for the node process.
@@ -1052,6 +1058,16 @@ impl InputRoutePlan {
             EVDEV_ROUTER_NAME.to_owned(),
         );
         self
+    }
+
+    /// Switch this plan to the privileged input-isolation helper.
+    ///
+    /// This only changes intent and the child environment. The supervisor
+    /// still asks the helper for a confirmed grab before spawning.
+    pub fn enable_input_isolation(&mut self) {
+        self.strategy = InputRoutingStrategy::InputIsolation;
+        self.grab_exclusive = true;
+        self.env = route_environment(&self.seat_id, &self.x_screen, INPUT_ISOLATION_ROUTER_NAME);
     }
 
     /// Environment additions for the node process.

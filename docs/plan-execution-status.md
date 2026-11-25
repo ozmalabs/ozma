@@ -142,6 +142,10 @@ also never touch a real UDC, ConfigFS mount, or block device.
 | Registration parity (P0) | Done (honest subset) | `seat_id`, configured-only `vnc_host`/`vnc_port`, and `vm_ip` + `vm_guest_ip`; VBAN/camera/Sunshine omitted and advertised as unsupported; credential-shaped TXT keys rejected. Controller discovery updated. See [`phase4-registration-parity.md`](phase4-registration-parity.md). |
 | Controller-only surfaces (P0) | Done (typed 501) | `/rpa/*`, `/backup/*`, `/ui/windows`, `/serial/*`, `/rgb/*`, `/current` return stable `supported:false` bodies and are advertised in `/api/v1/connection`; controller proxies preserve them. Real providers remain Python-only. See [`phase4-controller-surfaces.md`](phase4-controller-surfaces.md). |
 | Delete Python node trees | Blocked; criteria published | One-release overlap still required. Do not delete until every checkbox in [`phase4-cutover-audit.md`](phase4-cutover-audit.md) §9 is green on a frozen commit and the rollback tag exists. |
+| Live default-Rust cutover (validation) | Done (two regressions fixed) | Default `demo/run_demo.sh` passed discovery, health/detail, dashboard, HLS + proxy, snapshots, QMP input, paste, 24/24 switching, and graceful shutdown with no orphans. `--webrtc-fit-capture` and `demo test` cleanup were fixed afterward; a live WebRTC two-peer re-run is still pending. Clean-host `--host` 20/20 on detached `1cd866d`. See [`phase4-live-cutover-report.md`](phase4-live-cutover-report.md). |
+| UAC2 bridge → audio/node | Partial | ALSA/PipeWire adapters + dedicated pump; `/usb` reports `configured/running/stopped` with counters and typed errors, and `running` requires PCM. Real UDC/host-enumeration unproven. See [`phase4-uac2-node-report.md`](phase4-uac2-node-report.md). |
+| USB FunctionFS/SCSI/USB-IP | Partial | Typed FunctionFS lifecycle, SCSI BBB overlay-backed writable media with persistence, bounded USB/IP daemon with authorization and fail-closed TLS. No real UDC, wire protocol, or `vhci_hcd`. See [`phase4-usb-completeness-report.md`](phase4-usb-completeness-report.md). |
+| Multi-seat input isolation | Partial | `ozma-seat-input` helper (`EVIOCGRAB` + uinput) with typed protocol, validation, rollback, idempotent release, and SIGTERM cleanup; supervisor `--input-isolation helper`. Node/compositor does not consume the uinput devices yet. See [`phase4-multiseat-input-report.md`](phase4-multiseat-input-report.md). |
 
 Verification added by this work:
 
@@ -224,7 +228,7 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # 2248 passed, 39 ignored (current)
+cargo test --workspace                                   # 2314 passed, 41 ignored (current)
 cargo test -p ozma-node --test parity                    # Python/controller parity baseline (16)
 cargo test -p ozma-node --lib                            # node API, compat, session unit tests (136, 2 ignored)
 cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)

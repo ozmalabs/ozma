@@ -30,6 +30,9 @@ use crate::functionfs::{
     FunctionFsConfig, FunctionFsDaemon, FunctionFsDaemonStatus, FunctionFsEndpoint,
     FunctionFsStatus, MAX_FUNCTIONFS_DESCRIPTOR_BYTES, MAX_FUNCTIONFS_ENDPOINTS,
 };
+use crate::functionfs_lifecycle::{
+    FunctionFsDeviceState, FunctionFsDeviceStatus, FunctionFsStateMachine,
+};
 
 /// FunctionFS v2 descriptor blob magic.
 pub const FUNCTIONFS_DESCRIPTORS_MAGIC_V2: u32 = 3;
@@ -1345,6 +1348,10 @@ pub struct FunctionFsEventOutcome {
     pub configured: bool,
     /// Descriptors written and function enabled.
     pub live: bool,
+    /// Endpoint traffic has been observed after enable.
+    pub running: bool,
+    /// Device-level state after the event.
+    pub state: FunctionFsDeviceState,
 }
 
 /// One endpoint transfer collected by a read loop.
@@ -1393,6 +1400,7 @@ pub struct FunctionFsDaemonCore {
     opener: Box<dyn FunctionFsEndpointOpener>,
     endpoints: BTreeMap<u8, Box<dyn FunctionFsEndpointIo>>,
     state: DaemonState,
+    device: FunctionFsStateMachine,
     stats: FunctionFsDaemonStats,
 }
 
@@ -1428,6 +1436,7 @@ impl FunctionFsDaemonCore {
             opener,
             endpoints: BTreeMap::new(),
             state: DaemonState::default(),
+            device: FunctionFsStateMachine::new(),
             stats: FunctionFsDaemonStats::default(),
         })
     }
@@ -1435,6 +1444,21 @@ impl FunctionFsDaemonCore {
     /// Function model.
     pub fn config(&self) -> &FunctionFsConfig {
         &self.config
+    }
+
+    /// Device-level lifecycle state machine snapshot.
+    pub fn device_status(&self) -> FunctionFsDeviceStatus {
+        self.device.status()
+    }
+
+    /// Current device-level state.
+    pub fn device_state(&self) -> FunctionFsDeviceState {
+        self.device.state()
+    }
+
+    /// Whether endpoint traffic has actually been observed.
+    pub fn is_running(&self) -> bool {
+        self.device.is_running()
     }
 
     /// Explicit mount, if this core writes to a filesystem path.
@@ -1469,8 +1493,13 @@ impl FunctionFsDaemonCore {
 
     /// Snapshot used by [`FunctionFsStatus`].
     pub fn daemon_status(&self) -> FunctionFsDaemonStatus {
+        let device = self.device.status();
         FunctionFsDaemonStatus {
             live: self.is_live(),
+            state: device.state,
+            running: device.running,
+            udc_bound: device.udc_bound,
+            endpoint_events: device.endpoint_events,
             ep0_written: self.state.ep0_written,
             strings_written: self.state.strings_written,
             enabled: self.state.enabled,
@@ -1520,6 +1549,11 @@ impl FunctionFsDaemonCore {
         self.ep0.write_ep0(descriptors.strings())?;
         self.state.strings_written = true;
         self.stats.string_writes += 1;
+        self.device.bind_descriptors()?;
+        // The daemon owns an `ep0` transport, so a successful descriptor and
+        // string write proves the event stream is ready. This is deliberately
+        // distinct from `enabled`/`running`.
+        self.device.mark_ep0_ready()?;
         Ok(FunctionFsWriteReport {
             descriptor_bytes: blob.len(),
             string_bytes: descriptors.strings().len(),
@@ -1534,9 +1568,14 @@ impl FunctionFsDaemonCore {
     ) -> Result<FunctionFsEventOutcome, UsbError> {
         self.check_instance(config)?;
         match &event {
-            FunctionFsEvent::Bind => {}
+            FunctionFsEvent::Bind => {
+                self.device.bind_udc()?;
+            }
             FunctionFsEvent::Unbind => {
                 self.close_endpoints();
+                if self.device.descriptors_bound() {
+                    self.device.record_unbind()?;
+                }
             }
             FunctionFsEvent::Enable => {
                 if !self.descriptors_written() {
@@ -1555,10 +1594,20 @@ impl FunctionFsDaemonCore {
                         self.close_endpoints();
                         return Err(error);
                     }
+                    // Enable is not "running": endpoint traffic must still be
+                    // observed before the state machine leaves `enabled`.
+                    if let Err(error) = self.device.enable() {
+                        self.close_endpoints();
+                        self.state.enabled = false;
+                        return Err(error);
+                    }
                 }
             }
             FunctionFsEvent::Disable => {
                 self.close_endpoints();
+                if self.device.is_enabled() {
+                    self.device.disable()?;
+                }
             }
             FunctionFsEvent::Setup(request) => {
                 if !self.state.enabled {
@@ -1584,24 +1633,28 @@ impl FunctionFsDaemonCore {
                 } else {
                     self.ep0.write_ep0(&[])?;
                 }
-                return Ok(FunctionFsEventOutcome {
-                    event: event.event_type(),
-                    response: Some(response.data),
-                    enabled: self.state.enabled,
-                    configured: self.state.configured,
-                    live: self.is_live(),
-                });
+                return Ok(self.outcome(event.event_type(), Some(response.data)));
             }
             FunctionFsEvent::Suspend => {}
             FunctionFsEvent::Resume => {}
         }
-        Ok(FunctionFsEventOutcome {
-            event: event.event_type(),
-            response: None,
+        Ok(self.outcome(event.event_type(), None))
+    }
+
+    fn outcome(
+        &self,
+        event: FunctionFsEventType,
+        response: Option<Vec<u8>>,
+    ) -> FunctionFsEventOutcome {
+        FunctionFsEventOutcome {
+            event,
+            response,
             enabled: self.state.enabled,
             configured: self.state.configured,
             live: self.is_live(),
-        })
+            running: self.device.is_running(),
+            state: self.device.state(),
+        }
     }
 
     /// Read one event from `ep0` and handle it. Returns `None` when no event is
@@ -1664,6 +1717,9 @@ impl FunctionFsDaemonCore {
         let read = endpoint.read(&mut buffer)?;
         buffer.truncate(read);
         self.stats.bytes_read += read as u64;
+        if read > 0 {
+            self.device.record_endpoint_event()?;
+        }
         Ok(buffer)
     }
 
@@ -1695,6 +1751,9 @@ impl FunctionFsDaemonCore {
         }
         self.stats.bytes_written += written as u64;
         endpoint.flush()?;
+        if written > 0 {
+            self.device.record_endpoint_event()?;
+        }
         Ok(written)
     }
 
@@ -1733,6 +1792,9 @@ impl FunctionFsDaemonCore {
     /// Close endpoints and stop reporting live readiness.
     pub fn shutdown(&mut self) {
         self.close_endpoints();
+        if self.device.is_enabled() {
+            let _ = self.device.disable();
+        }
     }
 
     fn check_instance(&self, config: &FunctionFsConfig) -> Result<(), UsbError> {
@@ -1830,6 +1892,21 @@ impl LoopbackFunctionFsDaemon {
     /// Underlying core, mutable.
     pub fn core_mut(&mut self) -> &mut FunctionFsDaemonCore {
         &mut self.core
+    }
+
+    /// Device-level state machine snapshot.
+    pub fn device_status(&self) -> FunctionFsDeviceStatus {
+        self.core.device_status()
+    }
+
+    /// Current device-level state.
+    pub fn device_state(&self) -> FunctionFsDeviceState {
+        self.core.device_state()
+    }
+
+    /// Whether endpoint traffic has been observed.
+    pub fn is_running(&self) -> bool {
+        self.core.is_running()
     }
 
     /// Queue one event for [`Self::handle_next_event`].
@@ -1988,6 +2065,21 @@ impl FileFunctionFsDaemon {
     /// Underlying core, mutable.
     pub fn core_mut(&mut self) -> &mut FunctionFsDaemonCore {
         &mut self.core
+    }
+
+    /// Device-level state machine snapshot.
+    pub fn device_status(&self) -> FunctionFsDeviceStatus {
+        self.core.device_status()
+    }
+
+    /// Current device-level state.
+    pub fn device_state(&self) -> FunctionFsDeviceState {
+        self.core.device_state()
+    }
+
+    /// Whether endpoint traffic has been observed.
+    pub fn is_running(&self) -> bool {
+        self.core.is_running()
     }
 }
 

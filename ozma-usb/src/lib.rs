@@ -41,6 +41,15 @@
 //! * [`NbdServer`] serves a regular-file, in-memory, or overlay-backed image
 //!   over a bounded fixed-newstyle TCP/Unix NBD listener with an injectable
 //!   transport/clock; writable exports never modify their base image.
+//! * [`MassStorageDevice`] decodes USB Mass Storage BBB CBWs and serves the
+//!   SCSI block commands for read-only FAT32/ISO/raw media or overlay-backed
+//!   writable media, with typed bounds, read-only rejection, and FLUSH/stop
+//!   persistence.
+//! * [`UsbIpDaemon`] is a bounded in-process USB/IP control-plane state machine
+//!   (start/stop, export/list/attach/detach/unexport, peer connections,
+//!   authorization, hotplug log) with an injectable kernel backend. The default
+//!   [`NoUsbIpKernel`] returns typed `usbip-kernel-required` instead of faking a
+//!   `vhci_hcd`/`usbip-host` device; TLS remains fail-closed and external.
 //!
 //! No code in this crate uses `unsafe`, mounts a filesystem, opens a block
 //! device, writes a block device, or creates a real USB gadget. The ConfigFS
@@ -93,6 +102,7 @@ pub mod functionfs;
 pub mod functionfs_daemon;
 pub mod functionfs_lifecycle;
 pub mod iso;
+pub mod mass_storage;
 pub mod media;
 pub mod nbd;
 pub mod nbd_server;
@@ -102,6 +112,7 @@ pub mod subprocess;
 pub mod uac2;
 pub mod uac2_bridge;
 pub mod usbip;
+pub mod usbip_daemon;
 
 pub use config::{
     is_safe_identifier, HidProtocol, UsbFunction, UsbFunctionKind, UsbGadgetConfig,
@@ -138,14 +149,20 @@ pub use functionfs_daemon::{
     MAX_FUNCTIONFS_EP0_WRITE_BYTES,
 };
 pub use functionfs_lifecycle::{
-    CommandFunctionFsMounter, FakeFunctionFsMounter, FunctionFsLifecycle, FunctionFsLifecycleClock,
-    FunctionFsLifecycleConfig, FunctionFsLifecyclePhase, FunctionFsLifecycleStatus,
-    FunctionFsMounter, ManualFunctionFsLifecycleClock, SystemFunctionFsLifecycleClock,
-    DEFAULT_FUNCTIONFS_MOUNT_BASE,
+    CommandFunctionFsMounter, FakeFunctionFsMounter, FunctionFsDeviceState, FunctionFsDeviceStatus,
+    FunctionFsLifecycle, FunctionFsLifecycleClock, FunctionFsLifecycleConfig,
+    FunctionFsLifecyclePhase, FunctionFsLifecycleStatus, FunctionFsMounter, FunctionFsStateMachine,
+    ManualFunctionFsLifecycleClock, SystemFunctionFsLifecycleClock, DEFAULT_FUNCTIONFS_MOUNT_BASE,
 };
 pub use iso::{
     parse_iso_volume_descriptors, validate_iso_image, IsoImage, IsoVolumeDescriptor,
     ISO9660_SECTOR_SIZE,
+};
+pub use mass_storage::{
+    MassStorageDevice, MassStorageOverlayStatus, MassStoragePersistPolicy, ScsiCommandBlock,
+    ScsiReply, ScsiSense, ScsiStatus, SCSI_CBW_BYTES, SCSI_CSW_BYTES, SCSI_DEFAULT_MAX_MEDIA_BYTES,
+    SCSI_MAX_TRANSFER_BYTES, SCSI_SECTOR_BYTES, SENSE_DATA_PROTECT, SENSE_ILLEGAL_REQUEST,
+    SENSE_MEDIUM_ERROR, SENSE_NO_SENSE,
 };
 pub use media::{MassStorageImage, MediaFormat, MediaMode, MediaState, VirtualMedia};
 pub use nbd::{
@@ -188,4 +205,8 @@ pub use usbip::{
     SubprocessUsbIpController, UsbIpAttachment, UsbIpAuthorization, UsbIpConfig, UsbIpController,
     UsbIpHotplugEvent, UsbIpHotplugKind, UsbIpHotplugLog, UsbIpKey, UsbIpPeerGrant, UsbIpState,
     UsbIpTlsPolicy, UsbIpTlsStatus, UsbIpToken, DEFAULT_USBIP_PORT, MAX_USBIP_HOTPLUG_EVENTS,
+};
+pub use usbip_daemon::{
+    NoUsbIpKernel, UsbIpConnection, UsbIpDaemon, UsbIpDaemonConfig, UsbIpDaemonState,
+    UsbIpDaemonStatus, UsbIpKernelBackend, MAX_USBIP_DAEMON_CONNECTIONS,
 };

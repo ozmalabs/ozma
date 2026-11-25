@@ -8,6 +8,7 @@ license = "AGPL-3.0-only"
 [dependencies]
 ozma-protocol = { path = "../ozma-protocol" }
 ozma-pipewire = { path = "../ozma-pipewire" }
+ozma-usb = { path = "../ozma-usb" }
 alsa = { workspace = true }
 async-trait = "0.1"
 audiopus = "0.3.0-rc.0"
@@ -17,6 +18,5 @@ tokio = { version = "1", features = ["sync", "time", "rt", "macros", "process", 
 tracing = "0.1"
 
 [dev-dependencies]
-ozma-usb = { path = "../ozma-usb" }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["full"] }

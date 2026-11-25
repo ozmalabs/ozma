@@ -23,13 +23,13 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use ozma_multiseat::{
-    detect_drm, render_metrics, DrmDetection, EvdevGrabRouter, HostTopology, HotplugDebounce,
-    HotplugOptions, HttpHealthProbe, MultiseatPlan, MultiseatPlanner, MultiseatStatus,
-    OzmaAudioRouter, PlannerOptions, PortProbe, ProcessCommandRunner, ProcessLauncher,
-    ProcessSeatSupervisor, ReadinessProbe, SeatProfile, SeatReconciler, SeatResourceStatus,
-    SeatState, SeatStore, SeatSupervisor, SupervisorOptions, SysfsHotplugMonitor,
-    SysfsInputBackend, XInputRouter, XrandrDisplayBackend, XrandrOwnershipController,
-    DEFAULT_DEBOUNCE, DEFAULT_HEALTH_PATH, DEFAULT_NODE_BIN,
+    detect_drm, render_metrics, DrmDetection, EvdevGrabRouter, HelperClient, HelperClientConfig,
+    HostTopology, HotplugDebounce, HotplugOptions, HttpHealthProbe, MultiseatPlan,
+    MultiseatPlanner, MultiseatStatus, OzmaAudioRouter, PlannerOptions, PortProbe,
+    ProcessCommandRunner, ProcessLauncher, ProcessSeatSupervisor, ReadinessProbe, SeatProfile,
+    SeatReconciler, SeatResourceStatus, SeatState, SeatStore, SeatSupervisor, SupervisorOptions,
+    SysfsHotplugMonitor, SysfsInputBackend, XInputRouter, XrandrDisplayBackend,
+    XrandrOwnershipController, DEFAULT_DEBOUNCE, DEFAULT_HEALTH_PATH, DEFAULT_NODE_BIN,
 };
 
 /// Plan and supervise one `ozma-node` per seat on this host.
@@ -52,11 +52,14 @@ use ozma_multiseat::{
                   SIGINT/SIGTERM. `--apply-ownership` and `--apply-routing` opt in to applying \
                   each seat's xrandr ownership and xinput/evdev routing before spawn; both \
                   default off, a failed apply stops that spawn, and earlier seats are released. \
-                  `--seats-file` loads/reuses and atomically updates persisted seat identities; \
-                  `--hotplug` reconciles read-only sysfs display/input events; and \
-                  `--audio-router` ensures/removes per-seat null sinks. `--print-plan` and \
-                  `--dry-run` never run routing, ownership, audio, or hotplug actions and never \
-                  write the seat file."
+                  `--input-isolation helper` instead asks the privileged `ozma-seat-input` \
+                  helper to EVIOCGRAB each seat's devices and create per-seat uinput devices; \
+                  a missing helper or failed grab stops that spawn. `--seats-file` loads/reuses \
+                  and atomically updates persisted seat identities; `--hotplug` reconciles \
+                  read-only sysfs display/input events; and `--audio-router` ensures/removes \
+                  per-seat null sinks. `--print-plan` and `--dry-run` never run routing, \
+                  ownership, audio, input-isolation, or hotplug actions and never write the \
+                  seat file."
 )]
 struct Args {
     /// Node binary or path passed to every planned seat.
@@ -114,6 +117,15 @@ struct Args {
     /// Apply each seat's xinput/evdev input routing before spawning (default off).
     #[arg(long)]
     apply_routing: bool,
+
+    /// Input path: `xinput` (default, existing map-to-output strategy) or
+    /// `helper` (privileged `ozma-seat-input` EVIOCGRAB/uinput isolation).
+    #[arg(long, default_value = "xinput", value_name = "xinput|helper")]
+    input_isolation: String,
+
+    /// Helper binary used by `--input-isolation helper`.
+    #[arg(long, default_value = ozma_multiseat::HELPER_PROGRAM, value_name = "PATH")]
+    input_helper: PathBuf,
 
     /// Machine name used to build seat ids (`<machine>-seat-N`).
     #[arg(long, default_value = "ozma")]
@@ -214,6 +226,19 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
     plan.display_backend = topology.display_backend.clone();
     plan.input_backend = topology.input_backend.clone();
 
+    // Selecting `helper` changes routing intent before either the plan report
+    // or the supervisor sees it. It never grabs anything by itself.
+    if args.input_isolation == "helper" {
+        for seat in &mut plan.seats {
+            if let Some(route) = seat.input_route.as_mut() {
+                route.enable_input_isolation();
+                for (key, value) in route.environment() {
+                    seat.command.env.insert(key, value);
+                }
+            }
+        }
+    }
+
     if args.print_plan {
         print_plan_report(&args, &display, &topology, &drm, &plan)?;
         return Ok(());
@@ -229,6 +254,7 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
         dry_run: args.dry_run,
         apply_ownership: args.apply_ownership,
         apply_routing: args.apply_routing,
+        input_isolation: args.input_isolation == "helper",
     };
 
     if args.dry_run {
@@ -265,6 +291,14 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
         // unsupported error rather than pretending a grab happened.
         supervisor = supervisor.with_evdev_routing_controller(Box::new(EvdevGrabRouter::new()));
     }
+    if args.input_isolation == "helper" {
+        supervisor = supervisor.with_input_isolation_helper(Box::new(HelperClient::new(
+            HelperClientConfig {
+                program: args.input_helper.to_string_lossy().into_owned(),
+                ..HelperClientConfig::default()
+            },
+        )));
+    }
     if let Some(kind) = args.audio_router.as_deref() {
         let router: Box<dyn ozma_multiseat::SeatAudioRouter> = match kind {
             "pipewire" => Box::new(OzmaAudioRouter::pipewire()),
@@ -295,7 +329,7 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
             }
             Err(error) => {
                 eprintln!("seat {} failed to start: {error}", seat.config.id);
-                if args.apply_ownership || args.apply_routing {
+                if args.apply_ownership || args.apply_routing || args.input_isolation == "helper" {
                     // The supervisor already released every applied resource
                     // when the later seat could not be reserved. Stop any
                     // children started by this plan so the CLI does not leave
@@ -470,6 +504,19 @@ fn validate(args: &Args) -> Result<(), ozma_multiseat::MultiseatError> {
             args.readiness
         )));
     }
+    if !matches!(args.input_isolation.as_str(), "xinput" | "helper") {
+        return Err(ozma_multiseat::MultiseatError::Supervisor(format!(
+            "unknown input isolation {:?}; expected xinput or helper",
+            args.input_isolation
+        )));
+    }
+    if args.input_isolation == "helper" && args.apply_routing {
+        return Err(ozma_multiseat::MultiseatError::Supervisor(
+            "--input-isolation helper and --apply-routing are mutually exclusive; the helper \
+             grabs the seat's devices, while xinput mapping expects to share them"
+                .to_owned(),
+        ));
+    }
     if let Some(kind) = args.audio_router.as_deref() {
         if !matches!(kind, "pipewire" | "pulseaudio") {
             return Err(ozma_multiseat::MultiseatError::Audio(format!(
@@ -616,7 +663,11 @@ fn print_plan_report(
                     route.pointer_devices.join(", ")
                 },
                 if route.grab_exclusive {
-                    "modelled"
+                    if route.strategy == ozma_multiseat::InputRoutingStrategy::InputIsolation {
+                        "helper"
+                    } else {
+                        "modelled"
+                    }
                 } else {
                     "no"
                 }
@@ -699,11 +750,26 @@ fn resource_state(applied: bool, released: bool) -> &'static str {
 
 fn resource_summary(resources: &SeatResourceStatus) -> String {
     let mut summary = format!(
-        " resources(ownership={} routing={} audio={})",
+        " resources(ownership={} routing={} isolation={} audio={})",
         resource_state(resources.ownership_applied, resources.ownership_released),
         resource_state(resources.routing_applied, resources.routing_released),
+        resource_state(
+            resources.input_isolation_applied,
+            resources.input_isolation_released
+        ),
         resource_state(resources.audio_applied, resources.audio_released),
     );
+    if resources.grabbed_device_count != 0 || !resources.uinput_devices.is_empty() {
+        summary.push_str(&format!(
+            " grabbed={} uinput={}",
+            resources.grabbed_device_count,
+            if resources.uinput_devices.is_empty() {
+                "(none)".to_owned()
+            } else {
+                resources.uinput_devices.join(",")
+            }
+        ));
+    }
     for error in &resources.errors {
         summary.push_str(&format!(
             " resource_error[{} {}]={}",

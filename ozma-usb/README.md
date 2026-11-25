@@ -7,7 +7,8 @@ This crate is the model and controller layer of the Python
 `softnode/virtual_media.py` paths. It builds FAT32 images in memory, adds a
 bounded copy-on-write write overlay, models ISO/NBD media, includes a bounded
 fixed-newstyle NBD server backed by a regular file, an in-memory image, or a
-copy-on-write overlay, and
+copy-on-write overlay, serves the USB mass-storage SCSI/BOT data path over that
+same overlay, and includes a bounded in-process USB/IP daemon/control plane. It
 sequences FunctionFS from ConfigFS function creation through descriptor writes,
 readiness, and UDC bind/unbind. Default paths do not mount filesystems, open
 `/dev/hidg*`, or write a block device; an explicit `CommandFunctionFsMounter`
@@ -24,9 +25,9 @@ profile.
 | Functions | HID keyboard/mouse/custom, mass storage, UAC2 (`Uac2Config`), FunctionFS vendor (`FunctionFsConfig`) |
 | FunctionFS model | `FunctionFsConfig`, `FunctionFsEndpoint`, `FunctionFsStrings`, `FunctionFsDaemonSpec`, `FunctionFsReadiness`, `FunctionFsStatus`, `FunctionFsDaemon`/`MissingFunctionFsDaemon`/`ObservedFunctionFsDaemon`, generated device/config/string descriptors, class-specific descriptors, Microsoft OS descriptors |
 | FunctionFS daemon core | `FunctionFsMount`, `FunctionFsDescriptors` (v2 `ep0` blob + strings), `FunctionFsDaemonCore`, `LoopbackFunctionFsDaemon`/`FakeFunctionFsDaemon`, `FileFunctionFsDaemon`, `FunctionFsControlRequest`/`FunctionFsControlResponse`, `FunctionFsEvent`, injectable `FunctionFsEp0Io`/`FunctionFsEndpointIo`, bounded endpoint loops |
-| FunctionFS lifecycle | `FunctionFsLifecycleConfig`, `FunctionFsLifecycle`, `FunctionFsLifecyclePhase`/`Status`, injectable `FunctionFsMounter` with `CommandFunctionFsMounter`/`FakeFunctionFsMounter`, deterministic `FunctionFsLifecycleClock`; ConfigFS function/link creation, mountpoint expectation, `ep0` descriptor write, readiness timeout, bind rollback, unbind/cleanup |
+| FunctionFS lifecycle | `FunctionFsLifecycleConfig`, `FunctionFsLifecycle`, `FunctionFsLifecyclePhase`/`Status`, `FunctionFsStateMachine`, `FunctionFsDeviceState`/`Status`, injectable `FunctionFsMounter` with `CommandFunctionFsMounter`/`FakeFunctionFsMounter`, deterministic `FunctionFsLifecycleClock`; ConfigFS function/link creation, mountpoint expectation, `ep0` descriptor write, readiness timeout, explicit UDC bind/unbind readiness, bind rollback, unbind/cleanup |
 | FunctionFS control | Standard `GET_DESCRIPTOR` (device/configuration/string), `SET_CONFIGURATION`, `GET_CONFIGURATION`, `GET/SET_INTERFACE`, `GET_STATUS`, feature requests; typed rejection for class/vendor and unknown requests |
-| FunctionFS status | `FunctionFsDaemonStatus` nested in `FunctionFsStatus.daemon`: `live` only when the descriptor blob, string table, and enable event all succeeded |
+| FunctionFS status | `FunctionFsDaemonStatus` nested in `FunctionFsStatus.daemon`: `live` only when the descriptor blob, string table, and enable event all succeeded; `state`/`running`/`endpoint_events` only reach `running` after real endpoint traffic |
 | UAC2 model | `Uac2Config`, `Uac2Mode::{Microphone,Headset,Speaker}`, `Uac2DescriptorSet`, `Uac2Status`, `Uac2BridgeStatus::{Unsupported,Configured,Running,Stopped}` |
 | UAC2 bridge core | `Uac2Bridge`, `Uac2BridgeConfig`, injectable `Uac2EndpointIo` and `Uac2AudioSink`/`Uac2AudioSource`, `Uac2Packetizer`, `Uac2PcmFormat`/`Uac2SampleSize`, `convert_pcm`, `Uac2BridgeCounters`/`Uac2BridgeReport`, `FakeUac2Endpoint`/`FakeUac2AudioSink`/`FakeUac2AudioSource` |
 | Validation | Safe gadget/function names, VID/PID, strings, power, duplicate links, HID report shape, UAC2 rates/sizes/channels/modes, FunctionFS endpoint bounds/descriptor size, CD-ROM read-only |
@@ -36,6 +37,8 @@ profile.
 | Test/dry-run fake | `FakeUsbGadgetController` |
 | USB/IP model | `UsbIpConfig`, `UsbIpDevice`, `UsbIpState`, `UsbIpAttachment`, `UsbIpAuthorization`/`UsbIpKey`/`UsbIpToken` (host + token allow-lists), `UsbIpPeerGrant`, `UsbIpHotplugLog`/`UsbIpHotplugEvent`, `UsbIpTlsPolicy`/`UsbIpTlsStatus` |
 | USB/IP control | `UsbIpController`, `SubprocessUsbIpController` (`attach_with_token`, peer-side `authorize_peer`/`export_with_token`), bounded hotplug events, argv-only `CommandRunner`; legacy `UsbIpControl`/`SubprocessUsbController` |
+| USB/IP daemon | `UsbIpDaemon`, `UsbIpDaemonConfig`/`UsbIpDaemonState`/`UsbIpDaemonStatus`, bounded `UsbIpConnection`s, injectable `UsbIpKernelBackend` with explicit `NoUsbIpKernel`, export/list/attach/detach/unexport state machine, typed `usbip-kernel-required`, fail-closed TLS |
+| SCSI mass storage | `MassStorageDevice`, `ScsiCommandBlock`, `ScsiReply`/`ScsiSense`/`ScsiStatus`, `MassStoragePersistPolicy`, `MassStorageOverlayStatus`; BBB dispatch, read-only/CD-ROM rejection, copy-on-write writes through `WriteOverlay`, FLUSH/stop persistence |
 | FAT32 builder | `Fat32ImageBuilder`, `Fat32Node`, `build_fat32_image`, `fat32_image_from_directory`, `parse_fat32_image`, `Fat32Info`/`Fat32Layout` |
 | ISO media | `IsoImage::inspect`, `parse_iso_volume_descriptors`, read-only `MediaFormat::Iso9660` |
 | NBD model | `NbdExport`, `NbdExportDescriptor`, `NbdHandshake`, `NbdRequest`/`NbdReply` framing, newstyle option constants |
@@ -83,13 +86,17 @@ The node now selects the controller from configuration:
 ozma-node --usb-gadget --usb-udc dummy_udc.0 \
   --usb-configfs-root /sys/kernel/config/usb_gadget \
   --usb-media /srv/installer.iso --usb-media-cdrom \
-  --usb-uac2 --usb-vendor --usb-vendor-daemon /usr/local/bin/ozma-ffs
+  --usb-uac2 --usb-uac2-bridge \
+  --usb-uac2-sink-device hw:0,0 --usb-uac2-source-device hw:0,1 \
+  --usb-vendor --usb-vendor-daemon /usr/local/bin/ozma-ffs
 ```
 
 Equivalent environment variables are `OZMA_USB_GADGET`, `OZMA_USB_CONFIGFS_ROOT`,
 `OZMA_USB_UDC`, `OZMA_USB_MEDIA`, `OZMA_USB_MEDIA_RO`,
-`OZMA_USB_MEDIA_CDROM`, `OZMA_USB_UAC2`, `OZMA_USB_VENDOR`, and
-`OZMA_USB_VENDOR_DAEMON`. The node builds a HID keyboard + mouse gadget,
+`OZMA_USB_MEDIA_CDROM`, `OZMA_USB_UAC2`, `OZMA_USB_UAC2_BRIDGE`,
+`OZMA_USB_UAC2_SINK_DEVICE`, `OZMA_USB_UAC2_SOURCE_DEVICE`,
+`OZMA_USB_VENDOR`, and `OZMA_USB_VENDOR_DAEMON`. The node builds a HID
+keyboard + mouse gadget,
 optionally a mass-storage LUN, and opt-in UAC2/FunctionFS vendor functions, then
 optionally a mass-storage LUN, then creates and binds it only when a UDC is
 supplied and the root exists. A missing UDC/root/permission/media or a bind
@@ -319,8 +326,34 @@ never marks the function ready. `bind` refuses unless the phase is `ready`. A
 bind failure unbinds/removes the gadget, unmounts a lifecycle-owned mount, and
 returns the original typed error with phase `failed`. `cleanup` is idempotent
 and leaves a caller-supplied mount in place. `FunctionFsLifecycleStatus` exposes
-the phase, bound/mounted/ep0/string flags, paths, and the nested
-`FunctionFsStatus`.
+the phase, bound/mounted/ep0/string flags, paths, the nested `FunctionFsStatus`,
+and a `device` snapshot.
+
+#### FunctionFS device state machine
+
+`FunctionFsStateMachine` is the typed, event-driven companion to the ConfigFS
+lifecycle helper. Its states and transitions are explicit:
+
+```text
+unconfigured --bind_descriptors--> descriptors_bound
+descriptors_bound --mark_ep0_ready--> ep0_ready
+ep0_ready --bind_udc (UDC write)--> ep0_ready + udc_bound
+ep0_ready --enable event--> enabled
+enabled --endpoint transfer--> running
+enabled|running --disable event--> disabled
+any bound state --unbind event/UDC clear--> unbound
+```
+
+`udc_bind_ready()` is true only after descriptors and `ep0` readiness and while
+no UDC is bound; `udc_unbind_ready()` is true only while `udc_bound`. Out-of-order
+events return `invalid-functionfs-state`. Crucially, `running` requires a
+completed endpoint transfer (`record_endpoint_event`): descriptors, a mount, a
+readiness marker, a UDC bind, and an enable event are never enough. The same
+machine is embedded in `FunctionFsDaemonCore`; its status exposes `state`,
+`running`, `udc_bound`, and `endpoint_events`. `FunctionFsLifecycle` uses the
+machine for descriptor/ep0/bind/unbind readiness but never opens data endpoints,
+so `status.running()` stays false there (the ignored `real_udc_*` test asserts
+this).
 
 Readiness is explicit and never assumed:
 
@@ -449,6 +482,59 @@ embeds it; `Uac2Status::with_bridge_unavailable` attaches a typed
 when an endpoint/audio path is absent or inconsistent; it never synthesises a
 successful fake.
 
+#### Real ALSA/PipeWire adapters and node wiring
+
+`ozma-audio` now implements the bridge's audio traits with bounded,
+non-blocking devices:
+
+| Type | Path |
+|---|---|
+| `AlsaUac2Sink` | host→device USB OUT PCM into an ALSA playback PCM |
+| `AlsaUac2Source` | device→host USB IN PCM from an ALSA capture PCM |
+| `PipeWireUac2Sink` | host→device PCM into an existing `PipeWireAudioSink` (S16) |
+| `PipeWireUac2Source` | device→host PCM from an existing `PipeWireAudioSource` (S16) |
+| `Uac2PcmWriter`/`Uac2PcmReader` + factories | injectable byte devices used by default tests |
+
+ALSA PCMs are opened non-blocking and negotiated at exactly the bridge format
+(rate, channel count, packed S16/S24_3/S32); a nearest-match is rejected as a
+typed `uac2-format` error rather than silently resampled. `EAGAIN` becomes a
+zero-byte transfer (backpressure/underrun, never fake progress), and short
+writes/reads are returned and counted. `Uac2SinkStats`/`Uac2SourceStats` expose
+write/read calls, frames, short transfers, backpressure, underruns, device
+errors, and flushes through a cloneable handle. PipeWire streams only carry
+interleaved `i16`, so the PipeWire adapters accept S16 formats and reject wider
+ones.
+
+`ozma-node --usb-uac2 --usb-uac2-bridge` starts the pump only when the UAC2
+ConfigFS function and the gadget ALSA card exist and both host devices open.
+The kernel gadget card is exposed as an `Uac2EndpointIo`: its capture PCM
+(`hw:N,1`) is USB OUT playback, its playback PCM (`hw:N,0`) is USB IN capture.
+A missing function/card/device is a typed startup error and `/usb` keeps
+`bridge: "unsupported"`. While running, the UAC2 function carries
+`bridge_report` with `configured`/`running`/`stopped`, per-direction endpoint and
+format, packet interval/size, and cumulative counters. `running` is only emitted
+after real PCM bytes move; a started-but-idle bridge stays `configured`. A
+typed `uac2_bridge_error` (stable `kind` plus message) is added when the pump
+observes a device error. `--usb-uac2` without `--usb-uac2-bridge` remains
+descriptor-only and reports a typed unsupported reason; the legacy
+`usb_audio` ALSA loop is not started when the new bridge flag is set.
+
+The node wiring and adapter tests use fake PCM writers/readers, fake USB
+endpoints, and a fake device factory; they never open ALSA/PipeWire or a UDC:
+
+```bash
+cargo test -p ozma-audio --test uac2_adapters
+cargo test -p ozma-node --lib usb_uac2
+cargo test -p ozma-node --lib usb_status_reports
+```
+
+The only real-device test stays explicitly opt-in:
+
+```bash
+OZMA_AUDIO_TEST_DEVICE=default \
+  cargo test -p ozma-audio --test uac2_bridge_real -- --ignored
+```
+
 ## USB/IP
 
 `UsbIpConfig` records whether USB/IP is enabled, the default host/port
@@ -495,6 +581,34 @@ USB/IP wire protocol, and cannot intercept the kernel `vhci_hcd` data path.
 An external `usbipd`, firewall, TLS terminator, or encrypted tunnel (for
 example WireGuard/stunnel) must protect the wire protocol. No kernel
 `vhci_hcd` lifecycle exists in this crate.
+
+### In-process USB/IP daemon state machine
+
+`UsbIpDaemon` is the bounded control-plane daemon that the node can own without
+pretending to be `usbipd`. It keeps `stopped`/`listening` state, the local
+export list, the remote attachment list, up to
+`MAX_USBIP_DAEMON_CONNECTIONS` authorized peer sessions, and the existing
+bounded `UsbIpHotplugLog`. It reuses `UsbIpAuthorization::authorize_peer`, so a
+host allow-list, bearer token, and (when configured) key fingerprint are all
+checked **before** any kernel call. Accepted peers are stored as
+`UsbIpPeerGrant` metadata only; raw tokens and presented fingerprints are never
+retained, logged, or serialized.
+
+The kernel boundary is an injected `UsbIpKernelBackend`. The explicit default,
+`NoUsbIpKernel`, makes `export`, `unexport`, `attach`, and `detach` fail with
+`usbip-kernel-required` (mentioning `vhci_hcd`/`usbip-host` and privileges)
+rather than reporting a fabricated export or attachment. Tests inject an
+in-process fake backend; a real adapter would drive the existing argv-only
+`usbip` CLI. A failed detach leaves the recorded attachment in place so cleanup
+is never falsely claimed. Operations require `start()`; `stop()` clears tracked
+peer sessions but does not fabricate kernel unexport/detach.
+
+The daemon does not implement the USB/IP wire protocol and does not accept
+sockets in the default path. It is the state/enforcement layer a future node
+route or proxy front-end can call. TLS is exactly the fail-closed
+`UsbIpTlsPolicy` above: `Required` rejects construction, and `UsbIpDaemonStatus`
+reports `tls.available: false` with the external-terminator requirement. No TLS
+is faked.
 
 `SubprocessUsbIpController` implements `UsbIpController` with an injected
 `CommandRunner`:
@@ -550,8 +664,23 @@ remains available for the existing node wiring.
   backed by this overlay (`NbdOverlayBackend`): WRITE copies the touched base
   block, READ prefers overlay blocks, FLUSH/stop commit the checksummed
   persistence file according to `NbdOverlayPolicy`, and TRIM is a bounded
-  no-op. The SCSI/FunctionFS data path still uses the Python synthesiser and is
-  not wired to this overlay yet.
+  no-op.
+- **SCSI mass storage** (`mass_storage`): `MassStorageDevice` decodes USB Mass
+  Storage BBB CBWs (`ScsiCommandBlock`) and serves `TEST UNIT READY`,
+  `REQUEST SENSE`, `INQUIRY`, `MODE SENSE(6/10)`, `START STOP UNIT`,
+  `PREVENT ALLOW MEDIUM REMOVAL`, `READ CAPACITY(10)`, `READ FORMAT
+  CAPACITIES`, `READ(10)`, `WRITE(10)`, and `SYNCHRONIZE CACHE(10)`. Read-only
+  media (raw/FAT32/ISO/CD-ROM) is served directly and rejects writes with
+  `read-only-media` or a SCSI `DATA PROTECT / WRITE PROTECTED` sense; the
+  FAT32/ISO builders are unchanged. Writable media goes through the same
+  bounded `WriteOverlay` as NBD: reads prefer overlay blocks, writes copy the
+  touched base block, the base is immutable, and out-of-range/allocation
+  failures are typed. `SYNCHRONIZE CACHE(10)` calls `flush`, and `stop()`
+  commits the checksummed persistence file according to
+  `MassStoragePersistPolicy`; `load_writable_file` reloads it. Requests are
+  bounded to 1 MiB (2048 sectors), and `ScsiReply` returns the IN data,
+  residue, CSW status, and sense. No block device, mount, or USB transfer is
+  performed by this module.
 - **ISO** (`iso`): `IsoImage::inspect` reads at most 32 volume descriptors from
   an existing file, verifies `CD001`, the primary descriptor, both-endian
   size/block fields, and root-directory bounds. `MediaFormat::Iso9660` always
@@ -663,9 +792,14 @@ Relevant suites:
 | `tests/functionfs.rs` | FunctionFS descriptor generation, endpoint/string/daemon bounds, explicit readiness states, ConfigFS `ffs.<instance>` creation/status, fake status |
 | `tests/functionfs_daemon.rs` | v2 descriptor/string encoding and alignment, class/OS descriptors, temporary-mount `ep0` writes, standard control requests, enable/disable/live status, endpoint read/write/loopback, malformed/oversized inputs, lazily opened file endpoints |
 | `tests/functionfs_lifecycle.rs` | function/link creation, mountpoint validation, fake-mounter mount/unmount, `ep0` descriptor write, readiness success/timeout, bind failure rollback, unbind/cleanup, caller-supplied mount preservation, missing mount tool, config validation |
+| `tests/functionfs_state.rs` | typed `FunctionFsStateMachine` ordering, out-of-order typed errors, explicit UDC bind/unbind readiness, daemon status never `running` before endpoint traffic, bind/unbind events, lifecycle helper readiness gate, ignored real-UDC run |
+| `tests/mass_storage_scsi.rs` | SCSI CBW parse/dispatch, write/read-back through the overlay, base immutability, FLUSH/stop persistence + reload, read-only media and SCSI `DATA PROTECT`, typed bounds, malformed/phase errors, overlay exhaustion without partial allocation, read-only FAT32 image byte identity |
+| `tests/usbip_daemon.rs` | authorized/denied attach never reaches the kernel on denial, token/fingerprint enforcement, bounded connections, start/stop, export/detach/unexport cleanup, bounded hotplug log, typed `usbip-kernel-required`, fail-closed TLS, no secrets in status/Debug |
 | `tests/fat32_overlay.rs` | FAT32/raw writes and reads, base immutability, per-block copy-on-write, allocation ceiling and preflight atomicity, commit/reload, checksummed persistence corruption, discard/materialise |
 | `tests/uac2.rs` | UAC2 descriptor/channel/rate/size consistency, microphone/speaker/headset modes, invalid rates/channels/modes, ConfigFS attribute writes, descriptor-only unsupported bridge status |
 | `tests/uac2_bridge.rs` | sample-accurate 44.1/48 kHz packetization, 16/24/32-bit and mono/stereo conversion, no implicit resampling, playback ring drops/backpressure, partial/padded capture packets, flush/stop/restart, typed missing path/endpoint/overflow errors, status never live without data |
+| `ozma-audio/tests/uac2_adapters.rs` | ALSA-adapter round trip through the real bridge core, sink backpressure/drop counters, typed device errors, partial capture reads/padding, stop/flush, no live claim without PCM; in-memory fake PCM devices only |
+| `ozma-node` `usb_uac2`/`usb_status_*` | fake device factory configured/running/stopped/error states, typed start failures, `/usb` bridge overlay, endpoint/format/counters, no `running` without PCM counters |
 | `tests/usbip_controller.rs` | exact argv, list/port parsing (IPv4/IPv6), attach/detach state, disabled/missing/non-zero typed errors, config validation, host/token allow-list enforcement, no real `usbip` |
 | `tests/usbip_security.rs` | server-side peer host/token/key-fingerprint pairing, constant-time token/fingerprint comparison, no secrets in errors/Debug, TLS-required fail-closed policy, bounded ordered hotplug events, JSON metadata, no real `usbip` |
 | `tests/nbd_server.rs` | newstyle handshake, export name/list/info/go, read/write/flush/disc, request bounds, read-only write rejection, malformed/truncated frames, injected transport/clock deadline, concurrent loopback clients, Unix socket, server stop, file/media backends |
@@ -693,7 +827,12 @@ OZMA_FUNCTIONFS_MOUNT=/dev/ffs-ozma-test \
 
 It requires an existing FunctionFS mount (made by the caller; no mount or sudo
 is performed), opens `ep0`, writes descriptors/strings, and asserts that the
-status is not `live` without an observed enable event. The lifecycle helper's
+status is not `live` without an observed enable event. A second ignored test,
+`real_udc_binds_after_readiness_and_unbinds`, requires
+`OZMA_FUNCTIONFS_UDC`, `OZMA_FUNCTIONFS_MOUNT`,
+`OZMA_FUNCTIONFS_DAEMON`, and `OZMA_FUNCTIONFS_READY_MARKER` plus a real
+ConfigFS root; it binds and unbinds a UDC but still never claims `running`
+because the ConfigFS helper opens no data endpoints. The lifecycle helper's
 default tests use a temp root, a fake mounter, and a fake UDC name; they never
 mount or bind.
 
@@ -722,22 +861,24 @@ existing VM; the disposable QEMU is quit over QMP or killed on timeout.
 
 - Real gadget validation on `dummy_hcd` and hardware UDCs; currently only the
   ignored round trip exists, and node tests use a temp root/fake controller.
-- USB/IP security is still transport-level only: the host/token/key-fingerprint
-  allow-list is enforced before `usbip attach` and before peer-authorized
-  `usbip bind`, but there is no TLS, cryptographic pairing handshake,
-  challenge/response, daemon, or kernel `vhci_hcd` lifecycle. `Required` TLS
-  fails closed as `usbip-tls-unsupported`; an external
-  `usbipd`/firewall/TLS terminator must protect the wire protocol. Hotplug is a
-  bounded library event log only; a node route exposing `UsbIpController` and
+- USB/IP has an in-process, bounded control-plane daemon (`UsbIpDaemon`) with
+  start/stop, export/list/attach/detach/unexport, peer connections, peer
+  authorization, and a bounded hotplug log, but still no USB/IP wire protocol,
+  real socket listener, kernel hotplug monitor, or in-process TLS. The
+  host/token/key-fingerprint allow-list is enforced before any kernel call;
+  `attach`/`detach`/`export`/`unexport` require an injected
+  `UsbIpKernelBackend`, and the default `NoUsbIpKernel` returns typed
+  `usbip-kernel-required` instead of faking a `vhci_hcd`/`usbip-host` device.
+  `Required` TLS fails closed; an external `usbipd`/firewall/TLS terminator must
+  protect the wire protocol. A node route exposing the daemon and
   controller/API pairing remain open.
 - The FAT32 builder is a static snapshot, not the Python live `FATSynthesiser`
   (no sector-on-demand reads, inotify rescan, or long-name rescan stability).
-  Generated images are read-only. `WriteOverlay` is now wired into writable NBD
-  exports with bounded copy-on-write blocks and persistence, but it is not yet
-  connected to the SCSI/FunctionFS data path and has no FAT
-  metadata/consistency repair, directory-entry coalescing, compaction, or
-  write-back to a base image. `ozma-usb` still never writes a generated image
-  to disk or a block device.
+  Generated images are read-only. `WriteOverlay` is wired into writable NBD
+  exports and the SCSI mass-storage data path with bounded copy-on-write blocks
+  and persistence, but it has no FAT metadata/consistency repair, directory
+  coalescing, compaction, or write-back to a base image. `ozma-usb` still never
+  writes a generated image to disk or a block device.
 - ISO support validates descriptors only; no Joliet/Rock Ridge/El Torito
   parsing, directory extraction, writing, or mounting.
 - NBD is a bounded userspace server, not a kernel block device: no structured
@@ -747,16 +888,20 @@ existing VM; the disposable QEMU is quit over QMP or killed on timeout.
   does not exercise installers, UEFI, or a real target. Node wiring is one
   loopback export behind the existing `--usb-gadget` state and is not exposed
   through capabilities or registration.
-- FunctionFS now has an `ep0`/endpoint daemon core and an explicit
+- FunctionFS now has an `ep0`/endpoint daemon core, a typed
+  `FunctionFsStateMachine` (descriptors → ep0 → enabled → running → disabled →
+  unbound, with explicit UDC readiness), and an explicit
   `FunctionFsLifecycle` helper (ConfigFS function/link creation, mountpoint
   expectation, descriptor write, marker readiness/timeout, bind rollback,
   unbind/cleanup), but mounting in the default path still requires an injected
   mounter and caller privileges. The command mounter is untested against a real
   FunctionFS mount/UDC in the default suite; there is no persistent daemon
   process, restart supervision, real UDC event loop, node route that starts the
-  lifecycle, or vendor protocol. Class/vendor control requests are rejected
-  with typed errors until a protocol handler exists. Suspend and resume events
-  are accepted but not acted on. UAC2 models descriptors/capabilities, writes
+  lifecycle, or vendor protocol. `running` is deliberately only reachable after
+  a real endpoint transfer; a mount, marker, UDC bind, or enable event never
+  suffices. Class/vendor control requests are rejected with typed errors until a
+  protocol handler exists. Suspend and resume events are accepted but not acted
+  on. UAC2 models descriptors/capabilities, writes
   the primary ConfigFS attributes, and now includes a testable isochronous
   bridge core (`Uac2Bridge`) with injectable endpoints and audio paths. It does
   **not** yet service a real UDC/FunctionFS isochronous endpoint, open ALSA or

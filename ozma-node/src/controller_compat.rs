@@ -73,6 +73,7 @@ use crate::multi_hls::{
     MultiConsoleHls, MultiConsoleHlsStatus,
 };
 use crate::multi_webrtc::{MultiConsoleWebrtc, MultiConsoleWebrtcStatus};
+use crate::usb_uac2::{Uac2BridgeError, Uac2BridgeShared};
 use crate::webrtc::{WebRtcControl, WebRtcError};
 
 /// HID packet type for an 8-byte boot keyboard report.
@@ -1614,6 +1615,7 @@ pub struct UsbControl {
     capabilities: UsbGadgetCapabilities,
     error: Option<String>,
     nbd: Arc<Mutex<Option<NbdRuntime>>>,
+    uac2_bridge: Option<Uac2BridgeShared>,
 }
 
 struct NbdRuntime {
@@ -1635,6 +1637,7 @@ impl UsbControl {
             capabilities,
             error: None,
             nbd: Arc::new(Mutex::new(None)),
+            uac2_bridge: None,
         }
     }
 
@@ -1646,7 +1649,30 @@ impl UsbControl {
             capabilities: UsbGadgetCapabilities::unavailable(),
             error: Some(reason.into()),
             nbd: Arc::new(Mutex::new(None)),
+            uac2_bridge: None,
         }
+    }
+
+    /// Attach the runtime UAC2 bridge status snapshot.
+    ///
+    /// `None` leaves descriptor-only status untouched. A configured bridge
+    /// overlay is attached to every UAC2 function in `GET /usb`, including a
+    /// typed `unsupported` report when the bridge could not start.
+    pub fn with_uac2_bridge(mut self, bridge: Option<Uac2BridgeShared>) -> Self {
+        self.uac2_bridge = bridge;
+        self
+    }
+
+    /// Attach or replace the runtime UAC2 bridge status snapshot.
+    pub fn set_uac2_bridge(&mut self, bridge: Option<Uac2BridgeShared>) {
+        self.uac2_bridge = bridge;
+    }
+
+    /// Last typed bridge/adapter error, when one has been observed.
+    pub fn uac2_bridge_error(&self) -> Option<Uac2BridgeError> {
+        self.uac2_bridge
+            .as_ref()
+            .and_then(Uac2BridgeShared::last_error)
     }
 
     /// Configured gadget directory name.
@@ -1701,6 +1727,19 @@ impl UsbControl {
         controller
             .status(&self.gadget)
             .map(UsbGadgetSnapshot::from_status)
+            .map(|mut snapshot| {
+                if let Some(bridge) = &self.uac2_bridge {
+                    let report = bridge.report();
+                    for function in &mut snapshot.functions {
+                        if function.kind == UsbFunctionKind::Uac2 {
+                            if let Some(uac2) = function.uac2.take() {
+                                function.uac2 = Some(uac2.with_bridge_report(report.clone()));
+                            }
+                        }
+                    }
+                }
+                snapshot
+            })
             .map_err(|error| format!("{}: {error}", error.kind()))
     }
 
@@ -3231,7 +3270,7 @@ async fn usb_status(State(state): State<ConnectionState>) -> Response {
     match control.snapshot() {
         Ok(gadget) => {
             let media = gadget.media();
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "ok": true,
                 "available": gadget.bound,
                 "status": if gadget.bound { "running" } else { "unbound" },
@@ -3243,6 +3282,12 @@ async fn usb_status(State(state): State<ConnectionState>) -> Response {
                 "attached": [],
                 "attached_scan": false,
             });
+            if let Some(error) = control.uac2_bridge_error() {
+                body["uac2_bridge_error"] = serde_json::json!({
+                    "kind": error.kind,
+                    "message": error.message,
+                });
+            }
             Json(body).into_response()
         }
         Err(error) => usb_status_unavailable(&error),
@@ -10647,6 +10692,195 @@ mod tests {
         assert_eq!(vendor["requires_userspace"], true);
         assert_eq!(vendor["function_fs"]["ready"], false);
         assert_eq!(vendor["function_fs"]["readiness"], "daemon_not_configured");
+    }
+
+    #[tokio::test]
+    async fn usb_status_overlays_configured_bridge_without_claiming_live_audio() {
+        use ozma_usb::{
+            Uac2BridgeCounters, Uac2BridgeReport, Uac2BridgeStatus, Uac2BridgeStreamReport,
+            Uac2Direction, Uac2PcmFormat, Uac2SampleSize, UAC2_PLAYBACK_ENDPOINT,
+        };
+
+        let format = Uac2PcmFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            sample_size: Uac2SampleSize::S16,
+        };
+        let report = Uac2BridgeReport {
+            status: Uac2BridgeStatus::Configured,
+            playback: Some(Uac2BridgeStreamReport {
+                endpoint: UAC2_PLAYBACK_ENDPOINT,
+                direction: Uac2Direction::Out,
+                format,
+                packet_interval: 1,
+                max_packet_size: 1024,
+                maximum_packet_bytes: 24,
+            }),
+            capture: None,
+            counters: Uac2BridgeCounters::default(),
+            missing_paths: Vec::new(),
+            reason: None,
+        };
+        let state = uac2_usb_state(Some(crate::usb_uac2::Uac2BridgeShared::from_report(report)));
+        let (status, body) = get_json(&usb_router(state), "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        let audio = body["gadget"]["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|function| function["name"] == "uac2.audio")
+            .unwrap();
+        assert_eq!(audio["uac2"]["bridge"], "configured");
+        assert_eq!(audio["uac2"]["bridge_report"]["status"], "configured");
+        assert_eq!(
+            audio["uac2"]["bridge_report"]["playback"]["endpoint"],
+            UAC2_PLAYBACK_ENDPOINT
+        );
+        assert_eq!(
+            audio["uac2"]["bridge_report"]["playback"]["format"]["sample_rate"],
+            48_000
+        );
+        assert_eq!(
+            audio["uac2"]["bridge_report"]["playback"]["max_packet_size"],
+            1024
+        );
+        assert_eq!(audio["uac2"]["bridge_report"]["counters"]["sink_bytes"], 0);
+        assert_ne!(audio["uac2"]["bridge"], "running");
+    }
+
+    #[tokio::test]
+    async fn usb_status_reports_running_only_with_pcm_counters() {
+        use ozma_usb::{
+            Uac2BridgeCounters, Uac2BridgeReport, Uac2BridgeStatus, Uac2BridgeStreamReport,
+            Uac2Direction, Uac2PcmFormat, Uac2SampleSize, UAC2_CAPTURE_ENDPOINT,
+        };
+
+        let format = Uac2PcmFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            sample_size: Uac2SampleSize::S16,
+        };
+        let mut counters = Uac2BridgeCounters::default();
+        counters.sink_bytes = 1_920;
+        counters.sink_frames = 480;
+        counters.capture_bytes_out = 1_920;
+        counters.capture_frames_out = 480;
+        let report = Uac2BridgeReport {
+            status: Uac2BridgeStatus::Running,
+            playback: Some(Uac2BridgeStreamReport {
+                endpoint: 0x01,
+                direction: Uac2Direction::Out,
+                format,
+                packet_interval: 1,
+                max_packet_size: 1024,
+                maximum_packet_bytes: 24,
+            }),
+            capture: Some(Uac2BridgeStreamReport {
+                endpoint: UAC2_CAPTURE_ENDPOINT,
+                direction: Uac2Direction::In,
+                format,
+                packet_interval: 1,
+                max_packet_size: 1024,
+                maximum_packet_bytes: 24,
+            }),
+            counters,
+            missing_paths: Vec::new(),
+            reason: None,
+        };
+        let state = uac2_usb_state(Some(crate::usb_uac2::Uac2BridgeShared::from_report(report)));
+        let (status, body) = get_json(&usb_router(state), "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        let audio = body["gadget"]["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|function| function["name"] == "uac2.audio")
+            .unwrap();
+        assert_eq!(audio["uac2"]["bridge"], "running");
+        assert_eq!(
+            audio["uac2"]["bridge_report"]["counters"]["sink_bytes"],
+            1_920
+        );
+        assert_eq!(audio["uac2"]["bridge_report"]["capture"]["direction"], "in");
+        assert!(body.get("uac2_bridge_error").is_none());
+    }
+
+    #[tokio::test]
+    async fn usb_status_reports_unsupported_and_typed_bridge_errors() {
+        use ozma_usb::{Uac2BridgeCounters, Uac2BridgeReport, Uac2BridgeStatus};
+
+        let unsupported = Uac2BridgeReport::unsupported("uac2-missing-path: no gadget ALSA card");
+        let state = uac2_usb_state(Some(crate::usb_uac2::Uac2BridgeShared::from_report(
+            unsupported,
+        )));
+        let (status, body) = get_json(&usb_router(state), "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        let audio = body["gadget"]["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|function| function["name"] == "uac2.audio")
+            .unwrap();
+        assert_eq!(audio["uac2"]["bridge"], "unsupported");
+        assert_eq!(
+            audio["uac2"]["bridge_report"]["reason"],
+            "uac2-missing-path: no gadget ALSA card"
+        );
+        assert_ne!(audio["uac2"]["bridge"], "running");
+
+        let stopped = Uac2BridgeReport {
+            status: Uac2BridgeStatus::Stopped,
+            playback: None,
+            capture: None,
+            counters: Uac2BridgeCounters {
+                sink_bytes: 64,
+                sink_frames: 16,
+                ..Uac2BridgeCounters::default()
+            },
+            missing_paths: Vec::new(),
+            reason: None,
+        };
+        let shared = crate::usb_uac2::Uac2BridgeShared::from_report_with_error(
+            stopped,
+            crate::usb_uac2::Uac2BridgeError {
+                kind: "uac2-endpoint".to_owned(),
+                message: "backpressure".to_owned(),
+            },
+        );
+        let state = uac2_usb_state(Some(shared));
+        let (status, body) = get_json(&usb_router(state), "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        let audio = body["gadget"]["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|function| function["name"] == "uac2.audio")
+            .unwrap();
+        assert_eq!(audio["uac2"]["bridge"], "stopped");
+        assert_eq!(body["uac2_bridge_error"]["kind"], "uac2-endpoint");
+        assert_eq!(body["uac2_bridge_error"]["message"], "backpressure");
+    }
+
+    fn uac2_usb_state(bridge: Option<crate::usb_uac2::Uac2BridgeShared>) -> ConnectionState {
+        let fake = Arc::new(FakeUsbGadgetController::new());
+        let config = UsbGadgetConfig::new("ozma", "dummy_udc.0")
+            .with_function(UsbFunction::uac2("audio", 2, 1, 48_000, 16));
+        fake.create_gadget(&config).unwrap();
+        fake.bind("ozma", "dummy_udc.0").unwrap();
+        ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_usb(Some(
+            UsbControl::configured(fake, "ozma").with_uac2_bridge(bridge),
+        ))
     }
 
     #[tokio::test]

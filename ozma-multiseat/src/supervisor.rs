@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use crate::audio::{SeatAudioRouter, SeatAudioSpec};
 use crate::error::MultiseatError;
 use crate::input::InputGroup;
+use crate::input_isolation::{helper_devices, SeatInputHelper};
 use crate::ownership::{DisplayOwnership, DisplayOwnershipController};
 use crate::routing::{InputRoutePlan, InputRouter, InputRoutingStrategy, InputTarget};
 use crate::seat::{
@@ -356,6 +357,12 @@ pub struct SupervisorOptions {
     /// Off by default. The evdev strategy still requires an injected backend;
     /// the default backend is typed unsupported.
     pub apply_routing: bool,
+    /// Ask the privileged helper to grab each seat's devices before spawning.
+    ///
+    /// Off by default. When enabled, routing is not applied (the helper owns
+    /// input) and a helper that is missing or fails a grab is a typed start
+    /// failure, never a silent unisolated spawn.
+    pub input_isolation: bool,
 }
 
 impl Default for SupervisorOptions {
@@ -370,6 +377,7 @@ impl Default for SupervisorOptions {
             dry_run: false,
             apply_ownership: false,
             apply_routing: false,
+            input_isolation: false,
         }
     }
 }
@@ -462,6 +470,7 @@ pub struct ProcessSeatSupervisor {
     ownership: Option<Box<dyn DisplayOwnershipController>>,
     routing: Option<Box<dyn InputRouter>>,
     evdev_routing: Option<Box<dyn InputRouter>>,
+    input_helper: Option<Box<dyn SeatInputHelper>>,
     audio: Option<Box<dyn SeatAudioRouter>>,
     seats: BTreeMap<String, ManagedSeat>,
 }
@@ -489,6 +498,7 @@ impl ProcessSeatSupervisor {
             ownership: None,
             routing: None,
             evdev_routing: None,
+            input_helper: None,
             audio: None,
             seats: BTreeMap::new(),
         }
@@ -527,6 +537,18 @@ impl ProcessSeatSupervisor {
         self
     }
 
+    /// Install the privileged input-isolation helper client used by
+    /// [`SupervisorOptions::input_isolation`].
+    ///
+    /// Start asks the helper to grab the seat's complete device set before the
+    /// child is spawned. A missing helper, failed grab, or cross-seat conflict
+    /// is a typed failure: the seat is not spawned and earlier seats are
+    /// released. Stop/remove/shutdown release every confirmed seat.
+    pub fn with_input_isolation_helper(mut self, helper: Box<dyn SeatInputHelper>) -> Self {
+        self.input_helper = Some(helper);
+        self
+    }
+
     /// Install the per-seat audio sink router used by `--audio-router`.
     ///
     /// With a router installed, start ensures the seat's null sink (and its
@@ -550,12 +572,14 @@ impl ProcessSeatSupervisor {
     }
 
     /// Apply both opt-in resources for one seat in deterministic order:
-    /// xrandr ownership first, then input routing.
+    /// xrandr ownership first, then input routing or helper isolation.
     fn apply_seat_resources(&mut self, seat_id: &str) -> Result<(), MultiseatError> {
         if self.options.apply_ownership {
             self.apply_ownership(seat_id)?;
         }
-        if self.options.apply_routing {
+        // Helper isolation owns input when selected. Never apply xinput mapping
+        // to a device that is about to be grabbed (or was already grabbed).
+        if self.options.apply_routing && !self.options.input_isolation {
             if let Err(error) = self.apply_routing(seat_id) {
                 // The ownership applied a moment ago must not leak when
                 // routing cannot be reserved.
@@ -563,7 +587,136 @@ impl ProcessSeatSupervisor {
                 return Err(error);
             }
         }
+        if self.options.input_isolation {
+            if let Err(error) = self.apply_input_isolation(seat_id) {
+                self.release_seat_resources(seat_id);
+                return Err(error);
+            }
+        }
         self.ensure_seat_audio(seat_id);
+        Ok(())
+    }
+
+    /// Ask the helper to grab the seat's complete device set.
+    ///
+    /// The applied flag is only set from the helper's confirmed response. If a
+    /// previously applied assignment disappeared (helper restart), this
+    /// re-grabs instead of trusting the stale flag.
+    fn apply_input_isolation(&mut self, seat_id: &str) -> Result<(), MultiseatError> {
+        let (group, already_applied) = {
+            let Some(seat) = self.seats.get(seat_id) else {
+                return Err(MultiseatError::UnknownSeat(seat_id.to_owned()));
+            };
+            (seat.input.clone(), seat.resources.input_isolation_applied)
+        };
+        let Some(group) = group else {
+            // No input group means there is no physical input to isolate. The
+            // planner already emitted a SeatWithoutInput diagnostic.
+            return Ok(());
+        };
+        let devices = helper_devices(&group);
+        if devices.is_empty() {
+            return Ok(());
+        }
+        let expected_paths: Vec<String> =
+            devices.iter().map(|device| device.path.clone()).collect();
+
+        if self.input_helper.is_none() {
+            let error = MultiseatError::Unsupported(format!(
+                "seat {seat_id} requested helper input isolation but no input helper is configured"
+            ));
+            self.record_resource_error(
+                seat_id,
+                ResourceKind::InputIsolation,
+                ResourceAction::Apply,
+                &error.to_string(),
+            );
+            return Err(error);
+        }
+
+        if already_applied {
+            let status = self
+                .input_helper
+                .as_mut()
+                .expect("helper checked above")
+                .seat_status(seat_id);
+            match status {
+                Ok(Some(status)) if status.grabbed == expected_paths => {
+                    if let Some(seat) = self.seats.get_mut(seat_id) {
+                        seat.resources.grabbed_device_count = status.grabbed.len();
+                        seat.resources.uinput_devices = status.uinput_devices;
+                    }
+                    return Ok(());
+                }
+                Ok(_) => {
+                    // The helper lost the assignment. Do not keep claiming
+                    // isolation; fall through to a fresh grab.
+                    if let Some(seat) = self.seats.get_mut(seat_id) {
+                        seat.resources.input_isolation_applied = false;
+                        seat.resources.grabbed_device_count = 0;
+                        seat.resources.uinput_devices.clear();
+                    }
+                    self.record_resource_error(
+                        seat_id,
+                        ResourceKind::InputIsolation,
+                        ResourceAction::Apply,
+                        "helper no longer reports the seat's grab; re-applying",
+                    );
+                }
+                Err(error) => {
+                    if let Some(seat) = self.seats.get_mut(seat_id) {
+                        seat.resources.input_isolation_applied = false;
+                        seat.resources.grabbed_device_count = 0;
+                        seat.resources.uinput_devices.clear();
+                    }
+                    self.record_resource_error(
+                        seat_id,
+                        ResourceKind::InputIsolation,
+                        ResourceAction::Apply,
+                        &format!("checking helper assignment: {error}"),
+                    );
+                }
+            }
+        }
+
+        let assignment = self
+            .input_helper
+            .as_mut()
+            .expect("helper checked above")
+            .grab(seat_id, &devices);
+        let assignment = match assignment {
+            Ok(assignment) => assignment,
+            Err(error) => {
+                self.record_resource_error(
+                    seat_id,
+                    ResourceKind::InputIsolation,
+                    ResourceAction::Apply,
+                    &error.to_string(),
+                );
+                return Err(error);
+            }
+        };
+        if assignment.grabbed.len() != devices.len() {
+            let error = MultiseatError::InputIsolation(format!(
+                "helper confirmed {}/{} devices for seat {seat_id}; refusing partial isolation",
+                assignment.grabbed.len(),
+                devices.len()
+            ));
+            self.record_resource_error(
+                seat_id,
+                ResourceKind::InputIsolation,
+                ResourceAction::Apply,
+                &error.to_string(),
+            );
+            return Err(error);
+        }
+
+        if let Some(seat) = self.seats.get_mut(seat_id) {
+            seat.resources.input_isolation_applied = true;
+            seat.resources.input_isolation_released = false;
+            seat.resources.grabbed_device_count = assignment.grabbed.len();
+            seat.resources.uinput_devices = assignment.uinput_devices;
+        }
         Ok(())
     }
 
@@ -698,6 +851,10 @@ impl ProcessSeatSupervisor {
                      the default backend is unsupported"
                 ))),
             },
+            InputRoutingStrategy::InputIsolation => Err(MultiseatError::Unsupported(format!(
+                "seat {seat_id} requires the privileged input-isolation helper; \
+                 enable SupervisorOptions::input_isolation"
+            ))),
         };
 
         match result {
@@ -726,22 +883,56 @@ impl ProcessSeatSupervisor {
     /// release failure leaves the applied flag set, records a typed error, and
     /// does not hide the seat's lifecycle state.
     fn release_seat_resources(&mut self, seat_id: &str) {
-        let Some((routing_applied, ownership_applied, audio_applied, strategy, audio_sink)) =
-            self.seats.get(seat_id).map(|seat| {
-                (
-                    seat.resources.routing_applied,
-                    seat.resources.ownership_applied,
-                    seat.resources.audio_applied,
-                    seat.input_route
-                        .as_ref()
-                        .map(|route| route.strategy)
-                        .unwrap_or(InputRoutingStrategy::XInputMapToOutput),
-                    seat.audio_spec.name.clone(),
-                )
-            })
+        let Some((
+            routing_applied,
+            ownership_applied,
+            audio_applied,
+            isolation_applied,
+            strategy,
+            audio_sink,
+        )) = self.seats.get(seat_id).map(|seat| {
+            (
+                seat.resources.routing_applied,
+                seat.resources.ownership_applied,
+                seat.resources.audio_applied,
+                seat.resources.input_isolation_applied,
+                seat.input_route
+                    .as_ref()
+                    .map(|route| route.strategy)
+                    .unwrap_or(InputRoutingStrategy::XInputMapToOutput),
+                seat.audio_spec.name.clone(),
+            )
+        })
         else {
             return;
         };
+
+        // Isolation is released before routing/ownership (reverse of apply
+        // order). A failure leaves the applied flag set for a later retry.
+        if isolation_applied {
+            let result = match self.input_helper.as_mut() {
+                Some(helper) => helper.release(seat_id).map(|_| ()),
+                None => Err(MultiseatError::Unsupported(format!(
+                    "seat {seat_id} has applied input isolation but no helper is configured"
+                ))),
+            };
+            match result {
+                Ok(()) => {
+                    if let Some(seat) = self.seats.get_mut(seat_id) {
+                        seat.resources.input_isolation_applied = false;
+                        seat.resources.input_isolation_released = true;
+                        seat.resources.grabbed_device_count = 0;
+                        seat.resources.uinput_devices.clear();
+                    }
+                }
+                Err(error) => self.record_resource_error(
+                    seat_id,
+                    ResourceKind::InputIsolation,
+                    ResourceAction::Release,
+                    &error.to_string(),
+                ),
+            }
+        }
 
         if routing_applied {
             let result = match strategy {
@@ -757,6 +948,14 @@ impl ProcessSeatSupervisor {
                         "seat {seat_id} has an applied evdev route but no evdev backend is configured"
                     ))),
                 },
+                InputRoutingStrategy::InputIsolation => {
+                    // A helper-owned seat never has routing_applied, so this
+                    // arm is only reachable if a caller mixed strategies.
+                    Err(MultiseatError::Unsupported(format!(
+                        "seat {seat_id} has input-isolation routing; release it through \
+                         SupervisorOptions::input_isolation"
+                    )))
+                }
             };
             match result {
                 Ok(()) => {
@@ -819,6 +1018,18 @@ impl ProcessSeatSupervisor {
                 ),
             }
         }
+
+        // Do not keep a privileged helper alive with no confirmed grabs. It is
+        // started again lazily on the next seat start.
+        let any_isolation = self
+            .seats
+            .values()
+            .any(|seat| seat.resources.input_isolation_applied);
+        if self.options.input_isolation && !any_isolation {
+            if let Some(helper) = self.input_helper.as_mut() {
+                helper.shutdown();
+            }
+        }
     }
 
     /// Release every applied resource in reverse seat order.
@@ -833,6 +1044,7 @@ impl ProcessSeatSupervisor {
             .filter(|(_, seat)| {
                 seat.resources.ownership_applied
                     || seat.resources.routing_applied
+                    || seat.resources.input_isolation_applied
                     || seat.resources.audio_applied
             })
             .map(|(seat_id, _)| seat_id.clone())
@@ -946,6 +1158,102 @@ impl ProcessSeatSupervisor {
                 let _ = self.launch_once(&seat_id, now);
             }
         }
+
+        if self.options.input_isolation {
+            self.reconcile_input_isolation(now);
+        }
+    }
+
+    /// Detect a helper that restarted or lost a seat's grab and repair it.
+    ///
+    /// Isolation is never left claimed after a helper restart. If a fresh grab
+    /// also fails, the unisolated child is stopped and scheduled for a restart
+    /// rather than left running with a false isolation claim.
+    fn reconcile_input_isolation(&mut self, now: Instant) {
+        let applied: Vec<String> = self
+            .seats
+            .iter()
+            .filter(|(_, seat)| seat.resources.input_isolation_applied)
+            .map(|(seat_id, _)| seat_id.clone())
+            .collect();
+        if applied.is_empty() {
+            return;
+        }
+
+        for seat_id in applied {
+            let expected: Vec<String> = self
+                .seats
+                .get(&seat_id)
+                .and_then(|seat| seat.input.as_ref())
+                .map(|group| {
+                    helper_devices(group)
+                        .into_iter()
+                        .map(|device| device.path)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let helper_status = match self.input_helper.as_mut() {
+                Some(helper) => Some(helper.seat_status(&seat_id)),
+                None => None,
+            };
+            let intact = match helper_status {
+                Some(Ok(Some(status))) => status.grabbed == expected,
+                Some(Ok(None)) => false,
+                Some(Err(error)) => {
+                    self.record_resource_error(
+                        &seat_id,
+                        ResourceKind::InputIsolation,
+                        ResourceAction::Apply,
+                        &format!("checking helper assignment: {error}"),
+                    );
+                    false
+                }
+                None => false,
+            };
+            if intact {
+                continue;
+            }
+
+            if let Some(seat) = self.seats.get_mut(&seat_id) {
+                seat.resources.input_isolation_applied = false;
+                seat.resources.grabbed_device_count = 0;
+                seat.resources.uinput_devices.clear();
+            }
+            self.record_resource_error(
+                &seat_id,
+                ResourceKind::InputIsolation,
+                ResourceAction::Apply,
+                "helper lost the seat's grab; re-applying isolation",
+            );
+
+            if let Err(error) = self.apply_input_isolation(&seat_id) {
+                let stop_child = self
+                    .seats
+                    .get(&seat_id)
+                    .is_some_and(|seat| seat.child.is_some());
+                if !stop_child {
+                    continue;
+                }
+                let seat = self.seats.get_mut(&seat_id).expect("tracked seat");
+                if let Some(mut child) = seat.child.take() {
+                    if let Err(cleanup) = child.terminate() {
+                        seat.child = Some(child);
+                        seat.state = SeatState::Failed;
+                        seat.last_error = Some(format!(
+                            "input isolation lost ({error}); cleanup failed: {cleanup}"
+                        ));
+                        seat.next_restart = None;
+                    } else {
+                        seat.pid = None;
+                        seat.started_at = None;
+                        seat.last_error = Some(format!(
+                            "input isolation lost and could not be restored: {error}"
+                        ));
+                        schedule_restart(&self.options, seat, now);
+                    }
+                }
+            }
+        }
     }
 
     /// Stop a seat and forget it. Unknown ids are an error.
@@ -958,6 +1266,7 @@ impl ProcessSeatSupervisor {
         let status = self.stop(seat_id)?;
         if status.resources.ownership_applied
             || status.resources.routing_applied
+            || status.resources.input_isolation_applied
             || status.resources.audio_applied
         {
             return Ok(status);
@@ -1135,7 +1444,10 @@ impl ProcessSeatSupervisor {
             seat.input_route = plan.input_route.clone();
             // A fresh start after stop/release begins a new resource cycle;
             // keep applied state when this is a retry of the same reservation.
-            if !seat.resources.ownership_applied && !seat.resources.routing_applied {
+            if !seat.resources.ownership_applied
+                && !seat.resources.routing_applied
+                && !seat.resources.input_isolation_applied
+            {
                 seat.resources = SeatResourceStatus::default();
             }
             seat.state = SeatState::Starting;
@@ -1158,6 +1470,9 @@ impl ProcessSeatSupervisor {
                 if self.options.apply_routing && seat.input_route.is_some() {
                     message.push_str("; would apply input routing");
                 }
+                if self.options.input_isolation && seat.input.is_some() {
+                    message.push_str("; would grab input through the seat-input helper");
+                }
                 seat.message = Some(message);
                 return Ok(seat.status(now));
             }
@@ -1166,7 +1481,10 @@ impl ProcessSeatSupervisor {
         // Opt-in resources are reserved before the child exists. An apply
         // failure never spawns this seat, and earlier seats are rolled back so
         // a partially applied seat set is not left behind.
-        if self.options.apply_ownership || self.options.apply_routing {
+        if self.options.apply_ownership
+            || self.options.apply_routing
+            || self.options.input_isolation
+        {
             if let Err(error) = self.apply_seat_resources(&seat_id) {
                 self.release_seat_resources(&seat_id);
                 self.rollback_applied_resources();
@@ -1224,6 +1542,9 @@ impl Drop for ProcessSeatSupervisor {
         // Best-effort shutdown release; errors are dropped with the
         // supervisor. `stop`/`stop_all` surface them in status first.
         self.rollback_applied_resources();
+        if let Some(helper) = self.input_helper.as_mut() {
+            helper.shutdown();
+        }
     }
 }
 

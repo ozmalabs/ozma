@@ -2,22 +2,27 @@
 
 Status: **library + real subprocess supervisor + CLI + controller read-only
 grouping + persisted seats/hotplug reconciliation + opt-in
-input-routing/display-ownership/audio execution (2026-11-25).**
+input-routing/display-ownership/audio execution + opt-in privileged input
+isolation (2026-11-25).**
 The crate enumerates display/input topology, plans one desktop seat per output,
 can spawn, health-check, restart, stop, and report one `ozma-node --profile
-desktop` child per seat, and models the three opt-in resource layers: `xinput
+desktop` child per seat, and models the opt-in resource layers: `xinput
 map-to-output` input routing with rollback, per-seat `xrandr`
-output/mode/position ownership, and per-seat PipeWire/PulseAudio null sinks. The
-supervisor **applies those resources before spawning and releases them on
-stop/remove/shutdown** when the explicit `--apply-ownership`/`--apply-routing`/
-`--audio-router` CLI flags (or the matching `SupervisorOptions`/builder calls)
-are enabled; all default to off, and dry-run still performs no action. A
-versioned `seats.json` store (`--seats-file`) preserves seat ids, display
-outputs, input hubs, ports, and audio sinks across replans; a sysfs hotplug
-model (`--hotplug`) reconciles add/remove display and input-hub events into
-seat start/stop with debounce. It is **not wired into `ozma-node` or
-`ozma-softnode`**, and it creates no virtual display. No real evdev grab is
-performed and no input is injected. The controller can group the independent
+output/mode/position ownership, per-seat PipeWire/PulseAudio null sinks, and a
+privileged `ozma-seat-input` helper that performs real `EVIOCGRAB` and per-seat
+uinput creation. The supervisor **applies those resources before spawning and
+releases them on stop/remove/shutdown** when the explicit
+`--apply-ownership`/`--apply-routing`/`--audio-router`/`--input-isolation
+helper` CLI flags (or the matching `SupervisorOptions`/builder calls) are
+enabled; all default to off, and dry-run still performs no action. The default
+input path remains the xinput strategy; the helper path is never selected
+implicitly. A versioned `seats.json` store (`--seats-file`) preserves seat ids,
+display outputs, input hubs, ports, and audio sinks across replans; a sysfs
+hotplug model (`--hotplug`) reconciles add/remove display and input-hub events
+into seat start/stop with debounce. It is **not wired into `ozma-node` or
+`ozma-softnode`**, and it creates no virtual display. The helper grabs physical
+devices only when explicitly requested and confirmed; it is not invoked by the
+default plan, tests, or dry runs. The controller can group the independent
 per-seat node registrations for display, without merging them or taking over
 seat lifecycle.
 
@@ -69,6 +74,14 @@ Implemented:
   `assign_seats` all-or-nothing assignment. `EvdevGrabRouter` models exclusive
   `EVIOCGRAB` requests and per-seat uinput environment; its default backend
   returns a typed unsupported error instead of grabbing.
+- **Privileged input isolation** (`input_isolation` + `ozma-seat-input`): a
+  line-delimited JSON protocol and helper state machine with strict
+  `/dev/input/eventN` validation, duplicate/cross-seat rejection, and rollback.
+  The helper binary is the only component that opens evdev/uinput, calls
+  `EVIOCGRAB`, creates per-seat uinput devices, and relays events; its single
+  unsafe module sets `O_NONBLOCK` on a grabbed fd. `HelperClient` is the
+  non-privileged supervisor client and refuses a fake helper unless a test
+  explicitly opts in.
 - `ownership`: `DisplayOwnership` and `XrandrOwnershipController` model
   per-seat output ownership as
   `xrandr --output <output> --mode <mode> --pos <x>x<y>`, with apply/release
@@ -77,14 +90,16 @@ Implemented:
   explicit uinput seat.
 - Opt-in supervisor resource execution: with `apply_ownership`/`apply_routing`
   enabled, `ProcessSeatSupervisor` applies xrandr ownership and then
-  xinput/evdev routing **before** spawning a child. An apply failure prevents
-  that spawn, records a typed `SeatResourceError`, and releases resources
-  already applied for earlier seats. Stop, remove, rollback, and `Drop` release
-  routing before ownership, best effort, with failures kept in status.
+  xinput/evdev routing **before** spawning a child. With `input_isolation` it
+  instead asks the helper for a confirmed grab of the seat's complete device
+  set. An apply failure prevents that spawn, records a typed
+  `SeatResourceError`, and releases resources already applied for earlier seats.
+  Stop, remove, rollback, and `Drop` release isolation, routing, and ownership,
+  best effort, with failures kept in status.
 - Status carries `resources` (`ownership_applied`, `routing_applied`,
-  `audio_applied`, `ownership_released`, `routing_released`, `audio_released`,
-  and typed `errors`). The field is omitted when no resource action happened, so
-  default status is unchanged.
+  `input_isolation_applied`, `audio_applied`, matching `*_released` flags,
+  `grabbed_device_count`, `uinput_devices`, and typed `errors`). The field is
+  omitted when no resource action happened, so default status is unchanged.
 - **Seat persistence** (`persistence`): a versioned `SeatStore`/`seats.json`
   with explicit seat id, display output, input hub, device paths, UDP/HTTP
   ports, audio sink, and profile. Loads validate ids/displays/ports/sinks and
@@ -125,20 +140,22 @@ Deliberately not implemented yet:
   focus, so `xrandr` ownership is not screen isolation. Separate X screens,
   a per-seat X server/compositor, or DRM leasing are still required and are not
   created here. Wayland compositor seats are modelled only as a kind.
-- **Real exclusive evdev grabs.** `EvdevGrabRouter` models `EVIOCGRAB` and
-  provides the execution seam, but the default backend is unsupported because
-  the crate forbids `unsafe`; no privileged helper exists. udev/Xorg
-  `InputDevice` sections are not generated.
-- **Automatic routing/ownership/audio execution is opt-in.** The CLI executes
-  the planned ownership/routing/audio commands only with `--apply-ownership`,
-  `--apply-routing`, and/or `--audio-router`; all default off, and
+- **Real exclusive evdev grabs by default.** `EvdevGrabRouter` still models
+  `EVIOCGRAB` with an unsupported default backend. The real path is the
+  separate opt-in `ozma-seat-input` helper (`--input-isolation helper`);
+  udev/Xorg `InputDevice` sections are still not generated.
+- **Automatic routing/ownership/audio/isolation execution is opt-in.** The CLI
+  executes the planned ownership/routing/audio commands only with
+  `--apply-ownership`, `--apply-routing`, and/or `--audio-router`, and the
+  helper only with `--input-isolation helper`; all default off, and
   `--print-plan`/`--dry-run` never execute them. There is no policy engine,
   per-seat retry loop beyond the supervisor's restart path, or automatic
   reconciliation after external X layout changes. Evdev routing still requires
   an injected backend.
-- Per-seat uinput targeting at the kernel/compositor level; the node's uinput
-  sink still does not choose an X screen. The environment now names the target
-  seat, but the node must honour it.
+- **Kernel/compositor seat targeting for the helper's uinput devices.** The
+  helper creates and reports per-seat uinput devices and relays physical events,
+  but no node/compositor integration yet consumes those names as a seat input
+  source. The node's own uinput sink still does not choose an X screen.
 - **Per-process audio routing and DSP.** `ozma-audio` creates/removes the null
   sink and exposes its monitor target; moving individual application streams,
   microphone remaps, room correction, and a Windows virtual audio endpoint are
@@ -268,8 +285,9 @@ These layers turn the plan's device paths and output names into explicit
 commands. They are **opt-in** in the CLI and supervisor: with the flags off (the
 default) the plan is printed and injected into the child environment only; with
 `--apply-ownership`/`--apply-routing` the supervisor calls the
-`XrandrOwnershipController` and `XInputRouter` around the child lifecycle. A
-caller can still construct a router/controller directly.
+`XrandrOwnershipController` and `XInputRouter` around the child lifecycle, and
+with `--input-isolation helper` it asks the privileged helper for a confirmed
+grab. A caller can still construct a router/controller directly.
 
 ### Physical input routing
 
@@ -313,6 +331,69 @@ xinput map-to-output 12 HDMI-1
 xinput map-to-output 12 all          # release/reset
 ```
 
+### Real input isolation (`--input-isolation helper`)
+
+The xinput strategy maps a shared pointer inside one X server. Real isolation
+needs exclusive access to the physical evdev nodes. That is supplied by the
+separate `ozma-seat-input` helper, which is the only component that opens
+`/dev/input/event*`, issues `EVIOCGRAB`, or creates `/dev/uinput` devices.
+
+- **Opt-in selection.** `--input-isolation xinput` is the default and keeps the
+  existing xinput plan. `--input-isolation helper` rewrites each seat's
+  `InputRoutePlan` strategy to `seat-input-helper`, makes `grab_exclusive` true,
+  and installs `HelperClient`. It is mutually exclusive with `--apply-routing`,
+  because a grabbed device cannot also be shared through xinput.
+- **Helper protocol.** The supervisor spawns the helper (default program
+  `ozma-seat-input`, override with `--input-helper PATH`) and speaks one JSON
+  object per line over stdin/stdout. Requests are `hello`, `grab {seat_id,
+  devices}`, `release {seat_id}`, `status`, and `shutdown`. Responses are
+  `ready {protocol, helper, backend, pid}`, `grabbed {seat_id, grabbed,
+  uinput_devices}`, `released`, `status`, `shutting_down`, or a typed
+  `error {code, message, seat_id, device}`. The client checks the protocol
+  version and refuses a `fake` backend unless a test explicitly opts in.
+- **Validation and ownership.** The helper accepts only lexical
+  `/dev/input/event<digits>` paths, rejects duplicates in one request, and
+  rejects a device already grabbed by another seat or a changed set for a seat
+  that is already grabbed. It validates the whole request before touching a
+  device. The real backend additionally rejects symlinked event paths.
+- **Ordering and rollback.** For each seat the helper grabs each device, creates
+  one uinput device mirroring the source's key/relative/absolute/switch
+  capabilities, and starts a relay thread that forwards events. If any step
+  fails, it stops relays, destroys uinput devices, and ungrabs every device
+  already acquired before returning the typed error. No partial assignment is
+  recorded.
+- **Supervisor semantics.** With `input_isolation` enabled, start applies
+  ownership (if requested), then the confirmed helper grab, then audio; on any
+  failure the seat is not spawned, the typed `input_isolation` apply error is
+  stored, and earlier seats are released. Stop/remove/rollback/`Drop` release
+  isolation before routing/ownership. A release failure keeps
+  `input_isolation_applied` true and retains the seat for `remove` retry.
+- **Crash/restart honesty.** `tick` re-checks each applied seat with the helper.
+  If the helper restarted or lost the grab, the applied flag and grabbed count
+  are cleared, a typed error is recorded, and a fresh grab is attempted. If the
+  fresh grab fails, an unisolated running child is terminated and scheduled for
+  restart instead of leaving a false isolation claim.
+- **SIGTERM restore.** The helper blocks SIGTERM/SIGINT in the main thread,
+  waits on a safe `sigwait` thread, releases every seat's relays/uinput devices,
+  and exits. EOF or a malformed client also triggers release/shutdown.
+- **Status.** Each seat's `resources` carries `input_isolation_applied`,
+  `input_isolation_released`, `grabbed_device_count`, and `uinput_devices`
+  (for example `ozma-seat-host-seat-0-event0`), plus typed
+  `{"kind":"input_isolation",...}` errors. Nothing is redacted: the status is
+  loopback-only and is meant to be diagnostic.
+- **Default behavior.** With the flag absent, the helper is not spawned, no
+  device is opened, and the modelled `EvdevGrabRouter` still returns a typed
+  `Unsupported` error if an evdev strategy is requested without a real backend.
+
+```text
+{"op":"hello","protocol":1}
+{"event":"ready","protocol":1,"helper":"ozma-seat-input","backend":"real","pid":4242}
+{"op":"grab","seat_id":"host-seat-0","devices":[{"path":"/dev/input/event3","kind":"keyboard"}]}
+{"event":"grabbed","seat_id":"host-seat-0","grabbed":["/dev/input/event3"],"uinput_devices":["ozma-seat-host-seat-0-event3"]}
+{"op":"release","seat_id":"host-seat-0"}
+{"event":"released","seat_id":"host-seat-0","released":["/dev/input/event3"]}
+```
+
 ### Display ownership
 
 `DisplayOwnership` records seat id, kind, X screen, output, mode, geometry, and
@@ -353,11 +434,22 @@ fn status(&self) -> Vec<SeatRuntimeStatus>;
   input routing, before spawning. Ownership is applied through
   `XrandrOwnershipController`; xinput seats use `XInputRouter`; an evdev-strategy
   seat needs an injected evdev router, otherwise it fails with a typed
-  `Unsupported` error. A failed apply never spawns that seat, records a typed
-  `SeatResourceError`, and releases every resource already applied for earlier
-  seats in reverse order. Controllers are installed with
-  `with_ownership_controller`, `with_routing_controller`, and
-  `with_evdev_routing_controller`; without the flags no controller is called.
+  `Unsupported` error. With `input_isolation`, routing is skipped and the
+  helper grabs the seat's complete device set after ownership. A failed apply
+  never spawns that seat, records a typed `SeatResourceError`, and releases
+  every resource already applied for earlier seats in reverse order.
+  Controllers are installed with `with_ownership_controller`,
+  `with_routing_controller`, `with_evdev_routing_controller`, and
+  `with_input_isolation_helper`; without the flags no controller/helper is
+  called.
+- **Input isolation (opt-in).** `SeatInputHelper` is the supervisor seam;
+  `HelperClient` starts the privileged process lazily, negotiates protocol
+  version 1, and reports only helper-confirmed grabs. `resources` carries the
+  grabbed count, uinput names, and typed errors. A helper crash clears the
+  applied claim on the next tick; a re-grab is attempted, and a running child is
+  stopped/restarted when isolation cannot be restored. Dry-run never starts the
+  helper. When the last confirmed seat is released, the helper is asked to
+  release everything and stop; the next start starts it lazily again.
 - **Audio (opt-in).** With a `SeatAudioRouter` installed, start ensures the
   seat's `ozma-seat-N` null sink and records the `<sink>.monitor` target before
   spawning; stop/remove/rollback/shutdown unload it. An ensure failure is
@@ -445,11 +537,18 @@ stops any child still owned by the supervisor.
       "restarts": 0,
       "resources": {
         "ownership_applied": true,
-        "routing_applied": true,
+        "routing_applied": false,
+        "input_isolation_applied": true,
         "audio_applied": true,
         "ownership_released": false,
         "routing_released": false,
-        "audio_released": false
+        "input_isolation_released": false,
+        "audio_released": false,
+        "grabbed_device_count": 2,
+        "uinput_devices": [
+          "ozma-seat-host-seat-0-event0",
+          "ozma-seat-host-seat-0-event1"
+        ]
       }
     }
   ],
@@ -459,8 +558,9 @@ stops any child still owned by the supervisor.
 
 A failed seat also carries `last_error` and, while a restart is pending,
 `next_restart_in_ms`. Resource apply/release failures add entries such as
-`{"kind":"ownership","action":"release","message":"..."}` or
-`{"kind":"audio","action":"apply","message":"pactl is not installed"}` to
+`{"kind":"ownership","action":"release","message":"..."}`,
+`{"kind":"input_isolation","action":"apply","message":"helper error [grab_failed]: ..."}`
+or `{"kind":"audio","action":"apply","message":"pactl is not installed"}` to
 `resources.errors`; the field is omitted entirely when no resource action
 happened. `capability.node_count` always equals `capability.seat_count` and the
 number of seat entries. There is no merged super-node.
@@ -524,6 +624,11 @@ ozma-multiseat --display :0 \
 # default; a failed apply stops the start and releases earlier seats.
 ozma-multiseat --display :0 --apply-ownership --apply-routing
 
+# Opt in to real per-seat EVIOCGRAB/uinput isolation. This needs the
+# privileged helper and is mutually exclusive with --apply-routing.
+ozma-multiseat --display :0 --input-isolation helper \
+  --input-helper /usr/lib/ozma/ozma-seat-input
+
 # Persist stable seat ids/ports/sinks across replans, reconcile sysfs hotplug,
 # and create/remove per-seat null sinks through PipeWire's pactl API.
 ozma-multiseat --display :0 \
@@ -547,6 +652,8 @@ Configuration:
 | `--dry-run` | Record/print launch state without spawning or probing. |
 | `--apply-ownership` | Apply each seat's `xrandr` output ownership before spawn (default off). |
 | `--apply-routing` | Apply each seat's xinput/evdev input routing before spawn (default off). |
+| `--input-isolation xinput\|helper` | Input path. `xinput` is the default; `helper` uses privileged `EVIOCGRAB`/uinput isolation. |
+| `--input-helper PATH` | Helper binary for `--input-isolation helper` (default `ozma-seat-input`). |
 | `--seats-file PATH` | Load/reuse and atomically update persisted seat identities. Never written by `--print-plan`/`--dry-run`. |
 | `--hotplug` | Poll read-only sysfs DRM/input snapshots, debounce, and start/stop/restart seats. |
 | `--audio-router [pipewire\|pulseaudio]` | Ensure/remove `ozma-seat-N` null sinks around the child lifecycle (default kind `pipewire`). |
@@ -573,6 +680,15 @@ state and any release error; JSON carries `resources` on each seat. With the
 flags off (the default) the CLI never runs `xrandr`, `xinput`, or `pactl` for
 these resources, and `--print-plan`/`--dry-run` never run them even when the
 flags are present.
+
+With `--input-isolation helper`, start instead asks the helper to grab the
+seat's complete device set. The helper must confirm every grab and uinput
+device before the child is spawned. A missing helper, helper error, partial
+confirmation, or cross-seat conflict is a typed start failure; earlier seats are
+released. On stop/remove/shutdown the helper releases the seat. The local
+helper result is visible in `resources.grabbed_device_count` and
+`resources.uinput_devices`. The default `xinput` path does not start the helper
+or open a device.
 
 `--seats-file` loads a versioned JSON store (a missing file is empty). The CLI
 reuses persisted ids/ports/hubs/sinks for discovered displays, assigns unused
@@ -635,6 +751,17 @@ The default suite covers:
 - `EVIOCGRAB` command models, per-seat uinput environment, the unsupported
   default backend, and fake-backend grab/ungrab recording without touching
   `/dev/input`.
+- Input isolation (`tests/input_isolation.rs`): helper protocol JSON round-trip,
+  `hello`/`grabbed`/`released`/`status`/`shutdown` handling, strict
+  `/dev/input/eventN` validation, duplicate and cross-seat rejection, idempotent
+  same-seat grab and release, grab/uinput/release failure rollback, and a real
+  subprocess protocol check against `ozma-seat-input --backend fake`.
+- Input-isolation supervisor integration (`tests/input_isolation_supervisor.rs`):
+  confirmed grab before spawn, grabbed-count/uinput status, stop release, grab
+  failure without spawn plus earlier-seat rollback, helper readiness failure,
+  release failure retention and retry, helper crash detection and re-grab
+  without respawning the node, cross-seat conflict failure, dry-run no-helper,
+  and default isolation off.
 - Xrandr ownership argv (`--output/--mode/--pos`), apply/release through a fake
   runner, absent-`xrandr` typed errors, non-xrandr kind rejection, duplicate
   output rejection, and multi-seat apply rollback.
@@ -697,6 +824,20 @@ The first check only lists XInput devices. The second calls
 `xinput map-to-output` and resets to `all`; it must point at a disposable X
 server and never the operator's desktop. No evdev grab or input injection is
 part of either check.
+
+The real input-isolation smoke is separately gated and grabs one explicitly
+configured device, then releases it:
+
+```bash
+OZMA_MULTISEAT_REAL_INPUT_GRAB=1 \
+OZMA_MULTISEAT_INPUT_DEVICE=/dev/input/eventN \
+  cargo test -p ozma-multiseat --test input_isolation \
+  real_helper_grabs_and_releases_the_configured_device -- --ignored --nocapture
+```
+
+It needs permission to open/`EVIOCGRAB` the node and `/dev/uinput`. Use a
+spare device or a disposable VM; the test releases it before returning. Default
+tests never open `/dev/input` and never start the real helper backend.
 
 Display mode changes are opt-in separately:
 
@@ -766,13 +907,17 @@ local status surface. Still required for parity:
    are required. Virtual displays still depend on an external Xorg/dummy driver
    or the future IDD path. There is no Wayland compositor seat path.
 3. **Input routing execution and policy.** `xinput map-to-output` and rollback
-   are now invoked by the supervisor when `--apply-routing` is enabled, but
-   `EVIOCGRAB` still has no privileged grab helper, so evdev stays modelled and
-   typed unsupported. udev/Xorg `InputDevice` sections, device permissions,
-   hotplug re-routing, and durable per-seat input state are missing.
-4. **Per-seat uinput targeting.** The environment now names the target seat
-   (`OZMA_UINPUT_SEAT`), but injection still goes to the focused X
-   window/server, not a specific seat output or compositor seat.
+   are invoked by the supervisor when `--apply-routing` is enabled, and
+   `--input-isolation helper` now provides a real privileged `EVIOCGRAB`/uinput
+   helper with rollback, cross-seat rejection, and crash re-grab. Still missing:
+   udev/Xorg `InputDevice` sections, device-permission management (udev rules,
+   `input`/`uinput` groups or capabilities), hotplug re-routing policy, and
+   durable per-seat input state across supervisor restarts.
+4. **Per-seat input consumption.** The environment names the target seat
+   (`OZMA_UINPUT_SEAT`) and the helper reports the per-seat uinput device names,
+   but no node/compositor integration yet consumes those virtual devices as that
+   seat's input source. The helper relays physical events; injection into a
+   specific X screen or compositor seat is still missing.
 5. **Audio isolation.** Null-sink creation/removal and monitor targeting are
    now opt-in through `ozma-audio`/`--audio-router`; moving application streams,
    named microphone remaps, room correction/VBAN, and a Windows virtual endpoint

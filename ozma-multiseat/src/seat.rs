@@ -404,6 +404,8 @@ pub enum ResourceKind {
     Ownership,
     /// Per-seat `xinput`/evdev input routing.
     Routing,
+    /// Per-seat privileged input isolation (`EVIOCGRAB` + uinput helper).
+    InputIsolation,
     /// Per-seat PipeWire/PulseAudio null sink.
     Audio,
 }
@@ -414,6 +416,7 @@ impl ResourceKind {
         match self {
             Self::Ownership => "ownership",
             Self::Routing => "routing",
+            Self::InputIsolation => "input_isolation",
             Self::Audio => "audio",
         }
     }
@@ -467,6 +470,10 @@ pub struct SeatResourceStatus {
     /// A per-seat audio sink was ensured and has not been removed.
     #[serde(default)]
     pub audio_applied: bool,
+    /// The privileged input helper confirmed the seat's exclusive grabs and
+    /// uinput devices, and they have not been released.
+    #[serde(default)]
+    pub input_isolation_applied: bool,
     /// Ownership was released after being applied (or a previous release was
     /// retried successfully).
     #[serde(default)]
@@ -477,6 +484,15 @@ pub struct SeatResourceStatus {
     /// Audio sink was removed after being ensured.
     #[serde(default)]
     pub audio_released: bool,
+    /// Input isolation was released after being applied.
+    #[serde(default)]
+    pub input_isolation_released: bool,
+    /// Devices the helper confirmed as exclusively grabbed for this seat.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub grabbed_device_count: usize,
+    /// uinput device names the helper confirmed for this seat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uinput_devices: Vec<String>,
     /// Apply/release errors, in occurrence order. Best-effort release failures
     /// are reported here without hiding the seat's lifecycle state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -489,9 +505,13 @@ impl SeatResourceStatus {
         !self.ownership_applied
             && !self.routing_applied
             && !self.audio_applied
+            && !self.input_isolation_applied
             && !self.ownership_released
             && !self.routing_released
             && !self.audio_released
+            && !self.input_isolation_released
+            && self.grabbed_device_count == 0
+            && self.uinput_devices.is_empty()
             && self.errors.is_empty()
     }
 
@@ -508,6 +528,10 @@ impl SeatResourceStatus {
             message: message.into(),
         });
     }
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// State transition reported by a [`crate::supervisor::SeatSupervisor`].

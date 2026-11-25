@@ -742,6 +742,9 @@ mod tests {
             usb_uac2: false,
             usb_vendor: false,
             usb_vendor_daemon: None,
+            usb_uac2_bridge: false,
+            usb_uac2_sink_device: "default".to_owned(),
+            usb_uac2_source_device: "default".to_owned(),
         }
     }
 

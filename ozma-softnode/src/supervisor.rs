@@ -233,6 +233,8 @@ pub struct WebRtcChildOptions {
     pub shm_dir: Option<PathBuf>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Use the child's runtime capture geometry instead of fixed dimensions.
+    pub fit_capture: bool,
     pub fps: Option<u32>,
     pub bitrate_kbps: Option<u32>,
     /// Derive `--webrtc-audio-source <audio-sink>.monitor` per VM.
@@ -255,6 +257,7 @@ impl WebRtcChildOptions {
             || self.shm_dir.is_some()
             || self.width.is_some()
             || self.height.is_some()
+            || self.fit_capture
             || self.fps.is_some()
             || self.bitrate_kbps.is_some()
             || self.audio_from_sink
@@ -952,6 +955,9 @@ pub fn build_child_argv(
             "--webrtc-height",
             options.webrtc.height.map(|value| value.to_string()),
         );
+        if options.webrtc.fit_capture {
+            builder.push_flag("webrtc-fit-capture", "--webrtc-fit-capture", true);
+        }
         builder.push(
             "webrtc-fps",
             "--webrtc-fps",
@@ -1780,6 +1786,7 @@ mod tests {
                 shm_dir: Some(PathBuf::from("/dev/shm/ozma")),
                 width: Some(1280),
                 height: Some(720),
+                fit_capture: true,
                 fps: Some(30),
                 bitrate_kbps: Some(4_500),
                 audio_from_sink: true,

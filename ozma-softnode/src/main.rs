@@ -254,6 +254,10 @@ struct Args {
     #[arg(long, value_name = "PIXELS")]
     webrtc_height: Option<u32>,
 
+    /// Fit the WebRTC helper to each VM's runtime capture size
+    #[arg(long)]
+    webrtc_fit_capture: bool,
+
     /// WebRTC helper frame rate
     #[arg(long, value_name = "FPS")]
     webrtc_fps: Option<u32>,
@@ -602,6 +606,7 @@ async fn main() -> anyhow::Result<()> {
             shm_dir: args.webrtc_shm_dir,
             width: args.webrtc_width,
             height: args.webrtc_height,
+            fit_capture: args.webrtc_fit_capture,
             fps: args.webrtc_fps,
             bitrate_kbps: args.webrtc_bitrate_kbps,
             audio_from_sink: args.webrtc_audio_from_sink,

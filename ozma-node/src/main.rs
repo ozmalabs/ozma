@@ -53,7 +53,7 @@ use ozma_node::{
     multi_webrtc::{MultiConsoleWebrtc, MultiConsoleWebrtcConfig},
     platform, registration, shutdown,
     software::report::{InventoryReporter, DEFAULT_REPORT_INTERVAL},
-    usb_audio,
+    usb_audio, usb_uac2,
     webrtc::{WebRtcAudioBackend, WebRtcConfig, WebRtcControl, WebRtcHelper},
 };
 
@@ -456,6 +456,32 @@ pub struct Args {
     #[arg(long, env = "OZMA_USB_VENDOR_DAEMON", value_name = "PATH")]
     pub usb_vendor_daemon: Option<std::path::PathBuf>,
 
+    /// Start the UAC2 isochronous ↔ host-audio bridge.
+    ///
+    /// Requires `--usb-uac2`, a bound UAC2 gadget whose ALSA card is present,
+    /// and usable host audio devices. Without this flag the UAC2 function is
+    /// descriptor-only and `/usb` reports a typed `unsupported` bridge.
+    #[arg(long, env = "OZMA_USB_UAC2_BRIDGE")]
+    pub usb_uac2_bridge: bool,
+
+    /// Host playback device receiving host→device UAC2 PCM.
+    #[arg(
+        long,
+        env = "OZMA_USB_UAC2_SINK_DEVICE",
+        default_value = "default",
+        value_name = "ALSA"
+    )]
+    pub usb_uac2_sink_device: String,
+
+    /// Host capture device feeding device→host UAC2 PCM.
+    #[arg(
+        long,
+        env = "OZMA_USB_UAC2_SOURCE_DEVICE",
+        default_value = "default",
+        value_name = "ALSA"
+    )]
+    pub usb_uac2_source_device: String,
+
     /// Require local consent for workstation-class sessions.
     #[arg(long)]
     pub workstation_consent: bool,
@@ -704,6 +730,14 @@ pub struct Args {
     /// WebRTC helper frame height (must be greater than zero).
     #[arg(long, env = "OZMA_WEBRTC_HEIGHT", default_value_t = 480)]
     pub webrtc_height: u32,
+
+    /// Fit the WebRTC helper to the capture source's frame size once it is
+    /// opened, instead of rejecting a mismatch with `--webrtc-width/height`.
+    ///
+    /// Providers whose geometry is only known at runtime (QMP, VNC, X11) need
+    /// this; explicit dimensions still apply when capture declares no size.
+    #[arg(long, env = "OZMA_WEBRTC_FIT_CAPTURE")]
+    pub webrtc_fit_capture: bool,
 
     /// WebRTC helper frame rate (must be greater than zero).
     #[arg(long, env = "OZMA_WEBRTC_FPS", default_value_t = 30)]
@@ -1067,6 +1101,9 @@ async fn run() -> std::process::ExitCode {
         usb_uac2: args.usb_uac2,
         usb_vendor: args.usb_vendor,
         usb_vendor_daemon: args.usb_vendor_daemon.clone(),
+        usb_uac2_bridge: args.usb_uac2_bridge,
+        usb_uac2_sink_device: args.usb_uac2_sink_device.clone(),
+        usb_uac2_source_device: args.usb_uac2_source_device.clone(),
     };
 
     // A configured power backend must be visible to the controller dashboard.
@@ -1631,23 +1668,46 @@ async fn run() -> std::process::ExitCode {
                 None
             } else {
                 match open_first_capture_source(&capture_registry).and_then(|source| {
-                    WebRtcHelper::start(source, webrtc_config.clone())
-                        .map_err(|error| error.to_string())
+                    let mut start_config = webrtc_config.clone();
+                    if args.webrtc_fit_capture {
+                        let format = source.format();
+                        if format.width > 0 && format.height > 0 {
+                            if format.width != start_config.width
+                                || format.height != start_config.height
+                            {
+                                info!(
+                                    configured = %format!(
+                                        "{}x{}",
+                                        start_config.width, start_config.height
+                                    ),
+                                    capture = %format!("{}x{}", format.width, format.height),
+                                    "fitting WebRTC helper to the capture frame size"
+                                );
+                            }
+                            start_config.width = format.width;
+                            start_config.height = format.height;
+                        }
+                    }
+                    WebRtcHelper::start(source, start_config).map_err(|error| error.to_string())
                 }) {
                     Ok(helper) => {
+                        // Keep the geometry actually used, so a later console
+                        // switch restarts the helper at the same size.
+                        let used = helper.config();
+                        webrtc_switch_config = Some(used.clone());
                         info!(
                             pid = ?helper.status().helper_pid(),
-                            socket = %webrtc_config.socket_path.display(),
-                            shm = %webrtc_config.shm_path.display(),
-                            width = webrtc_config.width,
-                            height = webrtc_config.height,
-                            fps = webrtc_config.fps,
-                            audio = ?webrtc_config.audio_source,
-                            audio_backend = webrtc_config.audio_backend.as_arg(),
-                            stun = ?webrtc_config.stun_server,
-                            turn = ?webrtc_config.turn_server,
-                            turn_auth = webrtc_config.turn_user.is_some()
-                                && webrtc_config.turn_password.is_some(),
+                            socket = %used.socket_path.display(),
+                            shm = %used.shm_path.display(),
+                            width = used.width,
+                            height = used.height,
+                            fps = used.fps,
+                            audio = ?used.audio_source,
+                            audio_backend = used.audio_backend.as_arg(),
+                            stun = ?used.stun_server,
+                            turn = ?used.turn_server,
+                            turn_auth = used.turn_user.is_some()
+                                && used.turn_password.is_some(),
                             "WebRTC helper started"
                         );
                         Some(WebRtcControl::from_helper(helper))
@@ -1672,7 +1732,55 @@ async fn run() -> std::process::ExitCode {
     // unavailable state: the node keeps running, advertises no USB capability,
     // and /usb answers a typed 503. A node without --usb-gadget keeps the typed
     // 501 surface.
-    let usb_control = build_usb_control(&config);
+    let mut usb_control = build_usb_control(&config);
+    let mut uac2_alsa_runtime: Option<usb_uac2::Uac2BridgeRuntime> = None;
+    if let Some(control) = usb_control.as_mut() {
+        if !control.is_available() {
+            if config.usb_uac2_bridge {
+                let reason = control
+                    .error()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "USB gadget is unavailable".to_owned());
+                control.set_uac2_bridge(Some(usb_uac2::Uac2BridgeShared::unsupported(format!(
+                    "UAC2 bridge not started: {reason}"
+                ))));
+            }
+        } else if config.usb_uac2_bridge {
+            match usb_uac2::start_real(&config) {
+                Ok(runtime) => {
+                    info!(
+                        report = ?runtime.shared().report(),
+                        "UAC2 isochronous bridge started"
+                    );
+                    control.set_uac2_bridge(Some(runtime.shared()));
+                    uac2_alsa_runtime = Some(runtime);
+                }
+                Err(error) => {
+                    let reason = format!("{}: {error}", error.kind());
+                    warn!(
+                        kind = error.kind(),
+                        error = %error,
+                        "UAC2 bridge requested but not started; /usb will report unsupported"
+                    );
+                    control.set_uac2_bridge(Some(usb_uac2::Uac2BridgeShared::unsupported(reason)));
+                }
+            }
+        } else if config.usb_uac2 {
+            control.set_uac2_bridge(Some(usb_uac2::Uac2BridgeShared::unsupported(
+                "--usb-uac2-bridge was not requested; the UAC2 function is descriptor-only",
+            )));
+        }
+    }
+    if let Some(mut runtime) = uac2_alsa_runtime {
+        let uac2_shutdown = shutdown.clone();
+        background.push((
+            "uac2-alsa-bridge",
+            tokio::spawn(async move {
+                uac2_shutdown.cancelled().await;
+                runtime.stop();
+            }),
+        ));
+    }
     if let Some(control) = usb_control
         .as_ref()
         .filter(|control| control.is_available())
@@ -2288,7 +2396,10 @@ async fn run() -> std::process::ExitCode {
         ));
     }
 
-    if config.has_capability("audio") && config.profile != NodeProfile::Desktop {
+    if config.has_capability("audio")
+        && config.profile != NodeProfile::Desktop
+        && !config.usb_uac2_bridge
+    {
         let audio_shutdown = shutdown.clone();
         background.push((
             "uac2-bridge",

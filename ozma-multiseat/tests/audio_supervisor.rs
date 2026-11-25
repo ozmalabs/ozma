@@ -33,6 +33,7 @@ fn options(dry_run: bool) -> SupervisorOptions {
         dry_run,
         apply_ownership: false,
         apply_routing: false,
+        input_isolation: false,
     }
 }
 

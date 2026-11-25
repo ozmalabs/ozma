@@ -145,7 +145,10 @@ start_vm_node() {
             audio_args=(--audio-router pipewire --audio-capture-target "monitor:$sink" --audio-sink "$sink")
         fi
         if [[ "$DEMO_WEBRTC" == "1" ]]; then
-            webrtc_args=(--webrtc-helper python3 --webrtc-helper-script "$WEBRTC_SCRIPT")
+            # QMP capture geometry is only known at runtime; fit the helper to
+            # the real head instead of failing at the 640x480 default.
+            webrtc_args=(--webrtc-helper python3 --webrtc-helper-script "$WEBRTC_SCRIPT" \
+                --webrtc-fit-capture)
         fi
         "$RUST_NODE_BIN" \
             --name "$name" \
@@ -242,11 +245,17 @@ if [[ "${1:-}" == "test" ]]; then
     if [[ -f "$REPO_ROOT/.venv/bin/python" ]]; then
         PYTHON="$REPO_ROOT/.venv/bin/python"
     fi
-    # Start the stack
-    bash "$0" "$@"
+    # Start the stack. `set -e` would otherwise skip cleanup when the stack or
+    # the tests fail, leaving nodes, QEMU, and the controller running.
+    result=0
+    bash "$0" "$@" || result=$?
+    if [[ $result -ne 0 ]]; then
+        echo "ERROR: demo stack failed to start (exit $result); stopping what started." >&2
+        _stop_processes
+        exit $result
+    fi
     sleep 3  # extra settle time for all services to stabilise
-    run_tests
-    result=$?
+    run_tests || result=$?
     _stop_processes
     exit $result
 fi

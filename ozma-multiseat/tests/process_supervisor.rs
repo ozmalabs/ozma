@@ -52,6 +52,7 @@ fn options() -> SupervisorOptions {
         dry_run: false,
         apply_ownership: false,
         apply_routing: false,
+        input_isolation: false,
     }
 }
 

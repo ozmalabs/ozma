@@ -21,6 +21,7 @@ use crate::functionfs_daemon::{
     FunctionFsDescriptors, FunctionFsEndpointIo, FunctionFsEvent, FunctionFsEventOutcome,
     FunctionFsWriteReport,
 };
+use crate::functionfs_lifecycle::FunctionFsDeviceState;
 
 /// Maximum number of non-control endpoints a FunctionFS function may declare.
 pub const MAX_FUNCTIONFS_ENDPOINTS: usize = 15;
@@ -1038,6 +1039,19 @@ fn count_descriptor_type(bytes: &[u8], descriptor_type: u8) -> usize {
 pub struct FunctionFsDaemonStatus {
     /// Descriptor and string writes completed and the function is enabled.
     pub live: bool,
+    /// Device-level state (`unconfigured`, `descriptors_bound`, `ep0_ready`,
+    /// `enabled`, `running`, `disabled`, `unbound`).
+    #[serde(default)]
+    pub state: FunctionFsDeviceState,
+    /// At least one endpoint transfer completed after enable.
+    #[serde(default)]
+    pub running: bool,
+    /// ConfigFS has a UDC bound as observed by the daemon core.
+    #[serde(default)]
+    pub udc_bound: bool,
+    /// Successful endpoint transfers observed.
+    #[serde(default)]
+    pub endpoint_events: u64,
     /// The descriptor blob was written to `ep0`.
     pub ep0_written: bool,
     /// The string table was written to `ep0`.
