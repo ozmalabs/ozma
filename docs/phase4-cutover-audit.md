@@ -1158,3 +1158,20 @@ Per tree:
 - [`parity-matrix.md`](parity-matrix.md) and
   [`plan-execution-status.md`](plan-execution-status.md) are intentionally **not**
   edited here; the orchestrator updates them.
+
+### 17.7 Overlap gate resolution (2026-11-25)
+
+The frozen overlap gates were run at `6b881a1` (see
+[`phase4-overlap-gates-report.md`](phase4-overlap-gates-report.md)): workspace
+2,755/0/51, `metadata --locked`, container `--container --full` (20/0/1 and
+2,755/0/51), default Rust demo, and a live `ozma-virtual-node` systemd supervisor
+with a disposable libvirt VM all passed. `demo test` remained 70/5 with the five
+controller-only macro/automation/Connect assertions.
+
+The release owner recorded **waiver W1** for those five controller-only
+assertions (core switching/audio and all node/media/HLS/snapshot/input checks
+passed; risk is controller macro/automation behaviour, not the Rust node) and
+created the rollback tag **`rust-cutover-0.1.0-python-rollback`** on
+`6b881a1` for the one-release overlap. **Python-tree deletion remains NO-GO**:
+the §9 criteria and the Python-only parity providers are unchanged.
+

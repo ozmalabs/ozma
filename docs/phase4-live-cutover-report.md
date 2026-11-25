@@ -2034,3 +2034,52 @@ directory (13:06, before this run) and pre-existing `/tmp/ozma-webrtc-*`
 directories were left untouched. The only matching process at final check was
 an unrelated parallel session's `cargo test -p ozma-node --test
 desktop_profile` in the main checkout.
+
+## Frozen overlap gates at 6b881a1
+
+Date: 2026-11-25. Baseline:
+`6b881a1539c7fd2b0671e89d8e1f7c19daae5d82`
+(`feat(phase4): VNC Tight, libvirt URI/ACPI fixes, audit refresh 2`). Evidence
+was taken in a detached worktree at `/tmp/opencode/ozma-overlap-6b881a1`; the
+primary checkout (unrelated display/AIDA64 work) was not built or tested. No
+product code changed, and no commit or tag was created.
+
+**Verdict: viable one-release-overlap candidate, but not taggable as-is.**
+Frozen evidence, the container gate, and the live `ozma-virtual-node` systemd
+supervisor gate are now satisfied at this commit. The remaining blockers are
+the unchanged **70 passed / 5 failed** `demo test` result (no formal waiver
+recorded) and the absence of a
+`rust-cutover-<version>-python-rollback` tag. Python-tree deletion remains
+**NO-GO** for the unchanged §17 reasons. Full detail, commands, and the
+PASS/FAIL/Waiver table are in
+[`phase4-overlap-gates-report.md`](phase4-overlap-gates-report.md).
+
+| Gate | Result at `6b881a1` | Evidence |
+|---|---|---|
+| `cargo metadata --locked` | **PASS** | exit 0; 3,357,633-byte JSON; lock not rewritten |
+| `cargo test --workspace --no-fail-fast` | **PASS** | **2,755 passed / 0 failed / 51 ignored**, 206 blocks |
+| `cargo check --workspace --all-targets` | **PASS** | exit 0 in 33.76 s; one pre-existing `unused_mut` warning |
+| `cargo fmt --check` (touched crates) | **PASS** | `ozma-node`, `ozma-power` |
+| `clean-host --container --full` | **PASS** | rootless Podman; image digest `sha256:2bd1b59e…`; harness 20/0/1; workspace 2,755/0/51; deps 11/0/8 |
+| Default Rust demo | **PASS (isolated env)** | two nodes discovered, health, live HLS, 96,470-byte 1280×800 JPEG, QMP input changed 71 pixels, scenario switching, clean shutdown |
+| `demo test` (Rust) | **FAIL (W1 proposed)** | 70 passed / 5 failed: F19 macros, F20 automation, F25 `AI setups used: 0`, F26 `noise_cancellation blocked`, F26 `reason mentions upgrade`; core switching/audio all passed |
+| `ozma-virtual-node` systemd | **PASS** | real Alpine/libvirt VM; discovered, exact child argv, live status, stop/reap; packaged units 8/8 verify |
+| Rollback tag | **FAIL** | none created (validation-only run) |
+
+The demo needed documented host isolation, not product changes: a prior install
+made `/var/lib/ozma` unreadable to the invoking user, and another LAN host
+already advertises `Ozma Grid` over mDNS. The run used a network namespace plus
+a private writable `/var/lib/ozma` bind mount; the host file and firewall were
+not changed. The supervisor needed `LIBVIRT_DEFAULT_URI=qemu:///system` for a
+non-root `virsh` and a test-only `chmod 0666` on the disposable libvirt QMP
+socket (`0775 libvirt-qemu`); both are recorded as operational requirements.
+
+**Taggability:** the overlap can be tagged only after the release owner either
+repairs or formally records waiver **W1** for the five controller-only
+assertions and creates the rollback tag on this commit. The five failures are
+not node/media failures. Python deletion remains **NO-GO**.
+
+Cleanup: container image and target, worktree target, venv, netns/veth,
+libvirt domain/ISO, demo logs/cache, transient unit, and scratch files were
+removed; no unit was enabled, no service left running, and the worktree was
+removed after this section was written.
