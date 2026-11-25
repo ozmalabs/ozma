@@ -12,6 +12,8 @@ Each node advertises itself with these TXT records:
   frigate_host=<str>    Frigate HTTP host (camera nodes only)
   frigate_port=<int>    Frigate HTTP port (camera nodes only, default: 5000)
   camera_streams=<json> JSON array of stream dicts (camera nodes only)
+  seat_id=<str>          explicit seat identity (optional; name convention fallback)
+  vm_ip=<str>            VM guest IP (aliases direct-registration vm_guest_ip)
 
 Re-queries every mdns_requery_interval seconds to detect node loss.
 """
@@ -45,6 +47,25 @@ def _parse_txt(properties: dict[bytes, bytes | None]) -> dict[str, str]:
         val = v.decode("utf-8", errors="replace") if v is not None else ""
         out[key] = val
     return out
+
+
+def _seat_id_from_txt(txt: dict[str, str]) -> str:
+    """Explicit seat identity from a node TXT record.
+
+    Older nodes omit the key; they keep working because seat grouping falls
+    back to the ``<machine>-seat-<n>`` node-name convention.
+    """
+    return (txt.get("seat_id") or "").strip()
+
+
+def _vm_guest_ip_from_txt(txt: dict[str, str]) -> str | None:
+    """Guest IP for a VM node.
+
+    Python soft nodes advertise ``vm_ip``. Rust nodes emit both ``vm_ip`` and
+    the direct-registration alias ``vm_guest_ip``; accepting either keeps
+    discovery working across both providers.
+    """
+    return txt.get("vm_ip") or txt.get("vm_guest_ip") or None
 
 
 class DiscoveryService:
@@ -144,7 +165,7 @@ class DiscoveryService:
         sunshine_port_str = txt.get("sunshine_port", "")
         sunshine_port = int(sunshine_port_str) if sunshine_port_str.isdigit() else None
 
-        vm_guest_ip = txt.get("vm_ip") or None
+        vm_guest_ip = _vm_guest_ip_from_txt(txt)
 
         machine_class = txt.get("machine_class") or "workstation"
         frigate_host = txt.get("frigate_host") or None
@@ -183,6 +204,7 @@ class DiscoveryService:
             camera_streams=camera_streams,
             sunshine_port=sunshine_port,
             vm_guest_ip=vm_guest_ip,
+            seat_id=_seat_id_from_txt(txt),
         )
         await self._state.add_node(node)
         log.info("Node online: %s @ %s:%d role=%s hw=%s", name, host, port, node.role, node.hw)

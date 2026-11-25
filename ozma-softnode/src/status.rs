@@ -150,6 +150,8 @@ impl SupervisorTotals {
 ///   exists;
 /// * `awaiting-socket` — a configured QMP path does not exist yet;
 /// * `failed` — provisioning failed;
+/// * `argv-error` — a configured child option was rejected (for example an
+///   unsupported flag under `--reject-unsupported-node-flags`);
 /// * `discovery-only` — `--no-auto-manage`;
 /// * `excluded` — filtered by `--exclude`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +190,16 @@ pub struct VmStatus {
     pub evdev_mouse: Option<String>,
     /// Per-VM audio sink passed to the child as `--audio-sink`.
     pub audio_sink: Option<String>,
+    /// Exact child argv the supervisor would spawn, with secret values
+    /// replaced by `<redacted>`. Empty until a node spec has been built.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_argv: Vec<String>,
+    /// Configured child options that were not forwarded, for example a flag
+    /// the target `ozma-node` build does not advertise or a GPU-passthrough VM
+    /// with no Looking Glass path. Empty when every configured option was
+    /// forwarded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv_warnings: Vec<String>,
     /// `provisioned`, `pending`, `retrying`, `failed`, or `disabled`.
     pub agent_status: String,
     /// Consecutive failed in-guest agent checks.
@@ -220,6 +232,8 @@ impl VmStatus {
             evdev_keyboard: None,
             evdev_mouse: None,
             audio_sink: None,
+            child_argv: Vec::new(),
+            argv_warnings: Vec::new(),
             agent_status: "disabled".to_owned(),
             agent_checks: 0,
             child: None,
@@ -624,6 +638,12 @@ mod tests {
                     evdev_keyboard: None,
                     evdev_mouse: None,
                     audio_sink: Some("ozma-vm-a".to_owned()),
+                    child_argv: vec![
+                        "ozma-node".to_owned(),
+                        "--profile".to_owned(),
+                        "vm".to_owned(),
+                    ],
+                    argv_warnings: Vec::new(),
                     agent_status: "pending".to_owned(),
                     agent_checks: 0,
                     child: Some(ChildStatus {
@@ -696,6 +716,7 @@ mod tests {
             "evdev_keyboard",
             "evdev_mouse",
             "audio_sink",
+            "child_argv",
             "agent_status",
             "agent_checks",
             "child",
@@ -706,6 +727,10 @@ mod tests {
         assert_eq!(vm["child"]["hls"], "running");
         assert_eq!(vm["child"]["input"]["kind"], "qmp");
         assert_eq!(vm["child"]["stale"], false);
+        assert!(
+            vm.get("argv_warnings").is_none(),
+            "empty argv warnings are omitted from /status"
+        );
 
         // Round-trip keeps the schema stable.
         let decoded: SupervisorStatus = serde_json::from_value(json).expect("deserialize status");

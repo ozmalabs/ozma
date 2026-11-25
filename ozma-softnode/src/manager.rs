@@ -43,10 +43,10 @@ use crate::provisioning::{
 };
 use crate::status::{ChildInputStatus, ChildPowerStatus, ChildStatus, SupervisorStatus, VmStatus};
 use crate::supervisor::{
-    build_node_spec, restart_delay, NodeExitStatus, NodeHandle, NodeLauncher, NodeSpec,
-    PortAllocator, ProcessNodeLauncher, DEFAULT_BASE_PORT, DEFAULT_NODE_BIN,
-    DEFAULT_NODE_HTTP_BASE, DEFAULT_RESTART_BACKOFF_MAX_MS, DEFAULT_RESTART_BACKOFF_MS,
-    HEALTHY_UPTIME,
+    build_node_spec_with_options, restart_delay, ChildOptions, NodeExitStatus, NodeFlagSupport,
+    NodeHandle, NodeLauncher, NodeSpec, PortAllocator, ProcessNodeLauncher, UnsupportedPolicy,
+    DEFAULT_BASE_PORT, DEFAULT_NODE_BIN, DEFAULT_NODE_HTTP_BASE, DEFAULT_RESTART_BACKOFF_MAX_MS,
+    DEFAULT_RESTART_BACKOFF_MS, HEALTHY_UPTIME,
 };
 use crate::vm_info::VMInfo;
 
@@ -91,6 +91,16 @@ pub struct ManagerOptions {
     pub provision_config: ProvisionConfig,
     /// Opt-in per-VM audio sink provisioning.
     pub audio: AudioProvisionConfig,
+    /// Opt-in child argv features: HLS, display outputs, guest IP, WebRTC,
+    /// VNC capture, USB/media, and Looking Glass capture.
+    pub child: ChildOptions,
+    /// Long flags advertised by the target `ozma-node`. `Unknown` (the default)
+    /// assumes this crate's flags; probing enables honest unsupported-option
+    /// warnings in status instead of silently dropping a configured feature.
+    pub node_flag_support: NodeFlagSupport,
+    /// Runtime reaction to a configured flag the target does not advertise:
+    /// omit and warn (default), or reject that VM's child with a typed error.
+    pub unsupported_policy: UnsupportedPolicy,
 }
 
 impl Default for ManagerOptions {
@@ -114,6 +124,9 @@ impl Default for ManagerOptions {
             provision: false,
             provision_config: ProvisionConfig::default(),
             audio: AudioProvisionConfig::default(),
+            child: ChildOptions::default(),
+            node_flag_support: NodeFlagSupport::Unknown,
+            unsupported_policy: UnsupportedPolicy::Warn,
         }
     }
 }
@@ -168,6 +181,7 @@ enum VmSkipState {
     NeedsRestart,
     AwaitingSocket,
     ProvisionFailed,
+    ArgvError,
 }
 
 impl VmSkipState {
@@ -178,6 +192,7 @@ impl VmSkipState {
             Self::NeedsRestart => "needs-restart",
             Self::AwaitingSocket => "awaiting-socket",
             Self::ProvisionFailed => "failed",
+            Self::ArgvError => "argv-error",
         }
     }
 }
@@ -444,6 +459,10 @@ impl VirtualNodeManager {
             .audio
             .validate()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+        self.options
+            .child
+            .validate()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         Ok(())
     }
 
@@ -686,6 +705,52 @@ impl VirtualNodeManager {
             );
         } else {
             info!("  Audio sink:  off (no per-VM sink provisioning)");
+        }
+        if self.options.child.hls.enabled || self.options.child.hls.multi_console {
+            info!(
+                "  Child HLS:   on (dir root {}, encoder {})",
+                self.options
+                    .child
+                    .hls
+                    .dir_root
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "(node default)".to_owned()),
+                self.options
+                    .child
+                    .hls
+                    .encoder
+                    .as_deref()
+                    .unwrap_or("(node default)")
+            );
+        }
+        if self.options.child.webrtc.helper.is_some() {
+            info!(
+                "  Child WebRTC: helper {}",
+                self.options
+                    .child
+                    .webrtc
+                    .helper
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            );
+        }
+        if self.options.child.vnc.capture {
+            info!("  Child VNC:   capture selected for VMs with a discovered VNC port");
+        }
+        if self.options.child.usb.enabled {
+            info!(
+                "  Child USB:   gadget for VM {} (UDC {})",
+                self.options.child.usb.vm.as_deref().unwrap_or("(unset)"),
+                self.options.child.usb.udc.as_deref().unwrap_or("(unset)")
+            );
+        }
+        if !self.options.child.gpu.looking_glass.is_empty() {
+            info!(
+                "  Looking Glass: {} per-VM shm mapping(s)",
+                self.options.child.gpu.looking_glass.len()
+            );
         }
         if !self.options.exclude_patterns.is_empty() {
             info!(
@@ -1139,22 +1204,43 @@ impl ManagerInner {
                     let audio_sink_name = audio_sink.as_ref().map(|sink| sink.name.clone());
                     let mut state = self.state.lock().await;
 
-                    let node = if need_node {
+                    let (node, node_error) = if need_node {
                         match state.ports.allocate(&ready.name) {
-                            Ok(ports) => Some(NodeState::new(build_node_spec(
+                            Ok(ports) => match build_node_spec_with_options(
                                 &ready,
                                 ports,
                                 &self.options.node_bin,
                                 &self.options.controller_url,
                                 audio_sink_name.as_deref(),
-                            ))),
+                                &self.options.child,
+                                &self.options.node_flag_support,
+                                self.options.unsupported_policy,
+                            ) {
+                                Ok(spec) => {
+                                    for warning in &spec.warnings {
+                                        warn!(
+                                            "VM {}: child argv: {}",
+                                            ready.name,
+                                            warning.message()
+                                        );
+                                    }
+                                    (Some(NodeState::new(spec)), None)
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        "VM {}: cannot build ozma-node argv: {}",
+                                        ready.name, error
+                                    );
+                                    (None, Some(error.to_string()))
+                                }
+                            },
                             Err(error) => {
                                 warn!("VM {}: cannot allocate per-VM ports: {}", ready.name, error);
-                                None
+                                (None, Some(error.to_string()))
                             }
                         }
                     } else {
-                        None
+                        (None, None)
                     };
 
                     let name = ready.name.clone();
@@ -1167,14 +1253,20 @@ impl ManagerInner {
                             managed.evdev = evdev;
                             managed.audio_sink = audio_sink_name;
                         }
-                        managed.skip = None;
-                        managed.last_error = None;
+                        if node_error.is_some() {
+                            managed.skip = Some(VmSkipState::ArgvError);
+                        } else {
+                            managed.skip = None;
+                        }
+                        managed.last_error = node_error;
                         managed.provision_restart_warned = false;
                         managed.provision_failure_warned = false;
                     } else {
                         let mut managed = ManagedVm::new(ready, node);
                         managed.evdev = evdev;
                         managed.audio_sink = audio_sink_name;
+                        managed.skip = node_error.as_ref().map(|_| VmSkipState::ArgvError);
+                        managed.last_error = node_error;
                         state.vms.insert(name, managed);
                     }
                 }
@@ -1754,6 +1846,11 @@ fn vm_status(managed: &ManagedVm, auto_agent: bool, evdev_enabled: bool, now: In
         None => ("not-configured".to_owned(), None, None),
     };
 
+    let (child_argv, argv_warnings) = match node {
+        Some(node) => (node.spec.redacted_argv(), node.spec.warning_messages()),
+        None => (Vec::new(), Vec::new()),
+    };
+
     VmStatus {
         name: managed.vm.name.clone(),
         state: state.to_owned(),
@@ -1775,6 +1872,8 @@ fn vm_status(managed: &ManagedVm, auto_agent: bool, evdev_enabled: bool, now: In
         evdev_keyboard,
         evdev_mouse,
         audio_sink,
+        child_argv,
+        argv_warnings,
         agent_status: agent_status.to_owned(),
         agent_checks: managed.agent_check_failures,
         child: None,
@@ -2855,6 +2954,66 @@ mod tests {
         assert!(excluded.excluded);
         assert!(excluded.skipped);
         assert_eq!(excluded.hid_udp_port, None);
+    }
+
+    #[tokio::test]
+    async fn status_reports_child_argv_redacted_and_unsupported_option_warnings() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let mut options = options(true);
+        options.child.hls.enabled = true;
+        options.child.webrtc.helper = Some(PathBuf::from("/usr/bin/python3"));
+        options.child.webrtc.turn_password = Some("hunter2".to_owned());
+        // This target advertises the WebRTC flags but not `--hls`.
+        options.node_flag_support = NodeFlagSupport::from_help(
+            "--profile --name --qmp-socket --hid-udp-port --http-port \
+             --capture-provider --input-provider --power-provider \
+             --webrtc-helper --webrtc-turn-password",
+        );
+        let mgr = manager(options, launcher);
+
+        mgr.inner
+            .reconcile(vec![vm("vm-a", "/run/ozma/a.qmp")])
+            .await;
+        mgr.inner.supervise().await;
+
+        let status = mgr.status().await;
+        let vm_a = status.vms.iter().find(|vm| vm.name == "vm-a").unwrap();
+
+        assert!(!vm_a.child_argv.iter().any(|arg| arg == "--hls"));
+        assert!(vm_a
+            .argv_warnings
+            .iter()
+            .any(|warning| warning.contains("--hls")));
+        assert!(vm_a.child_argv.iter().any(|arg| arg == "--webrtc-helper"));
+        assert!(!vm_a.child_argv.iter().any(|arg| arg == "hunter2"));
+        assert!(vm_a.child_argv.iter().any(|arg| arg == "<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn reject_policy_surfaces_a_typed_argv_error_in_status() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let mut options = options(true);
+        options.child.hls.enabled = true;
+        options.node_flag_support = NodeFlagSupport::from_help(
+            "--profile --name --qmp-socket --hid-udp-port --http-port \
+             --capture-provider --input-provider --power-provider",
+        );
+        options.unsupported_policy = UnsupportedPolicy::Reject;
+        let mgr = manager(options, Arc::clone(&launcher));
+
+        mgr.inner
+            .reconcile(vec![vm("vm-a", "/run/ozma/a.qmp")])
+            .await;
+        mgr.inner.supervise().await;
+
+        assert!(
+            launcher.spawns().is_empty(),
+            "a rejected argv must not spawn a child"
+        );
+        let status = mgr.status().await;
+        let vm_a = status.vms.iter().find(|vm| vm.name == "vm-a").unwrap();
+        assert_eq!(vm_a.state, "argv-error");
+        assert!(vm_a.last_error.as_deref().unwrap_or("").contains("--hls"));
     }
 
     #[tokio::test]

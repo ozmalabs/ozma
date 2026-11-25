@@ -61,6 +61,20 @@ pub fn advertise_on(
     txt: &HashMap<String, String>,
     address: Option<IpAddr>,
 ) -> Result<MdnsHandle, Box<dyn std::error::Error + Send + Sync>> {
+    // Secrets (API tokens, credentials) must never be published in a TXT
+    // record, and the debug log below prints the properties. Reject before
+    // formatting or logging anything.
+    if let Some((key, _)) = txt
+        .iter()
+        .find(|(key, _)| crate::registration::is_secret_field(key))
+    {
+        return Err(format!(
+            "refusing to advertise credential-shaped mDNS TXT key `{key}`; \
+             secrets must not leave the node in discovery records"
+        )
+        .into());
+    }
+
     // Build TXT record properties: ["key=value", ...]
     let properties: Vec<String> = txt.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
@@ -133,6 +147,22 @@ mod tests {
             .err()
             .expect("oversized TXT must be rejected");
         assert!(error.to_string().contains("limit 255"), "{error}");
+    }
+
+    #[test]
+    fn credential_shaped_txt_keys_are_rejected_before_advertising() {
+        let mut txt = HashMap::new();
+        txt.insert("proto".to_owned(), "1".to_owned());
+        txt.insert("api_token".to_owned(), "s3cret".to_owned());
+        let error = advertise("secret-node", 7331, &txt)
+            .err()
+            .expect("secret TXT key must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("api_token"), "{message}");
+        assert!(
+            !message.contains("s3cret"),
+            "the rejection must not echo the secret value: {message}"
+        );
     }
 
     #[test]

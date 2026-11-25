@@ -1,8 +1,16 @@
 #!/bin/bash
+# LEGACY (one-release Python rollback path).
+#
 # Install ozma-virtual-node system configuration.
 #
 # Sets up udev rules, AppArmor policies, and libvirt QEMU config
 # so that virtual evdev devices can be used with QEMU input-linux.
+#
+# The Rust-first owner of these host steps is scripts/install-system.sh with
+# the assets under scripts/system/. It is compatible with the same
+# /dev/input/event* and uinput paths, never edits /etc/libvirt/qemu.conf, and
+# writes a copy-only snippet under /etc/ozma/. Use this script only while
+# rolling back to ozma-virtual-node (Python).
 #
 # Usage: sudo bash softnode/install/install.sh
 

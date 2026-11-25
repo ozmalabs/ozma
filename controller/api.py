@@ -4117,6 +4117,22 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 data = await resp.read()
                 return StreamingResponse(iter([data]), media_type="image/jpeg")
 
+    @app.get("/api/v1/nodes/{node_id}/hardware")
+    async def node_hardware(node_id: str, refresh: bool = False) -> Any:
+        """Proxy a node's HWiNFO-class hardware snapshot."""
+        suffix = "?refresh=true" if refresh else ""
+        return await _proxy_node_surface(node_id, f"/hardware{suffix}")
+
+    @app.get("/api/v1/nodes/{node_id}/hardware/summary")
+    async def node_hardware_summary(node_id: str, refresh: bool = False) -> Any:
+        suffix = "?refresh=true" if refresh else ""
+        return await _proxy_node_surface(node_id, f"/hardware/summary{suffix}")
+
+    @app.get("/api/v1/nodes/{node_id}/hardware/sensors")
+    async def node_hardware_sensors(node_id: str, refresh: bool = False) -> Any:
+        suffix = "?refresh=true" if refresh else ""
+        return await _proxy_node_surface(node_id, f"/hardware/sensors{suffix}")
+
     @app.post("/api/v1/nodes/{node_id}/rpa/key")
     async def node_rpa_key(node_id: str, body: dict) -> dict[str, Any]:
         return await _node_rpa_proxy(node_id, "key", "POST", body)

@@ -49,6 +49,8 @@ ozma-audio    = { path = "../ozma-audio" }
 ozma-decode   = { path = "../ozma-decode" }
 # USB gadget/ConfigFS/virtual-media controller (Phase 3 USB workstream).
 ozma-usb      = { path = "../ozma-usb" }
+# Deep HWiNFO-class hardware inventory and sensors.
+ozma-hardware = { path = "../ozma-hardware" }
 # Binary display envelopes (scene snapshots) for the reliable Display channel.
 ozma-display-protocol = { path = "../ozma-display-protocol" }
 # Browser camera/microphone reassembly is shared with the client side.

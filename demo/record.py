@@ -9,9 +9,13 @@ a video file.
 Usage:
   python demo/record.py [--url http://localhost:7380] [--out demo/recordings/demo.webm]
   python demo/record.py --convert   # also convert webm → mp4 with ffmpeg
+  python demo/record.py --start-services            # Rust nodes (default)
+  python demo/record.py --start-services --backend python   # rollback path
 
 Requirements:
   playwright installed via: pipx install playwright && playwright install chromium
+  --start-services needs an ozma-node binary (default backend) or the Python
+  softnode tree (--backend python).
 
 The script can optionally start/stop the Ozma demo services itself if they
 aren't already running (pass --start-services).
@@ -20,6 +24,8 @@ aren't already running (pass --start-services).
 import argparse
 import asyncio
 import json
+import os
+import shutil
 import subprocess
 import sys
 import time
@@ -29,6 +35,21 @@ from pathlib import Path
 
 PIPX_PYTHON = os.environ.get("PLAYWRIGHT_PYTHON", "python3")
 REPO_ROOT = Path(__file__).parent.parent
+
+
+def find_node_bin() -> Path | None:
+    """Locate ozma-node for the default Rust backend."""
+    override = os.environ.get("OZMA_NODE_BIN", "").strip()
+    if override:
+        return Path(override)
+    for candidate in (
+        REPO_ROOT / "target" / "release" / "ozma-node",
+        REPO_ROOT / "target" / "debug" / "ozma-node",
+    ):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    found = shutil.which("ozma-node")
+    return Path(found) if found else None
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +81,8 @@ def wait_for_api(base: str, timeout: float = 15.0) -> bool:
 
 _procs: list[subprocess.Popen] = []
 
-def start_services(base_url: str) -> None:
-    """Start controller + two soft nodes if the API isn't already up."""
+def start_services(base_url: str, backend: str = "rust") -> None:
+    """Start controller + two nodes if the API isn't already up."""
     if wait_for_api(base_url, timeout=2.0):
         print("  Controller already running.")
         return
@@ -77,14 +98,41 @@ def start_services(base_url: str) -> None:
     )
     _procs.append(ctrl)
 
-    print("  Starting soft nodes...")
+    node_bin = find_node_bin() if backend == "rust" else None
+    if backend == "rust" and node_bin is None:
+        print("ERROR: no ozma-node binary found for the Rust backend.", file=sys.stderr)
+        print("  Build it (cargo build -p ozma-node), set OZMA_NODE_BIN,", file=sys.stderr)
+        print("  or pass --backend python for the one-release rollback path.", file=sys.stderr)
+        stop_services()
+        sys.exit(1)
+
+    print(f"  Starting nodes (backend: {backend})...")
     for name, port in [("vm1", 7332), ("vm2", 7333)]:
+        qmp = f"/tmp/ozma-{name}.qmp"
+        if backend == "rust":
+            hls_dir = REPO_ROOT / "demo" / "logs" / f"hls-{name}"
+            hls_dir.mkdir(parents=True, exist_ok=True)
+            argv = [
+                str(node_bin),
+                "--name", name,
+                "--profile", "vm",
+                "--qmp-socket", qmp,
+                "--hid-udp-port", str(port),
+                "--http-port", str(port + 50),
+                "--capture-provider", "qmp",
+                "--input-provider", "qmp",
+                "--hls", "--hls-dir", str(hls_dir), "--hls-fps", "15",
+            ]
+        else:
+            argv = [
+                sys.executable,
+                str(REPO_ROOT / "softnode" / "soft_node.py"),
+                "--name", name,
+                "--port", str(port),
+                "--qmp", qmp,
+            ]
         proc = subprocess.Popen(
-            [sys.executable,
-             str(REPO_ROOT / "softnode" / "soft_node.py"),
-             "--name", name,
-             "--port", str(port),
-             "--qmp", f"/tmp/ozma-{name}.qmp"],
+            argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -258,7 +306,11 @@ def main() -> None:
     p.add_argument("--convert", action="store_true",
                    help="Convert webm output to mp4 via ffmpeg")
     p.add_argument("--start-services", action="store_true",
-                   help="Start controller+soft nodes if not already running")
+                   help="Start controller+nodes if not already running")
+    p.add_argument("--backend", choices=("rust", "python"),
+                   default=os.environ.get("OZMA_DEMO_BACKEND", "rust"),
+                   help="Node backend for --start-services (default: rust; "
+                        "python is the one-release rollback path)")
     p.add_argument("--wait-streams", action="store_true",
                    help="Wait for HLS streams to become active before recording")
     args = p.parse_args()
@@ -269,8 +321,8 @@ def main() -> None:
     w, h = (int(x) for x in args.size.lower().split("x"))
 
     if args.start_services:
-        print("Starting services...")
-        start_services(base)
+        print(f"Starting services (backend: {args.backend})...")
+        start_services(base, args.backend)
 
     # Verify API is reachable
     if not wait_for_api(base, timeout=5.0):

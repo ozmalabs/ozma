@@ -27,7 +27,21 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("ozma.softnode.gst_webrtc")
 
-_GST_WORKER = Path(__file__).parent / "gst_webrtc_worker.py"
+# The worker moved out of the Python node tree so the Rust node no longer
+# depends on `softnode/`. Prefer the explicit override, then the canonical
+# repo copy, then the installed copy, then the legacy in-tree path.
+_HERE = Path(__file__).resolve().parent
+_GST_WORKER_CANDIDATES = (
+    Path(os.environ["OZMA_WEBRTC_WORKER"]) if os.environ.get("OZMA_WEBRTC_WORKER") else None,
+    _HERE.parent / "scripts" / "webrtc" / "gst_webrtc_worker.py",
+    Path(sys.prefix) / "share" / "ozma" / "webrtc" / "gst_webrtc_worker.py",
+    Path.home() / ".local" / "share" / "ozma" / "webrtc" / "gst_webrtc_worker.py",
+    _HERE / "gst_webrtc_worker.py",
+)
+_GST_WORKER = next(
+    (path for path in _GST_WORKER_CANDIDATES if path is not None and path.is_file()),
+    _HERE / "gst_webrtc_worker.py",
+)
 
 
 class GstWebRTCStream:

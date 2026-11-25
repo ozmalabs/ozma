@@ -3,8 +3,9 @@
 #
 # What this starts:
 #   1. Two QEMU VMs (vm1, vm2) via demo/start_vms.sh
-#   2. Two nodes pointing at those QMP sockets (Python by default)
-#   3. The Ozma Controller daemon
+#   2. Two Rust nodes (`ozma-node --profile vm`) pointing at those QMP sockets
+#   3. The Ozma Controller daemon (still Python; the controller is the
+#      remaining Python component)
 #
 # Layout:
 #   Controller         → REST/WS on http://localhost:7380
@@ -12,35 +13,49 @@
 #   Node vm2           → UDP 7333, HTTP 7383, QMP /tmp/ozma-vm2.qmp
 #
 # Usage:
-#   bash demo/run_demo.sh           # Python soft nodes (rollback path)
-#   bash demo/run_demo.sh --rust    # Rust ozma-node --profile vm
-#   OZMA_DEMO_BACKEND=rust bash demo/run_demo.sh
+#   bash demo/run_demo.sh           # Rust ozma-node (default)
+#   bash demo/run_demo.sh --python  # Python soft nodes (one-release rollback)
+#   OZMA_DEMO_BACKEND=python bash demo/run_demo.sh
+#   bash demo/run_demo.sh --webrtc  # Rust nodes + GStreamer WebRTC helper
 #   bash demo/run_demo.sh stop      # stop everything
 #   bash demo/run_demo.sh status    # check process status
+#   bash demo/run_demo.sh --help    # this message (no services started)
 #
 # The Rust path uses the same VM/QMP sockets, mDNS node names, and controller.
 # Set OZMA_NODE_BIN to point at a specific ozma-node binary; otherwise the
 # script looks in target/release, target/debug, then $PATH.
+# WebRTC stays off by default; --webrtc passes the canonical helper at
+# scripts/webrtc/gst_webrtc_worker.py and requires Python 3 + GStreamer.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+usage() {
+    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+}
+
 # ---------------------------------------------------------------------------
-# Node backend: Python is the default/rollback path; --rust switches to the
-# Rust ozma-node --profile vm path. The variable is exported so the "test"
-# recursion below keeps the selection.
-DEMO_BACKEND="${OZMA_DEMO_BACKEND:-python}"
+# Node backend: Rust is the default. --python (or OZMA_DEMO_BACKEND=python)
+# keeps the one-release Python rollback path. The variable is exported so the
+# "test" recursion below keeps the selection.
+DEMO_BACKEND="${OZMA_DEMO_BACKEND:-rust}"
 case "${OZMA_DEMO_RUST:-0}" in
     1|true|yes|on) DEMO_BACKEND=rust ;;
 esac
+case "${OZMA_DEMO_PYTHON:-0}" in
+    1|true|yes|on) DEMO_BACKEND=python ;;
+esac
+DEMO_WEBRTC="${OZMA_DEMO_WEBRTC:-0}"
 
 ARGS=()
 for arg in "$@"; do
     case "$arg" in
         --rust) DEMO_BACKEND=rust ;;
         --python) DEMO_BACKEND=python ;;
+        --webrtc) DEMO_WEBRTC=1 ;;
+        -h|--help) usage; exit 0 ;;
         *) ARGS+=("$arg") ;;
     esac
 done
@@ -49,6 +64,13 @@ case "$DEMO_BACKEND" in
     rust|python) ;;
     *)
         echo "ERROR: OZMA_DEMO_BACKEND must be 'rust' or 'python' (got '$DEMO_BACKEND')" >&2
+        exit 1
+        ;;
+esac
+case "$DEMO_WEBRTC" in
+    0|1) ;;
+    *)
+        echo "ERROR: OZMA_DEMO_WEBRTC must be 0 or 1 (got '$DEMO_WEBRTC')" >&2
         exit 1
         ;;
 esac
@@ -64,6 +86,19 @@ if [[ "$DEMO_BACKEND" == "rust" && -z "$RUST_NODE_BIN" ]]; then
     done
     [[ -z "$RUST_NODE_BIN" ]] && RUST_NODE_BIN="$(command -v ozma-node 2>/dev/null || true)"
 fi
+
+WEBRTC_SCRIPT="${OZMA_WEBRTC_HELPER_SCRIPT:-$REPO_ROOT/scripts/webrtc/gst_webrtc_worker.py}"
+if [[ "$DEMO_WEBRTC" == "1" ]]; then
+    if [[ "$DEMO_BACKEND" != "rust" ]]; then
+        echo "ERROR: --webrtc is only wired for the Rust backend; drop --python." >&2
+        exit 1
+    fi
+    if [[ ! -f "$WEBRTC_SCRIPT" ]]; then
+        echo "ERROR: WebRTC helper not found at $WEBRTC_SCRIPT" >&2
+        echo "Set OZMA_WEBRTC_HELPER_SCRIPT or install it with scripts/install-rust.sh." >&2
+        exit 1
+    fi
+fi
 LOG_DIR="$SCRIPT_DIR/logs"
 SCENARIOS_SRC="$SCRIPT_DIR/scenarios.json"
 SCENARIOS_DEST="$REPO_ROOT/controller/scenarios.json"
@@ -72,8 +107,8 @@ PID_CTRL="/tmp/ozma-ctrl.pid"
 PID_SN1="/tmp/ozma-sn1.pid"
 PID_SN2="/tmp/ozma-sn2.pid"
 LOG_CTRL="$LOG_DIR/controller.log"
-LOG_SN1="$LOG_DIR/softnode-vm1.log"
-LOG_SN2="$LOG_DIR/softnode-vm2.log"
+LOG_SN1="$LOG_DIR/node-vm1.log"
+LOG_SN2="$LOG_DIR/node-vm2.log"
 
 # ---------------------------------------------------------------------------
 _stop_processes() {
@@ -104,9 +139,13 @@ start_vm_node() {
         local http_port=$((port + 50))
         local hls_dir="$LOG_DIR/hls-$name"
         local audio_args=()
+        local webrtc_args=()
         mkdir -p "$hls_dir"
         if command -v pactl >/dev/null 2>&1; then
             audio_args=(--audio-router pipewire --audio-capture-target "monitor:$sink" --audio-sink "$sink")
+        fi
+        if [[ "$DEMO_WEBRTC" == "1" ]]; then
+            webrtc_args=(--webrtc-helper python3 --webrtc-helper-script "$WEBRTC_SCRIPT")
         fi
         "$RUST_NODE_BIN" \
             --name "$name" \
@@ -118,6 +157,7 @@ start_vm_node() {
             --input-provider qmp \
             --hls --hls-dir "$hls_dir" --hls-fps 15 \
             "${audio_args[@]}" \
+            "${webrtc_args[@]}" \
             >"$log" 2>&1 &
     else
         "$PYTHON" "$REPO_ROOT/softnode/soft_node.py" \
@@ -277,7 +317,8 @@ echo ""
 echo "============================================================"
 echo "  Ozma Demo Running"
 echo "============================================================"
-echo "  Backend:      $DEMO_BACKEND"
+echo "  Backend:      $DEMO_BACKEND (default: rust)"
+echo "  WebRTC:       $([[ "$DEMO_WEBRTC" == "1" ]] && echo "helper enabled" || echo "off (typed 503)")"
 echo "  Web UI:       http://localhost:7380"
 echo "  API status:   http://localhost:7380/api/v1/status"
 echo "  Scenarios:    http://localhost:7380/api/v1/scenarios"
@@ -294,4 +335,7 @@ echo "    python demo/switch.py"
 echo ""
 echo "  Stop everything:"
 echo "    bash demo/run_demo.sh stop"
+echo ""
+echo "  One-release Python rollback:"
+echo "    bash demo/run_demo.sh --python"
 echo "============================================================"

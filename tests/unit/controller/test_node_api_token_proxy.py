@@ -179,6 +179,9 @@ PROXY_CASES = [
     ("get", f"/api/v1/nodes/{NODE_ID}/usb", None, "/usb"),
     ("get", f"/api/v1/streams/{NODE_ID}/codec", None, "/codec"),
     ("get", f"/api/v1/remote/{NODE_ID}/screenshot", None, "/display/snapshot"),
+    ("get", f"/api/v1/nodes/{NODE_ID}/hardware", None, "/hardware"),
+    ("get", f"/api/v1/nodes/{NODE_ID}/hardware/summary", None, "/hardware/summary"),
+    ("get", f"/api/v1/nodes/{NODE_ID}/hardware/sensors", None, "/hardware/sensors"),
 ]
 
 

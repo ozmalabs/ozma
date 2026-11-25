@@ -8,7 +8,8 @@
 //! same helper first and replaces it behind the same endpoints later with a
 //! native `webrtc-rs`/`str0m` implementation.
 //!
-//! The wire contract mirrors `softnode/gst_webrtc_worker.py`:
+//! The wire contract mirrors `scripts/webrtc/gst_webrtc_worker.py` (the
+//! one-release compatibility shim remains at `softnode/gst_webrtc_worker.py`):
 //!
 //! * the helper is spawned with
 //!   `[program] [script] --sock <path> --shm <path> --width <w> --height <h> --fps <fps>`;
@@ -122,7 +123,7 @@ impl WebRtcAudioBackend {
 pub struct WebRtcConfig {
     /// Helper executable (for example `/usr/bin/python3`).
     pub helper_program: PathBuf,
-    /// Optional first argument (for example `softnode/gst_webrtc_worker.py`).
+    /// Optional first argument (for example `scripts/webrtc/gst_webrtc_worker.py`).
     pub helper_script: Option<PathBuf>,
     /// Unix socket receiving newline-delimited signaling JSON.
     pub socket_path: PathBuf,

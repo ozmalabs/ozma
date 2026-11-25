@@ -36,7 +36,7 @@ export OZMA_VNC_HOST=127.0.0.1       # optional
 export OZMA_VNC_PORT=5901            # optional
 export OZMA_HLS_DIR=/tmp/ozma-gate2-hls
 export OZMA_WEBRTC_HELPER=/usr/bin/python3
-export OZMA_WEBRTC_HELPER_SCRIPT="$PWD/softnode/gst_webrtc_worker.py"
+export OZMA_WEBRTC_HELPER_SCRIPT="$PWD/scripts/webrtc/gst_webrtc_worker.py"
 
 scripts/gate2/run-gate2.sh
 ```
@@ -80,7 +80,7 @@ scripts/gate2/check-node.sh
 | `OZMA_FFMPEG_BIN` | `ffmpeg` | ffmpeg executable. |
 | `OZMA_HLS_DIR` | `/tmp/ozma-gate2-hls` | HLS output directory; preflight checks its parent is writable. |
 | `OZMA_WEBRTC_HELPER` | `python3` | Helper program. |
-| `OZMA_WEBRTC_HELPER_SCRIPT` | `softnode/gst_webrtc_worker.py` | Helper script. |
+| `OZMA_WEBRTC_HELPER_SCRIPT` | `scripts/webrtc/gst_webrtc_worker.py` (legacy `softnode/` fallback) | Helper script. |
 | `OZMA_GATE2_REPORT_DIR` | `/tmp/ozma-gate2` | `run-gate2.sh` report directory. |
 | `OZMA_GATE2_SKIP_LIBVIRT` | `0` | `1` allows a direct-QEMU setup with no libvirt domain. |
 | `OZMA_GATE2_SKIP_QMP` | `0` | `1` skips QMP checks; this is not a Gate 2 pass. |

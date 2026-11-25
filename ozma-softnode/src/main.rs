@@ -26,16 +26,22 @@ mod status;
 mod supervisor;
 mod vm_info;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{bail, Context};
 use audio_provisioning::AudioProvisionConfig;
 use clap::Parser;
 use evdev_provisioning::EvdevProvisionConfig;
 use manager::{ManagerOptions, VirtualNodeManager};
 use provisioning::{ProvisionConfig, DEFAULT_QMP_DIR};
-use tracing::info;
+use supervisor::{
+    ChildOptions, GpuPassthroughChildOptions, HlsChildOptions, NodeFlagSupport, UnsupportedPolicy,
+    UsbChildOptions, VncChildOptions, WebRtcChildOptions,
+};
+use tracing::{info, warn};
 
 /// Ozma Virtual Node — discover VMs and supervise one `ozma-node` per VM.
 ///
@@ -136,6 +142,245 @@ struct Args {
     #[arg(long, default_value = "", env = "OZMA_NODE_API_TOKEN", hide = true)]
     child_api_token: String,
 
+    /// Opt in to the child `--hls` pipeline (capture → ffmpeg → `/stream/*`)
+    ///
+    /// Off by default. Without it, supervised children advertise no stream and
+    /// the controller's HLS proxy gets 503, exactly as before this flag existed.
+    #[arg(long)]
+    hls: bool,
+
+    /// Root directory for per-VM HLS output (`<root>/<vm>`)
+    ///
+    /// Requires --hls or --multi-console-hls. When unset the child keeps its
+    /// own `/tmp/ozma-stream-<name>` default.
+    #[arg(long, value_name = "PATH")]
+    hls_dir: Option<PathBuf>,
+
+    /// Child HLS input frame rate
+    #[arg(long, value_name = "FPS")]
+    hls_fps: Option<u32>,
+
+    /// Child HLS H.264/HEVC bitrate in kbps
+    #[arg(long, value_name = "KBPS")]
+    hls_bitrate_kbps: Option<u32>,
+
+    /// Child HLS encoder (also the "codec" selector), for example `libx264`,
+    /// `hevc_vaapi`, or `h264_nvenc`
+    #[arg(long, value_name = "ENCODER")]
+    hls_encoder: Option<String>,
+
+    /// Child HLS pixel format (`yuv420p` or `p010`)
+    #[arg(long, value_name = "FORMAT")]
+    hls_pixel_format: Option<String>,
+
+    /// Select the 10-bit `p010` HLS target
+    #[arg(long)]
+    hls_10bit: bool,
+
+    /// Signal HDR color metadata (requires a 10-bit target)
+    #[arg(long)]
+    hls_hdr: bool,
+
+    /// HDR color primaries (for example `bt2020`)
+    #[arg(long, value_name = "NAME")]
+    hls_color_primaries: Option<String>,
+
+    /// HDR transfer characteristic (for example `smpte2084`)
+    #[arg(long, value_name = "NAME")]
+    hls_color_transfer: Option<String>,
+
+    /// HDR color matrix (for example `bt2020nc`)
+    #[arg(long, value_name = "NAME")]
+    hls_color_matrix: Option<String>,
+
+    /// Run one HLS pipeline per advertised VM console (implies --hls)
+    ///
+    /// Forwarded as `--multi-console-hls`; single-head QMP/VNC/Looking Glass
+    /// children report a typed limitation rather than a fake per-console stream.
+    #[arg(long)]
+    multi_console_hls: bool,
+
+    /// Maximum simultaneous per-console HLS pipelines
+    #[arg(long, value_name = "N")]
+    multi_console_hls_max: Option<usize>,
+
+    /// Idle seconds before a non-active per-console HLS pipeline stops
+    #[arg(long, value_name = "SECONDS")]
+    multi_console_hls_idle_seconds: Option<u64>,
+
+    /// Per-VM display output for the controller picker, repeatable
+    ///
+    /// Form: `VM=LABEL:WxH[:PRIMARY][:SOURCE]` or
+    /// `VM=INDEX:LABEL:WxH[:PRIMARY][:SOURCE]`. Forwarded only to that VM's
+    /// child as `--display-output`.
+    #[arg(long, value_name = "VM=SPEC")]
+    display_output: Vec<String>,
+
+    /// Per-VM guest IP advertised by the child, repeatable (`VM=IP`)
+    #[arg(long, value_name = "VM=IP")]
+    vm_guest_ip: Vec<String>,
+
+    /// Select VNC capture for VMs whose discovery backend exposed a VNC port
+    ///
+    /// This forwards `--capture-provider vnc --vnc-host --vnc-port`. It does not
+    /// register VNC metadata with the controller; `ozma-node` has no such field
+    /// yet. GPU-passthrough VMs are never switched to VNC.
+    #[arg(long)]
+    vnc_capture: bool,
+
+    /// External WebRTC helper executable (for example `/usr/bin/python3`)
+    ///
+    /// WebRTC stays disabled when unset. Other --webrtc-* options require this.
+    #[arg(long, value_name = "PATH")]
+    webrtc_helper: Option<PathBuf>,
+
+    /// First argument passed to the WebRTC helper (the worker script)
+    #[arg(long, value_name = "PATH")]
+    webrtc_helper_script: Option<PathBuf>,
+
+    /// Directory for per-VM WebRTC signaling sockets (`<dir>/<vm>.sock`)
+    #[arg(long, value_name = "PATH")]
+    webrtc_socket_dir: Option<PathBuf>,
+
+    /// Directory for per-VM WebRTC shared-memory frames (`<dir>/<vm>.shm`)
+    #[arg(long, value_name = "PATH")]
+    webrtc_shm_dir: Option<PathBuf>,
+
+    /// WebRTC helper frame width
+    #[arg(long, value_name = "PIXELS")]
+    webrtc_width: Option<u32>,
+
+    /// WebRTC helper frame height
+    #[arg(long, value_name = "PIXELS")]
+    webrtc_height: Option<u32>,
+
+    /// WebRTC helper frame rate
+    #[arg(long, value_name = "FPS")]
+    webrtc_fps: Option<u32>,
+
+    /// WebRTC H.264 bitrate in kbps
+    #[arg(long, value_name = "KBPS")]
+    webrtc_bitrate_kbps: Option<u32>,
+
+    /// Derive `--webrtc-audio-source <audio-sink>.monitor` per VM
+    #[arg(long)]
+    webrtc_audio_from_sink: bool,
+
+    /// WebRTC audio backend: `auto`, `pulse`, or `pipewire`
+    #[arg(long, value_name = "BACKEND", value_parser = ["auto", "pulse", "pipewire"])]
+    webrtc_audio_backend: Option<String>,
+
+    /// Optional STUN server URI for WebRTC ICE
+    #[arg(long, value_name = "URI")]
+    webrtc_stun: Option<String>,
+
+    /// Optional TURN server URI without credentials
+    #[arg(long, value_name = "URI")]
+    webrtc_turn: Option<String>,
+
+    /// TURN username (redacted from status and logs)
+    #[arg(long, value_name = "USER")]
+    webrtc_turn_user: Option<String>,
+
+    /// TURN password (redacted from status and logs)
+    #[arg(long, value_name = "PASSWORD", hide = true)]
+    webrtc_turn_password: Option<String>,
+
+    /// Enable one WebRTC helper per advertised VM console
+    #[arg(long)]
+    multi_console_webrtc: bool,
+
+    /// Maximum simultaneous per-console WebRTC helpers
+    #[arg(long, value_name = "N")]
+    multi_console_webrtc_max: Option<usize>,
+
+    /// Idle seconds before a non-active per-console WebRTC helper stops
+    #[arg(long, value_name = "SECONDS")]
+    multi_console_webrtc_idle_seconds: Option<u64>,
+
+    /// Opt in to USB gadget/media forwarding for exactly one VM child
+    ///
+    /// Requires --usb-vm and --usb-udc. USB is host-scoped, so the supervisor
+    /// forwards it to one child only instead of racing several children for the
+    /// same UDC.
+    #[arg(long)]
+    usb_gadget: bool,
+
+    /// The single VM whose child receives the USB gadget flags
+    #[arg(long, value_name = "VM")]
+    usb_vm: Option<String>,
+
+    /// UDC the USB gadget binds to
+    #[arg(long, value_name = "UDC")]
+    usb_udc: Option<String>,
+
+    /// ConfigFS composite-gadget root
+    #[arg(long, value_name = "PATH")]
+    usb_configfs_root: Option<PathBuf>,
+
+    /// Disk image or ISO exposed as the mass-storage LUN
+    #[arg(long, value_name = "PATH")]
+    usb_media: Option<PathBuf>,
+
+    /// Expose the mass-storage LUN read-only
+    #[arg(long)]
+    usb_media_ro: bool,
+
+    /// Present the mass-storage image as a read-only CD-ROM
+    #[arg(long)]
+    usb_media_cdrom: bool,
+
+    /// Add a UAC2 audio function (descriptors only)
+    #[arg(long)]
+    usb_uac2: bool,
+
+    /// Add a FunctionFS vendor function
+    #[arg(long)]
+    usb_vendor: bool,
+
+    /// Optional absolute FunctionFS vendor daemon path
+    #[arg(long, value_name = "PATH")]
+    usb_vendor_daemon: Option<PathBuf>,
+
+    /// Per-VM Looking Glass KVMFR shared-memory path, repeatable (`VM=PATH`)
+    ///
+    /// Used as `--capture-provider looking-glass --looking-glass-shm` for a VM
+    /// discovery marks as GPU passthrough. Without a mapping the supervisor
+    /// keeps qmp capture and reports that the agent-capture path is unsupervised.
+    #[arg(long, value_name = "VM=PATH")]
+    looking_glass_shm: Vec<String>,
+
+    /// Looking Glass polling rate in frames per second
+    #[arg(long, value_name = "FPS")]
+    looking_glass_fps: Option<u32>,
+
+    /// Looking Glass capture source id advertised by the child
+    #[arg(long, value_name = "ID")]
+    looking_glass_id: Option<String>,
+
+    /// Looking Glass capture source name advertised by the child
+    #[arg(long, value_name = "NAME")]
+    looking_glass_name: Option<String>,
+
+    /// Child audio routing backend (`none`, `pipewire`, `pulseaudio`)
+    #[arg(long, value_name = "BACKEND", value_parser = ["none", "pipewire", "pulseaudio"])]
+    audio_router: Option<String>,
+
+    /// Derive `--audio-capture-target monitor:<audio-sink>` per VM
+    #[arg(long)]
+    audio_capture_from_sink: bool,
+
+    /// Skip `ozma-node --help` probing and assume the current build's flags
+    ///
+    /// Probing enables typed "unsupported option" warnings in supervisor status.
+    #[arg(long)]
+    no_node_help_probe: bool,
+
+    /// Treat a configured child option the target `ozma-node` does not support
+    /// as a typed error (that VM gets no child) instead of a status warning
+    #[arg(long)]
+    reject_unsupported_node_flags: bool,
+
     /// Opt in to defining ozma QMP/display XML on libvirt domains
     ///
     /// Proxmox configuration is never edited.
@@ -214,6 +459,42 @@ struct Args {
     debug: bool,
 }
 
+/// Split a repeatable `VM=VALUE` argument.
+fn split_vm_value(raw: &str, option: &str) -> anyhow::Result<(String, String)> {
+    let (vm, value) = raw
+        .split_once('=')
+        .with_context(|| format!("{option} expects VM=VALUE, got {raw:?}"))?;
+    let vm = vm.trim();
+    let value = value.trim();
+    if vm.is_empty() || value.is_empty() {
+        bail!("{option} expects a non-empty VM and value, got {raw:?}");
+    }
+    Ok((vm.to_owned(), value.to_owned()))
+}
+
+/// Parse repeatable `VM=VALUE` arguments, rejecting duplicate VM keys instead
+/// of silently letting the last value win.
+fn parse_vm_map(values: &[String], option: &str) -> anyhow::Result<HashMap<String, String>> {
+    let mut parsed = HashMap::new();
+    for raw in values {
+        let (vm, value) = split_vm_value(raw, option)?;
+        if parsed.insert(vm.clone(), value).is_some() {
+            bail!("{option} was passed more than once for VM {vm:?}");
+        }
+    }
+    Ok(parsed)
+}
+
+/// Parse repeatable `VM=VALUE` arguments where one VM may have several values.
+fn parse_vm_lists(values: &[String], option: &str) -> anyhow::Result<HashMap<String, Vec<String>>> {
+    let mut parsed: HashMap<String, Vec<String>> = HashMap::new();
+    for raw in values {
+        let (vm, value) = split_vm_value(raw, option)?;
+        parsed.entry(vm).or_default().push(value);
+    }
+    Ok(parsed)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -261,10 +542,110 @@ async fn main() -> anyhow::Result<()> {
         enabled: args.provision_audio,
         backend: args.audio_backend,
         sink_prefix: args.audio_sink_prefix,
-        track_root: args.audio_track_root,
+        track_root: args.audio_track_root.clone(),
         state_path: args
             .audio_state_file
             .unwrap_or_else(audio_provisioning::default_state_path),
+    };
+
+    // Probe the target node once so configured-but-unsupported flags are
+    // reported in status instead of disappearing. `--help` is cheap and never
+    // starts a VM. Discovery-only mode does not spawn children, so skip it.
+    let node_flag_support = if args.no_node_help_probe || args.no_auto_manage {
+        NodeFlagSupport::Unknown
+    } else {
+        match supervisor::probe_node_flags(&args.node_bin) {
+            Ok(support) => {
+                info!(
+                    "Probed {} long flags from {} --help",
+                    support.len(),
+                    args.node_bin.display()
+                );
+                support
+            }
+            Err(error) => {
+                warn!(
+                    "Could not probe {} --help ({}); assuming the current build's \
+                     flags. Configured unsupported options will fail at spawn rather \
+                     than being reported in status.",
+                    args.node_bin.display(),
+                    error
+                );
+                NodeFlagSupport::Unknown
+            }
+        }
+    };
+
+    let child = ChildOptions {
+        hls: HlsChildOptions {
+            enabled: args.hls || args.multi_console_hls,
+            dir_root: args.hls_dir,
+            fps: args.hls_fps,
+            bitrate_kbps: args.hls_bitrate_kbps,
+            encoder: args.hls_encoder,
+            pixel_format: args.hls_pixel_format,
+            ten_bit: args.hls_10bit,
+            hdr: args.hls_hdr,
+            color_primaries: args.hls_color_primaries,
+            color_transfer: args.hls_color_transfer,
+            color_matrix: args.hls_color_matrix,
+            multi_console: args.multi_console_hls,
+            multi_console_max: args.multi_console_hls_max,
+            multi_console_idle_seconds: args.multi_console_hls_idle_seconds,
+        },
+        display_outputs: parse_vm_lists(&args.display_output, "--display-output")?,
+        guest_ips: parse_vm_map(&args.vm_guest_ip, "--vm-guest-ip")?,
+        webrtc: WebRtcChildOptions {
+            helper: args.webrtc_helper,
+            helper_script: args.webrtc_helper_script,
+            socket_dir: args.webrtc_socket_dir,
+            shm_dir: args.webrtc_shm_dir,
+            width: args.webrtc_width,
+            height: args.webrtc_height,
+            fps: args.webrtc_fps,
+            bitrate_kbps: args.webrtc_bitrate_kbps,
+            audio_from_sink: args.webrtc_audio_from_sink,
+            audio_backend: args.webrtc_audio_backend,
+            stun: args.webrtc_stun,
+            turn: args.webrtc_turn,
+            turn_user: args.webrtc_turn_user,
+            turn_password: args.webrtc_turn_password,
+            multi_console: args.multi_console_webrtc,
+            multi_console_max: args.multi_console_webrtc_max,
+            multi_console_idle_seconds: args.multi_console_webrtc_idle_seconds,
+        },
+        vnc: VncChildOptions {
+            capture: args.vnc_capture,
+        },
+        usb: UsbChildOptions {
+            enabled: args.usb_gadget,
+            vm: args.usb_vm,
+            udc: args.usb_udc,
+            configfs_root: args.usb_configfs_root,
+            media: args.usb_media,
+            media_ro: args.usb_media_ro,
+            media_cdrom: args.usb_media_cdrom,
+            uac2: args.usb_uac2,
+            vendor: args.usb_vendor,
+            vendor_daemon: args.usb_vendor_daemon,
+        },
+        gpu: GpuPassthroughChildOptions {
+            looking_glass: parse_vm_map(&args.looking_glass_shm, "--looking-glass-shm")?
+                .into_iter()
+                .map(|(vm, path)| (vm, PathBuf::from(path)))
+                .collect(),
+            looking_glass_fps: args.looking_glass_fps,
+            looking_glass_id: args.looking_glass_id,
+            looking_glass_name: args.looking_glass_name,
+        },
+        audio_router: args.audio_router,
+        audio_capture_from_sink: args.audio_capture_from_sink,
+        audio_track_root: args.audio_track_root.clone(),
+    };
+    let unsupported_policy = if args.reject_unsupported_node_flags {
+        UnsupportedPolicy::Reject
+    } else {
+        UnsupportedPolicy::Warn
     };
 
     let options = ManagerOptions {
@@ -284,6 +665,9 @@ async fn main() -> anyhow::Result<()> {
         provision: args.provision,
         provision_config,
         audio,
+        child,
+        node_flag_support,
+        unsupported_policy,
         ..ManagerOptions::default()
     };
 
@@ -373,6 +757,22 @@ mod tests {
         );
         assert!(args.audio_track_root.is_none());
         assert!(args.audio_state_file.is_none());
+        assert!(!args.hls);
+        assert!(args.hls_dir.is_none());
+        assert!(args.hls_fps.is_none());
+        assert!(!args.multi_console_hls);
+        assert!(args.display_output.is_empty());
+        assert!(args.vm_guest_ip.is_empty());
+        assert!(!args.vnc_capture);
+        assert!(args.webrtc_helper.is_none());
+        assert!(args.webrtc_turn_password.is_none());
+        assert!(!args.usb_gadget);
+        assert!(args.usb_vm.is_none());
+        assert!(args.looking_glass_shm.is_empty());
+        assert!(args.audio_router.is_none());
+        assert!(!args.audio_capture_from_sink);
+        assert!(!args.no_node_help_probe);
+        assert!(!args.reject_unsupported_node_flags);
     }
 
     #[test]
@@ -503,5 +903,90 @@ mod tests {
 
         assert!(!options.auto_manage);
         assert!(VirtualNodeManager::new(options).validate().is_ok());
+    }
+
+    #[test]
+    fn child_argv_parity_flags_parse() {
+        let args = Args::try_parse_from([
+            "ozma-virtual-node",
+            "--hls",
+            "--hls-dir",
+            "/srv/hls",
+            "--hls-fps",
+            "15",
+            "--hls-encoder",
+            "hevc_vaapi",
+            "--multi-console-hls",
+            "--display-output",
+            "vm-a=0:Console_0:1920x1080:dbus",
+            "--display-output",
+            "vm-a=1:Console_1:1280x720",
+            "--vm-guest-ip",
+            "vm-a=10.0.0.42",
+            "--vnc-capture",
+            "--webrtc-helper",
+            "/usr/bin/python3",
+            "--webrtc-socket-dir",
+            "/run/ozma/webrtc",
+            "--webrtc-turn-password",
+            "hunter2",
+            "--usb-gadget",
+            "--usb-vm",
+            "vm-a",
+            "--usb-udc",
+            "dummy_udc.0",
+            "--usb-media",
+            "/srv/media/installer.iso",
+            "--looking-glass-shm",
+            "vm-b=/dev/shm/looking-glass",
+            "--audio-router",
+            "pipewire",
+            "--audio-capture-from-sink",
+        ])
+        .expect("parse child argv parity flags");
+
+        assert!(args.hls);
+        assert_eq!(args.hls_dir, Some(PathBuf::from("/srv/hls")));
+        assert_eq!(args.hls_fps, Some(15));
+        assert_eq!(args.hls_encoder.as_deref(), Some("hevc_vaapi"));
+        assert!(args.multi_console_hls);
+        assert!(args.vnc_capture);
+        assert_eq!(args.webrtc_helper, Some(PathBuf::from("/usr/bin/python3")));
+        assert_eq!(args.webrtc_turn_password.as_deref(), Some("hunter2"));
+        assert!(args.usb_gadget);
+        assert_eq!(args.usb_vm.as_deref(), Some("vm-a"));
+        assert_eq!(args.usb_udc.as_deref(), Some("dummy_udc.0"));
+        assert_eq!(args.audio_router.as_deref(), Some("pipewire"));
+        assert!(args.audio_capture_from_sink);
+
+        let displays =
+            parse_vm_lists(&args.display_output, "--display-output").expect("parse displays");
+        assert_eq!(
+            displays.get("vm-a"),
+            Some(&vec![
+                "0:Console_0:1920x1080:dbus".to_owned(),
+                "1:Console_1:1280x720".to_owned(),
+            ])
+        );
+        let guests = parse_vm_map(&args.vm_guest_ip, "--vm-guest-ip").expect("parse guest IPs");
+        assert_eq!(guests.get("vm-a").map(String::as_str), Some("10.0.0.42"));
+        let looking_glass = parse_vm_map(&args.looking_glass_shm, "--looking-glass-shm")
+            .expect("parse looking glass");
+        assert_eq!(
+            looking_glass.get("vm-b").map(String::as_str),
+            Some("/dev/shm/looking-glass")
+        );
+    }
+
+    #[test]
+    fn repeatable_vm_assignments_reject_duplicates_and_missing_values() {
+        assert!(parse_vm_map(&["vm-a=10.0.0.1".to_owned()], "--vm-guest-ip").is_ok());
+        assert!(parse_vm_map(
+            &["vm-a=10.0.0.1".to_owned(), "vm-a=10.0.0.2".to_owned()],
+            "--vm-guest-ip"
+        )
+        .is_err());
+        assert!(parse_vm_map(&["vm-a".to_owned()], "--vm-guest-ip").is_err());
+        assert!(parse_vm_map(&["=10.0.0.1".to_owned()], "--vm-guest-ip").is_err());
     }
 }

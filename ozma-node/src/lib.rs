@@ -14,6 +14,7 @@ pub mod display_broker;
 pub mod display_compat;
 pub mod display_control;
 pub mod display_outputs;
+pub mod hardware;
 pub mod hls;
 pub mod input_select;
 pub mod keyboard_layout;

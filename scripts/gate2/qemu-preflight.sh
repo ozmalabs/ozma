@@ -20,7 +20,8 @@
 #   OZMA_FFMPEG_BIN             ffmpeg executable (default: ffmpeg)
 #   OZMA_HLS_DIR                HLS output directory (default: /tmp/ozma-gate2-hls)
 #   OZMA_WEBRTC_HELPER          helper program (default: python3)
-#   OZMA_WEBRTC_HELPER_SCRIPT   helper script (default: softnode/gst_webrtc_worker.py)
+#   OZMA_WEBRTC_HELPER_SCRIPT   helper script (default: scripts/webrtc/gst_webrtc_worker.py,
+#                               falling back to the legacy softnode path)
 #   OZMA_CONTROLLER_URL         controller base URL, for an optional /health check
 #   OZMA_GATE2_SKIP_LIBVIRT=1   allow a direct-QEMU setup with no libvirt domain
 #   OZMA_GATE2_SKIP_QMP=1       skip the QMP checks (not a Gate 2 pass)
@@ -327,7 +328,13 @@ if [ "$SKIP_WEBRTC" = "1" ]; then
     skip "WebRTC helper checks disabled (OZMA_GATE2_SKIP_WEBRTC=1); this is not a Gate 2 pass"
 else
     if [ -z "$WEBRTC_SCRIPT" ]; then
-        WEBRTC_SCRIPT="$repo_root/softnode/gst_webrtc_worker.py"
+        # Canonical location first; the softnode path is a one-release fallback
+        # for older checkouts that still have the legacy tree.
+        if [ -f "$repo_root/scripts/webrtc/gst_webrtc_worker.py" ]; then
+            WEBRTC_SCRIPT="$repo_root/scripts/webrtc/gst_webrtc_worker.py"
+        else
+            WEBRTC_SCRIPT="$repo_root/softnode/gst_webrtc_worker.py"
+        fi
     fi
 
     case "$WEBRTC_HELPER" in

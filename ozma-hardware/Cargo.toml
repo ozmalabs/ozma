@@ -1,0 +1,14 @@
+[package]
+name = "ozma-hardware"
+version = "0.1.0"
+edition = "2021"
+description = "HWiNFO-class hardware inventory and sensor collection for Ozma nodes."
+license = "AGPL-3.0-only"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+hostname = "0.4"
+sysinfo = "0.29"

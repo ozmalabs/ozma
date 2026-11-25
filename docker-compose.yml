@@ -6,9 +6,16 @@
 #
 # Then open http://localhost:7380 in your browser.
 #
-# Install soft nodes on target machines:
-#   uv pip install ozma-softnode
-#   ozma-softnode --name my-desktop --controller http://<this-machine>:7380
+# This compose file runs the controller only. Install a Rust node on each
+# target machine:
+#   scripts/install-rust.sh --build          # from a checkout
+#   ozma-node --profile desktop --name my-desktop \
+#       --register-url http://<this-machine>:7380
+# On a hypervisor:
+#   ozma-virtual-node --node-bin ozma-node --controller http://<this-machine>:7380
+#
+# One-release Python rollback (deprecated):
+#   uv pip install ozma-softnode && ozma-softnode --name my-desktop
 
 services:
   controller:

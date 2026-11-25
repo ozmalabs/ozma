@@ -2057,6 +2057,9 @@ pub struct ConnectionInfo {
     pub quic_port: u16,
     pub hid_udp_port: u16,
     pub sink_kind: String,
+    /// Registration fields the node actually advertised, plus typed
+    /// "not available" entries for controller fields it does not implement.
+    pub registration: crate::registration::RegistrationExtras,
 }
 
 impl ConnectionInfo {
@@ -2077,8 +2080,134 @@ impl ConnectionInfo {
             quic_port,
             hid_udp_port,
             sink_kind: sink_kind.into(),
+            registration: crate::registration::RegistrationExtras::default(),
         }
     }
+
+    /// Attach the registration fields the node actually advertised.
+    ///
+    /// `/api/v1/connection.registration` then shows the same `seat_id`/`vm_ip`/
+    /// VNC state as mDNS and direct registration, plus the named controller
+    /// fields the node cannot provide.
+    pub fn with_registration(
+        mut self,
+        registration: crate::registration::RegistrationExtras,
+    ) -> Self {
+        self.registration = registration;
+        self
+    }
+}
+
+/// One controller-only surface and whether this node serves it.
+///
+/// The fields are serialized into `/api/v1/connection.controller_surfaces` so a
+/// controller can discover Python-node/agent-only surfaces without probing
+/// them. `path_prefix`, `code`, and `remediation` are internal stub details and
+/// are deliberately not part of the advertised document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ControllerSurface {
+    /// Controller-facing surface name, for example `/api/v1/rpa/*`.
+    pub surface: &'static str,
+    /// Capability name used by the parity matrix and the typed error code.
+    pub capability: &'static str,
+    /// Whether this node implements the surface. Always `false` for a stub.
+    pub supported: bool,
+    /// Why the surface is absent, in operator terms.
+    pub reason: &'static str,
+    /// Python provider the controller used before the cutover.
+    pub python_reference: &'static str,
+    /// Request path prefix matched by the typed 501 handler.
+    #[serde(skip)]
+    pub path_prefix: &'static str,
+    /// Stable typed error code returned by the stub.
+    #[serde(skip)]
+    pub code: &'static str,
+    /// Actionable remediation returned by the stub.
+    #[serde(skip)]
+    pub remediation: &'static str,
+}
+
+/// Controller-only surfaces that this node advertises as unsupported.
+///
+/// Each entry is backed by a typed 501 route: the controller gets a stable
+/// `supported:false` document instead of a fabricated success, an empty 200, or
+/// a bare 404. Keep this list in sync with the handlers in [`legacy_router`] and
+/// [`public_router`], and with `docs/phase4-controller-surfaces.md`.
+pub const CONTROLLER_ONLY_SURFACES: &[ControllerSurface] = &[
+    ControllerSurface {
+        surface: "/api/v1/rpa/*",
+        capability: "rpa",
+        supported: false,
+        reason: "This node has no RPA/OCR engine or script runner.",
+        python_reference: "node/rpa.py (node/node.py:437-445)",
+        path_prefix: "/api/v1/rpa",
+        code: "rpa.unsupported",
+        remediation: "Keep the Python hardware node that owns the RPA/OCR engine, or use \
+                      /display/snapshot plus /input/* for manual control; this node does not \
+                      claim an RPA action ran.",
+    },
+    ControllerSurface {
+        surface: "/backup/*",
+        capability: "backup",
+        supported: false,
+        reason: "This node has no Restic backup manager or agent backup API.",
+        python_reference: "agent/backup.py (agent/ozma_desktop_agent.py)",
+        path_prefix: "/backup",
+        code: "backup.unsupported",
+        remediation: "Run the Python desktop agent with restic on the target, or manage backups \
+                      outside this node; this node does not claim a snapshot or restore.",
+    },
+    ControllerSurface {
+        surface: "/ui/windows",
+        capability: "ui_windows",
+        supported: false,
+        reason: "This node has no in-guest accessibility or window provider.",
+        python_reference: "agent/ozma_desktop_agent.py:996",
+        path_prefix: "/ui/windows",
+        code: "ui.windows_unsupported",
+        remediation: "Install an in-guest accessibility agent on the target; this node does not \
+                      invent window metadata.",
+    },
+    ControllerSurface {
+        surface: "/serial/*",
+        capability: "serial",
+        supported: false,
+        reason: "This node has no serial-console reader or buffer.",
+        python_reference: "node/serial_capture.py",
+        path_prefix: "/serial",
+        code: "serial.unsupported",
+        remediation: "Attach a serial-console provider that exposes /serial/buffer; no buffer is \
+                      fabricated.",
+    },
+    ControllerSurface {
+        surface: "/rgb/*",
+        capability: "rgb",
+        supported: false,
+        reason: "This node has no WS2812/SPI LED output driver.",
+        python_reference: "node/rgb_leds.py",
+        path_prefix: "/rgb",
+        code: "rgb.unsupported",
+        remediation: "Configure RGB lighting on the host that owns the SPI/LED controller; this \
+                      node does not claim an effect was applied.",
+    },
+    ControllerSurface {
+        surface: "/current",
+        capability: "current",
+        supported: false,
+        reason: "This node has no power-rail current/voltage sensor driver.",
+        python_reference: "node/current_sensor.py",
+        path_prefix: "/current",
+        code: "power.current_unsupported",
+        remediation: "Attach a sensor driver that exposes /current before enabling the \
+                      controller's USB power panel.",
+    },
+];
+
+/// Find the advertised controller-only surface for a request path.
+fn controller_surface_for_path(path: &str) -> Option<&'static ControllerSurface> {
+    CONTROLLER_ONLY_SURFACES.iter().find(|surface| {
+        path == surface.path_prefix || path.starts_with(&format!("{}/", surface.path_prefix))
+    })
 }
 
 /// Shared, optional power backend used by the compatibility power routes.
@@ -2413,6 +2542,16 @@ pub struct ConnectionResponse {
     pub multi_console_webrtc: Option<MultiConsoleWebrtcStatus>,
     /// Actual capture transport and enumerated source, or `available:false`.
     pub capture: CaptureStatus,
+    /// Optional registration fields (seat, guest IP, VNC) plus typed entries for
+    /// controller registration fields this node does not implement.
+    pub registration: crate::registration::RegistrationExtras,
+    /// Controller-only surfaces this node does not implement.
+    ///
+    /// Each entry is a typed, discoverable advertisement (`supported:false`)
+    /// with the capability name, reason, and Python provider. The controller can
+    /// read this document instead of probing every proxy and guessing from a
+    /// 404 or timeout.
+    pub controller_surfaces: &'static [ControllerSurface],
 }
 
 /// Build the control compatibility router. Mount it before the node API auth
@@ -2462,6 +2601,7 @@ pub fn public_router(state: ConnectionState) -> Router {
         .route("/status", get(node_status))
         .route("/agent/metrics", get(agent_metrics))
         .route("/ui/hints", get(ui_hints))
+        .route("/ui/windows", get(ui_windows))
         .route("/audio/nodes", get(audio_nodes))
         .route("/audio/sweep", post(audio_sweep))
         .with_state(state)
@@ -2586,9 +2726,13 @@ pub fn legacy_router(state: ConnectionState) -> Router {
         .route("/rgb/state", get(legacy_stub))
         .route("/rgb/effect", get(legacy_stub).post(legacy_stub))
         .route("/rgb/set", post(legacy_stub))
+        .route("/rgb/off", post(legacy_stub))
         .route("/current", get(legacy_stub))
+        .route("/current/history", get(legacy_stub))
         .route("/session/init", post(legacy_stub))
         .route("/serial/*rest", get(legacy_stub).post(legacy_stub))
+        .route("/api/v1/rpa/*rest", get(legacy_stub).post(legacy_stub))
+        .route("/backup/*rest", get(legacy_stub).post(legacy_stub))
         .with_state(state)
 }
 
@@ -2721,9 +2865,11 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         webrtc_audio_source,
         display_outputs: display.display_outputs,
         display_capture: display.display_capture,
+        registration: info.registration.clone(),
         multi_console_hls,
         multi_console_webrtc,
         capture: state.capture.clone(),
+        controller_surfaces: CONTROLLER_ONLY_SURFACES,
     })
 }
 
@@ -3016,39 +3162,61 @@ async fn ui_hints(
     }))
 }
 
+/// Stable typed 501 body for a controller-only surface.
+///
+/// The controller can distinguish an honest absence from a transient failure:
+/// `supported:false`, `surface`, `capability`, `reason`, and
+/// `python_reference` are always present, and no route ever fabricates a
+/// success, empty buffer, snapshot, or applied effect.
+fn unsupported_surface_response(surface: &'static ControllerSurface) -> Response {
+    let body = serde_json::json!({
+        "ok": false,
+        "code": surface.code,
+        "surface": surface.surface,
+        "capability": surface.capability,
+        "supported": surface.supported,
+        "reason": surface.reason,
+        "error": surface.reason,
+        "python_reference": surface.python_reference,
+        "remediation": surface.remediation,
+    });
+    (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
+}
+
 async fn legacy_stub(State(_state): State<ConnectionState>, uri: Uri) -> Response {
-    let (code, error, remediation) = match uri.path() {
-        "/rgb/state" | "/rgb/effect" | "/rgb/set" => (
-            "rgb.unsupported",
-            "RGB lighting control is not implemented on this node.",
-            "Configure RGB control on the host that owns the lighting controller; this node \
-             does not claim an effect was applied.",
-        ),
-        "/current" => (
-            "power.current_unsupported",
-            "Power-rail current/voltage telemetry is not implemented on this node.",
-            "Attach a sensor driver that exposes /current before enabling the controller's \
-             USB power panel.",
-        ),
-        "/session/init" => (
+    if let Some(surface) = controller_surface_for_path(uri.path()) {
+        return unsupported_surface_response(surface);
+    }
+    if uri.path() == "/session/init" {
+        return compat_error_with_remediation(
+            StatusCode::NOT_IMPLEMENTED,
             "session.init_unsupported",
             "The controller's encrypted /session/init handshake is not implemented on this node.",
-            "Use the node's native QUIC/WebTransport session API; do not treat this 501 as an \
-             established encrypted session.",
-        ),
-        path if path.starts_with("/serial") => (
-            "serial.unsupported",
-            "A serial console buffer is not implemented on this node.",
-            "Attach a serial console provider before enabling the controller's serial panel; \
-             no buffer is fabricated.",
-        ),
-        _ => (
-            "legacy.unsupported",
-            "This legacy controller route is not implemented on this node.",
-            "Use the native /api/v1 surface or a provider that implements this feature.",
-        ),
-    };
-    compat_error_with_remediation(StatusCode::NOT_IMPLEMENTED, code, error, Some(remediation))
+            Some(
+                "Use the node's native QUIC/WebTransport session API; do not treat this 501 as \
+                 an established encrypted session.",
+            ),
+        );
+    }
+    compat_error_with_remediation(
+        StatusCode::NOT_IMPLEMENTED,
+        "legacy.unsupported",
+        "This legacy controller route is not implemented on this node.",
+        Some("Use the native /api/v1 surface or a provider that implements this feature."),
+    )
+}
+
+/// `GET /ui/windows` — the Python agent's window-only hint surface.
+///
+/// This node has no in-guest accessibility provider, so it returns the same
+/// typed 501 advertisement as the other controller-only surfaces instead of an
+/// empty 200 that would look like a real window list.
+async fn ui_windows() -> Response {
+    let surface = CONTROLLER_ONLY_SURFACES
+        .iter()
+        .find(|surface| surface.capability == "ui_windows")
+        .expect("ui_windows surface is advertised");
+    unsupported_surface_response(surface)
 }
 
 /// `GET /usb` — read-only gadget status/capabilities.
@@ -5122,7 +5290,7 @@ fn webrtc_bitrate_failure(error: WebRtcError) -> Response {
             error.to_string(),
             Some(
                 "The helper did not acknowledge the bitrate request. \
-                 softnode/gst_webrtc_worker.py ignores it today, so this is an unsupported \
+                 scripts/webrtc/gst_webrtc_worker.py ignores it today, so this is an unsupported \
                  operation rather than a successful change.",
             ),
         ),
@@ -6739,9 +6907,15 @@ mod tests {
             ("/usb", "GET", "usb.unsupported"),
             ("/rgb/state", "GET", "rgb.unsupported"),
             ("/rgb/effect", "POST", "rgb.unsupported"),
+            ("/rgb/off", "POST", "rgb.unsupported"),
             ("/current", "GET", "power.current_unsupported"),
+            ("/current/history", "GET", "power.current_unsupported"),
             ("/session/init", "POST", "session.init_unsupported"),
             ("/serial/buffer?lines=50", "GET", "serial.unsupported"),
+            ("/api/v1/rpa/screen", "GET", "rpa.unsupported"),
+            ("/api/v1/rpa/key", "POST", "rpa.unsupported"),
+            ("/backup/snapshots", "GET", "backup.unsupported"),
+            ("/backup/run", "POST", "backup.unsupported"),
         ] {
             let response = app
                 .clone()
@@ -6761,6 +6935,84 @@ mod tests {
             assert_eq!(body["code"], expected, "{uri}");
             assert!(body["error"].is_string(), "{uri}");
             assert!(body["remediation"].is_string(), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn controller_only_surfaces_are_advertised_and_return_typed_501s() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        );
+        let (status, connection) =
+            get_json(&connection_router(state.clone()), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let advertised = connection["controller_surfaces"]
+            .as_array()
+            .expect("controller_surfaces must be an array");
+        let expected = [
+            ("/api/v1/rpa/*", "rpa"),
+            ("/backup/*", "backup"),
+            ("/ui/windows", "ui_windows"),
+            ("/serial/*", "serial"),
+            ("/rgb/*", "rgb"),
+            ("/current", "current"),
+        ];
+        assert_eq!(advertised.len(), expected.len());
+        for (surface, capability) in expected {
+            let entry = advertised
+                .iter()
+                .find(|entry| entry["capability"] == capability)
+                .unwrap_or_else(|| panic!("missing advertised capability {capability}"));
+            assert_eq!(entry["surface"], surface);
+            assert_eq!(entry["supported"], false);
+            assert!(entry["reason"].is_string());
+            let reference = entry["python_reference"]
+                .as_str()
+                .expect("python_reference is a string");
+            assert!(reference.contains("node/") || reference.contains("agent/"));
+        }
+
+        let app = compat_router(state.clone()).merge(public_router(state));
+        for (uri, method, capability) in [
+            ("/api/v1/rpa/screen", "GET", "rpa"),
+            ("/api/v1/rpa/screenshot", "GET", "rpa"),
+            ("/api/v1/rpa/key", "POST", "rpa"),
+            ("/backup/snapshots", "GET", "backup"),
+            ("/backup/restore", "POST", "backup"),
+            ("/ui/windows", "GET", "ui_windows"),
+            ("/serial/state", "GET", "serial"),
+            ("/rgb/state", "GET", "rgb"),
+            ("/current", "GET", "current"),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{uri}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/json",
+                "{uri}"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["ok"], false, "{uri}");
+            assert_eq!(body["supported"], false, "{uri}");
+            assert_eq!(body["capability"], capability, "{uri}");
+            assert!(body["surface"].is_string(), "{uri}");
+            assert!(body["reason"].is_string(), "{uri}");
+            assert!(body["python_reference"].is_string(), "{uri}");
         }
     }
 
@@ -10248,6 +10500,13 @@ mod tests {
             ("GET", "/usb/nbd", None),
             ("POST", "/usb/nbd/start", Some(serde_json::json!({}))),
             ("POST", "/usb/nbd/stop", Some(serde_json::json!({}))),
+            ("GET", "/api/v1/rpa/screen", None),
+            ("POST", "/api/v1/rpa/key", Some(serde_json::json!({}))),
+            ("GET", "/backup/snapshots", None),
+            ("POST", "/backup/run", Some(serde_json::json!({}))),
+            ("GET", "/rgb/state", None),
+            ("GET", "/current", None),
+            ("GET", "/serial/state", None),
         ] {
             let builder = Request::builder().method(method).uri(uri);
             let request = match body {

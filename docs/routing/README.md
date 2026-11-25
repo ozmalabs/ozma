@@ -143,6 +143,7 @@ language changes (e.g., Rust migration via PyO3).
 | [Physical Environment](environment.md) | Furniture, racks, sites, spaces, zones, floor plans, datacentre model. |
 | [Control Path](control-path.md) | How commands reach devices, dependency chains, reachability, fallback paths. |
 | [Thermal Management](thermal.md) | Fan curves, power profiles, thermal zones, intent-driven control. |
+| [Hardware Inventory](hardware.md) | HWiNFO-class CPU/memory/GPU/storage/motherboard/fan/voltage/battery/PCIe/network inventory and sensors. |
 
 ### Audio
 

@@ -7,11 +7,17 @@
 # Python softnode/node/agent trees, and never deletes anything. The Python
 # implementation remains the rollback path for one release.
 #
+# The GStreamer WebRTC helper is installed from scripts/webrtc/ into
+# <prefix>/share/ozma/webrtc/ so a node does not need a Python tree checkout.
+# It still runs under system Python with GStreamer; pass its installed path to
+# `ozma-node --webrtc-helper-script` or OZMA_WEBRTC_HELPER_SCRIPT.
+#
 # Usage:
 #   scripts/install-rust.sh --build                 # ~/.local user layout
 #   scripts/install-rust.sh --from-target target/release
 #   scripts/install-rust.sh --system --prefix /usr/local   # run as root
 #   scripts/install-rust.sh --dry-run --build
+#   scripts/install-rust.sh --build --no-helper     # skip the WebRTC helper
 #
 # Exit status: 0 success; 1 missing binary/refused overwrite; 2 usage error.
 
@@ -35,9 +41,11 @@ DO_BUILD=0
 DRY_RUN=0
 FORCE=0
 INSTALL_ENV=1
+INSTALL_HELPER=1
+HELPER_DIR=""
 
 usage() {
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -62,6 +70,9 @@ while [ "$#" -gt 0 ]; do
         --from-target=*) FROM_TARGET="${1#*=}" ;;
         --build) DO_BUILD=1 ;;
         --no-env) INSTALL_ENV=0 ;;
+        --no-helper) INSTALL_HELPER=0 ;;
+        --helper-dir) shift; HELPER_DIR="${1:-}" ;;
+        --helper-dir=*) HELPER_DIR="${1#*=}" ;;
         --dry-run) DRY_RUN=1 ;;
         --force) FORCE=1 ;;
         -h|--help) usage; exit 0 ;;
@@ -96,8 +107,10 @@ else
     SUP_RUNTIME_DIR="${SUP_RUNTIME_DIR:-$PREFIX/var/run/ozma}"
 fi
 
+HELPER_DIR="${HELPER_DIR:-$PREFIX/share/ozma/webrtc}"
+
 for path in "$PREFIX" "$BIN_DIR" "$UNITS_DIR" "$ENV_DIR" "$STATE_DIR" \
-            "$RUNTIME_DIR" "$SUP_STATE_DIR" "$SUP_RUNTIME_DIR"; do
+            "$RUNTIME_DIR" "$SUP_STATE_DIR" "$SUP_RUNTIME_DIR" "$HELPER_DIR"; do
     case "$path" in
         *[[:space:]\&\|]*) die "paths containing whitespace, '&', or '|' are not supported: $path" ;;
     esac
@@ -123,6 +136,7 @@ say "  environment: $ENV_DIR"
 say "  state:       $STATE_DIR"
 say "  runtime:     $RUNTIME_DIR"
 say "  supervisor:  $SUP_STATE_DIR $SUP_RUNTIME_DIR"
+say "  webrtc:      $([ "$INSTALL_HELPER" = "1" ] && echo "$HELPER_DIR/gst_webrtc_worker.py" || echo skipped)"
 say "  target:      $FROM_TARGET"
 [ "$DRY_RUN" = "1" ] && say "  dry run:     yes (no files are written)"
 say ""
@@ -155,6 +169,15 @@ install_file() {
 say "Installing binaries"
 install_file "$NODE_SRC" "$BIN_DIR/ozma-node" 0755
 install_file "$VNM_SRC" "$BIN_DIR/ozma-virtual-node" 0755
+
+if [ "$INSTALL_HELPER" = "1" ]; then
+    HELPER_SRC="$REPO_ROOT/scripts/webrtc/gst_webrtc_worker.py"
+    [ -f "$HELPER_SRC" ] || die "missing $HELPER_SRC"
+    say ""
+    say "Installing GStreamer WebRTC helper (Python 3 + GStreamer required at runtime)"
+    install_file "$HELPER_SRC" "$HELPER_DIR/gst_webrtc_worker.py" 0644
+    say "  pass it to a node with --webrtc-helper python3 --webrtc-helper-script $HELPER_DIR/gst_webrtc_worker.py"
+fi
 
 # ---------------------------------------------------------------------------
 say ""
@@ -246,6 +269,8 @@ Next steps (no sudo, no unit has been started):
        systemctl --user status ozma-node@vm.service
        journalctl --user -u ozma-node@vm.service -f
 
+Optional WebRTC: set OZMA_WEBRTC_HELPER=python3 and
+OZMA_WEBRTC_HELPER_SCRIPT="$HELPER_DIR/gst_webrtc_worker.py" in the env file.
 Hardware access (video/input/uinput) still requires host udev/group setup.
 The Python softnode/node/agent trees are untouched and remain the rollback path.
 EOF

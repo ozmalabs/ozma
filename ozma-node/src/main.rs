@@ -1947,7 +1947,9 @@ async fn run() -> std::process::ExitCode {
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with
     // `--api-token`. See `controller_compat::{compat_router, public_router}`.
-    let compat_router = controller_compat::compat_router(compat_state.clone());
+    let hardware_router = ozma_node::hardware::router(ozma_node::hardware::HardwareState::new());
+    let compat_router =
+        controller_compat::compat_router(compat_state.clone()).merge(hardware_router);
     let public_compat_router = controller_compat::public_router(compat_state);
 
     // Idle console sources must not stay open forever when no snapshot is

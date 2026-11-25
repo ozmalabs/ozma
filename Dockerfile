@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 # Ozma Controller — Docker image
 #
+# This image runs the Python controller only. Nodes are the Rust ozma-node /
+# ozma-virtual-node binaries installed on their target hosts; no Python node
+# tree is copied into this image.
+#
 # Usage:
 #   docker compose up          (recommended — uses docker-compose.yml)
 #   docker build -t ozma .     (standalone build)
@@ -35,9 +39,8 @@ WORKDIR /opt/ozma
 COPY controller/requirements.txt /opt/ozma/requirements.txt
 RUN uv pip install --system --no-cache-dir -r requirements.txt pynacl
 
-# Copy application code
+# Copy application code (controller only; nodes are separate Rust binaries)
 COPY controller/ /opt/ozma/controller/
-COPY softnode/ /opt/ozma/softnode/
 
 # Working directory for the controller
 WORKDIR /opt/ozma/controller
