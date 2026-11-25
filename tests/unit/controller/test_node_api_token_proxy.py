@@ -201,6 +201,135 @@ def test_proxy_sends_configured_bearer_token(
     assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
 
 
+def _typed_unsupported(capability: str, surface: str) -> dict:
+    return {
+        "ok": False,
+        "code": f"{capability}.unsupported",
+        "surface": surface,
+        "capability": capability,
+        "supported": False,
+        "reason": f"{capability} is not implemented on this node",
+        "error": f"{capability} is not implemented on this node",
+        "python_reference": "node/provider.py",
+        "remediation": "use the Python node or a real provider",
+    }
+
+
+SURFACE_PROXY_CASES = [
+    (
+        "get",
+        f"/api/v1/nodes/{NODE_ID}/rpa/screen",
+        None,
+        "/api/v1/rpa/screen",
+        "rpa",
+        "/api/v1/rpa/*",
+    ),
+    (
+        "get",
+        f"/api/v1/nodes/{NODE_ID}/rpa/screenshot",
+        None,
+        "/api/v1/rpa/screenshot",
+        "rpa",
+        "/api/v1/rpa/*",
+    ),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/rpa/key",
+        {"key": "enter"},
+        "/api/v1/rpa/key",
+        "rpa",
+        "/api/v1/rpa/*",
+    ),
+    (
+        "get",
+        f"/api/v1/nodes/{NODE_ID}/current",
+        None,
+        "/current",
+        "current",
+        "/current",
+    ),
+    (
+        "get",
+        f"/api/v1/nodes/{NODE_ID}/rgb/state",
+        None,
+        "/rgb/state",
+        "rgb",
+        "/rgb/*",
+    ),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/rgb/set",
+        {"color": [1, 2, 3]},
+        "/rgb/set",
+        "rgb",
+        "/rgb/*",
+    ),
+    (
+        "get",
+        f"/api/v1/backup/nodes/{NODE_ID}/snapshots",
+        None,
+        "/backup/snapshots",
+        "backup",
+        "/backup/*",
+    ),
+    (
+        "post",
+        f"/api/v1/backup/nodes/{NODE_ID}/run",
+        {"mode": "smart"},
+        "/backup/run",
+        "backup",
+        "/backup/*",
+    ),
+    (
+        "get",
+        f"/api/v1/nodes/{NODE_ID}/ui/hints",
+        None,
+        "/ui/hints",
+        "ui_windows",
+        "/ui/windows",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "method,url,body,node_path,capability,surface", SURFACE_PROXY_CASES
+)
+def test_controller_only_surface_proxies_preserve_typed_unsupported(
+    fake_node, tmp_path, method, url, body, node_path, capability, surface
+):
+    expected = _typed_unsupported(capability, surface)
+    fake_node.responder = lambda _method, _record: (
+        501,
+        expected,
+        "application/json",
+    )
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+    client = _client(app)
+
+    response = client.get(url) if method == "get" else client.post(url, json=body)
+
+    assert response.status_code == 501, response.text
+    assert response.json() == expected
+    assert response.headers["content-type"].startswith("application/json")
+    record = fake_node.requests[-1]
+    assert record["path"].startswith(node_path)
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_rpa_screenshot_still_returns_real_jpeg_bytes(fake_node, tmp_path):
+    fake_node.responder = lambda _method, _record: (200, JPEG, "image/jpeg")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(f"/api/v1/nodes/{NODE_ID}/rpa/screenshot")
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("image/jpeg")
+    assert response.content == JPEG
+    record = fake_node.requests[-1]
+    assert record["path"] == "/api/v1/rpa/screenshot"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
 def test_display_read_returns_node_outputs_and_uses_the_bearer_token(
     fake_node, tmp_path
 ):

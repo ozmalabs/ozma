@@ -1699,6 +1699,72 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             )
         return payload
 
+    def _is_typed_unsupported(payload: Any) -> bool:
+        """Whether a node body is a typed ``supported:false`` surface result."""
+        return (
+            isinstance(payload, dict)
+            and payload.get("supported") is False
+            and isinstance(payload.get("capability"), str)
+        )
+
+    async def _proxy_node_surface(
+        node_id: str, path: str, method: str = "GET", body: dict | None = None
+    ) -> Any:
+        """Proxy a controller-only surface, preserving typed 501 bodies.
+
+        Unlike ``_proxy_node`` this does not flatten an honest
+        ``supported:false`` node response into a 502. The controller dashboard
+        can show the node's surface, capability, reason, and Python reference
+        instead of treating the feature as a transport failure.
+        """
+        status, payload = await _proxy_node_response(node_id, path, method, body)
+        if status in (401, 403):
+            raise HTTPException(status_code=502, detail=_node_auth_error(status))
+        if status >= 400:
+            if _is_typed_unsupported(payload):
+                return JSONResponse(status_code=status, content=payload)
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise HTTPException(
+                status_code=502,
+                detail=detail or f"Node returned HTTP {status}",
+            )
+        return payload
+
+    async def _proxy_node_raw(
+        node_id: str, path: str, timeout: float = 10.0
+    ) -> tuple[int, str, bytes]:
+        """Fetch a node response as raw bytes, preserving its HTTP status.
+
+        Used by the RPA screenshot proxy so a typed JSON 501 is not returned as
+        ``image/jpeg`` bytes. The caller decides how to decode the body.
+        """
+        import urllib.error
+        import urllib.request
+
+        node = state.nodes.get(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+        port = node.api_port
+        if not port:
+            raise HTTPException(status_code=503, detail="Node has no HTTP API")
+        url = f"http://{node.host}:{port}{path}"
+
+        def _fetch() -> tuple[int, str, bytes]:
+            req = urllib.request.Request(url, headers=_node_headers(node))
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    content_type = r.headers.get_content_type() or "application/octet-stream"
+                    return r.status, content_type, r.read()
+            except urllib.error.HTTPError as e:
+                content_type = e.headers.get_content_type() or "application/json"
+                return e.code, content_type, e.read()
+
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _fetch)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Node unreachable: {e}")
+
     @app.get("/api/v1/nodes/{node_id}/display")
     async def node_display(node_id: str) -> dict[str, Any]:
         """Read a node's advertised consoles and active capture console."""
@@ -1765,16 +1831,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return await _proxy_node(node_id, f"/power/{action}", method="POST")
 
     @app.get("/api/v1/nodes/{node_id}/current")
-    async def node_current(node_id: str) -> dict[str, Any]:
-        return await _proxy_node(node_id, "/current")
+    async def node_current(node_id: str) -> Any:
+        return await _proxy_node_surface(node_id, "/current")
 
     @app.get("/api/v1/nodes/{node_id}/rgb/state")
-    async def node_rgb_state(node_id: str) -> dict[str, Any]:
-        return await _proxy_node(node_id, "/rgb/state")
+    async def node_rgb_state(node_id: str) -> Any:
+        return await _proxy_node_surface(node_id, "/rgb/state")
 
     @app.post("/api/v1/nodes/{node_id}/rgb/set")
-    async def node_rgb_set(node_id: str, body: dict = {}) -> dict[str, Any]:
-        return await _proxy_node(node_id, "/rgb/set", method="POST", body=body)
+    async def node_rgb_set(node_id: str, body: dict = {}) -> Any:
+        return await _proxy_node_surface(node_id, "/rgb/set", method="POST", body=body)
 
     @app.get("/api/v1/status")
     async def get_status() -> dict[str, Any]:
@@ -4081,22 +4147,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Node RPA proxy (forward to node's local RPA engine) ---
 
     async def _node_rpa_proxy(node_id: str, path: str, method: str = "GET",
-                               body: dict | None = None) -> dict:
-        """Proxy an RPA request to a node's local API."""
-        node = state.nodes.get(node_id)
-        if not node:
-            raise HTTPException(status_code=404, detail="Node not found")
-        api_port = node.api_port or 7380
-        url = f"http://{node.host}:{api_port}/api/v1/rpa/{path}"
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            if method == "GET":
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                    return await resp.json()
-            else:
-                async with session.post(url, json=body or {},
-                                        timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                    return await resp.json()
+                               body: dict | None = None) -> Any:
+        """Proxy an RPA request to a node's local API.
+
+        A Rust node answers typed 501 ``supported:false`` bodies; those are
+        passed through unchanged so the caller sees the real limitation instead
+        of a fabricated success or a generic 502.
+        """
+        return await _proxy_node_surface(
+            node_id, f"/api/v1/rpa/{path}", method=method, body=body
+        )
 
     @app.get("/api/v1/nodes/{node_id}/rpa/screen")
     async def node_rpa_screen(node_id: str, mode: str = "auto") -> dict[str, Any]:
@@ -4104,18 +4164,29 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return await _node_rpa_proxy(node_id, f"screen?mode={mode}")
 
     @app.get("/api/v1/nodes/{node_id}/rpa/screenshot")
-    async def node_rpa_screenshot(node_id: str) -> StreamingResponse:
-        """Get a JPEG screenshot from a node's capture card."""
-        node = state.nodes.get(node_id)
-        if not node:
-            raise HTTPException(status_code=404, detail="Node not found")
-        api_port = node.api_port or 7380
-        url = f"http://{node.host}:{api_port}/api/v1/rpa/screenshot"
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.read()
-                return StreamingResponse(iter([data]), media_type="image/jpeg")
+    async def node_rpa_screenshot(node_id: str) -> Any:
+        """Get a JPEG screenshot from a node's capture card.
+
+        A typed 501 JSON body is returned as JSON, never labelled image/jpeg.
+        """
+        status, content_type, data = await _proxy_node_raw(
+            node_id, "/api/v1/rpa/screenshot", timeout=10.0
+        )
+        if status in (401, 403):
+            raise HTTPException(status_code=502, detail=_node_auth_error(status))
+        if status >= 400:
+            try:
+                payload = json.loads(data)
+            except ValueError:
+                payload = None
+            if _is_typed_unsupported(payload):
+                return JSONResponse(status_code=status, content=payload)
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise HTTPException(
+                status_code=502,
+                detail=detail or f"Node returned HTTP {status}",
+            )
+        return Response(content=data, media_type=content_type or "image/jpeg")
 
     @app.get("/api/v1/nodes/{node_id}/hardware")
     async def node_hardware(node_id: str, refresh: bool = False) -> Any:
@@ -4335,7 +4406,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"providers": agent_engine._screen_reader._vision.list_providers()}
 
     @app.get("/api/v1/nodes/{node_id}/ui/hints")
-    async def node_ui_hints(node_id: str, level: int = 2) -> dict[str, Any]:
+    async def node_ui_hints(node_id: str, level: int = 2) -> Any:
         """
         Get UI hints from the agent running inside a node's target machine.
 
@@ -4343,30 +4414,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         Much faster and more accurate than OCR when the agent is available.
 
         Level 1: windows only. Level 2: + focused control. Level 3: + full tree.
+        A node without an in-guest hint provider returns its typed
+        ``supported:false`` body instead of a 200-shaped ``{"error": ...}``.
         """
-        node = state.nodes.get(node_id)
-        if not node:
-            raise HTTPException(status_code=404, detail="Node not found")
-        api_port = node.api_port or 7390
-        import aiohttp
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"http://{node.host}:{api_port}/ui/hints?level={level}",
-                    headers=_node_headers(node),
-                    timeout=aiohttp.ClientTimeout(total=3),
-                ) as resp:
-                    if resp.status in (401, 403):
-                        raise HTTPException(
-                            status_code=502, detail=_node_auth_error(resp.status)
-                        )
-                    if resp.status == 200:
-                        return await resp.json()
-                    return {"error": f"Agent returned {resp.status}"}
-        except HTTPException:
-            raise
-        except Exception as e:
-            return {"error": f"Agent not reachable: {e}", "hint": "Agent may not be installed on target machine"}
+        return await _proxy_node_surface(node_id, f"/ui/hints?level={level}")
 
     @app.post("/api/v1/vision/detect")
     async def vision_detect(body: dict) -> dict[str, Any]:
@@ -10664,7 +10715,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         reachable at the registered api_port.
         """
         _require_scope(request, SCOPE_READ)
-        result = await _backup_nudge().proxy_get(node_id, "/backup/snapshots")
+        result = await _proxy_node_surface(node_id, "/backup/snapshots")
+        if isinstance(result, JSONResponse):
+            return result
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable or backup not configured")
         snapshots = result if isinstance(result, list) else [result]
@@ -10677,10 +10730,12 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         """Browse the file tree within a specific snapshot."""
         _require_scope(request, SCOPE_READ)
         path = request.query_params.get("path", "/")
-        result = await _backup_nudge().proxy_get(
+        result = await _proxy_node_surface(
             node_id,
             f"/backup/snapshots/{snapshot_id}/files?path={path}",
         )
+        if isinstance(result, JSONResponse):
+            return result
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable")
         files = result if isinstance(result, list) else [result]
@@ -10696,7 +10751,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         """
         _require_scope(request, SCOPE_WRITE)
         body = await request.json()
-        result = await _backup_nudge().proxy_post(node_id, "/backup/restore", body)
+        result = await _proxy_node_surface(
+            node_id, "/backup/restore", method="POST", body=body
+        )
+        if isinstance(result, JSONResponse):
+            return result
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable or restore failed")
         return result
@@ -10707,7 +10766,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         _require_scope(request, SCOPE_WRITE)
         body = await request.json()
         mode = body.get("mode", "smart")
-        result = await _backup_nudge().proxy_post(node_id, "/backup/run", {"mode": mode})
+        result = await _proxy_node_surface(
+            node_id, "/backup/run", method="POST", body={"mode": mode}
+        )
+        if isinstance(result, JSONResponse):
+            return result
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable")
         return result
@@ -10716,7 +10779,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def backup_node_apps(request: Request, node_id: str) -> dict[str, Any]:
         """List installed apps on a node (for selective restore)."""
         _require_scope(request, SCOPE_READ)
-        result = await _backup_nudge().proxy_get(node_id, "/backup/apps")
+        result = await _proxy_node_surface(node_id, "/backup/apps")
+        if isinstance(result, JSONResponse):
+            return result
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable")
         apps = result if isinstance(result, list) else [result]
@@ -10727,7 +10792,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         """Reinstall apps on a node from its inventory snapshot."""
         _require_scope(request, SCOPE_WRITE)
         body = await request.json()
-        result = await _backup_nudge().proxy_post(node_id, "/backup/apps/restore", body)
+        result = await _proxy_node_surface(
+            node_id, "/backup/apps/restore", method="POST", body=body
+        )
+        if isinstance(result, JSONResponse):
+            return result
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable")
         return result

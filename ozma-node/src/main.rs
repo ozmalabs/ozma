@@ -1705,6 +1705,18 @@ async fn run() -> std::process::ExitCode {
         }
     }
 
+    // Controller-compatibility registration fields that depend on real
+    // configuration. Everything absent here is omitted from mDNS and direct
+    // registration instead of being sent as an empty endpoint. The same value
+    // is reported on `/api/v1/connection.registration` so a controller (or an
+    // operator) can distinguish "not available" from "configured empty".
+    let registration_extras = registration::RegistrationExtras::resolve(
+        registration::seat_id_from_env().as_deref(),
+        args.vnc_host.as_deref(),
+        args.vnc_port,
+        args.vm_guest_ip.as_deref(),
+    );
+
     let compat_stats = controller_compat::CompatStats::default();
     let connection_info = controller_compat::ConnectionInfo::new(
         node_id.as_str(),
@@ -1713,7 +1725,8 @@ async fn run() -> std::process::ExitCode {
         quic_port,
         config.hid_udp_port,
         sink_kind,
-    );
+    )
+    .with_registration(registration_extras.clone());
     // Runtime codec override control. Probed against the host exactly like the
     // session backend. When HLS is running, POST /codec restarts the HLS
     // pipeline with the selected software encoder; when HLS is off the override
@@ -1967,6 +1980,7 @@ async fn run() -> std::process::ExitCode {
             .with_display_control(display_control)
             .with_console_broker(console_broker.clone())
             .with_multi_console_hls(multi_console_hls.clone())
+            .with_multi_console_webrtc(multi_console_webrtc.clone())
             .with_capture(capture_status);
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with
@@ -2204,7 +2218,7 @@ async fn run() -> std::process::ExitCode {
     let local_ip = resolve_local_ip(&args);
     info!(ip = %local_ip, "Resolved local IP");
 
-    let txt = build_txt(&args, &local_ip);
+    let txt = build_txt(&args, &local_ip, &registration_extras);
 
     let mdns_handle = match mdns::advertise_on(
         &config.name,
@@ -2840,7 +2854,11 @@ fn resolve_local_ip(args: &Args) -> String {
 ///
 /// Every value is a string: the controller's direct-registration model expects
 /// strings for ports and JSON-encoded lists.
-fn build_txt(args: &Args, local_ip: &str) -> std::collections::HashMap<String, String> {
+fn build_txt(
+    args: &Args,
+    local_ip: &str,
+    registration_extras: &registration::RegistrationExtras,
+) -> std::collections::HashMap<String, String> {
     let mut txt = std::collections::HashMap::new();
     txt.insert("proto".into(), "1".into());
     txt.insert("role".into(), args.role.clone());
@@ -2865,11 +2883,6 @@ fn build_txt(args: &Args, local_ip: &str) -> std::collections::HashMap<String, S
     );
     txt.insert("display_outputs".into(), args.display_outputs_json.clone());
     txt.insert("pci_devices".into(), args.pci_devices_json.clone());
-    if let Some(vm_guest_ip) = args.vm_guest_ip.as_deref().map(str::trim) {
-        if !vm_guest_ip.is_empty() {
-            txt.insert("vm_guest_ip".into(), vm_guest_ip.to_owned());
-        }
-    }
     if args.rtsp_port != 0 {
         txt.insert("rtsp_port".into(), args.rtsp_port.to_string());
     }
@@ -2895,6 +2908,11 @@ fn build_txt(args: &Args, local_ip: &str) -> std::collections::HashMap<String, S
         );
         txt.insert("audio_sink".into(), audio_sink.to_owned());
     }
+    // seat_id, VNC, and the vm_ip/vm_guest_ip pair only exist when configured.
+    // VBAN, camera/Frigate, and Sunshine fields stay absent because the Rust
+    // node has no backend for them; /api/v1/connection.registration names them
+    // as unsupported controller fields.
+    registration_extras.apply_to_txt(&mut txt);
     txt.insert("host".into(), local_ip.to_string());
     txt
 }
@@ -3363,9 +3381,16 @@ mod tests {
             "--audio-sink",
             "ozma-node",
         ]);
-        let txt = build_txt(&args, "192.0.2.10");
+        let extras = registration::RegistrationExtras::resolve(
+            None,
+            None,
+            None,
+            args.vm_guest_ip.as_deref(),
+        );
+        let txt = build_txt(&args, "192.0.2.10", &extras);
 
         assert_eq!(txt["capture_device"], "/dev/video0");
+        assert_eq!(txt["vm_ip"], "10.0.0.42");
         assert_eq!(txt["vm_guest_ip"], "10.0.0.42");
         assert_eq!(txt["audio_sink"], "ozma-node");
         assert_eq!(txt["audio_type"], "pipewire");
@@ -3374,5 +3399,52 @@ mod tests {
         assert_eq!(txt["display_outputs"], "[]");
         assert_eq!(txt["pci_devices"], "[]");
         assert_eq!(txt["host"], "192.0.2.10");
+        assert!(!txt.contains_key("seat_id"));
+        assert!(!txt.contains_key("vnc_host"));
+        assert!(!txt.contains_key("audio_vban_port"));
+        assert!(!txt.contains_key("camera_streams"));
+        assert!(!txt.contains_key("frigate_host"));
+        assert!(!txt.contains_key("sunshine_port"));
+    }
+
+    #[test]
+    fn txt_vm_case_emits_vnc_endpoint_and_both_guest_ip_keys() {
+        let args = Args::parse_from([
+            "ozma-node",
+            "--profile",
+            "vm",
+            "--vnc-host",
+            "127.0.0.1",
+            "--vnc-port",
+            "5901",
+            "--vm-guest-ip",
+            "10.0.0.42",
+        ]);
+        let extras = registration::RegistrationExtras::resolve(
+            None,
+            args.vnc_host.as_deref(),
+            args.vnc_port,
+            args.vm_guest_ip.as_deref(),
+        );
+        let txt = build_txt(&args, "192.0.2.20", &extras);
+
+        assert_eq!(txt["vnc_host"], "127.0.0.1");
+        assert_eq!(txt["vnc_port"], "5901");
+        assert_eq!(txt["vm_ip"], "10.0.0.42");
+        assert_eq!(txt["vm_guest_ip"], "10.0.0.42");
+        assert!(!txt.contains_key("seat_id"));
+    }
+
+    #[test]
+    fn txt_multiseat_case_emits_only_the_explicit_seat_id() {
+        let args = Args::parse_from(["ozma-node", "--profile", "desktop"]);
+        let extras =
+            registration::RegistrationExtras::resolve(Some("rig-1-seat-0"), None, None, None);
+        let txt = build_txt(&args, "192.0.2.30", &extras);
+
+        assert_eq!(txt["seat_id"], "rig-1-seat-0");
+        assert!(!txt.contains_key("vnc_host"));
+        assert!(!txt.contains_key("vm_ip"));
+        assert!(!txt.contains_key("vm_guest_ip"));
     }
 }
