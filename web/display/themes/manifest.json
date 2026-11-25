@@ -1,0 +1,285 @@
+{
+  "schema": "org.ozma.theme-pack/1",
+  "type": "theme_pack",
+  "id": "ozma-core-themes",
+  "name": "Ozma Core Themes",
+  "version": "1.0.0",
+  "author": "ozmalabs",
+  "license": "AGPL-3.0-only",
+  "description": "First-party, dependency-free display themes for the Ozma browser adapter. No third-party assets or fonts.",
+  "provenance": {
+    "type": "original",
+    "source": "ozmalabs",
+    "author": "ozmalabs",
+    "method": "authored",
+    "notes": "Original Ozma display themes; colour, typography, shape, and vibe metadata authored for this pack."
+  },
+  "tags": [
+    "core",
+    "first-party",
+    "original",
+    "theme",
+    "dark",
+    "light",
+    "noc",
+    "audio",
+    "minimal"
+  ],
+  "vibe": {
+    "taxonomy": "org.ozma.vibe/1",
+    "keywords": ["core", "first-party", "original", "technical"],
+    "mood": ["calm", "technical", "serious"],
+    "density": "dashboard",
+    "color": ["high_contrast", "neutral"],
+    "typography": ["geometric_sans", "monospace"],
+    "ornament": ["minimal"],
+    "confidence": 0.94
+  },
+  "shape": {
+    "widget_kind": "theme",
+    "aspect_ratio": 1.4167,
+    "chart_mark": "line",
+    "texture": "flat",
+    "elevation": "raised",
+    "glow": false,
+    "animation": "subtle"
+  },
+  "coherence": {
+    "score": 0.94,
+    "dimensions": {
+      "mood": 0.95,
+      "form": 0.93,
+      "color": 0.96,
+      "typography": 0.94,
+      "density": 0.93,
+      "motion": 0.9
+    },
+    "outliers": [],
+    "conflicts": [],
+    "suggestions": [],
+    "confidence": 0.9
+  },
+  "min_ozma_version": "1.0.0",
+  "min_display_schema": "org.ozma.theme/1",
+  "capabilities": ["rendered_widget"],
+  "permissions": [],
+  "assets": [],
+  "checksums": {
+    "algorithm": "sha256",
+    "files": {
+      "core-dark.json": "5f7ad13a5aa459a5d660f876a81749a35f45c0d0c31d63250490f69762a889d7",
+      "core-light.json": "70784ccd69106f81d25a3898d61311b0a6914f55c1e7b855845faeb4592412c7",
+      "noc.json": "980fb49cfcb0ad807b2c3c44efa1e8ad1bfd9cb8f83d12ad79fe434e431126fc",
+      "audio.json": "9592c1e04131534cc10501d8e4d8417927f3f2065bfc6478252c704fcf2d2265",
+      "minimal.json": "9d7c1caa493368dac2e2b2d6b14905fc1863cc8aa792d26d0f65fbcd536eb39a"
+    }
+  },
+  "themes": [
+    {
+      "id": "org.ozma.theme.core-dark",
+      "name": "Core Dark",
+      "path": "core-dark.json",
+      "sha256": "5f7ad13a5aa459a5d660f876a81749a35f45c0d0c31d63250490f69762a889d7",
+      "license": "AGPL-3.0-only WITH OzmaPluginException",
+      "tags": ["dark", "technical", "calm", "default"],
+      "vibe": {
+        "taxonomy": "org.ozma.vibe/1",
+        "keywords": ["minimal", "dark", "technical", "calm"],
+        "mood": ["calm", "technical"],
+        "era": "flat_2010s",
+        "form": ["rounded", "segmented"],
+        "material": ["matte"],
+        "density": "dashboard",
+        "color": ["high_contrast", "cool"],
+        "typography": ["geometric_sans", "monospace"],
+        "ornament": ["minimal"],
+        "confidence": 0.9
+      },
+      "shape": {
+        "widget_kind": "theme",
+        "aspect_ratio": 1.4167,
+        "corner_radius_ratio": 0.026,
+        "stroke_width_ratio": 0.02,
+        "chart_mark": "line",
+        "texture": "flat",
+        "elevation": "raised",
+        "glow": false,
+        "animation": "subtle"
+      },
+      "coherence": {
+        "score": 0.93,
+        "outliers": [],
+        "conflicts": [],
+        "suggestions": [],
+        "confidence": 0.88
+      }
+    },
+    {
+      "id": "org.ozma.theme.core-light",
+      "name": "Core Light",
+      "path": "core-light.json",
+      "sha256": "70784ccd69106f81d25a3898d61311b0a6914f55c1e7b855845faeb4592412c7",
+      "license": "AGPL-3.0-only WITH OzmaPluginException",
+      "tags": ["light", "accessible", "technical", "calm"],
+      "vibe": {
+        "taxonomy": "org.ozma.vibe/1",
+        "keywords": ["accessible", "light", "technical", "calm", "first-party"],
+        "mood": ["calm", "technical", "optimistic"],
+        "era": "flat_2010s",
+        "form": ["rounded", "segmented"],
+        "material": ["matte", "paper"],
+        "density": "dashboard",
+        "color": ["high_contrast", "cool", "accessible"],
+        "typography": ["geometric_sans", "monospace"],
+        "motion": ["static", "subtle"],
+        "references": ["industrial_control", "scandinavian"],
+        "ornament": ["minimal", "flat"],
+        "confidence": 0.95
+      },
+      "shape": {
+        "widget_kind": "theme",
+        "aspect_ratio": 1.4167,
+        "corner_radius_ratio": 0.018,
+        "stroke_width_ratio": 0.012,
+        "chart_mark": "line",
+        "texture": "flat",
+        "elevation": "raised",
+        "glow": false,
+        "animation": "subtle"
+      },
+      "coherence": {
+        "score": 0.95,
+        "outliers": [],
+        "conflicts": [],
+        "suggestions": [],
+        "confidence": 0.9
+      }
+    },
+    {
+      "id": "org.ozma.theme.noc",
+      "name": "NOC",
+      "path": "noc.json",
+      "sha256": "980fb49cfcb0ad807b2c3c44efa1e8ad1bfd9cb8f83d12ad79fe434e431126fc",
+      "license": "AGPL-3.0-only WITH OzmaPluginException",
+      "tags": ["dark", "noc", "high-contrast", "glanceable"],
+      "vibe": {
+        "taxonomy": "org.ozma.vibe/1",
+        "keywords": ["noc", "dark", "glanceable", "technical", "high_alert"],
+        "mood": ["alert", "serious", "technical"],
+        "era": "flat_2010s",
+        "form": ["segmented", "square", "wireframe"],
+        "material": ["glass", "neon", "crt"],
+        "density": "dashboard",
+        "color": ["high_contrast", "neon", "cool", "phosphor_cyan"],
+        "typography": ["monospace", "condensed", "geometric_sans"],
+        "motion": ["subtle", "sweep"],
+        "references": ["noc", "industrial_control", "aerospace"],
+        "ornament": ["minimal", "flat"],
+        "confidence": 0.93
+      },
+      "shape": {
+        "widget_kind": "theme",
+        "aspect_ratio": 1.4167,
+        "corner_radius_ratio": 0.006,
+        "stroke_width_ratio": 0.016,
+        "chart_mark": "line",
+        "texture": "scanline",
+        "elevation": "flat",
+        "glow": true,
+        "animation": "sweep"
+      },
+      "coherence": {
+        "score": 0.92,
+        "outliers": [],
+        "conflicts": [],
+        "suggestions": [],
+        "confidence": 0.88
+      }
+    },
+    {
+      "id": "org.ozma.theme.audio",
+      "name": "Audio",
+      "path": "audio.json",
+      "sha256": "9592c1e04131534cc10501d8e4d8417927f3f2065bfc6478252c704fcf2d2265",
+      "license": "AGPL-3.0-only WITH OzmaPluginException",
+      "tags": ["audio", "warm", "studio", "vu", "analog"],
+      "vibe": {
+        "taxonomy": "org.ozma.vibe/1",
+        "keywords": ["studio", "warm", "vu", "analog", "cozy"],
+        "mood": ["cozy", "calm", "serious"],
+        "era": "hi_fi_1970s",
+        "form": ["circular", "rounded", "needle"],
+        "material": ["wood", "brushed_metal", "amber"],
+        "density": "balanced",
+        "color": ["warm", "amber", "high_contrast"],
+        "typography": ["geometric_sans", "monospace"],
+        "motion": ["needle", "glow", "subtle"],
+        "references": ["hi_fi", "studio", "industrial_control"],
+        "ornament": ["skeuomorphic", "minimal"],
+        "confidence": 0.91
+      },
+      "shape": {
+        "widget_kind": "theme",
+        "aspect_ratio": 1.4167,
+        "corner_radius_ratio": 0.025,
+        "stroke_width_ratio": 0.02,
+        "arc_start_deg": -120,
+        "arc_end_deg": 120,
+        "needle_style": "classic",
+        "chart_mark": "area",
+        "texture": "matte",
+        "elevation": "raised",
+        "glow": false,
+        "animation": "needle"
+      },
+      "coherence": {
+        "score": 0.9,
+        "outliers": [],
+        "conflicts": [],
+        "suggestions": [],
+        "confidence": 0.86
+      }
+    },
+    {
+      "id": "org.ozma.theme.minimal",
+      "name": "Minimal",
+      "path": "minimal.json",
+      "sha256": "9d7c1caa493368dac2e2b2d6b14905fc1863cc8aa792d26d0f65fbcd536eb39a",
+      "license": "AGPL-3.0-only WITH OzmaPluginException",
+      "tags": ["minimal", "monochrome", "quiet", "editorial"],
+      "vibe": {
+        "taxonomy": "org.ozma.vibe/1",
+        "keywords": ["minimal", "monochrome", "quiet", "editorial", "first-party"],
+        "mood": ["calm", "serious", "quiet"],
+        "era": "flat_2010s",
+        "form": ["square", "thin", "segmented"],
+        "material": ["paper", "matte"],
+        "density": "sparse",
+        "color": ["monochrome", "high_contrast", "neutral"],
+        "typography": ["geometric_sans", "humanist_sans"],
+        "motion": ["static", "subtle"],
+        "references": ["bauhaus", "scandinavian", "editorial"],
+        "ornament": ["minimal", "flat"],
+        "confidence": 0.96
+      },
+      "shape": {
+        "widget_kind": "theme",
+        "aspect_ratio": 1.4167,
+        "corner_radius_ratio": 0.004,
+        "stroke_width_ratio": 0.006,
+        "chart_mark": "line",
+        "texture": "flat",
+        "elevation": "flat",
+        "glow": false,
+        "animation": "none"
+      },
+      "coherence": {
+        "score": 0.97,
+        "outliers": [],
+        "conflicts": [],
+        "suggestions": [],
+        "confidence": 0.92
+      }
+    }
+  ]
+}

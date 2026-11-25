@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SensorPanel version="1" author="fixture" custom_root="keep-me">
+  <Gauge id="TCPU" label="CPU Temp" sensor="TCPU" unit="C" min="0" max="100"
+         x="10" y="20" width="120" height="120" color="#ff0000"
+         custom_attr="opaque"/>
+  <Bar id="SMEMUTI" label="Memory" min="0" max="100" x="10" y="150"
+       width="200" height="20" barcolor="#00ff00"/>
+  <Label id="cpu-label" text="CPU" x="0" y="0"/>
+  <Sensor id="TGPU1" label="GPU" unit="C" value="42"
+          unknown_sensor_key="retained"/>
+  <UnknownWidget weird="yes"><child>raw</child></UnknownWidget>
+  <script language="lua">print("never run")</script>
+</SensorPanel>

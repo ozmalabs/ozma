@@ -1,0 +1,27 @@
+{
+  "id": 42,
+  "type": "gauge",
+  "title": "Standalone Pressure",
+  "schemaVersion": 39,
+  "datasource": {"type": "prometheus", "uid": "prom-1"},
+  "gridPos": {"x": 4, "y": 2, "w": 6, "h": 6},
+  "targets": [
+    {"refId": "A", "expr": "pressure_pa", "legendFormat": "Pressure"}
+  ],
+  "fieldConfig": {
+    "defaults": {
+      "unit": "pressurebar",
+      "min": 0,
+      "max": 120,
+      "thresholds": {
+        "mode": "absolute",
+        "steps": [
+          {"value": null, "color": "green"},
+          {"value": 100, "color": "red"}
+        ]
+      }
+    },
+    "overrides": []
+  },
+  "options": {"showThresholdLabels": true}
+}

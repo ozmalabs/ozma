@@ -16,10 +16,12 @@
 
 use thiserror::Error;
 
+pub mod extract;
 pub mod model;
 pub mod translate;
 pub mod vibe;
 
+pub use extract::*;
 pub use model::*;
 pub use translate::*;
 pub use vibe::*;

@@ -11857,6 +11857,12 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     asset_repository = AssetRepository()
     app.include_router(_asset_router(asset_repository))
 
+    # Private display imports (lossless source capture, never auto-published)
+    from display_import_api import build_router as _import_router
+    from display_import_store import ImportStore
+    display_import_store = ImportStore()
+    app.include_router(_import_router(display_import_store))
+
     # GraphQL API (optional — requires strawberry-graphql)
     if _GRAPHQL_AVAILABLE and _gql_create_router is not None:
         graphql_router = _gql_create_router(state, _auth, mesh_ca)

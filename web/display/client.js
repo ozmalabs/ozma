@@ -42,6 +42,8 @@ const WIDGET_TYPES = new Set([
   'bar',
   'vu_meter',
   'sparkline',
+  'chart',
+  'history',
   'icon',
   'scenario',
   'clock',
@@ -53,7 +55,10 @@ const WIDGET_TYPES = new Set([
 
 const DEFAULT_THEME = 'core-dark';
 const GAUGE_MODULE_URL = './widgets/gauge.js';
+const SPARKLINE_MODULE_URL = './widgets/sparkline.js';
 const THEME_MODULE_URL = './theme.js';
+export const DEFAULT_HISTORY_POINTS = 120;
+export const MAX_HISTORY_POINTS = 4096;
 
 const els = typeof document !== 'undefined'
   ? {
@@ -97,14 +102,17 @@ const state = {
   actionsById: new Map(),
   actionsByKey: new Map(),
   gaugeModule: null,
+  sparklineModule: null,
   themeModule: null,
   theme: null,
   themeTokens: {},
   themeCanvas: null,
+  historyByField: new Map(),
 };
 
 let actionSequence = 0n;
 let gaugeSequence = 0;
+let sparklineSequence = 0;
 
 /* ------------------------------------------------------------------------- */
 /* Small utilities                                                            */
@@ -275,10 +283,58 @@ export function gaugeModeForType(type) {
 }
 
 /**
- * Choose between the SVG gauge renderer and the legacy fallback.
+ * Map a widget type to a sparkline rendering mode, or null when it should use
+ * another renderer. `chart` requires an explicit history configuration so a
+ * plain chart does not accidentally become a rolling history widget.
  */
-export function widgetRenderKind(node, { hasGaugeModule = false } = {}) {
+export function sparklineModeForType(type, node = null) {
+  const name = String(type || '').toLowerCase();
+  if (name === 'sparkline' || name === 'history') return 'sparkline';
+  if (name === 'chart') {
+    const history = node?.history;
+    if (history === undefined || history === null || history === false) return null;
+    if (Array.isArray(history)) return history.length ? 'sparkline' : null;
+    if (typeof history === 'object') return Object.keys(history).length ? 'sparkline' : null;
+    return 'sparkline';
+  }
+  return null;
+}
+
+/**
+ * Bounded history capacity for a node. Widgets can set
+ * `history.points` or `history.window`; a numeric `history` shorthand is also
+ * accepted. Values are clamped to a safe, bounded ring size.
+ */
+export function historyCapacityForNode(node, fallback = DEFAULT_HISTORY_POINTS) {
+  const history = node?.history;
+  let raw;
+  if (typeof history === 'number') raw = history;
+  else if (typeof history === 'string' && history.trim()) raw = history;
+  else if (history && typeof history === 'object') {
+    raw = history.points ?? history.window ?? history.capacity ?? history.limit;
+  }
+  if (raw === undefined || raw === null || raw === '') {
+    raw = node?.historyPoints ?? node?.history_points;
+  }
+
+  const number = Number(raw);
+  if (!Number.isFinite(number) || number <= 0) {
+    return Math.max(1, Math.min(MAX_HISTORY_POINTS, Math.floor(Number(fallback) || DEFAULT_HISTORY_POINTS)));
+  }
+  return Math.max(1, Math.min(MAX_HISTORY_POINTS, Math.floor(number)));
+}
+
+/**
+ * Choose between the SVG sparkline/gauge renderers and the legacy fallback.
+ */
+export function widgetRenderKind(
+  node,
+  { hasGaugeModule = false, hasSparklineModule = false } = {},
+) {
   const type = typeof node === 'string' ? node : node?.type;
+  if (hasSparklineModule && sparklineModeForType(type, typeof node === 'string' ? null : node)) {
+    return 'sparkline';
+  }
   if (hasGaugeModule && gaugeModeForType(type)) return 'gauge';
   return 'fallback';
 }
@@ -456,7 +512,19 @@ function sendRegistration(ws) {
     height,
     protocol: 'protobuf',
     wire_format: 'protobuf',
-    capabilities: ['label', 'text', 'number', 'gauge', 'bar', 'vu_meter', 'icon', 'protobuf'],
+    capabilities: [
+      'label',
+      'text',
+      'number',
+      'gauge',
+      'bar',
+      'vu_meter',
+      'sparkline',
+      'chart',
+      'history',
+      'icon',
+      'protobuf',
+    ],
   };
   ws.send(JSON.stringify(registration));
   log(`Registered ${state.deviceId} (${width}×${height}, protobuf)`);
@@ -587,6 +655,7 @@ function renderDefinition(definition) {
   state.fieldByKey.clear();
   state.values.clear();
   state.valuesByKey.clear();
+  state.historyByField.clear();
   state.bindings = [];
   state.textBindings = [];
   state.fieldRows.clear();
@@ -679,9 +748,12 @@ function renderWidget(node) {
   const type = String(node.type || 'widget').toLowerCase();
   const field = resolveField(node);
   const action = resolveAction(node);
-  const gaugeMode = widgetRenderKind(node, { hasGaugeModule: Boolean(state.gaugeModule) }) === 'gauge'
-    ? gaugeModeForType(type)
-    : null;
+  const renderKind = widgetRenderKind(node, {
+    hasGaugeModule: Boolean(state.gaugeModule),
+    hasSparklineModule: Boolean(state.sparklineModule),
+  });
+  const sparklineMode = renderKind === 'sparkline' ? sparklineModeForType(type, node) : null;
+  const gaugeMode = renderKind === 'gauge' ? gaugeModeForType(type) : null;
 
   const card = document.createElement('article');
   card.className = `widget widget-${cssToken(type)}`;
@@ -693,6 +765,21 @@ function renderWidget(node) {
     heading.className = 'widget-label';
     heading.textContent = headingText;
     card.append(heading);
+  }
+
+  if (sparklineMode) {
+    const host = document.createElement('div');
+    host.className = 'sparkline-host';
+    host.dataset.sparkline = sparklineMode;
+    try {
+      mountSparkline(host, node, field, sparklineMode, headingText);
+      card.classList.add('widget-meter', 'widget-sparkline-svg');
+      card.append(host);
+      if (action) attachAction(card, action, node);
+      return card;
+    } catch {
+      // Fall through to the existing card/meter renderer.
+    }
   }
 
   if (gaugeMode) {
@@ -848,6 +935,114 @@ function updateGauge(host, config, value, tokens, options) {
     const severityWord = severity === 'crit' ? 'critical' : severity === 'warn' ? 'warning' : 'normal';
     desc.textContent = `${geometry.label || 'Gauge'} reading ${reading}; range ${gauge.formatGaugeValue(geometry.min, geometry)} to ${gauge.formatGaugeValue(geometry.max, geometry)}${unit ? ` ${unit}` : ''}; ${severityWord}.`;
   }
+}
+
+function historySample(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value === 'boolean') return value ? 1 : 0;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'bigint') {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+  return null;
+}
+
+function ensureHistoryRing(fieldId, capacity) {
+  let ring = state.historyByField.get(fieldId);
+  if (!ring) {
+    ring = { capacity: null, samples: [] };
+    state.historyByField.set(fieldId, ring);
+  }
+
+  const requested = Number(capacity);
+  if (Number.isFinite(requested) && requested > 0) {
+    const bounded = Math.max(1, Math.min(MAX_HISTORY_POINTS, Math.floor(requested)));
+    ring.capacity = ring.capacity === null ? bounded : Math.max(ring.capacity, bounded);
+  }
+  if (ring.capacity === null) ring.capacity = DEFAULT_HISTORY_POINTS;
+  if (ring.samples.length > ring.capacity) {
+    ring.samples = ring.samples.slice(-ring.capacity);
+  }
+  return ring;
+}
+
+function historyForField(fieldId) {
+  return state.historyByField.get(fieldId)?.samples ?? [];
+}
+
+function recordHistory(fieldId, value) {
+  if (fieldId === undefined || fieldId === null) return;
+  const ring = ensureHistoryRing(fieldId);
+  ring.samples.push(historySample(value));
+  if (ring.samples.length > ring.capacity) {
+    ring.samples.splice(0, ring.samples.length - ring.capacity);
+  }
+}
+
+function sparklineConfigForNode(node, field, mode, label) {
+  return {
+    mode,
+    min: node.min,
+    max: node.max,
+    warn: node.warn ?? node.warn_at ?? node.warnAt,
+    crit: node.crit ?? node.critical ?? node.crit_at ?? node.critAt,
+    value: node.value,
+    unit: node.unit ?? field?.unit,
+    decimals: node.decimals,
+    label: label || node.label || node.title || node.name || '',
+    width: node.width,
+    height: node.height,
+    showValue: node.showValue ?? node.show_value,
+    area: node.area ?? node.areaFill ?? node.area_fill,
+    fill: node.fill,
+    baseline: node.baseline,
+    ticks: node.ticks ?? node.tickCount ?? node.tick_count,
+    showTicks: node.showTicks ?? node.show_ticks,
+    showTickLabels: node.showTickLabels ?? node.tickLabels,
+    lineWidth: node.lineWidth ?? node.line_width ?? node.strokeWidth ?? node.stroke_width,
+    mark: node.mark ?? node.chartMark ?? node.chart_mark ?? node.chart,
+    animate: node.animate,
+    history: node.history,
+  };
+}
+
+function mountSparkline(host, node, field, mode, label) {
+  const sparkline = state.sparklineModule;
+  if (!sparkline || typeof sparkline.renderSparkline !== 'function') {
+    throw new Error('sparkline module unavailable');
+  }
+
+  const config = sparklineConfigForNode(node, field, mode, label);
+  const tokens = state.themeTokens || {};
+  const capacity = historyCapacityForNode(node);
+  const fieldId = field?.id;
+  let history = [];
+
+  if (fieldId !== undefined && fieldId !== null) {
+    ensureHistoryRing(fieldId, capacity);
+    history = historyForField(fieldId);
+  } else if (Array.isArray(node.history)) {
+    history = node.history;
+  }
+
+  sparklineSequence += 1;
+  const options = { id: node.id || node.key || `${mode}-${sparklineSequence}` };
+  const svg = sparkline.renderSparkline(host, config, history, tokens, options);
+
+  if (fieldId === undefined || fieldId === null) return svg;
+
+  const apply = () => {
+    const current = historyForField(fieldId);
+    if (typeof sparkline.updateSparkline === 'function') {
+      sparkline.updateSparkline(host, current, config, tokens, options);
+    } else {
+      sparkline.renderSparkline(host, config, current, tokens, options);
+    }
+  };
+  state.bindings.push({ fieldId, apply });
+  if (history.length) apply();
+  return svg;
 }
 
 function widgetHeading(node, type, field) {
@@ -1049,6 +1244,7 @@ function applyDataUpdate(update) {
     state.values.set(item.fieldId, item.value);
     const field = state.fieldById.get(item.fieldId);
     if (field) state.valuesByKey.set(field.key, item.value);
+    recordHistory(item.fieldId, item.value);
     updateFieldRow(item.fieldId, item.value);
   }
 
@@ -1189,11 +1385,13 @@ async function applySelectedTheme(themeModule) {
 }
 
 async function bootstrapOptionalModules() {
-  const [themeModule, gaugeModule] = await Promise.all([
+  const [themeModule, gaugeModule, sparklineModule] = await Promise.all([
     loadThemeModule(),
     importOptional(GAUGE_MODULE_URL),
+    importOptional(SPARKLINE_MODULE_URL),
   ]);
   if (gaugeModule) state.gaugeModule = gaugeModule;
+  if (sparklineModule) state.sparklineModule = sparklineModule;
   if (themeModule) {
     state.themeModule = themeModule;
     await applySelectedTheme(themeModule);

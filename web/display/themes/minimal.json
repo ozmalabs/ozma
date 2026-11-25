@@ -1,0 +1,228 @@
+{
+  "schema": "org.ozma.theme/1",
+  "id": "org.ozma.theme.minimal",
+  "name": "Minimal",
+  "author": "Ozma Labs",
+  "license": "AGPL-3.0-only WITH OzmaPluginException",
+  "provenance": {
+    "source": "original",
+    "inspired_by": ["bauhaus", "scandinavian"]
+  },
+  "vibe": {
+    "taxonomy": "org.ozma.vibe/1",
+    "keywords": ["minimal", "monochrome", "quiet", "editorial", "first-party"],
+    "mood": ["calm", "serious", "quiet"],
+    "era": "flat_2010s",
+    "form": ["square", "thin", "segmented"],
+    "material": ["paper", "matte"],
+    "density": "sparse",
+    "color": ["monochrome", "high_contrast", "neutral"],
+    "typography": ["geometric_sans", "humanist_sans"],
+    "motion": ["static", "subtle"],
+    "references": ["bauhaus", "scandinavian", "editorial"],
+    "ornament": ["minimal", "flat"],
+    "confidence": 0.96,
+    "provenance": {
+      "source_keywords": ["minimal", "monochrome", "quiet"],
+      "derived_keywords": ["high_contrast", "neutral"],
+      "user_keywords": [],
+      "methods": ["human", "palette", "contrast"]
+    }
+  },
+  "shape": {
+    "widget_kind": "theme",
+    "aspect_ratio": 1.4167,
+    "corner_radius_ratio": 0.004,
+    "stroke_width_ratio": 0.006,
+    "fill_ratio": 0.06,
+    "symmetry": "none",
+    "tick_count": 4,
+    "segment_count": 1,
+    "chart_mark": "line",
+    "texture": "flat",
+    "elevation": "flat",
+    "glow": false,
+    "animation": "none"
+  },
+  "coherence": {
+    "score": 0.97,
+    "dimensions": {
+      "mood": 0.97,
+      "era": 0.9,
+      "form": 0.96,
+      "material": 0.95,
+      "color": 0.98,
+      "typography": 0.96,
+      "density": 0.98,
+      "motion": 0.95
+    },
+    "outliers": [],
+    "conflicts": [],
+    "suggestions": [
+      "Prefer whitespace and rules over shadow or glow to keep the surface quiet."
+    ],
+    "confidence": 0.92
+  },
+  "canvas": {
+    "width": 680,
+    "height": 480,
+    "background": "{color.bg}"
+  },
+  "tokens": {
+    "color": {
+      "bg": { "$type": "color", "$value": "#fbfbfb" },
+      "panel": { "$type": "color", "$value": "#ffffff" },
+      "fg": { "$type": "color", "$value": "#181818" },
+      "muted": { "$type": "color", "$value": "#5c5c5c" },
+      "dim": { "$type": "color", "$value": "#767676" },
+      "accent": { "$type": "color", "$value": "#2b2b2b" },
+      "ok": { "$type": "color", "$value": "#37604a" },
+      "warn": { "$type": "color", "$value": "#7a5c1e" },
+      "crit": { "$type": "color", "$value": "#8c3a34" },
+      "track": { "$type": "color", "$value": "#e6e6e6" },
+      "grid": { "$type": "color", "$value": "#ececec" },
+      "border": { "$type": "color", "$value": "#dcdcdc" }
+    },
+    "radius": { "$type": "dimension", "$value": "2px" },
+    "radius.sm": { "$type": "dimension", "$value": "1px" },
+    "radius.lg": { "$type": "dimension", "$value": "3px" },
+    "font": {
+      "family": {
+        "$type": "fontFamily",
+        "$value": ["Inter", "system-ui", "sans-serif"]
+      },
+      "mono": {
+        "$type": "fontFamily",
+        "$value": ["JetBrains Mono", "ui-monospace", "monospace"]
+      },
+      "size": {
+        "base": { "$type": "dimension", "$value": "13px" },
+        "small": { "$type": "dimension", "$value": "10px" },
+        "heading": { "$type": "dimension", "$value": "16px" }
+      },
+      "weight": {
+        "body": { "$type": "fontWeight", "$value": 400 },
+        "strong": { "$type": "fontWeight", "$value": 600 }
+      }
+    },
+    "typography": {
+      "body": {
+        "$type": "typography",
+        "$value": "400 13px/1.5 {font.family}"
+      },
+      "heading": {
+        "$type": "typography",
+        "$value": "600 16px/1.3 {font.family}"
+      },
+      "mono": {
+        "$type": "typography",
+        "$value": "400 11px/1.4 {font.mono}"
+      }
+    },
+    "shadow.card": {
+      "$type": "shadow",
+      "$value": "0 1px 2px rgba(0, 0, 0, 0.06)"
+    },
+    "shadow.raised": {
+      "$type": "shadow",
+      "$value": "none"
+    },
+    "gauge": {
+      "fill": { "$type": "color", "$value": "{color.accent}" },
+      "track": { "$type": "color", "$value": "{color.track}" },
+      "warn": { "$type": "color", "$value": "{color.warn}" },
+      "crit": { "$type": "color", "$value": "{color.crit}" },
+      "thickness": { "$type": "dimension", "$value": "10px" }
+    },
+    "sparkline": {
+      "line": { "$type": "color", "$value": "{color.accent}" },
+      "fill": { "$type": "color", "$value": "{color.accent}" },
+      "track": { "$type": "color", "$value": "{color.track}" },
+      "grid": { "$type": "color", "$value": "{color.grid}" },
+      "baseline": { "$type": "color", "$value": "{color.dim}" },
+      "text": { "$type": "color", "$value": "{color.fg}" },
+      "warn": { "$type": "color", "$value": "{color.warn}" },
+      "crit": { "$type": "color", "$value": "{color.crit}" },
+      "width": { "$type": "dimension", "$value": "1.5px" },
+      "height": { "$type": "dimension", "$value": "64px" },
+      "area-opacity": { "$type": "number", "$value": 0.08 }
+    }
+  },
+  "widgets": [
+    {
+      "type": "gauge",
+      "x": 20,
+      "y": 20,
+      "w": 180,
+      "h": 180,
+      "metric": "@active.TCPU",
+      "min": 0,
+      "max": 100,
+      "label": "CPU",
+      "unit": "°C",
+      "warn": 70,
+      "crit": 90,
+      "style": "arc",
+      "tickCount": 4,
+      "rounded": false,
+      "decimals": 0
+    },
+    {
+      "type": "bar",
+      "x": 20,
+      "y": 220,
+      "w": 320,
+      "h": 56,
+      "metric": "@active.MEM",
+      "min": 0,
+      "max": 100,
+      "label": "Memory",
+      "unit": "%",
+      "warn": 80,
+      "crit": 95,
+      "style": "bar"
+    },
+    {
+      "type": "sparkline",
+      "x": 20,
+      "y": 300,
+      "w": 320,
+      "h": 72,
+      "metric": "@active.TCPU",
+      "min": 0,
+      "max": 100,
+      "label": "CPU trend",
+      "unit": "°C",
+      "showValue": true,
+      "baseline": "min",
+      "ticks": 2,
+      "decimals": 0,
+      "history": { "points": 60 }
+    },
+    {
+      "type": "chart",
+      "x": 360,
+      "y": 220,
+      "w": 300,
+      "h": 152,
+      "metric": "@active.RX",
+      "min": 0,
+      "max": 1000,
+      "label": "Network",
+      "unit": "Mb/s",
+      "history": { "window": 90 }
+    },
+    {
+      "type": "history",
+      "x": 360,
+      "y": 20,
+      "w": 300,
+      "h": 96,
+      "metric": "@active.LOAD",
+      "min": 0,
+      "max": 8,
+      "label": "Load",
+      "history": { "points": 120 }
+    }
+  ]
+}

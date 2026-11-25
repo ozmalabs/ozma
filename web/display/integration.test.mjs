@@ -11,7 +11,9 @@ import assert from 'node:assert/strict';
 
 import {
   gaugeModeForType,
+  historyCapacityForNode,
   selectThemeSelection,
+  sparklineModeForType,
   widgetRenderKind,
 } from './client.js';
 
@@ -118,4 +120,59 @@ test('a missing theme module preserves the existing appearance', () => {
     selectThemeSelection({ dataTheme: 'core-light', hasThemeModule: false }),
     null,
   );
+});
+
+/* ------------------------------------------------------------------------- */
+/* Sparkline/history selection                                                */
+/* ------------------------------------------------------------------------- */
+
+test('sparkline, history, and chart-with-history map to the sparkline widget', () => {
+  assert.equal(sparklineModeForType('sparkline'), 'sparkline');
+  assert.equal(sparklineModeForType('SPARKLINE'), 'sparkline');
+  assert.equal(sparklineModeForType('history'), 'sparkline');
+  assert.equal(sparklineModeForType('chart'), null);
+  assert.equal(sparklineModeForType('chart', { history: { points: 60 } }), 'sparkline');
+  assert.equal(sparklineModeForType('chart', { history: { window: 30 } }), 'sparkline');
+  assert.equal(sparklineModeForType('chart', { history: [1, 2, 3] }), 'sparkline');
+  assert.equal(sparklineModeForType('chart', { history: {} }), null);
+  assert.equal(sparklineModeForType('text'), null);
+  assert.equal(sparklineModeForType(undefined), null);
+});
+
+test('sparkline renderer wins for mapped types only when the module is available', () => {
+  assert.equal(
+    widgetRenderKind({ type: 'sparkline' }, { hasSparklineModule: true }),
+    'sparkline',
+  );
+  assert.equal(
+    widgetRenderKind({ type: 'history' }, { hasSparklineModule: true }),
+    'sparkline',
+  );
+  assert.equal(
+    widgetRenderKind({ type: 'chart', history: { points: 20 } }, { hasSparklineModule: true }),
+    'sparkline',
+  );
+  assert.equal(
+    widgetRenderKind({ type: 'chart', history: { points: 20 } }, { hasGaugeModule: true }),
+    'fallback',
+  );
+  assert.equal(
+    widgetRenderKind({ type: 'chart' }, { hasSparklineModule: true }),
+    'fallback',
+  );
+  assert.equal(
+    widgetRenderKind({ type: 'gauge' }, { hasGaugeModule: true, hasSparklineModule: true }),
+    'gauge',
+  );
+});
+
+test('historyCapacityForNode uses points/window and stays bounded', () => {
+  assert.equal(historyCapacityForNode({}), 120);
+  assert.equal(historyCapacityForNode({ history: { points: 30 } }), 30);
+  assert.equal(historyCapacityForNode({ history: { window: 45 } }), 45);
+  assert.equal(historyCapacityForNode({ history: 10 }), 10);
+  assert.equal(historyCapacityForNode({ history: { points: 0 } }), 120);
+  assert.equal(historyCapacityForNode({ history: { points: -5 } }, 40), 40);
+  assert.equal(historyCapacityForNode({ history: { points: 99_999 } }), 4096);
+  assert.equal(historyCapacityForNode({ history: { points: '15' } }), 15);
 });

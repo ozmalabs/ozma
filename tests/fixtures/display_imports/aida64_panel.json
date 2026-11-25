@@ -1,0 +1,36 @@
+{
+  "version": "2",
+  "custom_top": "keep",
+  "widgets": [
+    {
+      "type": "gauge",
+      "id": "TCPU",
+      "label": "CPU",
+      "sensor": "TCPU",
+      "unit": "C",
+      "min": 0,
+      "max": 100
+    },
+    {
+      "type": "bar",
+      "id": "SMEMUTI",
+      "label": "Memory",
+      "min": 0,
+      "max": 100
+    },
+    {
+      "type": "label",
+      "id": "time",
+      "text": "TIME"
+    },
+    {
+      "type": "sensor",
+      "id": "SGPU1UTI",
+      "label": "GPU",
+      "unit": "%",
+      "value": 10,
+      "vendor_x": 1
+    }
+  ],
+  "unknown_vendor": {"a": 1}
+}

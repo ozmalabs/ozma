@@ -2,8 +2,8 @@
 
 **Status:** Executable plan derived from
 [`display-widget-library-research.md`](display-widget-library-research.md).
-First slice implemented: M0, M1, M3/M3b core models, M4 core matching, and
-M5 browser theme/gauge foundations. See §6.1 for the current task ledger.
+Implemented: M0–M4, M6, and most of M5/M7. See §6.1 for the current task
+ledger and remaining render/CI hardening work.
 **Scope:** widget/theme repository, shared database, lossless Widget IR,
 font intent/translation, render adapters, importers, and built-in themes.
 
@@ -113,29 +113,30 @@ M0 must land before B/C/D/E merge to avoid schema churn.
 | M6 | Importers | AIDA64/SensorPanel, Rainmeter, Home Assistant, MagicMirror, Grafana imports produce lossless capture reports + export reports |
 | M7 | Hardening and rollout | CI licence/security gates; fuzz; migration; docs; feature flags default-on for local repo/IR; release notes |
 
-### 6.1 Implementation status (first slice)
+### 6.1 Implementation status
 
 | Milestone | State | Landed | Remaining |
 |---|---|---|---|
-| M0 Contracts | **Done** | `ozma-display-ir` models/validation/canonical hash; `controller/display_ir.py` parity; six `schemas/display/*.schema.json`; golden fixtures; wire-vs-IR storage documented in crate/module docs | Task-level doc `WGT-004` cross-link in `docs/protocols.md` |
-| M1 Local repository | **Mostly done** | `controller/asset_repository.py` index/cache/install/update/rollback, hashes, signatures, safe extraction, sync policy, API router wired in `controller/api.py`; `retro-gauges` manifest migrated; `WidgetPack` preserves repository fields | Controller config surface for `AssetSyncPolicy` (`WGT-025`); operator docs |
-| M2 Connect shared DB | **Not started** | — | `WGT-030`–`WGT-036` |
-| M3 IR/translation core | **Partial** | IR→`ScreenLayout`/`DisplayDefinition`, compact `meta.ozma_ir`, validation, export-report helper; browser gauge/bar adapters | Number/text/sparkline/status/icon adapters; PNG renderer; per-target export golden tests (`WGT-043`–`WGT-045`) |
-| M3b Vibe/shape/coherence | **Partial** | Versioned `org.ozma.vibe/1` models/validation; source/user/derived keyword separation; coherence report model; repository `vibe`/`shape`/`coherence` search and related packs | Shape extraction from SVG/CSS/preview; coherence scoring across packs/scenes; local vision tagging (`WGT-047`, `WGT-048`, `WGT-049a`) |
-| M4 Font subsystem | **Partial** | `ozma-fonts` TTF/OTF metadata, PANOSE/metrics/scripts/features, `fsType` licence gate, deterministic shape/intent matching, export planning, 30 tests | Python controller matching, WOFF2/TTF/OTF subsetting, LVGL/u8g2/BDF export, golden corpus, font report wiring into IR (`WGT-052`–`WGT-057`) |
-| M5 Render adapters/themes | **Partial** | Browser theme loader + `core-dark` theme with vibe/shape; SVG gauge/bar/dual-bar/threshold family; client integration with a11y and reduced motion | uPlot sparkline, PNG renderer, LVGL exporter, AIDA64 panel output, Adaptive Cards, editor, remaining 4 themes (`WGT-062`–`WGT-069`) |
-| M6 Importers | **Not started** | — | `WGT-070`–`WGT-078`; AIDA64 work is uncommitted in another track |
-| M7 Hardening | **Not started** | Licence allowlist + signature verification foundations exist in the repository | CI gates, fuzz, sandbox, feature flags, operator docs (`WGT-080`–`WGT-087`) |
+| M0 Contracts | **Done** | `ozma-display-ir` models/validation/canonical hash; `controller/display_ir.py` parity; six `schemas/display/*.schema.json`; golden fixtures; lossless capture arrays aligned across Rust/Python/importers | `WGT-004` cross-link in `docs/protocols.md` |
+| M1 Local repository | **Done** | `controller/asset_repository.py` index/cache/install/update/rollback, hashes, signatures, safe extraction, sync policy, API router; `retro-gauges` manifest migrated; `WidgetPack` preserves repository fields; signed Connect index sync interop tested | Operator deployment tuning only |
+| M2 Connect shared DB | **Done** | `connect/assets/` SQLAlchemy models + portable migration, object storage, deterministic signed index, search/entry/versions/categories/submit/stats/snapshot API, licence + attestation rules, 27 tests; controller→Connect sync tests | Production key management and a Connect deployment/UI |
+| M3 IR/translation core | **Mostly done** | IR→`ScreenLayout`/`DisplayDefinition`, compact `meta.ozma_ir`, validation, export-report helper; semantic adapters for gauge/bar/number/text/sparkline/status/icon/table/card; PNG render-plan + SVG preview; LVGL export with reports | Canvas-backed PNG end-to-end test (dependency missing here); per-target golden snapshots (`WGT-045`); AIDA64 panel output |
+| M3b Vibe/shape/coherence | **Done** | `org.ozma.vibe/1` models/validation; SVG/CSS/property shape extraction; source/user/derived keyword separation; advisory coherence with dimensions/outliers/conflicts/overrides; Rust/Python parity; repository filter/related packs | Optional local vision tagging (`WGT-049a`, disabled by default) |
+| M4 Font subsystem | **Done** | `ozma-fonts` and `controller/font_translation.py` metadata, PANOSE/metrics/scripts/features, `fsType` licence gate, deterministic shape/intent matching, plan_export and reports; TTF/OTF subsetting, BDF, LVGL C, PIL previews; 30 Rust + 36 Python tests | WOFF2 write path requires optional `brotli`; expand CJK/Arabic/Indic shaping golden corpus (`WGT-056`) |
+| M5 Render adapters/themes | **Mostly done** | Browser theme loader; `core-dark`, `core-light`, `noc`, `audio`, `minimal` + hashed theme-pack manifest; SVG gauge/bar/dual/threshold and sparkline/history widgets with a11y; PNG render-plan integration; LVGL C/JSON; Adaptive Cards export | uPlot/gridstack editor; AIDA64 panel output; full browser/LVGL/AIDA64 golden parity |
+| M6 Importers | **Done** | AIDA64/SensorPanel (ZIP/XML/JSON/HTML, safe extraction), Rainmeter INI, Home Assistant YAML, MagicMirror non-evaluating JS reader, Grafana dashboards/panels, Adaptive Cards import/export; private import store + API; lossless capture and IR validation tests | Native AIDA64 `.rslcd` remains best-effort/opaque by design (`WGT-070` recon) |
+| M7 Hardening | **Partial** | `OZMA_DISPLAY_*` feature flags, licence/checksum/sandbox gate script, signed index and pack verification, operator/authoring/publishing/importing/font docs, 69 config/licence tests | CI wiring, fuzz targets, browser sandbox enforcement, performance budgets, release notes (`WGT-080`–`WGT-087`) |
 
 Known gaps for the next slice:
 
-1. Python font matching (`controller/font_translation.py`) and physical
-   subset/raster export.
-2. Shape extraction and cross-pack coherence scoring; current types are
-   contracts, not extractors.
-3. Controller PNG/LVGL/AIDA64/Adaptive Cards consumption of the IR.
-4. Connect shared database and submission workflow.
-5. Controller config/feature flags for sync mode and IR enablement.
+1. Canvas-backed PNG rendering and AIDA64 panel output from IR (AIDA64 is
+   owned by a separate in-flight track).
+2. Golden visual parity snapshots across browser, PNG, LVGL, Adaptive Cards,
+   and any AIDA64 target.
+3. Full font shaping corpus (CJK, Arabic/Indic), WOFF2 writing with `brotli`,
+   and production Ed25519 key distribution.
+4. CI licence/fuzz/sandbox gates and performance budgets.
+5. Connect deployment, review UI, and public marketplace surface.
 
 ## 7. Task backlog
 

@@ -1,0 +1,251 @@
+{
+  "schema": "org.ozma.theme/1",
+  "id": "org.ozma.theme.audio",
+  "name": "Audio",
+  "author": "Ozma Labs",
+  "license": "AGPL-3.0-only WITH OzmaPluginException",
+  "provenance": {
+    "source": "original",
+    "inspired_by": ["hi-fi-studio", "analog-instrumentation"]
+  },
+  "vibe": {
+    "taxonomy": "org.ozma.vibe/1",
+    "keywords": ["studio", "warm", "vu", "analog", "cozy"],
+    "mood": ["cozy", "calm", "serious"],
+    "era": "hi_fi_1970s",
+    "form": ["circular", "rounded", "needle"],
+    "material": ["wood", "brushed_metal", "amber"],
+    "density": "balanced",
+    "color": ["warm", "amber", "high_contrast"],
+    "typography": ["geometric_sans", "monospace"],
+    "motion": ["needle", "glow", "subtle"],
+    "references": ["hi_fi", "studio", "industrial_control"],
+    "ornament": ["skeuomorphic", "minimal"],
+    "confidence": 0.91,
+    "provenance": {
+      "source_keywords": ["studio", "warm", "vu"],
+      "derived_keywords": ["amber", "brushed_metal"],
+      "user_keywords": [],
+      "methods": ["human", "palette"]
+    }
+  },
+  "shape": {
+    "widget_kind": "theme",
+    "aspect_ratio": 1.4167,
+    "corner_radius_ratio": 0.025,
+    "stroke_width_ratio": 0.02,
+    "fill_ratio": 0.2,
+    "symmetry": "none",
+    "arc_start_deg": -120,
+    "arc_end_deg": 120,
+    "needle_style": "classic",
+    "tick_count": 5,
+    "segment_count": 3,
+    "chart_mark": "area",
+    "texture": "matte",
+    "elevation": "raised",
+    "glow": false,
+    "animation": "needle"
+  },
+  "coherence": {
+    "score": 0.9,
+    "dimensions": {
+      "mood": 0.93,
+      "era": 0.95,
+      "form": 0.9,
+      "material": 0.94,
+      "color": 0.92,
+      "typography": 0.86,
+      "density": 0.88,
+      "motion": 0.9
+    },
+    "outliers": [],
+    "conflicts": [],
+    "suggestions": [
+      "Keep the amber accent for primary levels and reserve red for clipping or critical state."
+    ],
+    "confidence": 0.86
+  },
+  "canvas": {
+    "width": 680,
+    "height": 480,
+    "background": "{color.bg}"
+  },
+  "tokens": {
+    "color": {
+      "bg": { "$type": "color", "$value": "#1a1210" },
+      "panel": { "$type": "color", "$value": "#241915" },
+      "fg": { "$type": "color", "$value": "#f7e9d7" },
+      "muted": { "$type": "color", "$value": "#c7ad91" },
+      "dim": { "$type": "color", "$value": "#9c8169" },
+      "accent": { "$type": "color", "$value": "#e0a45c" },
+      "ok": { "$type": "color", "$value": "#86c98a" },
+      "warn": { "$type": "color", "$value": "#f0b34d" },
+      "crit": { "$type": "color", "$value": "#e0644a" },
+      "track": { "$type": "color", "$value": "rgba(247, 233, 215, 0.14)" },
+      "grid": { "$type": "color", "$value": "rgba(224, 164, 92, 0.22)" },
+      "border": { "$type": "color", "$value": "#5a4030" }
+    },
+    "radius": { "$type": "dimension", "$value": "10px" },
+    "radius.sm": { "$type": "dimension", "$value": "6px" },
+    "radius.lg": { "$type": "dimension", "$value": "16px" },
+    "font": {
+      "family": {
+        "$type": "fontFamily",
+        "$value": ["Inter", "system-ui", "sans-serif"]
+      },
+      "mono": {
+        "$type": "fontFamily",
+        "$value": ["JetBrains Mono", "ui-monospace", "monospace"]
+      },
+      "size": {
+        "base": { "$type": "dimension", "$value": "14px" },
+        "small": { "$type": "dimension", "$value": "11px" },
+        "heading": { "$type": "dimension", "$value": "18px" }
+      },
+      "weight": {
+        "body": { "$type": "fontWeight", "$value": 400 },
+        "strong": { "$type": "fontWeight", "$value": 650 }
+      }
+    },
+    "typography": {
+      "body": {
+        "$type": "typography",
+        "$value": "400 14px/1.45 {font.family}"
+      },
+      "heading": {
+        "$type": "typography",
+        "$value": "650 18px/1.25 {font.family}"
+      },
+      "mono": {
+        "$type": "typography",
+        "$value": "500 12px/1.4 {font.mono}"
+      }
+    },
+    "shadow.card": {
+      "$type": "shadow",
+      "$value": "0 14px 34px rgba(0, 0, 0, 0.42)"
+    },
+    "shadow.raised": {
+      "$type": "shadow",
+      "$value": "inset 0 1px 0 rgba(255, 240, 220, 0.12), 0 2px 8px rgba(0, 0, 0, 0.28)"
+    },
+    "gauge": {
+      "fill": { "$type": "color", "$value": "{color.accent}" },
+      "track": { "$type": "color", "$value": "{color.track}" },
+      "warn": { "$type": "color", "$value": "{color.warn}" },
+      "crit": { "$type": "color", "$value": "{color.crit}" },
+      "thickness": { "$type": "dimension", "$value": "16px" }
+    },
+    "sparkline": {
+      "line": { "$type": "color", "$value": "{color.accent}" },
+      "fill": { "$type": "color", "$value": "{color.accent}" },
+      "track": { "$type": "color", "$value": "{color.track}" },
+      "grid": { "$type": "color", "$value": "{color.grid}" },
+      "baseline": { "$type": "color", "$value": "{color.dim}" },
+      "text": { "$type": "color", "$value": "{color.fg}" },
+      "warn": { "$type": "color", "$value": "{color.warn}" },
+      "crit": { "$type": "color", "$value": "{color.crit}" },
+      "width": { "$type": "dimension", "$value": "2px" },
+      "height": { "$type": "dimension", "$value": "72px" },
+      "area-opacity": { "$type": "number", "$value": 0.2 }
+    }
+  },
+  "widgets": [
+    {
+      "type": "gauge",
+      "x": 20,
+      "y": 20,
+      "w": 180,
+      "h": 180,
+      "metric": "@active.LOAD",
+      "min": 0,
+      "max": 100,
+      "label": "CPU",
+      "unit": "%",
+      "warn": 70,
+      "crit": 90,
+      "style": "arc",
+      "tickCount": 5,
+      "rounded": true,
+      "decimals": 0
+    },
+    {
+      "type": "vu_meter",
+      "x": 20,
+      "y": 220,
+      "w": 320,
+      "h": 56,
+      "metric": "@active.LEVEL_L",
+      "min": -60,
+      "max": 0,
+      "label": "Left",
+      "unit": "dB",
+      "warn": -12,
+      "crit": -3,
+      "style": "bar"
+    },
+    {
+      "type": "vu_meter",
+      "x": 20,
+      "y": 288,
+      "w": 320,
+      "h": 56,
+      "metric": "@active.LEVEL_R",
+      "min": -60,
+      "max": 0,
+      "label": "Right",
+      "unit": "dB",
+      "warn": -12,
+      "crit": -3,
+      "style": "bar"
+    },
+    {
+      "type": "sparkline",
+      "x": 360,
+      "y": 20,
+      "w": 300,
+      "h": 120,
+      "metric": "@active.LEVEL_L",
+      "min": -60,
+      "max": 0,
+      "label": "Level history",
+      "unit": "dB",
+      "warn": -12,
+      "crit": -3,
+      "showValue": true,
+      "area": true,
+      "baseline": "min",
+      "ticks": 4,
+      "decimals": 1,
+      "history": { "points": 90 }
+    },
+    {
+      "type": "chart",
+      "x": 360,
+      "y": 160,
+      "w": 300,
+      "h": 120,
+      "metric": "@active.LEVEL_R",
+      "min": -60,
+      "max": 0,
+      "label": "Right channel",
+      "unit": "dB",
+      "area": true,
+      "history": { "window": 90 }
+    },
+    {
+      "type": "history",
+      "x": 360,
+      "y": 300,
+      "w": 300,
+      "h": 72,
+      "metric": "@active.LUFS",
+      "min": -30,
+      "max": 0,
+      "label": "Loudness",
+      "unit": "LUFS",
+      "history": { "points": 120 }
+    }
+  ]
+}

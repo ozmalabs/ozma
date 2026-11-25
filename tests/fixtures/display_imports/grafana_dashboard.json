@@ -1,0 +1,127 @@
+{
+  "meta": {
+    "slug": "fixture-dashboard",
+    "version": 3,
+    "canSave": false
+  },
+  "dashboard": {
+    "id": 7,
+    "uid": "fixture-uid",
+    "title": "Fixture Dashboard",
+    "description": "Importer fixture",
+    "schemaVersion": 39,
+    "tags": ["ozma", "fixture"],
+    "timezone": "browser",
+    "templating": {
+      "list": [
+        {
+          "name": "instance",
+          "type": "query",
+          "datasource": {"type": "prometheus", "uid": "prom-1"},
+          "query": "label_values(up, instance)"
+        }
+      ]
+    },
+    "panels": [
+      {
+        "id": 1,
+        "type": "row",
+        "title": "Overview",
+        "collapsed": false,
+        "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1},
+        "panels": [
+          {
+            "id": 2,
+            "type": "gauge",
+            "title": "CPU",
+            "datasource": {"type": "prometheus", "uid": "prom-1"},
+            "gridPos": {"x": 0, "y": 1, "w": 8, "h": 8},
+            "targets": [
+              {
+                "refId": "A",
+                "expr": "100 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100",
+                "legendFormat": "CPU"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "percent",
+                "min": 0,
+                "max": 100,
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {"value": null, "color": "green"},
+                    {"value": 70, "color": "yellow"},
+                    {"value": 90, "color": "red"}
+                  ]
+                }
+              },
+              "overrides": [
+                {
+                  "matcher": {"id": "byName", "options": "CPU"},
+                  "properties": [
+                    {"id": "color", "value": {"mode": "thresholds"}}
+                  ]
+                }
+              ]
+            },
+            "options": {
+              "reduceOptions": {"calcs": ["lastNotNull"]},
+              "orientation": "auto"
+            },
+            "transformations": [
+              {"id": "organize", "options": {"excludeByName": {"Time": true}}}
+            ]
+          },
+          {
+            "id": 3,
+            "type": "stat",
+            "title": "Uptime",
+            "targets": [{"refId": "B", "expr": "up"}],
+            "fieldConfig": {"defaults": {"unit": "s"}}
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "type": "bargauge",
+        "title": "Queue Depth",
+        "targets": [{"refId": "A", "expr": "queue_depth"}],
+        "fieldConfig": {"defaults": {"unit": "short"}}
+      },
+      {
+        "id": 5,
+        "type": "timeseries",
+        "title": "Traffic",
+        "targets": [{"refId": "A", "expr": "rate(bytes_total[5m])"}],
+        "fieldConfig": {"defaults": {"unit": "Bps"}},
+        "transformations": [{"id": "reduce", "options": {}}]
+      },
+      {
+        "id": 6,
+        "type": "graph",
+        "title": "Legacy Graph",
+        "targets": [{"refId": "A", "expr": "legacy_metric"}]
+      },
+      {
+        "id": 7,
+        "type": "table",
+        "title": "Table",
+        "targets": [{"refId": "A", "expr": "table_metric", "format": "table"}]
+      },
+      {
+        "id": 8,
+        "type": "text",
+        "title": "Notes",
+        "options": {"content": "<b>hello</b>", "mode": "html"}
+      },
+      {
+        "id": 9,
+        "type": "heatmap",
+        "title": "Unsupported Heatmap",
+        "targets": []
+      }
+    ]
+  }
+}

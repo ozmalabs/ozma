@@ -15,6 +15,7 @@
  */
 
 const { createCanvas } = require('@napi-rs/canvas');
+const { irToRenderPlan, planToSvg } = require('./display_ir');
 
 // ── Template registry ───────────────────────────────────────────────────────
 
@@ -341,4 +342,226 @@ function luminance(hex) {
   return 0.299 * r + 0.587 * g + 0.114 * b;
 }
 
-module.exports = { renderTemplate, listTemplates, registerTemplate };
+// ── Semantic IR rendering (WGT-043 / WGT-063) ──────────────────────────────
+
+function roundedRect(ctx, x, y, w, h, radius) {
+  const r = Math.max(0, Math.min(radius || 0, Math.min(w, h) / 2));
+  ctx.beginPath();
+  if (r > 0 && typeof ctx.roundRect === 'function') {
+    ctx.roundRect(x, y, w, h, r);
+    return;
+  }
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function drawPlanText(ctx, op) {
+  ctx.save();
+  if (op.fill && op.fill !== 'none' && op.fill !== 'transparent') ctx.fillStyle = op.fill;
+  ctx.font = `${op.fontWeight === 'bold' ? 'bold ' : ''}${op.fontSize}px ${op.fontFamily || 'sans-serif'}`;
+  ctx.textAlign = op.align === 'center' ? 'center' : (op.align === 'right' ? 'right' : 'left');
+  ctx.textBaseline = op.baseline === 'middle' ? 'middle' : (op.baseline === 'top' ? 'top' : 'alphabetic');
+  const text = String(op.text ?? '');
+  if (op.maxWidth) {
+    ctx.fillText(text, op.x, op.y, op.maxWidth);
+  } else {
+    ctx.fillText(text, op.x, op.y);
+  }
+  ctx.restore();
+}
+
+function drawPlanBar(ctx, op) {
+  const span = op.max > op.min ? op.max - op.min : 1;
+  const pct = Math.max(0, Math.min(1, (op.value - op.min) / span));
+  ctx.save();
+  ctx.fillStyle = op.track || '#1a1a22';
+  roundedRect(ctx, op.x, op.y, op.w, op.h, op.radius);
+  ctx.fill();
+  ctx.fillStyle = op.fill || '#5b6fff';
+  if (op.orientation === 'vertical') {
+    const height = op.h * pct;
+    roundedRect(ctx, op.x, op.y + op.h - height, op.w, height, op.radius);
+  } else {
+    roundedRect(ctx, op.x, op.y, op.w * pct, op.h, op.radius);
+  }
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawPlanArc(ctx, op) {
+  const start = (op.startAngle * Math.PI) / 180;
+  const end = (op.endAngle * Math.PI) / 180;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(op.cx, op.cy, op.r, start, end);
+  if (op.fill && op.fill !== 'none' && op.fill !== 'transparent' && (!op.lineWidth || op.lineWidth === 0)) {
+    ctx.fillStyle = op.fill;
+    ctx.fill();
+  } else {
+    ctx.strokeStyle = op.stroke || '#5b6fff';
+    ctx.lineWidth = op.lineWidth || 1;
+    if (op.cap === 'round') ctx.lineCap = 'round';
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawPlanOp(ctx, op) {
+  switch (op.op) {
+    case 'group': {
+      ctx.save();
+      if (op.clip) {
+        ctx.beginPath();
+        ctx.rect(op.clip.x, op.clip.y, op.clip.w, op.clip.h);
+        ctx.clip();
+      }
+      for (const child of op.children) drawPlanOp(ctx, child);
+      ctx.restore();
+      return;
+    }
+    case 'rect':
+      ctx.save();
+      if (op.opacity !== undefined) ctx.globalAlpha = op.opacity;
+      roundedRect(ctx, op.x, op.y, op.w, op.h, op.radius);
+      if (op.fill && op.fill !== 'none' && op.fill !== 'transparent') {
+        ctx.fillStyle = op.fill;
+        ctx.fill();
+      }
+      if (op.stroke && op.lineWidth) {
+        ctx.strokeStyle = op.stroke;
+        ctx.lineWidth = op.lineWidth;
+        ctx.stroke();
+      }
+      ctx.restore();
+      return;
+    case 'text':
+      drawPlanText(ctx, op);
+      return;
+    case 'arc':
+      drawPlanArc(ctx, op);
+      return;
+    case 'bar':
+      drawPlanBar(ctx, op);
+      return;
+    case 'line':
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(op.x1, op.y1);
+      ctx.lineTo(op.x2, op.y2);
+      ctx.strokeStyle = op.stroke || '#fff';
+      ctx.lineWidth = op.lineWidth || 1;
+      ctx.lineCap = op.cap === 'round' ? 'round' : 'butt';
+      ctx.stroke();
+      ctx.restore();
+      return;
+    case 'polyline': {
+      if (!op.points || op.points.length < 2) return;
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(op.points[0][0], op.points[0][1]);
+      for (let i = 1; i < op.points.length; i += 1) {
+        ctx.lineTo(op.points[i][0], op.points[i][1]);
+      }
+      if (op.fill) {
+        ctx.closePath();
+        ctx.fillStyle = op.fill;
+        ctx.globalAlpha = 0.3;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+      ctx.strokeStyle = op.stroke || '#5b6fff';
+      ctx.lineWidth = op.lineWidth || 1;
+      ctx.stroke();
+      ctx.restore();
+      return;
+    }
+    case 'image':
+      // Remote images are deliberately not fetched by the renderer.  Draw a
+      // stable placeholder so a layout still renders offline.
+      ctx.save();
+      ctx.fillStyle = '#111118';
+      ctx.fillRect(op.x, op.y, op.w, op.h);
+      ctx.strokeStyle = '#444';
+      ctx.strokeRect(op.x, op.y, op.w, op.h);
+      if (op.alt) drawPlanText(ctx, {
+        ...op,
+        text: op.alt,
+        fontSize: Math.max(8, Math.min(op.w, op.h) * 0.12),
+        fill: '#8d9bb3',
+        align: 'center',
+        baseline: 'middle',
+        x: op.x + op.w / 2,
+        y: op.y + op.h / 2,
+      });
+      ctx.restore();
+      return;
+    case 'icon': {
+      ctx.save();
+      const size = Math.min(op.w, op.h) * 0.42;
+      const cx = op.x + op.w / 2;
+      const cy = op.y + op.h / 2;
+      ctx.strokeStyle = op.color || '#5b6fff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, size, 0, Math.PI * 2);
+      ctx.stroke();
+      drawPlanText(ctx, {
+        text: String(op.name || '?').charAt(0).toUpperCase(),
+        x: cx,
+        y: cy,
+        fill: op.color || '#5b6fff',
+        fontSize: size,
+        align: 'center',
+        baseline: 'middle',
+        fontWeight: 'bold',
+      });
+      ctx.restore();
+      return;
+    }
+    default:
+      throw new Error(`unknown render plan operation "${op.op}"`);
+  }
+}
+
+function drawRenderPlan(ctx, plan) {
+  for (const op of plan.ops) drawPlanOp(ctx, op);
+}
+
+/**
+ * Render a ScreenLayout/definition or Widget IR through the semantic adapter.
+ *
+ * The template path in `renderTemplate` is unchanged; this is an additive
+ * entry point used when a request supplies `{ir}` or `{layout}`.
+ */
+async function renderIr(input, data, width, height, format = 'png', options = {}) {
+  const plan = irToRenderPlan(input, {
+    ...(options || {}),
+    data: data || {},
+    width: width || options.width,
+    height: height || options.height,
+  });
+  const canvas = createCanvas(plan.width, plan.height);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = plan.background || '#0a0a0f';
+  ctx.fillRect(0, 0, plan.width, plan.height);
+  drawRenderPlan(ctx, plan);
+  if (format === 'jpeg') return canvas.toBuffer('image/jpeg');
+  if (format === 'svg') return Buffer.from(planToSvg(plan), 'utf8');
+  return canvas.toBuffer('image/png');
+}
+
+module.exports = {
+  renderTemplate,
+  renderIr,
+  drawRenderPlan,
+  listTemplates,
+  registerTemplate,
+};

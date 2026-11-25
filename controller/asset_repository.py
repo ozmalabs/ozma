@@ -673,6 +673,7 @@ class AssetIndex:
         self.etag: str = ""
         self.content_hash: str = ""
         self.signature: str = ""
+        self.signature_meta: dict[str, Any] = {}
         self.extra: dict[str, Any] = {}
         self._entries: list[AssetPackEntry] = []
         for entry in entries or []:
@@ -745,6 +746,12 @@ class AssetIndex:
         self.signature = (
             str(metadata.get("signature") or "") if isinstance(metadata, Mapping) else ""
         )
+        signature_meta = metadata.get("signature") if isinstance(metadata, Mapping) else None
+        if isinstance(signature_meta, Mapping):
+            self.signature = str(signature_meta.get("value") or "")
+            self.signature_meta = dict(signature_meta)
+        else:
+            self.signature_meta = {}
         known = {"schema", "last_sync", "etag", "content_hash", "hash", "signature",
                  "entries", "packs", "index"}
         self.extra = (
@@ -1994,8 +2001,19 @@ class AssetRepository:
 
         payload, raw = _response_payload(response)
         signature = ""
+        signed_payload = raw
         if isinstance(payload, Mapping):
-            signature = str(payload.get("signature") or "")
+            raw_signature = payload.get("signature")
+            if isinstance(raw_signature, Mapping):
+                # Connect indexes sign canonical JSON without the signature
+                # envelope; the controller must verify that same payload.
+                signature = str(raw_signature.get("value") or "")
+                unsigned = {
+                    key: value for key, value in payload.items() if key != "signature"
+                }
+                signed_payload = _canonical_json(unsigned)
+            else:
+                signature = str(raw_signature or "")
         if signature:
             if self.signature_verifier is None:
                 raise AssetSignatureError(
@@ -2003,7 +2021,7 @@ class AssetRepository:
                 )
             try:
                 valid = _invoke_verifier(
-                    self.signature_verifier, raw, signature, {}
+                    self.signature_verifier, signed_payload, signature, {}
                 )
             except Exception as exc:
                 raise AssetSignatureError(

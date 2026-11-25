@@ -1,0 +1,82 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "lang": "en",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": "Hello **Ozma**",
+      "weight": "Bolder",
+      "size": "Medium"
+    },
+    {
+      "type": "FactSet",
+      "facts": [
+        {"title": "Uptime", "value": "42d"},
+        {"title": "Node", "value": "alpha"}
+      ]
+    },
+    {
+      "type": "Image",
+      "url": "https://example.com/logo.png",
+      "altText": "Ozma logo"
+    },
+    {
+      "type": "Media",
+      "poster": "https://example.com/poster.png",
+      "sources": [
+        {"mimeType": "video/mp4", "url": "https://example.com/clip.mp4"}
+      ]
+    },
+    {
+      "type": "Container",
+      "items": [
+        {"type": "TextBlock", "text": "Inside container"},
+        {
+          "type": "ColumnSet",
+          "columns": [
+            {
+              "type": "Column",
+              "width": "1",
+              "items": [{"type": "TextBlock", "text": "Col A"}]
+            },
+            {
+              "type": "Column",
+              "width": "1",
+              "items": [{"type": "TextBlock", "text": "Col B"}]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "ActionSet",
+      "actions": [
+        {
+          "type": "Action.OpenUrl",
+          "title": "Docs",
+          "url": "https://example.com/docs"
+        },
+        {
+          "type": "Action.Submit",
+          "title": "Unsafe",
+          "data": {"script": "alert(1)"}
+        }
+      ]
+    },
+    {
+      "type": "Input.Text",
+      "id": "name",
+      "label": "Unsupported input"
+    },
+    {
+      "type": "RichTextBlock",
+      "inlines": [{"type": "TextRun", "text": "Unsupported rich"}]
+    }
+  ],
+  "actions": [
+    {"type": "Action.OpenUrl", "title": "Home", "url": "https://example.com/"}
+  ],
+  "metadata": {"fixture": true}
+}

@@ -1,0 +1,42 @@
+title: Fixture Dashboard
+views:
+  - title: Main
+    path: main
+    badges: []
+    cards:
+      - type: gauge
+        entity: sensor.cpu_temperature
+        name: CPU
+        unit: "°C"
+        min: 0
+        max: 100
+        tap_action:
+          action: more-info
+        vendor_extra: keep
+      - type: history-graph
+        entities:
+          - sensor.cpu_temperature
+          - entity: sensor.memory_usage
+            name: Memory
+        hours_to_show: 24
+      - type: markdown
+        content: |
+          **Hi** <script>alert(1)</script>
+          custom: kept
+      - type: button
+        entity: switch.office_light
+        tap_action:
+          action: toggle
+        icon: mdi:lightbulb
+      - type: picture-entity
+        entity: camera.front
+        image: /local/front.png
+      - type: entities
+        title: Sensors
+        entities:
+          - sensor.gpu_temp
+      - type: custom:mini-graph-card
+        entities:
+          - sensor.cpu_temperature
+        custom_option: opaque
+        style: "color: red"

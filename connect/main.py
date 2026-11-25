@@ -12,3 +12,17 @@ app.include_router(controllers_router)
 app.include_router(nodes_router)
 app.include_router(relay_router)
 app.include_router(billing_router)
+
+
+def _include_asset_routes() -> None:
+    """Install the shared asset router without making it a hard dependency."""
+    from connect.assets.router import router as assets_router
+
+    app.include_router(assets_router)
+
+
+try:
+    _include_asset_routes()
+except ImportError:
+    # Assets are optional in deployments that do not use the shared database.
+    pass

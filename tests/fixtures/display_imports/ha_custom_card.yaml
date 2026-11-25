@@ -1,0 +1,6 @@
+type: custom:button-card
+entity: light.kitchen
+custom_option:
+  deep: true
+tap_action:
+  action: toggle

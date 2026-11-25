@@ -1,0 +1,2 @@
+type: entities
+entities: !!python/object/apply:os.system ["echo pwned"]
