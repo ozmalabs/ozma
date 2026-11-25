@@ -63,6 +63,9 @@ class _FakeNodeHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 — http.server API
         self._handle("POST")
 
+    def do_DELETE(self) -> None:  # noqa: N802 — http.server API
+        self._handle("DELETE")
+
     def log_message(self, *args) -> None:
         pass
 
@@ -182,6 +185,9 @@ PROXY_CASES = [
     ("get", f"/api/v1/nodes/{NODE_ID}/hardware", None, "/hardware"),
     ("get", f"/api/v1/nodes/{NODE_ID}/hardware/summary", None, "/hardware/summary"),
     ("get", f"/api/v1/nodes/{NODE_ID}/hardware/sensors", None, "/hardware/sensors"),
+    ("get", f"/api/v1/nodes/{NODE_ID}/storage", None, "/storage"),
+    ("get", f"/api/v1/nodes/{NODE_ID}/apps", None, "/apps"),
+    ("get", f"/api/v1/nodes/{NODE_ID}/self", None, "/self"),
 ]
 
 
@@ -199,6 +205,21 @@ def test_proxy_sends_configured_bearer_token(
     record = fake_node.requests[-1]
     assert record["path"].startswith(node_path)
     assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_apps_proxy_forwards_limit_to_the_node(fake_node, tmp_path):
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+    client = _client(app)
+
+    response = client.get(f"/api/v1/nodes/{NODE_ID}/apps?limit=7")
+
+    assert response.status_code == 200, response.text
+    record = fake_node.requests[-1]
+    assert record["path"].startswith("/apps?limit=7")
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+    client.get(f"/api/v1/nodes/{NODE_ID}/apps?limit=1000")
+    assert fake_node.requests[-1]["path"].startswith("/apps?limit=100")
 
 
 def _typed_unsupported(capability: str, surface: str) -> dict:
@@ -311,6 +332,39 @@ def test_controller_only_surface_proxies_preserve_typed_unsupported(
     assert response.status_code == 501, response.text
     assert response.json() == expected
     assert response.headers["content-type"].startswith("application/json")
+    record = fake_node.requests[-1]
+    assert record["path"].startswith(node_path)
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+@pytest.mark.parametrize(
+    "url,node_path,code",
+    [
+        (f"/api/v1/nodes/{NODE_ID}/storage", "/storage", "storage.proc-unavailable"),
+        (f"/api/v1/nodes/{NODE_ID}/apps", "/apps", "apps.proc-unavailable"),
+        (f"/api/v1/nodes/{NODE_ID}/self", "/self", "self.proc-unavailable"),
+    ],
+)
+def test_host_surface_proxies_preserve_typed_errors(
+    fake_node, tmp_path, url, node_path, code
+):
+    expected = {
+        "ok": False,
+        "available": False,
+        "code": code,
+        "error": "procfs is not readable",
+    }
+    fake_node.responder = lambda _method, _record: (
+        503,
+        expected,
+        "application/json",
+    )
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(url)
+
+    assert response.status_code == 503, response.text
+    assert response.json() == expected
     record = fake_node.requests[-1]
     assert record["path"].startswith(node_path)
     assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
@@ -747,3 +801,124 @@ def test_software_inventory_ingest_is_exempt_from_controller_auth(fake_node, tmp
 
     read = client.get("/api/v1/software/hosts")
     assert read.status_code == 401
+
+
+def test_backup_status_proxy_preserves_real_json_without_token_leak(fake_node, tmp_path):
+    expected = {
+        "ok": True,
+        "supported": True,
+        "configured": True,
+        "restic": {"available": True, "program": "/usr/bin/restic"},
+        "repo": {"path": "/srv/ozma-backup", "state": "ready"},
+        "password": {"configured": True},
+        "sources": ["/srv/data"],
+        "restore_roots": ["/srv/restore"],
+        "last_snapshot": {"id": "a" * 64, "short_id": "a" * 8},
+        "snapshot_error": None,
+        "last_run": None,
+    }
+    fake_node.responder = lambda _method, _record: (200, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(f"/api/v1/backup/nodes/{NODE_ID}/status")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["path"] == "/backup/status"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_backup_proxy_preserves_typed_errors_without_token_leak(fake_node, tmp_path):
+    expected = {
+        "ok": False,
+        "supported": True,
+        "code": "backup.path-not-allowed",
+        "error": "the path is outside the configured backup allow-list",
+        "remediation": "Only paths below --backup-source roots are allowed.",
+    }
+    fake_node.responder = lambda _method, _record: (400, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/backup/nodes/{NODE_ID}/run",
+        json={"mode": "smart", "paths": ["/etc"], "tags": ["manual"]},
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["path"] == "/backup/run"
+    assert record["body"] == {
+        "mode": "smart",
+        "paths": ["/etc"],
+        "tags": ["manual"],
+    }
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_backup_snapshots_proxy_preserves_node_document(fake_node, tmp_path):
+    expected = {
+        "ok": True,
+        "snapshots": [{"id": "b" * 64, "short_id": "b" * 8, "tags": ["manual"]}],
+        "count": 1,
+        "total": 1,
+        "limit": 20,
+        "truncated": False,
+    }
+    fake_node.responder = lambda _method, _record: (200, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(
+        f"/api/v1/backup/nodes/{NODE_ID}/snapshots"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    assert fake_node.requests[-1]["path"] == "/backup/snapshots"
+
+
+def test_backup_delete_proxy_uses_delete_and_preserves_policy(fake_node, tmp_path):
+    snapshot_id = "c" * 64
+    expected = {
+        "ok": True,
+        "deleted": snapshot_id,
+        "pruned": True,
+        "policy": "exact-snapshot-only",
+    }
+    fake_node.responder = lambda _method, _record: (200, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).delete(
+        f"/api/v1/backup/nodes/{NODE_ID}/snapshots/{snapshot_id}"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "DELETE"
+    assert record["path"] == f"/backup/snapshots/{snapshot_id}"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_backup_init_proxy_preserves_typed_missing_binary(fake_node, tmp_path):
+    expected = {
+        "ok": False,
+        "supported": True,
+        "code": "backup.restic-missing",
+        "error": "the restic binary is not available",
+        "remediation": "Install restic or point --backup-restic at an executable.",
+    }
+    fake_node.responder = lambda _method, _record: (503, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(f"/api/v1/backup/nodes/{NODE_ID}/init")
+
+    assert response.status_code == 503, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    assert fake_node.requests[-1]["path"] == "/backup/init"

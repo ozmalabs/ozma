@@ -1674,7 +1674,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                                                      **_node_headers(node)},
                                             method="POST")
             else:
-                req = urllib.request.Request(url, headers=_node_headers(node))
+                req = urllib.request.Request(
+                    url, headers=_node_headers(node), method=method
+                )
             try:
                 with urllib.request.urlopen(req, timeout=5) as r:
                     payload = r.read()
@@ -1717,6 +1719,36 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             and isinstance(payload.get("capability"), str)
         )
 
+    def _is_typed_host_surface_error(payload: Any) -> bool:
+        """Whether a node body is a typed storage/apps/self failure.
+
+        The Rust node answers an unreadable procfs/source with
+        ``storage.proc-unavailable``, ``apps.proc-unavailable``, or
+        ``self.proc-unavailable``. Preserve that document and status instead of
+        flattening it into a generic controller 502.
+        """
+        return (
+            isinstance(payload, dict)
+            and isinstance(payload.get("code"), str)
+            and payload["code"].startswith(("storage.", "apps.", "self."))
+            and isinstance(payload.get("error"), str)
+        )
+
+    def _is_typed_backup_error(payload: Any) -> bool:
+        """Whether a node body is a typed local-backup failure.
+
+        The Rust provider uses stable ``backup.*`` codes for missing restic,
+        invalid repositories/passwords, allow-list rejections, restores that
+        escape their roots, and restic failures. Preserve those documents
+        instead of flattening them to a generic 502.
+        """
+        return (
+            isinstance(payload, dict)
+            and isinstance(payload.get("code"), str)
+            and payload["code"].startswith("backup.")
+            and isinstance(payload.get("error"), str)
+        )
+
     async def _proxy_node_surface(
         node_id: str, path: str, method: str = "GET", body: dict | None = None
     ) -> Any:
@@ -1731,7 +1763,30 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if status in (401, 403):
             raise HTTPException(status_code=502, detail=_node_auth_error(status))
         if status >= 400:
-            if _is_typed_unsupported(payload):
+            if _is_typed_unsupported(payload) or _is_typed_host_surface_error(payload):
+                return JSONResponse(status_code=status, content=payload)
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise HTTPException(
+                status_code=502,
+                detail=detail or f"Node returned HTTP {status}",
+            )
+        return payload
+
+    async def _proxy_backup_surface(
+        node_id: str, path: str, method: str = "GET", body: dict | None = None
+    ) -> Any:
+        """Proxy a local-backup surface without hiding real JSON or typed errors.
+
+        Success bodies are returned verbatim. A typed unsupported document or a
+        ``backup.*`` error keeps its node status/code/error/remediation. The node
+        bearer token is only sent in the request header and is never copied into
+        the response or error detail.
+        """
+        status, payload = await _proxy_node_response(node_id, path, method, body)
+        if status in (401, 403):
+            raise HTTPException(status_code=502, detail=_node_auth_error(status))
+        if status >= 400:
+            if _is_typed_unsupported(payload) or _is_typed_backup_error(payload):
                 return JSONResponse(status_code=status, content=payload)
             detail = payload.get("error") if isinstance(payload, dict) else None
             raise HTTPException(
@@ -4290,6 +4345,24 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def node_hardware_sensors(node_id: str, refresh: bool = False) -> Any:
         suffix = "?refresh=true" if refresh else ""
         return await _proxy_node_surface(node_id, f"/hardware/sensors{suffix}")
+
+    @app.get("/api/v1/nodes/{node_id}/storage")
+    async def node_storage(node_id: str) -> Any:
+        """Proxy a node's bounded mounted-block-filesystem report."""
+        return await _proxy_node_surface(node_id, "/storage")
+
+    @app.get("/api/v1/nodes/{node_id}/apps")
+    async def node_apps(node_id: str, limit: int | None = None) -> Any:
+        """Proxy a node's bounded process list; the node caps ``limit``."""
+        suffix = ""
+        if limit is not None:
+            suffix = f"?limit={max(1, min(limit, 100))}"
+        return await _proxy_node_surface(node_id, f"/apps{suffix}")
+
+    @app.get("/api/v1/nodes/{node_id}/self")
+    async def node_self(node_id: str) -> Any:
+        """Proxy a node process's bounded self-management report."""
+        return await _proxy_node_surface(node_id, "/self")
 
     @app.post("/api/v1/nodes/{node_id}/rpa/key")
     async def node_rpa_key(node_id: str, body: dict) -> dict[str, Any]:
@@ -10793,22 +10866,47 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(503, "Backup proxy not configured")
         return backup_nudge
 
+    @app.get("/api/v1/backup/nodes/{node_id}/status")
+    async def backup_node_status(request: Request, node_id: str) -> Any:
+        """Read the node's local restic repository and last-snapshot status."""
+        _require_scope(request, SCOPE_READ)
+        return await _proxy_backup_surface(node_id, "/backup/status")
+
+    @app.post("/api/v1/backup/nodes/{node_id}/init")
+    async def backup_node_init(request: Request, node_id: str) -> Any:
+        """Initialize a node's local restic repository (idempotent)."""
+        _require_scope(request, SCOPE_WRITE)
+        return await _proxy_backup_surface(node_id, "/backup/init", method="POST", body={})
+
     @app.get("/api/v1/backup/nodes/{node_id}/snapshots")
-    async def backup_node_snapshots(request: Request, node_id: str) -> dict[str, Any]:
+    async def backup_node_snapshots(request: Request, node_id: str) -> Any:
         """
         List Restic snapshots for a node.
 
-        Proxied to the node's agent API.  Requires the agent to be running and
-        reachable at the registered api_port.
+        Proxied to the node's local backup API. The Rust node returns
+        ``{"ok":true,"snapshots":[...]}``; keep that document verbatim. A Python
+        agent that returns a bare list keeps the historical wrapper.
         """
         _require_scope(request, SCOPE_READ)
-        result = await _proxy_node_surface(node_id, "/backup/snapshots")
+        result = await _proxy_backup_surface(node_id, "/backup/snapshots")
         if isinstance(result, JSONResponse):
             return result
-        if result is None:
-            raise HTTPException(503, f"Node {node_id!r} agent unreachable or backup not configured")
+        if isinstance(result, dict) and "snapshots" in result:
+            return result
         snapshots = result if isinstance(result, list) else [result]
         return {"snapshots": snapshots}
+
+    @app.delete("/api/v1/backup/nodes/{node_id}/snapshots/{snapshot_id}")
+    async def backup_node_snapshot_delete(
+        request: Request, node_id: str, snapshot_id: str,
+    ) -> Any:
+        """Forget one exact snapshot on a node; the node applies its own policy."""
+        _require_scope(request, SCOPE_WRITE)
+        return await _proxy_backup_surface(
+            node_id,
+            f"/backup/snapshots/{snapshot_id}",
+            method="DELETE",
+        )
 
     @app.get("/api/v1/backup/nodes/{node_id}/snapshots/{snapshot_id}/files")
     async def backup_node_snapshot_files(
@@ -10829,7 +10927,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"files": files}
 
     @app.post("/api/v1/backup/nodes/{node_id}/restore")
-    async def backup_node_restore(request: Request, node_id: str) -> dict[str, Any]:
+    async def backup_node_restore(request: Request, node_id: str) -> Any:
         """
         Trigger a selective restore on a node.
 
@@ -10838,29 +10936,22 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         """
         _require_scope(request, SCOPE_WRITE)
         body = await request.json()
-        result = await _proxy_node_surface(
+        return await _proxy_backup_surface(
             node_id, "/backup/restore", method="POST", body=body
         )
-        if isinstance(result, JSONResponse):
-            return result
-        if result is None:
-            raise HTTPException(503, f"Node {node_id!r} agent unreachable or restore failed")
-        return result
 
     @app.post("/api/v1/backup/nodes/{node_id}/run")
-    async def backup_node_run(request: Request, node_id: str) -> dict[str, Any]:
+    async def backup_node_run(request: Request, node_id: str) -> Any:
         """Trigger an on-demand backup on a node."""
         _require_scope(request, SCOPE_WRITE)
         body = await request.json()
-        mode = body.get("mode", "smart")
-        result = await _proxy_node_surface(
-            node_id, "/backup/run", method="POST", body={"mode": mode}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Backup run body must be a JSON object")
+        if "mode" not in body:
+            body = {**body, "mode": "smart"}
+        return await _proxy_backup_surface(
+            node_id, "/backup/run", method="POST", body=body
         )
-        if isinstance(result, JSONResponse):
-            return result
-        if result is None:
-            raise HTTPException(503, f"Node {node_id!r} agent unreachable")
-        return result
 
     @app.get("/api/v1/backup/nodes/{node_id}/apps")
     async def backup_node_apps(request: Request, node_id: str) -> dict[str, Any]:

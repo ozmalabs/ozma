@@ -895,6 +895,65 @@ pub struct Args {
     #[arg(long, env = "OZMA_SEATS_FILE", value_name = "PATH")]
     pub seats_file: Option<std::path::PathBuf>,
 
+    /// Opt in to the local Restic backup provider (`/backup/*`).
+    ///
+    /// Must be an absolute local repository path. Remote restic backends
+    /// (`s3:`, `sftp:`, `rest:`, …) are rejected. Requires
+    /// `--backup-password-file`; there are no default sources.
+    #[arg(
+        long,
+        env = "OZMA_BACKUP_REPO",
+        value_name = "PATH",
+        requires = "backup_password_file"
+    )]
+    pub backup_repo: Option<std::path::PathBuf>,
+
+    /// Absolute path to the restic repository password file (mode 0600).
+    ///
+    /// The contents are passed to restic through `RESTIC_PASSWORD_FILE`; the
+    /// password is never placed in argv, logs, or status JSON.
+    #[arg(
+        long,
+        env = "OZMA_BACKUP_PASSWORD_FILE",
+        value_name = "PATH",
+        requires = "backup_repo"
+    )]
+    pub backup_password_file: Option<std::path::PathBuf>,
+
+    /// Absolute directory allow-listed as a backup source. Repeatable.
+    ///
+    /// There are no default sources, and whole-system roots such as `/`, `/etc`,
+    /// `/home`, and `/var` are rejected. `POST /backup/run` can only select
+    /// paths equal to or below these roots.
+    #[arg(
+        long = "backup-source",
+        env = "OZMA_BACKUP_SOURCE",
+        value_name = "PATH",
+        requires = "backup_repo"
+    )]
+    pub backup_source: Vec<std::path::PathBuf>,
+
+    /// Absolute directory allow-listed as a restore target root. Repeatable.
+    ///
+    /// Restores require a target below one of these roots; symlinks and `..`
+    /// escapes are rejected.
+    #[arg(
+        long = "backup-restore-dir",
+        env = "OZMA_BACKUP_RESTORE_DIR",
+        value_name = "PATH",
+        requires = "backup_repo"
+    )]
+    pub backup_restore_dir: Vec<std::path::PathBuf>,
+
+    /// restic executable used by the local backup provider (default `restic`).
+    #[arg(
+        long,
+        env = "OZMA_BACKUP_RESTIC",
+        value_name = "PATH",
+        requires = "backup_repo"
+    )]
+    pub backup_restic: Option<std::path::PathBuf>,
+
     /// Enable the local HLS pipeline: capture → ffmpeg → `/stream/*`.
     ///
     /// Requires a video capture source and an ffmpeg binary. WebRTC is not
@@ -2689,6 +2748,42 @@ async fn run() -> std::process::ExitCode {
         capabilities.capture.first(),
     );
     let hardware_state = ozma_node::hardware::HardwareState::new();
+    let backup_service = match args.backup_repo.clone() {
+        None => None,
+        Some(repo) => {
+            let config = ozma_node::backup::BackupConfig {
+                repo,
+                password_file: args.backup_password_file.clone().unwrap_or_default(),
+                sources: args.backup_source.clone(),
+                restore_roots: args.backup_restore_dir.clone(),
+                restic_bin: args
+                    .backup_restic
+                    .clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from("restic")),
+                timeouts: ozma_node::backup::BackupTimeouts::default(),
+            };
+            match ozma_node::backup::BackupService::new(config) {
+                Ok(service) => {
+                    info!(
+                        repo = %service.config().repo.display(),
+                        sources = service.config().sources.len(),
+                        restore_roots = service.config().restore_roots.len(),
+                        "local backup provider configured"
+                    );
+                    Some(service)
+                }
+                Err(error) => {
+                    error!(
+                        code = error.code(),
+                        error = %error,
+                        remediation = error.remediation(),
+                        "invalid local backup configuration"
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+    };
     let desktop_controls = (config.profile == NodeProfile::Desktop).then(|| {
         let x11_display = config
             .x11_display
@@ -2723,7 +2818,8 @@ async fn run() -> std::process::ExitCode {
             .with_capture(capture_status)
             .with_hardware(hardware_state.clone())
             .with_vnc_registration(vnc_registration)
-            .with_desktop_controls(desktop_controls);
+            .with_desktop_controls(desktop_controls)
+            .with_backup(backup_service);
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with
     // `--api-token`. See `controller_compat::{compat_router, public_router}`.
@@ -3857,13 +3953,23 @@ async fn probe_audio_server() -> Result<(), String> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.trim();
-    let detail = if stderr.is_empty() {
-        format!("exit status {}", output.status)
-    } else {
-        format!("exit status {}: {stderr}", output.status)
-    };
+    let detail = probe_failure_detail(&output.status, &stderr);
     Err(format!("`pactl info` failed with {detail}"))
+}
+
+/// Render a failed `pactl info` probe without repeating its status prefix.
+///
+/// `ExitStatus` already displays as `exit status: 1`, so prepending
+/// `exit status` produced `exit status exit status: 1` in
+/// `/api/v1/connection.audio_error` and the typed 503 body. stderr is
+/// collapsed to one line because it is embedded in JSON.
+fn probe_failure_detail(status: &impl std::fmt::Display, stderr: &str) -> String {
+    let stderr = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    if stderr.is_empty() {
+        format!("{status}")
+    } else {
+        format!("{status}: {stderr}")
+    }
 }
 
 /// Whether an executable named `name` exists on `PATH`.
@@ -4247,6 +4353,25 @@ pub fn node_id_for(name: &str) -> NodeId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_failure_detail_does_not_repeat_the_status_prefix() {
+        assert_eq!(
+            probe_failure_detail(&"exit status: 1", "Connection refused\n"),
+            "exit status: 1: Connection refused"
+        );
+        assert_eq!(
+            probe_failure_detail(
+                &"exit status: 1",
+                "  Connection failure:\nConnection refused \n"
+            ),
+            "exit status: 1: Connection failure: Connection refused"
+        );
+        assert_eq!(
+            probe_failure_detail(&"exit status: 1", ""),
+            "exit status: 1"
+        );
+    }
 
     #[test]
     fn webrtc_is_disabled_by_default() {

@@ -47,6 +47,10 @@ commit. The controller pytest ran against the checkout's unchanged Python tree.
 - QEMU with KVM (`/dev/kvm` writable), ffmpeg n9.1, avahi-daemon active,
   PipeWire/PulseAudio reachable through `pactl`, Firefox available for headless
   dashboard verification.
+- Route-level `/audio/*` validation (apply/remove/play/stop, null-sink monitor
+  capture, controller proxy) was run separately against the host graph; see
+  [`phase4-audio-live-report.md`](phase4-audio-live-report.md). The demo below
+  used monitor audio but did not exercise these control routes.
 - Two disposable direct-QEMU Alpine 3.21.3 VMs from `demo/start_vms.sh`
   (no libvirt domains, no sudo; a PATH `sudo` shim made `v4l2loopback` setup
   fail non-fatally).

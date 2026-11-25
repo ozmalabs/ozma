@@ -73,9 +73,11 @@
 //!   unmuted, and a profile that only recorded a sink runs no command. An
 //!   unknown profile id is a successful no-op.
 //! - [`AudioRouter::play_reference`] stops any previous playback, checks that
-//!   the resolved track file exists, then spawns the player. It returns once
-//!   the child is running. [`AudioRouter::stop_playback`] kills and reaps the
-//!   child and is a no-op when nothing is playing.
+//!   the resolved track file exists and that the named sink exists, then spawns
+//!   the player. The sink check is required because `pw-play --target` and
+//!   `paplay --device` fall back to the default sink when the name is unknown.
+//!   It returns once the child is running. [`AudioRouter::stop_playback`] kills
+//!   and reaps the child and is a no-op when nothing is playing.
 
 use std::{
     collections::HashMap,
@@ -1228,6 +1230,21 @@ impl RouterCore {
             });
         }
 
+        // `pw-play --target` and `paplay --device` silently fall back to the
+        // default sink when the named sink is missing, so spawning without this
+        // check reported `ok` and played on the user's speakers instead.
+        if !self.sink_exists(&spec.sink).await? {
+            return Err(AudioError::Refused {
+                operation: "play_reference".to_owned(),
+                reason: format!("playback sink `{}` does not exist", spec.sink),
+                remediation: "Create the sink first (`AudioRouter::ensure_sink` or \
+                              `ozma-node --audio-sink <name>`), or pass an existing sink name. \
+                              No player was started; pw-play/paplay would otherwise fall back \
+                              to the default sink."
+                    .to_owned(),
+            });
+        }
+
         self.stop_playback().await?;
         let argv = self.tool.argv(&spec.sink, &path);
         let child = self.runner.spawn(&argv).await?;
@@ -2340,7 +2357,7 @@ mod tests {
     #[tokio::test]
     async fn pipewire_playback_spawns_pw_play_and_stop_kills_the_child() {
         let track = TempTrack::new("sweep.flac");
-        let fake = Arc::new(FakeRunner::default());
+        let fake = Arc::new(FakeRunner::with_responses(vec![Ok(sink_list("ozma-vm1"))]));
         let router = PipeWireAudioRouter::with_config(
             fake.clone(),
             RouterConfig::default().with_track_root(&track.dir),
@@ -2373,7 +2390,7 @@ mod tests {
     #[tokio::test]
     async fn pulseaudio_playback_uses_paplay_device_flag() {
         let track = TempTrack::new("sweep.wav");
-        let fake = Arc::new(FakeRunner::default());
+        let fake = Arc::new(FakeRunner::with_responses(vec![Ok(sink_list("ozma-vm2"))]));
         let router = PulseAudioAudioRouter::with_config(
             fake.clone(),
             RouterConfig::default().with_track_root(&track.dir),
@@ -2410,6 +2427,38 @@ mod tests {
 
         assert!(matches!(error, AudioError::TrackNotFound { .. }));
         assert!(fake.spawns().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_playback_sink_is_refused_and_does_not_spawn() {
+        let track = TempTrack::new("present.flac");
+        // The empty sink list means `play_reference` must refuse before spawning.
+        let fake = Arc::new(FakeRunner::with_responses(vec![Ok(
+            CommandOutput::success(""),
+        )]));
+        let router = PipeWireAudioRouter::with_config(
+            fake.clone(),
+            RouterConfig::default().with_track_root(&track.dir),
+        );
+
+        let error = router
+            .play_reference(AudioPlaybackSpec::new(&track.name, "ozma-absent").unwrap())
+            .await
+            .unwrap_err();
+
+        match error {
+            AudioError::Refused {
+                operation, reason, ..
+            } => {
+                assert_eq!(operation, "play_reference");
+                assert!(reason.contains("ozma-absent"), "{reason}");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(
+            fake.spawns().is_empty(),
+            "a missing sink must not reach pw-play/paplay"
+        );
     }
 
     #[test]

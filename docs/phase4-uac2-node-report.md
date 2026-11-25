@@ -154,9 +154,13 @@ OZMA_AUDIO_TEST_DEVICE=default \
    2 playback / 1 capture channels, 48 kHz, S16. The adapters support
    S16/S24_3/S32 and 1–8 channels, but no node CLI selects them yet. PipeWire
    adapters intentionally accept S16 only.
-4. **PipeWire live validation.** The wrappers compile and are covered by
+4. **PipeWire adapter live validation.** The wrappers compile and are covered by
    conversion/bounds logic, but no live PipeWire graph (S16/F32 conversion,
-   monitor capture, underrun behaviour) was run in this task.
+   monitor capture, underrun behaviour) was run for the UAC2 adapters. The
+   separate `/audio/*` routing path (`pactl`/`pw-play`, null-sink monitor
+   capture) was live-validated in
+   [`phase4-audio-live-report.md`](phase4-audio-live-report.md); that run does
+   not exercise these UAC2 wrappers.
 5. **Hotplug.** The legacy `usb_audio` watcher reopens on card
    disappearance/reappearance. The new runtime probes once at startup and
    reports a typed unsupported/error state; it does not recreate a bridge after

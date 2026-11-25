@@ -3465,7 +3465,7 @@ pub struct ControllerSurface {
     pub remediation: &'static str,
 }
 
-/// RPA sub-surfaces this node now implements for real.
+/// Controller surfaces this node implements for real (RPA and local backup).
 ///
 /// These are advertised alongside [`CONTROLLER_ONLY_SURFACES`] so a controller
 /// can tell an implemented primitive from a typed 501 without probing.
@@ -3510,6 +3510,66 @@ pub const RPA_IMPLEMENTED_SURFACES: &[ControllerSurface] = &[
         code: "rpa.ocr",
         remediation: "",
     },
+    ControllerSurface {
+        surface: "/backup/status",
+        capability: "backup.status",
+        supported: true,
+        reason: "Reports the configured local restic repository state and last snapshot without exposing the password.",
+        python_reference: "agent/backup.py::BackupManager.get_status",
+        path_prefix: "/backup/status",
+        code: "backup.status",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/backup/init",
+        capability: "backup.init",
+        supported: true,
+        reason: "Initializes the configured local repository idempotently with RESTIC_PASSWORD_FILE.",
+        python_reference: "agent/backup.py::BackupManager._ensure_repo_init",
+        path_prefix: "/backup/init",
+        code: "backup.init",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/backup/run",
+        capability: "backup.run",
+        supported: true,
+        reason: "Runs a bounded restic backup over allow-listed --backup-source paths and returns the JSON summary.",
+        python_reference: "agent/backup.py::BackupManager.run_backup",
+        path_prefix: "/backup/run",
+        code: "backup.run",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/backup/snapshots",
+        capability: "backup.snapshots",
+        supported: true,
+        reason: "Lists a bounded, secret-free restic snapshot document.",
+        python_reference: "agent/backup.py::BackupManager.list_snapshots",
+        path_prefix: "/backup/snapshots",
+        code: "backup.snapshots",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/backup/restore",
+        capability: "backup.restore",
+        supported: true,
+        reason: "Restores an explicit snapshot below an allow-listed --backup-restore-dir.",
+        python_reference: "agent/backup.py::BackupManager.restore",
+        path_prefix: "/backup/restore",
+        code: "backup.restore",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/backup/snapshots/{id}",
+        capability: "backup.delete",
+        supported: true,
+        reason: "Forgets one exact snapshot and prunes only unreferenced data; no retention policy is applied.",
+        python_reference: "agent/backup.py::BackupManager._prune",
+        path_prefix: "/backup/snapshots",
+        code: "backup.delete",
+        remediation: "",
+    },
 ];
 
 /// Controller-only surfaces that this node advertises as unsupported.
@@ -3535,12 +3595,11 @@ pub const CONTROLLER_ONLY_SURFACES: &[ControllerSurface] = &[
         surface: "/backup/*",
         capability: "backup",
         supported: false,
-        reason: "This node has no Restic backup manager or agent backup API.",
+        reason: "Only local status/init/run/snapshots/restore/delete are implemented; app inventory, config writes, estimate, verify, onboarding, and cloud destinations remain unsupported.",
         python_reference: "agent/backup.py (agent/ozma_desktop_agent.py)",
         path_prefix: "/backup",
         code: "backup.unsupported",
-        remediation: "Run the Python desktop agent with restic on the target, or manage backups \
-                      outside this node; this node does not claim a snapshot or restore.",
+        remediation: "Use /backup/status|init|run|snapshots|restore and DELETE /backup/snapshots/{id}, or run the Python desktop agent with restic for app inventory, cloud destinations, verification, and scheduling.",
     },
     ControllerSurface {
         surface: "/ui/windows",
@@ -3642,6 +3701,9 @@ pub struct ConnectionState {
     /// Optional deep hardware sampler used to enrich `/agent/metrics` with
     /// the documented AIDA64 sensor IDs.
     pub hardware: Option<crate::hardware::HardwareState>,
+    /// Bounded read-only storage/process/self surfaces and their startup
+    /// availability advertisement.
+    pub host_surfaces: crate::host_surfaces::HostSurfacesState,
     /// Controller-facing display outputs (VM consoles or raw host outputs).
     pub display_outputs: serde_json::Value,
     /// Live capture console/provider and any multi-console limitation.
@@ -3669,6 +3731,10 @@ pub struct ConnectionState {
     /// profiles keeps those routes at a typed 501; on `desktop` it is always
     /// attached and reports tool absence through typed 503s.
     pub desktop_controls: Option<crate::desktop_compat::DesktopControls>,
+    /// Opt-in local Restic backup provider. `None` means no `--backup-repo`
+    /// was configured; core `/backup/*` routes then answer a typed 503 and
+    /// unsupported sub-surfaces stay typed 501.
+    pub backup: Option<crate::backup::BackupService>,
 }
 
 /// Registration view of the optional internal RFB listener.
@@ -3722,6 +3788,10 @@ impl ConnectionState {
     }
 
     pub fn new(info: ConnectionInfo, stats: CompatStats) -> Self {
+        let host_surfaces = crate::host_surfaces::HostSurfacesState::host_with_identity(
+            info.node_id.clone(),
+            info.profile.clone(),
+        );
         Self {
             info,
             stats,
@@ -3740,6 +3810,7 @@ impl ConnectionState {
             video_streams: VideoStreams::default(),
             metrics: crate::agent_metrics::AgentMetricsSampler::default(),
             hardware: None,
+            host_surfaces,
             display_outputs: serde_json::json!([]),
             display_capture: DisplayCaptureStatus::default(),
             display_control: None,
@@ -3749,6 +3820,7 @@ impl ConnectionState {
             capture: CaptureStatus::default(),
             vnc_registration: None,
             desktop_controls: None,
+            backup: None,
         }
     }
 
@@ -3954,6 +4026,16 @@ impl ConnectionState {
         self
     }
 
+    /// Attach the opt-in local Restic backup provider.
+    ///
+    /// Without it, `GET /backup/status` reports `configured:false`, core
+    /// `/backup/*` operations return a typed 503, and app/config/cloud
+    /// sub-surfaces remain typed 501s.
+    pub fn with_backup(mut self, backup: Option<crate::backup::BackupService>) -> Self {
+        self.backup = backup;
+        self
+    }
+
     /// Attach the one-shot display snapshot control.
     ///
     /// `None` keeps `GET /display/snapshot` at a typed 503; attaching an empty
@@ -4067,6 +4149,11 @@ pub struct ConnectionResponse {
     /// with a typed 501). The controller can read this document instead of
     /// probing every proxy and guessing from a 404 or timeout.
     pub controller_surfaces: Vec<ControllerSurface>,
+    /// Bounded host-surface availability (`storage`, `apps`, `self`).
+    ///
+    /// Discovery only: availability comes from cheap startup procfs opens, and
+    /// the document never contains a mount list, process list, pid, or RSS.
+    pub host_surfaces: crate::host_surfaces::HostSurfaceAdvertisement,
     /// Desktop-profile geometry/clipboard/wallpaper availability. Omitted on
     /// other profiles. Availability is a `PATH` lookup, not a probe command.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4095,6 +4182,8 @@ pub fn compat_router(state: ConnectionState) -> Router {
         .merge(usb_router(state.clone()))
         .merge(display_router(state.clone()))
         .merge(crate::desktop_compat::router(state.clone()))
+        .merge(crate::host_surfaces::router(state.host_surfaces.clone()))
+        .merge(crate::backup::router(state.backup.clone()))
         .merge(legacy_router(state))
 }
 
@@ -4433,6 +4522,7 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
             .chain(CONTROLLER_ONLY_SURFACES)
             .copied()
             .collect(),
+        host_surfaces: state.host_surfaces.advertisement(),
         desktop_controls: state
             .desktop_controls
             .as_ref()
@@ -9604,6 +9694,11 @@ mod tests {
         assert_eq!(body["api_port"], 7382);
         assert_eq!(body["hid_udp_port"], 7331);
         assert_eq!(body["hls"], "not-configured");
+        assert_eq!(body["host_surfaces"]["storage"]["supported"], true);
+        assert_eq!(body["host_surfaces"]["storage"]["path"], "/storage");
+        assert_eq!(body["host_surfaces"]["storage"]["guarded"], true);
+        assert_eq!(body["host_surfaces"]["apps"]["limit"], 100);
+        assert_eq!(body["host_surfaces"]["self"]["path"], "/self");
 
         // The desktop profile's legacy /status alias is the same document.
         let (status, alias) = get_json(&app, "/status").await;
@@ -9664,8 +9759,9 @@ mod tests {
             ("/api/v1/rpa/screen", "GET", "rpa.unsupported"),
             ("/api/v1/rpa/script", "POST", "rpa.unsupported"),
             ("/api/v1/rpa/enter_bios", "POST", "rpa.unsupported"),
-            ("/backup/snapshots", "GET", "backup.unsupported"),
-            ("/backup/run", "POST", "backup.unsupported"),
+            ("/backup/apps", "GET", "backup.unsupported"),
+            ("/backup/config", "GET", "backup.unsupported"),
+            ("/backup/apps/restore", "POST", "backup.unsupported"),
         ] {
             let response = app
                 .clone()
@@ -9685,6 +9781,63 @@ mod tests {
             assert_eq!(body["code"], expected, "{uri}");
             assert!(body["error"].is_string(), "{uri}");
             assert!(body["remediation"].is_string(), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_core_is_typed_not_configured_without_a_repo() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        );
+        let app = compat_router(state);
+
+        let (status, body) = get_json(&app, "/backup/status").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["supported"], true);
+        assert_eq!(body["configured"], false);
+        assert_eq!(body["repo"]["state"], "unconfigured");
+        assert!(body["last_snapshot"].is_null());
+
+        for (uri, method) in [
+            ("/backup/init", "POST"),
+            ("/backup/run", "POST"),
+            ("/backup/snapshots", "GET"),
+            ("/backup/restore", "POST"),
+            ("/backup/snapshots/0123456789abcdef", "DELETE"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["code"], "backup.not-configured", "{uri}");
+            assert_eq!(body["supported"], true, "{uri}");
+            assert!(
+                !body
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("restic_password"),
+                "{uri}"
+            );
         }
     }
 
@@ -9713,6 +9866,12 @@ mod tests {
             ("/api/v1/rpa/key", "rpa.key"),
             ("/api/v1/rpa/screenshot", "rpa.screenshot"),
             ("/api/v1/rpa/ocr", "rpa.ocr"),
+            ("/backup/status", "backup.status"),
+            ("/backup/init", "backup.init"),
+            ("/backup/run", "backup.run"),
+            ("/backup/snapshots", "backup.snapshots"),
+            ("/backup/restore", "backup.restore"),
+            ("/backup/snapshots/{id}", "backup.delete"),
         ];
         let unsupported = [
             ("/api/v1/rpa/*", "rpa"),
@@ -9758,8 +9917,9 @@ mod tests {
             ("/api/v1/rpa/set_boot_usb", "POST", "rpa"),
             ("/api/v1/rpa/wait_for_text", "POST", "rpa"),
             ("/api/v1/rpa/click", "POST", "rpa"),
-            ("/backup/snapshots", "GET", "backup"),
-            ("/backup/restore", "POST", "backup"),
+            ("/backup/apps", "GET", "backup"),
+            ("/backup/config", "GET", "backup"),
+            ("/backup/apps/restore", "POST", "backup"),
             ("/ui/windows", "GET", "ui_windows"),
             ("/serial/state", "GET", "serial"),
             ("/rgb/state", "GET", "rgb"),
@@ -13687,6 +13847,12 @@ mod tests {
             ("GET", "/usb/nbd", None),
             ("POST", "/usb/nbd/start", Some(serde_json::json!({}))),
             ("POST", "/usb/nbd/stop", Some(serde_json::json!({}))),
+            ("GET", "/storage", None),
+            ("GET", "/api/v1/storage", None),
+            ("GET", "/apps?limit=5", None),
+            ("GET", "/api/v1/apps", None),
+            ("GET", "/self", None),
+            ("GET", "/api/v1/self", None),
             ("GET", "/api/v1/rpa/screen", None),
             (
                 "POST",
