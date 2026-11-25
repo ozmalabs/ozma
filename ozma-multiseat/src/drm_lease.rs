@@ -11,7 +11,8 @@
 //! a compositor, program scanout, move an X output, or isolate the host's
 //! desktop. A seat that requests a lease receives an owned lessee fd and a typed
 //! status note saying exactly that. The default multi-seat display backend is
-//! still `shared`.
+//! still `shared`. For an opt-in scanout proof layered on the lease, see
+//! [`crate::drm_scanout`]; it proves one static framebuffer, not a compositor.
 //!
 //! Card selection is conservative. [`DrmCardSelector::AutoVirtual`] only picks
 //! a card whose sysfs driver is `vkms`; a real GPU/card is leased only when the
@@ -24,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
@@ -311,6 +312,14 @@ pub trait DrmLeaseHandle: Send {
     fn plane_ids(&self) -> &[u32];
     /// Lessee fd number while the lease is active.
     fn fd(&self) -> Option<RawFd>;
+    /// Borrowed lessee fd while the lease is active.
+    ///
+    /// This is the safe handle used by KMS operations that must run as the
+    /// lessee (for example the opt-in scanout proof). It is `None` after
+    /// revoke/drop.
+    fn as_fd(&self) -> Option<BorrowedFd<'_>> {
+        None
+    }
     /// Set or clear `FD_CLOEXEC` for child fd inheritance.
     fn set_inheritable(&self, inheritable: bool) -> Result<(), DrmLeaseError>;
     /// Query the kernel for the lease's object IDs.
@@ -1379,6 +1388,10 @@ mod real {
 
         fn fd(&self) -> Option<RawFd> {
             self.fd.as_ref().map(AsRawFd::as_raw_fd)
+        }
+
+        fn as_fd(&self) -> Option<BorrowedFd<'_>> {
+            self.fd.as_ref().map(AsFd::as_fd)
         }
 
         fn set_inheritable(&self, inheritable: bool) -> Result<(), DrmLeaseError> {

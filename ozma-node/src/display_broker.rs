@@ -432,10 +432,13 @@ impl ConsoleBroker {
                 .retryable(),
             )
         })?;
-        let control = SnapshotControl::new(registry)
+        let mut control = SnapshotControl::new(registry)
             .with_timeout(self.inner.config.snapshot_timeout)
             .with_quality(self.inner.config.jpeg_quality)
             .with_source_cache(true);
+        if let Some(source_id) = self.inner.factory.source_id() {
+            control = control.with_source_id(source_id);
+        }
         entries.insert(
             console,
             BrokerEntry {

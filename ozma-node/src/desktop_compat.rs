@@ -27,6 +27,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,6 +64,19 @@ pub const BACKGROUND_GRACE: Duration = Duration::from_millis(750);
 pub const MAX_DISPLAY_COORDINATE: i32 = 65_535;
 /// Files larger than this are not read while checking the wallpaper format.
 const WALLPAPER_MAGIC_BYTES: usize = 12;
+/// How long after the direct child exits the runner waits for inherited
+/// stdout/stderr pipes to reach EOF.
+///
+/// `xclip -i`/`xsel -i` fork a selection-owner child that inherits both pipes and
+/// keeps them open for the lifetime of the clipboard owner. Treating pipe EOF as
+/// command completion would therefore wait forever (and return a false timeout).
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(150);
+/// Environment variable tagging the selection-owner process tree started by
+/// this node. It lets shutdown/replacement find an owner even when the tool
+/// daemonizes into a new session (where a process-group kill cannot reach it).
+const SELECTION_OWNER_ENV: &str = "OZMA_CLIPBOARD_OWNER";
+/// Monotonic suffix for selection-owner markers.
+static OWNER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Typed failure from the process boundary.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -118,6 +132,12 @@ pub struct CommandRequest {
     pub args: Vec<String>,
     /// Optional bounded stdin payload.
     pub stdin: Option<Vec<u8>>,
+    /// Extra environment variables (for example `DISPLAY`) for the child.
+    pub env: Vec<(String, String)>,
+    /// Start the child in a new process group so it and any forked selection
+    /// owner can be terminated together. The group id is returned in
+    /// [`CommandOutput::group_id`].
+    pub isolate_process_group: bool,
     /// Per-command deadline.
     pub timeout: Duration,
     /// Maximum retained stdout bytes.
@@ -133,6 +153,8 @@ impl CommandRequest {
             program: program.into(),
             args,
             stdin: None,
+            env: Vec::new(),
+            isolate_process_group: false,
             timeout: COMMAND_TIMEOUT,
             max_stdout: MAX_COMMAND_STDOUT,
             max_stderr: MAX_COMMAND_STDERR,
@@ -142,6 +164,18 @@ impl CommandRequest {
     /// Attach a bounded stdin payload.
     pub fn with_stdin(mut self, stdin: Vec<u8>) -> Self {
         self.stdin = Some(stdin);
+        self
+    }
+
+    /// Add one environment variable for the child.
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Start the child in its own process group.
+    pub fn with_process_group(mut self, isolate: bool) -> Self {
+        self.isolate_process_group = isolate;
         self
     }
 }
@@ -157,6 +191,12 @@ pub struct CommandOutput {
     pub stderr: String,
     /// Whether stdout exceeded the requested bound.
     pub stdout_truncated: bool,
+    /// Process-group id when [`CommandRequest::isolate_process_group`] was set.
+    ///
+    /// The direct child is the group leader. A tool that forks a long-lived
+    /// helper (X11 clipboard owners) leaves that helper in this group unless it
+    /// daemonizes into a new session.
+    pub group_id: Option<u32>,
 }
 
 impl CommandOutput {
@@ -263,6 +303,50 @@ where
     Ok((buffer, truncated))
 }
 
+#[derive(Default)]
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+type SharedOutput = Arc<Mutex<CapturedOutput>>;
+
+/// Read into a shared buffer so a bounded drain grace can keep whatever the
+/// direct child wrote before an inherited pipe was closed.
+async fn read_into_shared<R>(mut reader: R, limit: usize, output: SharedOutput)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        let mut captured = output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if captured.truncated {
+            break;
+        }
+        let remaining = limit.saturating_sub(captured.bytes.len());
+        if read > remaining {
+            captured.bytes.extend_from_slice(&chunk[..remaining]);
+            captured.truncated = true;
+            break;
+        }
+        captured.bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn snapshot_output(output: &SharedOutput) -> (Vec<u8>, bool) {
+    let captured = output
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    (captured.bytes.clone(), captured.truncated)
+}
+
 #[async_trait]
 impl CommandRunner for SystemCommandRunner {
     fn lookup(&self, program: &str) -> Option<PathBuf> {
@@ -282,9 +366,16 @@ impl CommandRunner for SystemCommandRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        for (key, value) in &request.env {
+            command.env(key, value);
+        }
+        if request.isolate_process_group {
+            command.process_group(0);
+        }
         let mut child = command
             .spawn()
             .map_err(|error| CommandError::spawn(&program, error))?;
+        let group_id = request.isolate_process_group.then(|| child.id()).flatten();
 
         if let Some(stdin) = request.stdin {
             if let Some(mut handle) = child.stdin.take() {
@@ -297,52 +388,73 @@ impl CommandRunner for SystemCommandRunner {
             }
         }
 
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
         let max_stdout = request.max_stdout;
         let max_stderr = request.max_stderr;
+        let stdout_output = Arc::new(Mutex::new(CapturedOutput::default()));
+        let stderr_output = Arc::new(Mutex::new(CapturedOutput::default()));
+        let mut stdout_task = child.stdout.take().map(|reader| {
+            let output = stdout_output.clone();
+            tokio::spawn(read_into_shared(reader, max_stdout, output))
+        });
+        let mut stderr_task = child.stderr.take().map(|reader| {
+            let output = stderr_output.clone();
+            tokio::spawn(read_into_shared(reader, max_stderr, output))
+        });
         let timeout_program = program.clone();
         let program_for_wait = program.clone();
-        let wait = async move {
-            let (stdout_result, stderr_result, status_result) = tokio::join!(
-                async move {
-                    match stdout {
-                        Some(reader) => read_limited(reader, max_stdout).await,
-                        None => Ok((Vec::new(), false)),
-                    }
-                },
-                async move {
-                    match stderr {
-                        Some(reader) => read_limited(reader, max_stderr).await,
-                        None => Ok((Vec::new(), false)),
-                    }
-                },
-                async move {
-                    child
-                        .wait()
-                        .await
-                        .map_err(|error| CommandError::io(&program_for_wait, error))
+
+        // Command completion is the direct child's exit, not pipe EOF: tools
+        // such as `xclip -i` fork a selection owner that inherits stdout/stderr
+        // and stays alive. Readers run concurrently (so a large output cannot
+        // deadlock the child) and are given a short bounded grace after exit.
+        let status = match tokio::time::timeout(request.timeout, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                if let Some(group_id) = group_id {
+                    terminate_process_group(group_id);
                 }
-            );
-            let (stdout, stdout_truncated) =
-                stdout_result.map_err(|error| CommandError::io(&program, error))?;
-            let (stderr, _) = stderr_result.map_err(|error| CommandError::io(&program, error))?;
-            let status = status_result?;
-            Ok::<CommandOutput, CommandError>(CommandOutput {
-                status: status.code(),
-                stdout,
-                stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                stdout_truncated,
-            })
+                return Err(CommandError::io(&program_for_wait, error));
+            }
+            Err(_) => {
+                if let Some(group_id) = group_id {
+                    terminate_process_group(group_id);
+                }
+                return Err(CommandError::Timeout {
+                    program: timeout_program,
+                    timeout_ms: request.timeout.as_millis(),
+                });
+            }
         };
 
-        match tokio::time::timeout(request.timeout, wait).await {
-            Ok(result) => result,
-            Err(_) => Err(CommandError::Timeout {
-                program: timeout_program,
-                timeout_ms: request.timeout.as_millis(),
-            }),
+        let drain = async {
+            if let Some(task) = stdout_task.as_mut() {
+                let _ = task.await;
+            }
+            if let Some(task) = stderr_task.as_mut() {
+                let _ = task.await;
+            }
+        };
+        if tokio::time::timeout(OUTPUT_DRAIN_GRACE, drain)
+            .await
+            .is_err()
+        {
+            if let Some(task) = stdout_task.as_ref() {
+                task.abort();
+            }
+            if let Some(task) = stderr_task.as_ref() {
+                task.abort();
+            }
         }
+        let (stdout, stdout_truncated) = snapshot_output(&stdout_output);
+        let (stderr, _) = snapshot_output(&stderr_output);
+
+        Ok(CommandOutput {
+            status: status.code(),
+            stdout,
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            stdout_truncated,
+            group_id,
+        })
     }
 
     async fn spawn_background(
@@ -358,6 +470,9 @@ impl CommandRunner for SystemCommandRunner {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        for (key, value) in &request.env {
+            command.env(key, value);
+        }
         let mut child = command
             .spawn()
             .map_err(|error| CommandError::spawn(&program, error))?;
@@ -375,7 +490,17 @@ impl CommandRunner for SystemCommandRunner {
             Ok(status) => {
                 let status = status.map_err(|error| CommandError::io(&program, error))?;
                 let stderr = match stderr_task {
-                    Some(task) => task.await.unwrap_or_default(),
+                    Some(mut task) => {
+                        match tokio::time::timeout(OUTPUT_DRAIN_GRACE, &mut task).await {
+                            Ok(joined) => joined.unwrap_or_default(),
+                            Err(_) => {
+                                // A forked helper still holds stderr; the direct
+                                // child's exit is the completion signal.
+                                task.abort();
+                                String::new()
+                            }
+                        }
+                    }
                     None => String::new(),
                 };
                 Ok(BackgroundOutcome::Exited(CommandOutput {
@@ -383,6 +508,7 @@ impl CommandRunner for SystemCommandRunner {
                     stdout: Vec::new(),
                     stderr,
                     stdout_truncated: false,
+                    group_id: None,
                 }))
             }
             Err(_) => Ok(BackgroundOutcome::Running(Box::new(SystemBackground {
@@ -405,6 +531,146 @@ impl BackgroundHandle for SystemBackground {
             task.abort();
         }
     }
+}
+
+/// A process tree this node started for a long-lived desktop setting.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessOwner {
+    /// Group id returned by the direct child, when it was isolated.
+    pub group_id: Option<u32>,
+    /// Marker carried in [`SELECTION_OWNER_ENV`] by the child and its forks.
+    pub marker: Option<String>,
+}
+
+/// Injectable owner-termination boundary.
+///
+/// The real implementation sends `SIGTERM` to an isolated process group and to
+/// processes carrying this node's marker. Tests substitute a recorder so owner
+/// replacement and shutdown are observable without touching real processes.
+pub trait ProcessController: Send + Sync {
+    /// Terminate the process tree described by `owner`. Best-effort.
+    fn terminate(&self, owner: &ProcessOwner);
+}
+
+/// Real process-tree terminator.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemProcessController;
+
+impl ProcessController for SystemProcessController {
+    fn terminate(&self, owner: &ProcessOwner) {
+        let Some(marker) = owner.marker.as_deref() else {
+            // Without a marker there is no way to prove a recycled process
+            // group still belongs to this node, so do not risk killing it.
+            return;
+        };
+        let marked = marked_processes(marker);
+        if marked.is_empty() {
+            return;
+        }
+        // A process-group kill is only safe when a process carrying this
+        // node's unique marker is still in that group. Otherwise the id may
+        // have been recycled by an unrelated process tree.
+        if let Some(group_id) = owner
+            .group_id
+            .filter(|group| marked.iter().any(|(_, pgid)| pgid == group))
+        {
+            terminate_process_group(group_id);
+            return;
+        }
+        for (pid, _) in marked {
+            terminate_pid(pid);
+        }
+    }
+}
+
+fn terminate_pid(pid: i32) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(2)` has no memory-safety preconditions. The pid came
+        // from `/proc` and carries this node's unique marker.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+fn terminate_process_group(group_id: u32) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(2)` has no memory-safety preconditions. A negative pid
+        // addresses the process group this node created for the child.
+        unsafe {
+            libc::kill(-(group_id as i32), libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = group_id;
+    }
+}
+
+/// Find `(pid, process-group id)` for every live process carrying `marker`.
+fn marked_processes(marker: &str) -> Vec<(i32, u32)> {
+    #[cfg(target_os = "linux")]
+    {
+        let needle = format!("{SELECTION_OWNER_ENV}={marker}");
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let own_pid = std::process::id() as i32;
+        let mut marked = Vec::new();
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if pid == own_pid {
+                continue;
+            }
+            let Ok(environ) = std::fs::read(entry.path().join("environ")) else {
+                continue;
+            };
+            let matched = environ
+                .split(|byte| *byte == 0)
+                .any(|variable| variable == needle.as_bytes());
+            if !matched {
+                continue;
+            }
+            if let Some(pgid) = process_group_of(pid) {
+                marked.push((pid, pgid));
+            }
+        }
+        marked
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = marker;
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_of(pid: i32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field may contain spaces or parentheses, so parse after its
+    // final `)`. Remaining fields start at state (3), ppid (4), pgrp (5).
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(2)?.parse().ok()
+}
+
+fn next_owner_marker() -> String {
+    format!(
+        "ozma-{}-{}",
+        std::process::id(),
+        OWNER_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Tool availability for one control, computed by `PATH` lookup only.
@@ -683,10 +949,16 @@ pub struct WallpaperStatus {
     pub available: bool,
     /// Tool that would be used.
     pub tool: String,
-    /// X11 display, when present.
+    /// Resolved X11 display (`--x11-display`, else ambient `DISPLAY`).
+    pub display: Option<String>,
+    /// X11 display, when present. Kept as an explicit name for clients that
+    /// read the same field from `desktop_controls`.
     pub x11_display: Option<String>,
     /// Wayland display, when present.
     pub wayland_display: Option<String>,
+    /// Last wallpaper accepted by this node. Mirrors `last_applied` under the
+    /// same name used by `/api/v1/connection.desktop_controls`.
+    pub last_wallpaper: Option<WallpaperApplied>,
     /// Last wallpaper accepted by this node.
     pub last_applied: Option<WallpaperApplied>,
     /// `false`: the node has no portable read-back command.
@@ -742,7 +1014,13 @@ impl WallpaperTool {
 
     fn args(self, path: &str) -> Vec<String> {
         match self {
-            Self::Feh => vec!["--bg-fill".to_owned(), path.to_owned()],
+            // `--no-fehbg` keeps the operator's home directory untouched:
+            // feh otherwise writes `~/.fehbg` as a side effect.
+            Self::Feh => vec![
+                "--no-fehbg".to_owned(),
+                "--bg-fill".to_owned(),
+                path.to_owned(),
+            ],
             Self::Xwallpaper => vec!["--zoom".to_owned(), path.to_owned()],
             Self::Swaybg => vec![
                 "-i".to_owned(),
@@ -750,6 +1028,23 @@ impl WallpaperTool {
                 "-m".to_owned(),
                 "fill".to_owned(),
             ],
+        }
+    }
+
+    /// Session environment for this tool. The resolved display always wins
+    /// over ambient values so a node cannot paint another seat.
+    fn env(
+        self,
+        x11_display: Option<&str>,
+        wayland_display: Option<&str>,
+    ) -> Vec<(String, String)> {
+        match self {
+            Self::Feh | Self::Xwallpaper => x11_display
+                .map(|display| vec![("DISPLAY".to_owned(), display.to_owned())])
+                .unwrap_or_default(),
+            Self::Swaybg => wayland_display
+                .map(|display| vec![("WAYLAND_DISPLAY".to_owned(), display.to_owned())])
+                .unwrap_or_default(),
         }
     }
 
@@ -914,13 +1209,30 @@ fn json_rejection(error: JsonRejection) -> Response {
 struct DesktopState {
     last_wallpaper: Option<WallpaperApplied>,
     background: Option<Box<dyn BackgroundHandle>>,
+    selection_owner: Option<ProcessOwner>,
 }
 
 struct DesktopInner {
     runner: Arc<dyn CommandRunner>,
+    process: Arc<dyn ProcessController>,
     display: Option<String>,
     wayland_display: Option<String>,
     state: Mutex<DesktopState>,
+}
+
+impl Drop for DesktopInner {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(owner) = state.selection_owner.take() {
+            self.process.terminate(&owner);
+        }
+        if let Some(mut background) = state.background.take() {
+            background.kill();
+        }
+    }
 }
 
 impl std::fmt::Debug for DesktopInner {
@@ -953,13 +1265,74 @@ impl DesktopControls {
         display: Option<String>,
         wayland_display: Option<String>,
     ) -> Self {
+        Self::new_with_process(
+            runner,
+            Arc::new(SystemProcessController),
+            display,
+            wayland_display,
+        )
+    }
+
+    fn new_with_process(
+        runner: Arc<dyn CommandRunner>,
+        process: Arc<dyn ProcessController>,
+        display: Option<String>,
+        wayland_display: Option<String>,
+    ) -> Self {
         Self {
             inner: Arc::new(DesktopInner {
                 runner,
+                process,
                 display: normalize_session_name(display),
                 wayland_display: normalize_session_name(wayland_display),
                 state: Mutex::new(DesktopState::default()),
             }),
+        }
+    }
+
+    /// Replace the owner-termination boundary. Test-only.
+    #[cfg(test)]
+    pub fn with_process_controller(mut self, process: Arc<dyn ProcessController>) -> Self {
+        self.inner = Arc::new(DesktopInner {
+            runner: self.inner.runner.clone(),
+            process,
+            display: self.inner.display.clone(),
+            wayland_display: self.inner.wayland_display.clone(),
+            state: Mutex::new(DesktopState::default()),
+        });
+        self
+    }
+
+    /// Stop the selection owner and any persistent wallpaper process this node
+    /// started. Idempotent; called on node shutdown.
+    pub fn shutdown(&self) {
+        let (owner, background) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (state.selection_owner.take(), state.background.take())
+        };
+        if let Some(owner) = owner {
+            self.inner.process.terminate(&owner);
+        }
+        if let Some(mut background) = background {
+            background.kill();
+        }
+    }
+
+    fn replace_selection_owner(&self, owner: ProcessOwner) {
+        let previous = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.selection_owner.replace(owner)
+        };
+        if let Some(previous) = previous {
+            self.inner.process.terminate(&previous);
         }
     }
 
@@ -1515,21 +1888,28 @@ impl DesktopControls {
 
     /// Read UTF-8 text from the X11 clipboard.
     pub async fn clipboard(&self) -> Result<ClipboardRead, DesktopError> {
-        let (_, tool, _) = self.require_clipboard()?;
+        let (display, tool, _) = self.require_clipboard()?;
         let (program, args) = clipboard_read_argv(&tool);
         let mut request =
-            CommandRequest::new(program, args.iter().map(|arg| (*arg).to_owned()).collect());
+            CommandRequest::new(program, args.iter().map(|arg| (*arg).to_owned()).collect())
+                .with_env("DISPLAY", display.clone());
         request.max_stdout = MAX_CLIPBOARD_BYTES + 1;
-        let output =
-            self.inner
-                .runner
-                .run(request)
-                .await
-                .map_err(|error| DesktopError::ApplyFailed {
+        let output = self.inner.runner.run(request).await.map_err(|error| {
+            if looks_like_no_display(&error.to_string()) {
+                DesktopError::NoDisplay {
+                    reason: format!(
+                        "The X11 clipboard could not be read because display {display} is \
+                         unavailable: {error}"
+                    ),
+                }
+            } else {
+                DesktopError::ApplyFailed {
                     code: "clipboard.read_failed",
                     message: format!("Could not run {tool}: {error}"),
-                    details: serde_json::json!({ "tool": tool }),
-                })?;
+                    details: serde_json::json!({ "tool": tool, "display": display }),
+                }
+            }
+        })?;
         if !output.success() {
             if looks_like_no_display(&output.stderr) {
                 return Err(DesktopError::NoDisplay {
@@ -1590,7 +1970,7 @@ impl DesktopControls {
 
     /// Write UTF-8 text to the X11 clipboard.
     pub async fn set_clipboard(&self, text: String) -> Result<ClipboardWrite, DesktopError> {
-        let (_, tool, _) = self.require_clipboard()?;
+        let (display, tool, _) = self.require_clipboard()?;
         let bytes = text.as_bytes().to_vec();
         if bytes.len() > MAX_CLIPBOARD_BYTES {
             return Err(DesktopError::TooLarge {
@@ -1610,24 +1990,42 @@ impl DesktopControls {
             });
         }
         let (program, args) = clipboard_write_argv(&tool);
+        let marker = next_owner_marker();
         let request =
             CommandRequest::new(program, args.iter().map(|arg| (*arg).to_owned()).collect())
-                .with_stdin(bytes.clone());
-        let output =
-            self.inner
-                .runner
-                .run(request)
-                .await
-                .map_err(|error| DesktopError::ApplyFailed {
+                .with_stdin(bytes.clone())
+                .with_env("DISPLAY", display.clone())
+                .with_env(SELECTION_OWNER_ENV, marker.clone())
+                // `xclip`/`xsel` fork a selection owner. Isolating the process
+                // group lets a later write or shutdown terminate exactly that
+                // owner (plus the marker fallback for a daemonized child).
+                .with_process_group(true);
+        let output = self.inner.runner.run(request).await.map_err(|error| {
+            if looks_like_no_display(&error.to_string()) {
+                DesktopError::NoDisplay {
+                    reason: format!(
+                        "The X11 clipboard could not be written because display {display} is \
+                         unavailable: {error}"
+                    ),
+                }
+            } else {
+                DesktopError::ApplyFailed {
                     code: "clipboard.write_failed",
                     message: format!("Could not run {tool}: {error}"),
-                    details: serde_json::json!({ "tool": tool }),
-                })?;
+                    details: serde_json::json!({ "tool": tool, "display": display }),
+                }
+            }
+        })?;
+        let candidate = ProcessOwner {
+            group_id: output.group_id,
+            marker: Some(marker),
+        };
         if !output.success() {
+            self.inner.process.terminate(&candidate);
             if looks_like_no_display(&output.stderr) {
                 return Err(DesktopError::NoDisplay {
                     reason: format!(
-                        "The X11 clipboard could not be written because the display is \
+                        "The X11 clipboard could not be written because display {display} is \
                          unavailable: {}",
                         output.stderr.trim()
                     ),
@@ -1641,11 +2039,13 @@ impl DesktopControls {
                 ),
                 details: serde_json::json!({
                     "tool": tool,
+                    "display": display,
                     "status": output.status,
                     "stderr": output.stderr.trim(),
                 }),
             });
         }
+        self.replace_selection_owner(candidate);
         Ok(ClipboardWrite {
             ok: true,
             written: true,
@@ -1668,8 +2068,10 @@ impl DesktopControls {
             ok: true,
             available: true,
             tool: tool.name().to_owned(),
+            display: self.inner.display.clone(),
             x11_display: self.inner.display.clone(),
             wayland_display: self.inner.wayland_display.clone(),
+            last_wallpaper: last_applied.clone(),
             last_applied,
             verified: false,
             note: "feh, xwallpaper, and swaybg do not expose a portable read-back command; \
@@ -1684,7 +2086,13 @@ impl DesktopControls {
         let canonical_string = canonical.to_string_lossy().into_owned();
         let argv: Vec<String> = tool.args(&canonical_string);
         let program = tool.name().to_owned();
-        let request = CommandRequest::new(program.clone(), argv.clone());
+        let mut request = CommandRequest::new(program.clone(), argv.clone());
+        for (key, value) in tool.env(
+            self.inner.display.as_deref(),
+            self.inner.wayland_display.as_deref(),
+        ) {
+            request = request.with_env(key, value);
+        }
 
         if tool.persistent() {
             match self
@@ -1694,6 +2102,15 @@ impl DesktopControls {
                 .await
             {
                 Ok(BackgroundOutcome::Exited(output)) if output.success() => {}
+                Ok(BackgroundOutcome::Exited(output)) if looks_like_no_display(&output.stderr) => {
+                    return Err(DesktopError::NoDisplay {
+                        reason: format!(
+                            "The wallpaper could not be applied because the {program} session is \
+                             unavailable: {}",
+                            output.stderr.trim()
+                        ),
+                    });
+                }
                 Ok(BackgroundOutcome::Exited(output)) => {
                     return Err(DesktopError::ApplyFailed {
                         code: "wallpaper.apply_failed",
@@ -1735,17 +2152,35 @@ impl DesktopControls {
             }
         } else {
             let output = self.inner.runner.run(request).await.map_err(|error| {
-                DesktopError::ApplyFailed {
-                    code: "wallpaper.apply_failed",
-                    message: format!("Could not run {program}: {error}"),
-                    details: serde_json::json!({
-                        "tool": program,
-                        "path": canonical_string,
-                        "argv": argv,
-                    }),
+                if looks_like_no_display(&error.to_string()) {
+                    DesktopError::NoDisplay {
+                        reason: format!(
+                            "The wallpaper could not be applied because the {program} display is \
+                             unavailable: {error}"
+                        ),
+                    }
+                } else {
+                    DesktopError::ApplyFailed {
+                        code: "wallpaper.apply_failed",
+                        message: format!("Could not run {program}: {error}"),
+                        details: serde_json::json!({
+                            "tool": program,
+                            "path": canonical_string,
+                            "argv": argv,
+                        }),
+                    }
                 }
             })?;
             if !output.success() {
+                if looks_like_no_display(&output.stderr) {
+                    return Err(DesktopError::NoDisplay {
+                        reason: format!(
+                            "The wallpaper could not be applied because the {program} display is \
+                             unavailable: {}",
+                            output.stderr.trim()
+                        ),
+                    });
+                }
                 return Err(DesktopError::ApplyFailed {
                     code: "wallpaper.apply_failed",
                     message: format!(
@@ -1803,9 +2238,13 @@ fn normalize_session_name(name: Option<String>) -> Option<String> {
 fn looks_like_no_display(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("can't open display")
+        || message.contains("can't open x display")
         || message.contains("cannot open display")
+        || message.contains("cannot open x display")
         || message.contains("unable to open display")
         || message.contains("couldn't connect to display")
+        || message.contains("failed to connect to wayland")
+        || message.contains("could not connect to wayland")
         || message.contains("no display")
 }
 
@@ -2438,6 +2877,7 @@ pub mod testing {
             stdout: stdout.as_bytes().to_vec(),
             stderr: String::new(),
             stdout_truncated: false,
+            group_id: None,
         })
     }
 
@@ -2448,6 +2888,7 @@ pub mod testing {
             stdout: Vec::new(),
             stderr: stderr.to_owned(),
             stdout_truncated: false,
+            group_id: None,
         })
     }
 
@@ -2792,12 +3233,14 @@ mod tests {
                     stdout: vec![b'x'; MAX_CLIPBOARD_BYTES + 1],
                     stderr: String::new(),
                     stdout_truncated: true,
+                    group_id: None,
                 })),
                 Script::Run(Ok(CommandOutput {
                     status: Some(0),
                     stdout: vec![0xFF, 0xFE],
                     stderr: String::new(),
                     stdout_truncated: false,
+                    group_id: None,
                 })),
             ],
         );
@@ -2805,6 +3248,11 @@ mod tests {
         assert_eq!(read.text, "hello");
         assert_eq!(read.tool, "xclip");
         assert_eq!(runner.calls()[0].args, ["-selection", "clipboard", "-o"]);
+        assert_eq!(
+            runner.calls()[0].env,
+            [("DISPLAY".to_owned(), ":0".to_owned())],
+            "the resolved display must be passed, not read from ambient DISPLAY"
+        );
 
         let error = controls.clipboard().await.unwrap_err();
         assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -2866,7 +3314,24 @@ mod tests {
         let change = controls.set_wallpaper(png.to_str().unwrap()).await.unwrap();
         assert_eq!(change.format, "png");
         assert!(!change.persistent);
-        assert_eq!(runner.calls()[0].args, ["--bg-fill", png.to_str().unwrap()]);
+        assert_eq!(
+            runner.calls()[0].args,
+            ["--no-fehbg", "--bg-fill", png.to_str().unwrap()]
+        );
+        assert_eq!(
+            runner.calls()[0].env,
+            [("DISPLAY".to_owned(), ":0".to_owned())]
+        );
+        let status = controls.wallpaper().await.unwrap();
+        assert_eq!(status.display.as_deref(), Some(":0"));
+        assert_eq!(status.last_wallpaper, status.last_applied);
+        assert_eq!(
+            status
+                .last_wallpaper
+                .as_ref()
+                .map(|applied| applied.path.as_str()),
+            Some(png.to_str().unwrap())
+        );
 
         let relative = controls.set_wallpaper("relative.png").await.unwrap_err();
         assert_eq!(relative.api_error().code, "wallpaper.invalid_path");
@@ -2922,6 +3387,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wallpaper_no_display_is_typed_503_not_502() {
+        let directory = tempfile::tempdir().unwrap();
+        let png = directory.path().join("wall.png");
+        tokio::fs::write(&png, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+            .await
+            .unwrap();
+        let (controls, _) = fake_controls(
+            &["feh"],
+            vec![Script::Run(failed(
+                1,
+                "feh ERROR: Can't open X display. It *is* running, yeah?",
+            ))],
+        );
+        let error = controls
+            .set_wallpaper(png.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.api_error().code, "desktop.no_display");
+    }
+
+    #[tokio::test]
     async fn wallpaper_swaybg_running_is_success_and_persistent() {
         let directory = tempfile::tempdir().unwrap();
         let png = directory.path().join("wall.png");
@@ -2945,6 +3432,10 @@ mod tests {
         assert_eq!(
             runner.calls()[0].args,
             ["-i", png.to_str().unwrap(), "-m", "fill"]
+        );
+        assert_eq!(
+            runner.calls()[0].env,
+            [("WAYLAND_DISPLAY".to_owned(), "wayland-0".to_owned())]
         );
         assert_eq!(change.applied, true);
         assert_eq!(
@@ -3055,6 +3546,208 @@ mod tests {
             serde_json::from_slice::<Value>(&body).unwrap()["code"],
             "desktop.not_enabled"
         );
+    }
+
+    #[tokio::test]
+    async fn real_runner_returns_when_the_direct_child_exits_despite_inherited_pipes() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("grandchild.pid");
+        // The background child inherits stdout/stderr. The old runner waited for
+        // pipe EOF and therefore timed out after the direct shell exited.
+        let script = format!(
+            "sleep 30 & echo $! > '{}'; exit 0",
+            pid_file.to_string_lossy()
+        );
+        let started = std::time::Instant::now();
+        let output = SystemCommandRunner
+            .run(CommandRequest::new("sh", vec!["-c".to_owned(), script]))
+            .await
+            .expect("direct child exits successfully");
+        assert!(output.success());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "runner waited for the inherited pipe: {:?}",
+            started.elapsed()
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        // SAFETY: `kill(2)` has no memory-safety preconditions. The pid came
+        // from the background process started by this test.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        wait_until_process_gone(pid);
+    }
+
+    struct RecordingProcessController {
+        terminated: Mutex<Vec<ProcessOwner>>,
+    }
+
+    impl RecordingProcessController {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                terminated: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn terminated(&self) -> Vec<ProcessOwner> {
+            self.terminated.lock().unwrap().clone()
+        }
+    }
+
+    impl ProcessController for RecordingProcessController {
+        fn terminate(&self, owner: &ProcessOwner) {
+            self.terminated.lock().unwrap().push(owner.clone());
+        }
+    }
+
+    fn grouped(group_id: u32) -> Result<CommandOutput, CommandError> {
+        Ok(CommandOutput {
+            status: Some(0),
+            stdout: Vec::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            group_id: Some(group_id),
+        })
+    }
+
+    #[tokio::test]
+    async fn clipboard_write_tracks_one_owner_and_replaces_it_on_the_next_write() {
+        let runner = Arc::new(FakeCommandRunner::new(
+            &["xclip"],
+            vec![Script::Run(grouped(4101)), Script::Run(grouped(4102))],
+        ));
+        let process = RecordingProcessController::new();
+        let controls = DesktopControls::new(runner.clone(), Some(":0".to_owned()), None)
+            .with_process_controller(process.clone());
+
+        controls.set_clipboard("one".to_owned()).await.unwrap();
+        assert!(process.terminated().is_empty(), "first owner stays live");
+        controls.set_clipboard("two".to_owned()).await.unwrap();
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        for call in &calls {
+            assert_eq!(call.env[0], ("DISPLAY".to_owned(), ":0".to_owned()));
+            assert!(call
+                .env
+                .iter()
+                .any(|(key, value)| { key == SELECTION_OWNER_ENV && value.starts_with("ozma-") }));
+            assert!(call.isolate_process_group);
+        }
+        let terminated = process.terminated();
+        assert_eq!(terminated.len(), 1, "only the previous owner is replaced");
+        assert_eq!(terminated[0].group_id, Some(4101));
+
+        controls.shutdown();
+        let terminated = process.terminated();
+        assert_eq!(terminated.len(), 2);
+        assert_eq!(terminated[1].group_id, Some(4102));
+        assert!(terminated.iter().all(|owner| owner.group_id.is_some()));
+    }
+
+    struct ScriptToolRunner {
+        script: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for ScriptToolRunner {
+        fn lookup(&self, program: &str) -> Option<PathBuf> {
+            matches!(program, "xclip" | "xsel").then(|| self.script.clone())
+        }
+
+        async fn run(&self, mut request: CommandRequest) -> Result<CommandOutput, CommandError> {
+            if matches!(request.program.as_str(), "xclip" | "xsel") {
+                // Execute through `sh` so the just-written script cannot hit
+                // ETXTBSY on the test filesystem.
+                request.program = "sh".to_owned();
+                request
+                    .args
+                    .insert(0, self.script.to_string_lossy().into_owned());
+            }
+            SystemCommandRunner.run(request).await
+        }
+
+        async fn spawn_background(
+            &self,
+            request: CommandRequest,
+            grace: Duration,
+        ) -> Result<BackgroundOutcome, CommandError> {
+            SystemCommandRunner.spawn_background(request, grace).await
+        }
+    }
+
+    fn process_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes for the process; it does not deliver a
+        // signal.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn wait_until_process_gone(pid: i32) {
+        for _ in 0..200 {
+            if !process_alive(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("process {pid} survived owner termination");
+    }
+
+    #[tokio::test]
+    async fn real_write_completes_and_keeps_exactly_one_fake_selection_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("xclip");
+        let owners = directory.path().join("owners");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\n( sleep 60 ) &\necho $! >> '{}'\nexit 0\n",
+                owners.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let controls = DesktopControls::new(
+            Arc::new(ScriptToolRunner { script }),
+            Some(":0".to_owned()),
+            None,
+        );
+        let started = std::time::Instant::now();
+        let write = controls
+            .set_clipboard("one".to_owned())
+            .await
+            .expect("write must not wait for the forked owner");
+        assert!(write.written);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "clipboard write blocked on the owner: {:?}",
+            started.elapsed()
+        );
+
+        controls.set_clipboard("two".to_owned()).await.unwrap();
+        let pids: Vec<i32> = std::fs::read_to_string(&owners)
+            .unwrap()
+            .lines()
+            .map(|line| line.trim().parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 2, "one owner per write: {pids:?}");
+        wait_until_process_gone(pids[0]);
+        assert!(
+            process_alive(pids[1]),
+            "second owner must stay alive until replaced"
+        );
+
+        controls.shutdown();
+        wait_until_process_gone(pids[1]);
     }
 
     #[tokio::test]

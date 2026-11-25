@@ -45,7 +45,9 @@ use ozma_display::vm::{VmConsoleBackend, MAX_VM_CONSOLES};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::display_control::{open_first_source, ConsoleSelectionObserver, ConsoleSourceFactory};
+use crate::display_control::{
+    open_selected_source, ConsoleSelectionObserver, ConsoleSourceFactory,
+};
 use crate::display_outputs::{DisplayOutput, DisplayOutputSelection};
 use crate::hls::{
     HlsConfig, HlsController, HlsEncoder, HlsError, HlsRestartOutcome, HlsSourceFactory, HlsStatus,
@@ -233,8 +235,10 @@ impl ConsoleHlsFactory for ControllerHlsFactory {
         config: HlsConfig,
     ) -> Result<Arc<dyn ConsoleHlsPipeline>, String> {
         let registry = self.console_factory.registry(console)?;
+        let source_id = self.console_factory.source_id().map(str::to_owned);
         let source_factory: HlsSourceFactory = Arc::new(move || {
-            open_first_source(&registry).map_err(|message| HlsError::Source { message })
+            open_selected_source(&registry, source_id.as_deref())
+                .map_err(|message| HlsError::Source { message })
         });
         let controller = HlsController::new(source_factory, config);
         controller

@@ -34,11 +34,11 @@ use axum::http::StatusCode;
 use ozma_capture::CaptureRegistry;
 use ozma_display::vm::VmConsoleBackend;
 use ozma_media::CaptureSource;
-use ozma_protocol::{codes, ApiError};
+use ozma_protocol::{codes, ApiError, CaptureCapability};
 use ozma_qmp::SharedQmpClient;
 use serde::{Deserialize, Serialize};
 
-use crate::config::NodeConfig;
+use crate::config::{NodeConfig, NodeProfile};
 use crate::controller_compat::DisplayCaptureStatus;
 use crate::display_outputs::{DisplayOutput, DisplayOutputSelection};
 use crate::hls::HlsController;
@@ -67,6 +67,15 @@ pub trait ConsoleSourceFactory: Send + Sync {
 
     /// Recompute the controller-facing outputs for `console`.
     fn selection(&self, console: u32) -> Result<DisplayOutputSelection, String>;
+
+    /// Explicit source id (`--capture-device`) this factory must select.
+    ///
+    /// `None` keeps the historical first-enumerated source behaviour. A
+    /// configured id that discovery cannot find is a typed failure in
+    /// [`open_selected_source`]; it never falls back to another device.
+    fn source_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// One pipeline that owns a capture source and can be restarted.
@@ -727,6 +736,12 @@ impl ConsoleSourceFactory for ConfigConsoleFactory {
     fn selection(&self, console: u32) -> Result<DisplayOutputSelection, String> {
         self.with_console(console).resolve_display_outputs()
     }
+
+    fn source_id(&self) -> Option<&str> {
+        (self.config.profile != NodeProfile::Vm)
+            .then_some(self.config.capture_device.as_deref())
+            .flatten()
+    }
 }
 
 /// HLS pipeline adapter for console switching.
@@ -854,20 +869,49 @@ impl SwitchablePipeline for WebRtcPipelineSwitch {
 /// then open exactly the selected capability. Providers keep their own honest
 /// errors; no source is fabricated.
 pub fn open_first_source(registry: &CaptureRegistry) -> Result<Box<dyn CaptureSource>, String> {
+    open_selected_source(registry, None)
+}
+
+/// Open the source selected by `requested`, else the first advertised source.
+///
+/// `requested` is a capture source id (a V4L2 device path such as
+/// `/dev/video42`) or the advertised source name. When it is set, discovery
+/// must contain an exact match: a missing device is a failure, not an
+/// invitation to open the first enumerated camera.
+pub fn open_selected_source(
+    registry: &CaptureRegistry,
+    requested: Option<&str>,
+) -> Result<Box<dyn CaptureSource>, String> {
     let sources = registry.enumerate().map_err(|error| {
         format!(
             "capture discovery failed: {} ({})",
             error.message, error.code
         )
     })?;
-    let source = sources
-        .into_iter()
-        .next()
-        .ok_or_else(|| "no capture source is available for the selected console".to_owned())?;
+    let source = match requested.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(requested) => sources
+            .into_iter()
+            .find(|capability| capability_matches(capability, requested))
+            .ok_or_else(|| {
+                format!(
+                    "requested capture source `{requested}` is not available; refusing to fall \
+                     back to another capture device"
+                )
+            })?,
+        None => sources
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no capture source is available for the selected console".to_owned())?,
+    };
     let id = source.id.clone();
     registry
         .open(&source)
         .map_err(|error| format!("opening capture source `{id}` failed: {}", error.message))
+}
+
+/// True when a discovered source is the one named by `--capture-device`.
+pub fn capability_matches(capability: &CaptureCapability, requested: &str) -> bool {
+    capability.id == requested || capability.name == requested
 }
 
 #[cfg(test)]
@@ -875,9 +919,55 @@ mod tests {
     use super::*;
     use ozma_capture::FakeCaptureProvider;
     use ozma_display::vm::VmConsoleBackend;
+    use ozma_media::{FrameFormat, PixelFormat};
     use ozma_protocol::CaptureCapability;
     use serde_json::json;
     use std::sync::atomic::AtomicBool;
+
+    fn multi_source_registry() -> CaptureRegistry {
+        CaptureRegistry::new()
+            .with(
+                FakeCaptureProvider::new()
+                    .with_identity("/dev/video0", "Creative Live! Cam")
+                    .with_format(FrameFormat::rgb24(64, 48)),
+            )
+            .with(
+                FakeCaptureProvider::new()
+                    .with_identity("/dev/video42", "ozma-capture-test")
+                    .with_format(FrameFormat::rgb24(32, 24)),
+            )
+    }
+
+    #[test]
+    fn selected_capture_device_is_opened_by_path_or_name() {
+        let registry = multi_source_registry();
+        let source = open_selected_source(&registry, Some("/dev/video42")).expect("selected path");
+        assert_eq!(source.id(), "/dev/video42");
+        assert_eq!(source.format().pixel_format, PixelFormat::Rgb24);
+
+        let by_name = open_selected_source(&registry, Some("ozma-capture-test")).expect("name");
+        assert_eq!(by_name.id(), "/dev/video42");
+
+        // No selector keeps the historical first-source behaviour.
+        let first = open_first_source(&registry).expect("first");
+        assert_eq!(first.id(), "/dev/video0");
+    }
+
+    #[test]
+    fn missing_capture_device_is_typed_and_never_falls_back_to_the_first_camera() {
+        let registry = multi_source_registry();
+        let error = open_selected_source(&registry, Some("/dev/video99"))
+            .err()
+            .expect("missing device");
+        assert!(
+            error.contains("/dev/video99") && error.contains("refusing to fall back"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("/dev/video0"),
+            "error must name the requested device, not the fallback: {error}"
+        );
+    }
 
     fn outputs(current: u32) -> DisplayOutputSelection {
         let specs = vec![

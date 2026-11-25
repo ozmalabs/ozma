@@ -96,9 +96,11 @@ pub mod alsa;
 pub mod error;
 pub mod fake;
 pub mod frame;
+pub mod graph;
 pub mod opus;
 pub mod pipewire;
 pub mod router;
+pub mod sweep;
 pub mod target;
 pub mod traits;
 pub mod uac2;
@@ -113,6 +115,10 @@ pub use frame::{
     format_label, opus_format, samples_per_frame, AudioFormat, AudioFrame, AudioReframer, CHANNELS,
     FRAME_MICROS, FRAME_SAMPLES, SAMPLE_RATE,
 };
+pub use graph::{
+    read_graph, AudioGraphLink, AudioGraphNode, AudioGraphSnapshot, AudioGraphStream,
+    GRAPH_TIMEOUT, MAX_GRAPH_NODES, MAX_GRAPH_STREAMS,
+};
 pub use opus::{default_config, OpusDecoder, OpusEncoder, MAX_OPUS_PACKET_BYTES, OPUS_ENCODER_ID};
 pub use pipewire::PipeWireCapture;
 pub use router::{
@@ -122,6 +128,12 @@ pub use router::{
     TokioCommandRunner, DEFAULT_SINK_CHANNELS, DEFAULT_SINK_RATE, DEFAULT_SOURCE_CHANNELS,
     DEFAULT_VOLUME_PERCENT, MAX_SINK_CHANNELS, MAX_SINK_RATE, MAX_SOURCE_CHANNELS, MIN_SINK_RATE,
     NULL_SINK_MODULE, PACTL, PAPLAY, PW_PLAY, REMAP_SOURCE_MODULE,
+};
+pub use sweep::{
+    run_sweep, CaptureSession, PlaybackSession, SweepBand, SweepDescriptor, SweepIo,
+    SweepMeasurement, SweepOutcome, SweepProfile, SweepRequest, SystemSweepIo, MAX_SWEEP_CHANNELS,
+    MAX_SWEEP_DURATION_SECS, MAX_SWEEP_HZ, MAX_SWEEP_SAMPLE_RATE, MAX_SWEEP_TAIL_SECS,
+    MIN_SWEEP_DURATION_SECS, MIN_SWEEP_HZ, MIN_SWEEP_SAMPLE_RATE, MIN_SWEEP_TAIL_SECS,
 };
 pub use target::{AudioTarget, MONITOR_PREFIX, NODE_PREFIX, OBJECT_PREFIX};
 pub use traits::{AudioEncoder, AudioSource, EncodedAudio, EncoderConfig};

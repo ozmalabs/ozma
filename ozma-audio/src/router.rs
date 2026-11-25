@@ -95,6 +95,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::error::AudioError;
+use crate::graph::{read_graph, AudioGraphSnapshot};
+use crate::sweep::{run_sweep, sweep_unsupported, SweepIo, SweepOutcome, SweepRequest};
 use crate::target::AudioTarget;
 
 /// The PulseAudio control binary, also provided by `pipewire-pulse`.
@@ -124,7 +126,8 @@ pub const DEFAULT_SINK_CHANNELS: u16 = 2;
 /// Volume a profile removal restores.
 pub const DEFAULT_VOLUME_PERCENT: u8 = 100;
 
-const PACTL_REMEDIATION: &str = "Install pulseaudio-utils (or pipewire-pulse) so `pactl` is on \
+pub(crate) const PACTL_REMEDIATION: &str =
+    "Install pulseaudio-utils (or pipewire-pulse) so `pactl` is on \
                                  PATH, and ensure the PipeWire/PulseAudio server is running.";
 const PW_PLAY_REMEDIATION: &str = "Install pipewire-bin so `pw-play` is on PATH, or use the \
                                    PulseAudio router with `paplay`.";
@@ -813,6 +816,30 @@ pub trait AudioRouter: Send + Sync {
 
     /// Stop the current reference-track playback, if any.
     async fn stop_playback(&self) -> Result<(), AudioError>;
+
+    /// Read a bounded snapshot of the existing graph.
+    ///
+    /// The default refuses instead of returning an empty snapshot; a backend
+    /// that cannot enumerate must not look like a graph with no nodes.
+    async fn graph(&self) -> Result<AudioGraphSnapshot, AudioError> {
+        Err(AudioError::Unsupported {
+            feature: "audio graph enumeration".to_owned(),
+            remediation: "Use a router backed by a PulseAudio-compatible server so `pactl \
+                          -f json` can list sinks and sources. No graph was fabricated."
+                .to_owned(),
+        })
+    }
+
+    /// Run a generated log sweep and measure the captured response.
+    ///
+    /// The default refuses before generating audio. The real PipeWire/PulseAudio
+    /// routers generate a temporary sweep, play it to the named sink, capture
+    /// the named source, and return a measured profile only when audio was
+    /// captured.
+    async fn sweep(&self, request: SweepRequest) -> Result<SweepOutcome, AudioError> {
+        let _ = request;
+        Err(sweep_unsupported())
+    }
 }
 
 /// Configuration shared by both routers.
@@ -1259,6 +1286,37 @@ impl RouterCore {
             None => Ok(()),
         }
     }
+
+    async fn graph(&self) -> Result<AudioGraphSnapshot, AudioError> {
+        read_graph(self.runner.as_ref()).await
+    }
+
+    async fn sweep(&self, request: SweepRequest) -> Result<SweepOutcome, AudioError> {
+        request.validate()?;
+        if !self.sink_exists(&request.sink).await? {
+            return Err(AudioError::Refused {
+                operation: "sweep".to_owned(),
+                reason: format!("playback sink `{}` does not exist", request.sink),
+                remediation: "Create the sink first (`AudioRouter::ensure_sink`) or pass an \
+                              existing sink name. No sweep was played."
+                    .to_owned(),
+            });
+        }
+        if !self.source_exists(&request.source).await? {
+            return Err(AudioError::Refused {
+                operation: "sweep".to_owned(),
+                reason: format!("capture source `{}` does not exist", request.source),
+                remediation: "Pass an existing source or a `<sink>.monitor` source. No capture \
+                              was started."
+                    .to_owned(),
+            });
+        }
+        let io: Box<dyn SweepIo> = match self.tool {
+            PlaybackTool::PipeWire => Box::new(crate::sweep::SystemSweepIo::pipewire()),
+            PlaybackTool::PulseAudio => Box::new(crate::sweep::SystemSweepIo::pulseaudio()),
+        };
+        run_sweep(request, io.as_ref()).await
+    }
 }
 
 /// PipeWire-side router: `pactl` for graph management, `pw-play` for tracks.
@@ -1380,6 +1438,14 @@ macro_rules! impl_audio_router {
             async fn stop_playback(&self) -> Result<(), AudioError> {
                 self.core.stop_playback().await
             }
+
+            async fn graph(&self) -> Result<AudioGraphSnapshot, AudioError> {
+                self.core.graph().await
+            }
+
+            async fn sweep(&self, request: SweepRequest) -> Result<SweepOutcome, AudioError> {
+                self.core.sweep(request).await
+            }
         }
     };
 }
@@ -1492,7 +1558,7 @@ fn parse_remap_source_module(stdout: &str, source: &str) -> Result<Option<u32>, 
     parse_named_module(stdout, REMAP_SOURCE_MODULE, "source_name", source)
 }
 
-fn validate_token(field: &str, value: &str) -> Result<(), AudioError> {
+pub(crate) fn validate_token(field: &str, value: &str) -> Result<(), AudioError> {
     if value.is_empty() {
         return Err(invalid_spec(field, "must not be empty"));
     }
@@ -1534,7 +1600,10 @@ fn invalid_spec(field: &str, reason: impl Into<String>) -> AudioError {
     }
 }
 
-fn check_status(argv: &[String], output: CommandOutput) -> Result<CommandOutput, AudioError> {
+pub(crate) fn check_status(
+    argv: &[String],
+    output: CommandOutput,
+) -> Result<CommandOutput, AudioError> {
     if output.is_success() {
         Ok(output)
     } else {
@@ -1556,7 +1625,7 @@ fn split_argv(argv: &[String]) -> Result<(&str, &[String]), AudioError> {
     Ok((program, &argv[1..]))
 }
 
-fn map_spawn_error(program: &str, error: io::Error) -> AudioError {
+pub(crate) fn map_spawn_error(program: &str, error: io::Error) -> AudioError {
     if error.kind() == io::ErrorKind::NotFound {
         AudioError::MissingCommand {
             command: program.to_owned(),
@@ -1580,7 +1649,7 @@ fn remediation_for(program: &str) -> &'static str {
 }
 
 /// Render an argv for diagnostics only. Never passed to a shell.
-fn render_command(argv: &[String]) -> String {
+pub(crate) fn render_command(argv: &[String]) -> String {
     argv.iter()
         .map(|argument| {
             if argument.is_empty() || argument.chars().any(char::is_whitespace) {

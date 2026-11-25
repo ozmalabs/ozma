@@ -1047,7 +1047,7 @@ async fn audio_routes_remain_typed_501_without_a_router() {
 }
 
 #[tokio::test]
-async fn public_audio_discovery_and_sweep_are_typed_501s() {
+async fn public_audio_discovery_and_sweep_are_typed_503s_without_a_router() {
     let baseline = baseline(include_str!("parity/http_baseline.json"));
     let state = ConnectionState::new(
         ConnectionInfo::new(
@@ -1063,17 +1063,19 @@ async fn public_audio_discovery_and_sweep_are_typed_501s() {
     let app = public_router(state);
 
     let (status, nodes) = get_json(&app, "/audio/nodes").await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_shape(
         &nodes,
-        &baseline["audio_nodes_unsupported"],
-        "audio_nodes_unsupported",
+        &baseline["audio_nodes_unavailable"],
+        "audio_nodes_unavailable",
     );
     assert_eq!(nodes["ok"], false);
     assert_eq!(nodes["available"], false);
-    assert_eq!(nodes["code"], "audio-nodes-unsupported");
+    assert_eq!(nodes["code"], "audio-graph-unavailable");
     assert_eq!(nodes["nodes"], json!([]));
     assert_eq!(nodes["links"], json!([]));
+    assert_eq!(nodes["default_sink"], Value::Null);
+    assert_eq!(nodes["default_source"], Value::Null);
 
     let (status, sweep) = post_json(
         &app,
@@ -1081,15 +1083,15 @@ async fn public_audio_discovery_and_sweep_are_typed_501s() {
         json!({"source": "mic", "sink": "speaker"}),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_shape(
         &sweep,
-        &baseline["audio_sweep_unsupported"],
-        "audio_sweep_unsupported",
+        &baseline["audio_sweep_unavailable"],
+        "audio_sweep_unavailable",
     );
     assert_eq!(sweep["ok"], false);
     assert_eq!(sweep["available"], false);
-    assert_eq!(sweep["code"], "audio-sweep-unsupported");
+    assert_eq!(sweep["code"], "audio.unavailable");
     assert!(sweep["profile"].is_null());
 }
 

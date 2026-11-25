@@ -13,9 +13,12 @@
 //! * ffmpeg reads packed RGB24 frames from stdin and writes a rolling HLS
 //!   playlist (`stream.m3u8`) plus `seg_%05d.ts` segments.
 //! * [`HlsConfig::validate`] rejects values ffmpeg would misinterpret.
-//! * Only `rgb24` and `bgra` sources are accepted. `bgra` is converted to
-//!   `rgb24`; MJPEG/YUYV/NV12 are rejected with a typed error rather than being
-//!   mislabelled as RGB and fed to the encoder.
+//! * `rgb24`, `bgra`, `mjpeg`, `yuyv`, and `nv12` sources are accepted. BGRA,
+//!   MJPEG, YUYV, and NV12 are converted to packed RGB24 before they are fed to
+//!   ffmpeg, so a V4L2 device that negotiates any of those layouts can drive
+//!   HLS. P010 is passed through byte-for-byte as `p010le`. Other compressed
+//!   layouts (H.264/HEVC/AV1) remain a typed refusal rather than being
+//!   mislabelled as raw pixels.
 //! * A source whose frame size changes (a guest reset or display mode switch)
 //!   restarts ffmpeg with the new `-s WxH` instead of failing. The new
 //!   generation appends to the existing playlist with
@@ -675,7 +678,8 @@ pub struct HlsConfig {
     ///
     /// [`HlsPipeline`] sets this from the opened source before spawning ffmpeg.
     /// The default is RGB24 so a directly constructed config produces the
-    /// historical argv. P010 is fed as `p010le`; BGRA is converted to RGB24.
+    /// historical argv. P010 is fed as `p010le`; BGRA, MJPEG, YUYV, and NV12 are
+    /// converted to RGB24 by the feeder.
     pub input_pixel_format: PixelFormat,
     /// Optional input width override.
     pub width: Option<u32>,
@@ -969,9 +973,18 @@ pub enum HlsError {
     },
     /// A pixel format cannot be fed to ffmpeg's raw RGB24 input.
     #[error(
-        "HLS cannot feed `{0}` frames to ffmpeg as raw RGB24; only rgb24 and bgra are supported"
+        "HLS cannot feed `{0}` frames to ffmpeg as raw RGB24; rgb24, bgra, mjpeg, yuyv, nv12, \
+         and p010 are supported"
     )]
     UnsupportedFormat(PixelFormat),
+    /// A supported capture layout could not be converted to RGB24.
+    #[error("HLS could not convert `{format}` frames to rgb24: {message}")]
+    Convert {
+        /// Source layout.
+        format: PixelFormat,
+        /// Conversion failure.
+        message: String,
+    },
     /// A frame's pixel layout differs from the source's declared format.
     #[error("frame format `{actual}` does not match the source's declared `{expected}` format")]
     FormatMismatch {
@@ -2021,11 +2034,14 @@ impl HlsPipeline {
         let manifest = config.manifest_path();
         let status = HlsStatus::starting(manifest.clone());
         let declared = source.format();
-        // The feeder may convert BGRA to RGB24 in Rust, but P010 is passed
-        // through byte-for-byte. Store the exact rawvideo layout so argv and
-        // the feeder cannot disagree after a `/codec` restart or size change.
+        // The feeder converts BGRA/MJPEG/YUYV/NV12 to packed RGB24 in Rust;
+        // P010 is passed through byte-for-byte. Store the exact rawvideo layout
+        // so argv and the feeder cannot disagree after a `/codec` restart or
+        // size change.
         config.input_pixel_format = match declared.pixel_format {
-            PixelFormat::Bgra => PixelFormat::Rgb24,
+            PixelFormat::Bgra | PixelFormat::Mjpeg | PixelFormat::Yuyv | PixelFormat::Nv12 => {
+                PixelFormat::Rgb24
+            }
             other => other,
         };
         let expected = initial_dimensions(&config, declared);
@@ -2832,22 +2848,11 @@ fn convert_frame(
             }
             Ok(data.to_vec())
         }
-        PixelFormat::Bgra => {
-            let expected = byte_len(PixelFormat::Bgra, width, height)?;
-            if data.len() != expected {
-                return Err(HlsError::FrameSize {
-                    format: PixelFormat::Bgra,
-                    width,
-                    height,
-                    expected,
-                    actual: data.len(),
-                });
-            }
-            let mut rgb = Vec::with_capacity(expected / 4 * 3);
-            for pixel in data.chunks_exact(4) {
-                rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
-            }
-            Ok(rgb)
+        PixelFormat::Bgra | PixelFormat::Mjpeg | PixelFormat::Yuyv | PixelFormat::Nv12 => {
+            ozma_encode::to_rgb24(frame.format(), data).map_err(|error| HlsError::Convert {
+                format: expected_format,
+                message: error.to_string(),
+            })
         }
         PixelFormat::P010 => {
             let expected = byte_len(PixelFormat::P010, width, height)?;
@@ -2885,7 +2890,12 @@ fn byte_len(format: PixelFormat, width: u32, height: u32) -> Result<usize, HlsEr
 
 fn ensure_supported(format: PixelFormat) -> Result<(), HlsError> {
     match format {
-        PixelFormat::Rgb24 | PixelFormat::Bgra | PixelFormat::P010 => Ok(()),
+        PixelFormat::Rgb24
+        | PixelFormat::Bgra
+        | PixelFormat::Mjpeg
+        | PixelFormat::Yuyv
+        | PixelFormat::Nv12
+        | PixelFormat::P010 => Ok(()),
         other => Err(HlsError::UnsupportedFormat(other)),
     }
 }
@@ -4920,9 +4930,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_pixel_formats_are_rejected_before_spawning() {
+    async fn yuyv_frames_are_converted_to_rgb24() {
         let directory = temp_dir("yuyv");
         let format = FrameFormat::new(PixelFormat::Yuyv, 2, 2);
+        let yuyv = vec![
+            16, 128, 235, 128, // row 0: limited-range black, then white
+            16, 128, 235, 128, // row 1
+        ];
+        let (source, _) = FakeSource::new(format, vec![Ok(frame(format, 0, yuyv))], false);
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let spawns = recording.spawns.clone();
+        let mut pipeline = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .expect("YUYV source starts");
+
+        wait_until(|| writes.lock().unwrap().len() == 1).await;
+        assert_eq!(
+            writes.lock().unwrap()[0],
+            vec![0, 0, 0, 255, 255, 255, 0, 0, 0, 255, 255, 255]
+        );
+        assert_eq!(pipeline.config().input_pixel_format, PixelFormat::Rgb24);
+        assert_eq!(spawns.lock().unwrap().len(), 1);
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn nv12_frames_are_converted_to_rgb24() {
+        let directory = temp_dir("nv12");
+        let format = FrameFormat::new(PixelFormat::Nv12, 2, 2);
+        let nv12 = vec![16, 235, 16, 235, 128, 128];
+        let (source, _) = FakeSource::new(format, vec![Ok(frame(format, 0, nv12))], false);
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let mut pipeline = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .expect("NV12 source starts");
+
+        wait_until(|| writes.lock().unwrap().len() == 1).await;
+        assert_eq!(
+            writes.lock().unwrap()[0],
+            vec![0, 0, 0, 255, 255, 255, 0, 0, 0, 255, 255, 255]
+        );
+        assert_eq!(pipeline.config().input_pixel_format, PixelFormat::Rgb24);
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn mjpeg_frames_are_decoded_to_rgb24() {
+        let directory = temp_dir("mjpeg");
+        let format = FrameFormat::new(PixelFormat::Mjpeg, 2, 2);
+        let source_jpeg = ozma_encode::encode_jpeg_rgb(
+            &[200, 30, 40, 200, 30, 40, 10, 220, 90, 10, 220, 90],
+            2,
+            2,
+            95,
+        )
+        .expect("JPEG");
+        let (source, _) = FakeSource::new(format, vec![Ok(frame(format, 0, source_jpeg))], false);
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let mut pipeline = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .expect("MJPEG source starts");
+
+        wait_until(|| writes.lock().unwrap().len() == 1).await;
+        let rgb = writes.lock().unwrap()[0].clone();
+        assert_eq!(rgb.len(), 2 * 2 * 3);
+        assert!(rgb[0] > 170 && rgb[1] < 70, "decoded first pixel: {rgb:?}");
+        assert!(rgb[6] < 70 && rgb[7] > 180, "decoded third pixel: {rgb:?}");
+        assert_eq!(pipeline.config().input_pixel_format, PixelFormat::Rgb24);
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn unsupported_pixel_formats_are_rejected_before_spawning() {
+        let directory = temp_dir("h264");
+        let format = FrameFormat::new(PixelFormat::H264, 2, 2);
         let (source, _) = FakeSource::new(format, vec![], false);
         let recording = RecordingSpawner::default();
         let spawns = recording.spawns.clone();
@@ -4936,11 +5041,11 @@ mod tests {
             spawner(recording),
         )
         .err()
-        .expect("yuyv must be rejected");
+        .expect("H.264 pass-through must be rejected");
 
         assert!(matches!(
             error,
-            HlsError::UnsupportedFormat(PixelFormat::Yuyv)
+            HlsError::UnsupportedFormat(PixelFormat::H264)
         ));
         assert!(
             spawns.lock().unwrap().is_empty(),

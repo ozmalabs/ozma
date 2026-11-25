@@ -2129,12 +2129,14 @@ async fn run() -> std::process::ExitCode {
             HlsStatus::failed("video capability is disabled")
         } else {
             let registry = registry_slot.clone();
+            let requested_source = capture_source_selection(&config);
             let source_factory: HlsSourceFactory = std::sync::Arc::new(move || {
                 let registry = registry
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
-                open_first_capture_source(&registry).map_err(|message| HlsError::Source { message })
+                open_capture_source(&registry, requested_source.as_deref())
+                    .map_err(|message| HlsError::Source { message })
             });
             let controller = HlsController::new(source_factory, hls_config);
             match controller.start().await {
@@ -2241,7 +2243,8 @@ async fn run() -> std::process::ExitCode {
                 );
                 None
             } else {
-                match open_first_capture_source(&capture_registry) {
+                let requested_source = capture_source_selection(&config);
+                match open_capture_source(&capture_registry, requested_source.as_deref()) {
                     Err(error) => {
                         warn!(
                             error = %error,
@@ -2743,10 +2746,30 @@ async fn run() -> std::process::ExitCode {
         .ok()
         .flatten()
         .unwrap_or_else(|| "none".to_owned());
-    let capture_status = controller_compat::CaptureStatus::from_capability(
-        capture_provider,
-        capabilities.capture.first(),
-    );
+    // Advertise the source the node actually selected, not whichever device
+    // happened to enumerate first. A configured-but-absent device is reported
+    // as unavailable with its requested id rather than as another camera.
+    let capture_status = match capture_source_selection(&config) {
+        Some(requested) => match capabilities.capture.iter().find(|capability| {
+            ozma_node::display_control::capability_matches(capability, &requested)
+        }) {
+            Some(capability) => controller_compat::CaptureStatus::from_capability(
+                capture_provider,
+                Some(capability),
+            ),
+            None => controller_compat::CaptureStatus {
+                provider: capture_provider,
+                kind: None,
+                source: Some(requested),
+                name: None,
+                available: false,
+            },
+        },
+        None => controller_compat::CaptureStatus::from_capability(
+            capture_provider,
+            capabilities.capture.first(),
+        ),
+    };
     let hardware_state = ozma_node::hardware::HardwareState::new();
     let backup_service = match args.backup_repo.clone() {
         None => None,
@@ -2797,6 +2820,9 @@ async fn run() -> std::process::ExitCode {
             .filter(|display| !display.is_empty());
         ozma_node::desktop_compat::DesktopControls::system(x11_display, wayland_display)
     });
+    // Keep a handle for shutdown: a clipboard selection owner or persistent
+    // wallpaper daemon must not outlive the node.
+    let desktop_controls_shutdown = desktop_controls.clone();
     let compat_state =
         controller_compat::ConnectionState::new(connection_info, compat_stats.clone())
             .with_power(power)
@@ -2809,7 +2835,13 @@ async fn run() -> std::process::ExitCode {
             .with_audio(audio_control)
             .with_usb(usb_control)
             .with_webrtc(webrtc_control.clone())
-            .with_snapshot(Some(SnapshotControl::from_shared(registry_slot.clone())))
+            .with_snapshot(Some({
+                let control = SnapshotControl::from_shared(registry_slot.clone());
+                match capture_source_selection(&config) {
+                    Some(source_id) => control.with_source_id(source_id),
+                    None => control,
+                }
+            }))
             .with_display_outputs(display_outputs_value, display_capture)
             .with_display_control(display_control)
             .with_console_broker(console_broker.clone())
@@ -3427,6 +3459,12 @@ async fn run() -> std::process::ExitCode {
         .await;
     }
 
+    // Terminate the X11 clipboard selection owner and any persistent wallpaper
+    // process this node started. Best-effort and idempotent.
+    if let Some(controls) = desktop_controls_shutdown.as_ref() {
+        controls.shutdown();
+    }
+
     // Dropping the responder unregisters the mDNS record. It is a std thread
     // with its own runtime, so it cannot block process exit even if it stalls.
     drop(mdns_handle);
@@ -3450,27 +3488,31 @@ fn default_hls_dir(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp").join(format!("ozma-stream-{safe}"))
 }
 
-/// Open the first registry source for a helper/pipeline.
+/// Open the registry source for a helper/pipeline.
 ///
 /// This uses the same registry as the VM/hardware profile: a VM node streams
-/// its QMP display and a hardware node streams its V4L2/PipeWire source.
-fn open_first_capture_source(
+/// its QMP display and a hardware node streams its V4L2/PipeWire source. When
+/// `requested` is set (`--capture-device`), only an exact source id/name match
+/// is opened; a missing device fails instead of falling back to the first
+/// camera.
+fn open_capture_source(
     registry: &ozma_capture::CaptureRegistry,
+    requested: Option<&str>,
 ) -> Result<Box<dyn ozma_media::CaptureSource>, String> {
-    let sources = registry.enumerate().map_err(|error| {
-        format!(
-            "capture discovery failed: {} ({})",
-            error.message, error.code
-        )
-    })?;
-    let source = sources
-        .into_iter()
-        .next()
-        .ok_or_else(|| "no capture source is available".to_owned())?;
-    let id = source.id.clone();
-    registry
-        .open(&source)
-        .map_err(|error| format!("opening capture source `{id}` failed: {}", error.message))
+    ozma_node::display_control::open_selected_source(registry, requested)
+}
+
+/// The explicit `--capture-device` source selector, normalized for comparison.
+///
+/// `--capture-device` is a host-device selector (V4L2 path/name); a VM node's
+/// capture source is its QMP/VNC/D-Bus display, not a device path.
+fn capture_source_selection(config: &NodeConfig) -> Option<String> {
+    (config.profile != NodeProfile::Vm)
+        .then(|| config.capture_device.as_deref())
+        .flatten()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
 }
 
 /// Default WebRTC signaling socket. `/tmp` is writable without extra

@@ -194,23 +194,27 @@ async fn desktop_profile_serves_status_snapshot_and_connection_with_fake_provide
     assert_eq!(captures[0]["id"], "fake0");
     assert_eq!(captures[0]["kind"], "fake");
 
-    // Audio routing is not configured, so the control route is a typed 501 and
-    // discovery/sweep stay honest unsupported responses rather than fake graphs.
-    for (method, route) in [
-        ("GET", "/audio/nodes"),
-        ("POST", "/audio/sweep"),
-        ("POST", "/audio/stop"),
+    // Audio routing is not configured, so discovery/sweep are typed 503s and
+    // never fabricate a graph or a profile; the control route stays a 501.
+    for (method, route, expected) in [
+        (
+            "GET",
+            "/audio/nodes",
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            "POST",
+            "/audio/sweep",
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        ("POST", "/audio/stop", reqwest::StatusCode::NOT_IMPLEMENTED),
     ] {
         let request = match method {
             "GET" => client.get(format!("{base}{route}")),
             _ => client.post(format!("{base}{route}")),
         };
         let response = request.send().await.expect(route);
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::NOT_IMPLEMENTED,
-            "{method} {route}"
-        );
+        assert_eq!(response.status(), expected, "{method} {route}");
         let body: Value = response.json().await.expect("audio error JSON");
         assert_eq!(body["ok"], false, "{method} {route}");
     }

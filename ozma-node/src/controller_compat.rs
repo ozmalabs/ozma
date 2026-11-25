@@ -40,7 +40,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream;
-use ozma_audio::{AudioError, AudioPlaybackSpec, AudioProfile, AudioRouter, AudioSourceProfile};
+use ozma_audio::{
+    AudioError, AudioPlaybackSpec, AudioProfile, AudioRouter, AudioSourceProfile, SweepOutcome,
+    SweepRequest,
+};
 use ozma_encode::{
     backend_name, CodecOverrideState, CodecPreference, EncoderOverride, EncoderRegistry,
     OverrideReceipt,
@@ -7172,58 +7175,314 @@ fn audio_error_response(error: AudioError) -> Response {
     api_error_response(status, error.to_api_error())
 }
 
-/// `GET /audio/nodes` — typed unsupported response with the soft-node shape.
+/// `GET /audio/nodes` — a bounded, read-only `pactl -f json` graph snapshot.
 ///
-/// The Python soft node returns `{"nodes": [...], "default_sink": "...",
-/// "default_source": "..."}` from its PipeWire watcher. The Rust
-/// [`AudioRouter`] controls an existing graph but has no node-enumeration
-/// operation, so this node cannot honestly fill that list. The controller
-/// proxies the body to the dashboard, which can then show the exact reason
-/// instead of an empty fake graph. The route is public because the controller's
-/// proxy sends no node token; it never mutates state.
-async fn audio_nodes(State(_state): State<ConnectionState>) -> Response {
+/// The body matches the soft-node shape the controller expects: `nodes`,
+/// `links`, `default_sink`, and `default_source`. `streams` carries active
+/// sink-inputs/source-outputs, and `links_available` is false because `pactl`
+/// has no graph-link listing. A router that cannot enumerate returns a typed
+/// 503; an empty list is never fabricated for a missing server or tool. The
+/// route is public because the controller's proxy sends no node token, and it
+/// runs only `list`/`info`, so it cannot change graph state.
+async fn audio_nodes(State(state): State<ConnectionState>) -> Response {
+    let Some(control) = state.audio.as_ref() else {
+        return audio_graph_unavailable(
+            "audio routing is not configured on this node",
+            "Start ozma-node with --audio-router pipewire or --audio-router pulseaudio so \
+             `pactl -f json` can enumerate the existing graph. No graph was fabricated.",
+        );
+    };
+    let router = match control.router() {
+        Ok(router) => router.clone(),
+        Err(response) => return response,
+    };
+
+    match router.graph().await {
+        Ok(graph) => {
+            let mut body = match serde_json::to_value(&graph) {
+                Ok(value) => value,
+                Err(error) => {
+                    return audio_graph_unavailable(
+                        &format!("could not serialise graph snapshot: {error}"),
+                        "This is an internal error; no nodes were fabricated.",
+                    )
+                }
+            };
+            if let Some(object) = body.as_object_mut() {
+                object.insert("ok".to_owned(), Value::Bool(true));
+                object.insert("available".to_owned(), Value::Bool(true));
+                object.insert(
+                    "backend".to_owned(),
+                    Value::String(control.backend().to_owned()),
+                );
+            }
+            Json(body).into_response()
+        }
+        Err(error) => audio_graph_error_response(error),
+    }
+}
+
+/// `POST /audio/sweep` — a real generated-sweep measurement.
+///
+/// Accepts a bounded frequency/duration/profile request. The router plays a
+/// generated log sweep to `sink`, captures `source` (normally
+/// `<sink>.monitor`), and returns a profile only after audio was captured. A
+/// missing tool, sink, source, or silent capture is a typed error with
+/// `ok:false`, `available:false`, and `profile:null`; no measurement is
+/// invented. The route is public because the controller's existing proxy sends
+/// no node token.
+async fn audio_sweep(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<AudioSweepRequest>, JsonRejection>,
+) -> Response {
+    // Availability is checked before the body so an unconfigured node answers
+    // a typed 503 instead of a body-extractor status, regardless of body shape.
+    let Some(control) = state.audio.as_ref() else {
+        return audio_sweep_error_response(sweep_unavailable());
+    };
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    let router = match control.router() {
+        Ok(router) => router.clone(),
+        Err(response) => return response,
+    };
+
+    let Some(source) = non_empty(payload.source.clone()) else {
+        return compat_error(
+            StatusCode::BAD_REQUEST,
+            "audio-missing-source",
+            "missing `source` (an existing source or `<sink>.monitor`)",
+        );
+    };
+    let Some(sink) = non_empty(payload.sink.clone()) else {
+        return compat_error(
+            StatusCode::BAD_REQUEST,
+            "audio-missing-sink",
+            "missing `sink` (an existing sink to play the generated sweep through)",
+        );
+    };
+
+    let mut request = SweepRequest::new(source, sink);
+    if let Some(value) = payload.start_hz {
+        request.start_hz = value;
+    }
+    if let Some(value) = payload.end_hz {
+        request.end_hz = value;
+    }
+    if let Some(value) = payload.duration_secs {
+        request.duration_secs = value;
+    }
+    if let Some(value) = payload.sample_rate {
+        request.sample_rate = value;
+    }
+    if let Some(value) = payload.channels {
+        request.channels = value;
+    }
+    if let Some(value) = payload.amplitude {
+        request.amplitude = value;
+    }
+    if let Some(value) = payload.start_delay_ms {
+        request.start_delay_ms = value;
+    }
+    if let Some(value) = payload.tail_secs {
+        request.tail_secs = value;
+    }
+    for (field, value) in [
+        ("phone_model", &mut request.phone_model),
+        ("target_curve", &mut request.target_curve),
+        ("room_name", &mut request.room_name),
+        ("node_id", &mut request.node_id),
+        ("mic_type", &mut request.mic_type),
+        ("mic_model", &mut request.mic_model),
+    ] {
+        if let Some(provided) = payload.profile_value(field) {
+            *value = provided;
+        }
+    }
+
+    // Validate before the router call so every backend rejects out-of-range
+    // or unsafe requests, including test/alternate routers.
+    if let Err(error) = request.validate() {
+        return audio_sweep_error_response(error);
+    }
+
+    match router.sweep(request).await {
+        Ok(outcome) => sweep_success_response(control.backend(), outcome),
+        Err(error) => audio_sweep_error_response(error),
+    }
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AudioSweepRequest {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    sink: Option<String>,
+    #[serde(default)]
+    start_hz: Option<f64>,
+    #[serde(default)]
+    end_hz: Option<f64>,
+    #[serde(default, alias = "duration")]
+    duration_secs: Option<f64>,
+    #[serde(default)]
+    sample_rate: Option<u32>,
+    #[serde(default)]
+    channels: Option<u16>,
+    #[serde(default)]
+    amplitude: Option<f64>,
+    #[serde(default)]
+    start_delay_ms: Option<u64>,
+    #[serde(default)]
+    tail_secs: Option<f64>,
+    #[serde(default)]
+    phone_model: Option<String>,
+    #[serde(default)]
+    target_curve: Option<String>,
+    #[serde(default)]
+    room_name: Option<String>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    mic_type: Option<String>,
+    #[serde(default)]
+    mic_model: Option<String>,
+}
+
+impl AudioSweepRequest {
+    fn profile_value(&self, field: &str) -> Option<String> {
+        match field {
+            "phone_model" => self.phone_model.clone(),
+            "target_curve" => self.target_curve.clone(),
+            "room_name" => self.room_name.clone(),
+            "node_id" => self.node_id.clone(),
+            "mic_type" => self.mic_type.clone(),
+            "mic_model" => self.mic_model.clone(),
+            _ => None,
+        }
+    }
+}
+
+fn sweep_success_response(backend: &str, outcome: SweepOutcome) -> Response {
+    let mut profile = match serde_json::to_value(&outcome.profile) {
+        Ok(profile) => profile,
+        Err(error) => {
+            return audio_sweep_error_response(AudioError::Process {
+                command: "sweep profile".to_owned(),
+                message: error.to_string(),
+            })
+        }
+    };
+    let measurement = profile.get("measurement").cloned().unwrap_or(Value::Null);
+    if let Some(object) = profile.as_object_mut() {
+        object.insert("ok".to_owned(), Value::Bool(true));
+        object.insert("available".to_owned(), Value::Bool(true));
+        object.insert("backend".to_owned(), Value::String(backend.to_owned()));
+    }
+    Json(serde_json::json!({
+        "ok": true,
+        "available": true,
+        "backend": backend,
+        "profile": profile,
+        "measurement": measurement,
+    }))
+    .into_response()
+}
+
+fn audio_graph_unavailable(error: &str, remediation: &str) -> Response {
     (
-        StatusCode::NOT_IMPLEMENTED,
+        StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
             "ok": false,
             "available": false,
-            "code": "audio-nodes-unsupported",
-            "error": "This node does not enumerate PipeWire/PulseAudio graph nodes.",
-            "remediation": "Use a soft node with a PipeWire watcher for room-correction device \
-                            discovery, or choose a sink by name with --audio-sink. The Rust \
-                            AudioRouter controls an existing graph and does not expose a node \
-                            listing; no nodes are fabricated.",
+            "code": "audio-graph-unavailable",
+            "error": format!("audio graph enumeration is unavailable: {error}"),
+            "remediation": remediation,
             "nodes": [],
             "links": [],
-            "default_sink": serde_json::Value::Null,
-            "default_source": serde_json::Value::Null,
+            "default_sink": Value::Null,
+            "default_source": Value::Null,
         })),
     )
         .into_response()
 }
 
-/// `POST /audio/sweep` — typed unsupported response with the soft-node shape.
-///
-/// `controller/api.py::run_room_sweep` proxies a sweep to the node when the
-/// request names one. The Rust node has no room-correction engine or sweep
-/// transport, so it never claims a profile. The route is public because that
-/// proxy sends no node token; the 501 is the whole behaviour, so the public
-/// surface cannot change state.
-async fn audio_sweep() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "ok": false,
-            "available": false,
-            "code": "audio-sweep-unsupported",
-            "error": "Room-correction sweeps are not implemented on this node.",
-            "remediation": "Run the sweep on the controller host or a soft node with \
-                            room_correction. This node has no sweep engine and returns no \
-                            fabricated profile.",
-            "profile": serde_json::Value::Null,
-        })),
-    )
-        .into_response()
+fn audio_graph_error_response(error: AudioError) -> Response {
+    let status = match &error {
+        AudioError::InvalidSpec { .. } | AudioError::InvalidTarget(_) => StatusCode::BAD_REQUEST,
+        AudioError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
+        AudioError::MissingCommand { .. }
+        | AudioError::Unavailable { .. }
+        | AudioError::Process { .. }
+        | AudioError::CommandFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    let api = error.to_api_error();
+    let mut body = serde_json::json!({
+        "ok": false,
+        "available": false,
+        "code": api.code,
+        "error": api.message,
+        "nodes": [],
+        "links": [],
+        "default_sink": Value::Null,
+        "default_source": Value::Null,
+    });
+    if let Some(remediation) = api.remediation {
+        body["remediation"] = Value::String(remediation);
+    }
+    if !api.details.is_null() {
+        body["details"] = api.details;
+    }
+    (status, Json(body)).into_response()
+}
+
+fn sweep_unavailable() -> AudioError {
+    AudioError::Unavailable {
+        device: "audio sweep".to_owned(),
+        message: "audio routing is not configured on this node".to_owned(),
+        remediation: "Start ozma-node with --audio-router pipewire or --audio-router \
+                      pulseaudio and ensure pw-play/pw-record or paplay/parec are installed. \
+                      No sweep was generated or played."
+            .to_owned(),
+    }
+}
+
+fn audio_sweep_error_response(error: AudioError) -> Response {
+    let status = match &error {
+        AudioError::InvalidSpec { .. } | AudioError::InvalidTarget(_) => StatusCode::BAD_REQUEST,
+        AudioError::Refused { .. } | AudioError::TrackNotFound { .. } => StatusCode::BAD_REQUEST,
+        AudioError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
+        AudioError::MissingCommand { .. }
+        | AudioError::Unavailable { .. }
+        | AudioError::Process { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    let api = error.to_api_error();
+    let mut body = serde_json::json!({
+        "ok": false,
+        "available": false,
+        "profile": Value::Null,
+        "code": api.code,
+        "error": api.message,
+    });
+    if let Some(remediation) = api.remediation {
+        body["remediation"] = Value::String(remediation);
+    }
+    if !api.details.is_null() {
+        body["details"] = api.details;
+    }
+    if api.retryable {
+        body["retryable"] = Value::Bool(true);
+    }
+    (status, Json(body)).into_response()
 }
 
 fn api_error_response(status: StatusCode, error: ApiError) -> Response {
@@ -7873,8 +8132,9 @@ mod tests {
     }
 
     use ozma_audio::{
-        audio_codes, AudioSinkSpec, AudioSinkState, AudioSourceProfile, AudioSourceRef,
-        AudioSourceSpec, AudioSourceState, AudioStreamRef,
+        audio_codes, AudioGraphNode, AudioGraphSnapshot, AudioSinkSpec, AudioSinkState,
+        AudioSourceProfile, AudioSourceRef, AudioSourceSpec, AudioSourceState, AudioStreamRef,
+        SweepDescriptor, SweepMeasurement, SweepProfile,
     };
 
     struct FakeAudioRouter {
@@ -7980,6 +8240,81 @@ mod tests {
 
         async fn stop_playback(&self) -> Result<(), AudioError> {
             self.record("stop".to_owned())
+        }
+
+        async fn graph(&self) -> Result<AudioGraphSnapshot, AudioError> {
+            self.record("graph".to_owned())?;
+            Ok(AudioGraphSnapshot {
+                nodes: vec![AudioGraphNode {
+                    id: 1,
+                    name: "ozma-vm1".to_owned(),
+                    description: "Ozma VM 1".to_owned(),
+                    media_class: "Audio/Sink".to_owned(),
+                    default: true,
+                    state: "RUNNING".to_owned(),
+                    mute: false,
+                    volume_percent: Some(75.0),
+                    monitor_source: Some("ozma-vm1.monitor".to_owned()),
+                    monitor_of_sink: None,
+                }],
+                streams: Vec::new(),
+                links: Vec::new(),
+                default_sink: Some("ozma-vm1".to_owned()),
+                default_source: Some("ozma-vm1.monitor".to_owned()),
+                truncated: false,
+                links_available: false,
+            })
+        }
+
+        async fn sweep(&self, request: SweepRequest) -> Result<SweepOutcome, AudioError> {
+            self.record(format!(
+                "sweep:{}:{}:{:.1}-{:.1}:{:.1}",
+                request.source,
+                request.sink,
+                request.start_hz,
+                request.end_hz,
+                request.duration_secs
+            ))?;
+            Ok(SweepOutcome {
+                profile: SweepProfile {
+                    id: "sweep-test".to_owned(),
+                    name: if request.room_name.trim().is_empty() {
+                        "Test room".to_owned()
+                    } else {
+                        request.room_name.trim().to_owned()
+                    },
+                    created_at: 1.0,
+                    bands: Vec::new(),
+                    band_count: 0,
+                    mic_type: request.mic_type,
+                    phone_model: request.phone_model,
+                    mic_model: request.mic_model,
+                    target_curve: request.target_curve,
+                    room_name: request.room_name,
+                    node_id: request.node_id,
+                    active: false,
+                    measurement: SweepMeasurement {
+                        sample_rate: request.sample_rate,
+                        channels: request.channels,
+                        captured_frames: 48_000,
+                        captured_secs: 1.0,
+                        peak: 0.5,
+                        peak_dbfs: -6.0,
+                        rms_dbfs: -12.0,
+                        noise_floor_dbfs: -80.0,
+                        impulse_peak: 0.5,
+                        impulse_index: 100,
+                        impulse_index_secs: 0.002,
+                        rt60_secs: Some(0.4),
+                        decay_db_per_sec: Some(-150.0),
+                        sweep: SweepDescriptor {
+                            start_hz: request.start_hz,
+                            end_hz: request.end_hz,
+                            duration_secs: request.duration_secs,
+                        },
+                    },
+                },
+            })
         }
     }
 
@@ -13694,6 +14029,123 @@ mod tests {
 
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(body["code"], "audio-routing-unsupported");
+    }
+
+    #[tokio::test]
+    async fn public_audio_nodes_returns_the_router_snapshot() {
+        let router = Arc::new(FakeAudioRouter::new());
+        let app = public_router(audio_state(Some(router.clone()), Some("ozma-vm1")));
+
+        let (status, body) = get_json(&app, "/audio/nodes").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["available"], true);
+        assert_eq!(body["backend"], "pipewire");
+        assert_eq!(body["default_sink"], "ozma-vm1");
+        assert_eq!(body["default_source"], "ozma-vm1.monitor");
+        assert_eq!(body["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(body["nodes"][0]["name"], "ozma-vm1");
+        assert_eq!(body["nodes"][0]["media_class"], "Audio/Sink");
+        assert_eq!(body["nodes"][0]["volume_percent"], 75.0);
+        assert_eq!(body["links"], serde_json::json!([]));
+        assert_eq!(body["links_available"], false);
+        assert_eq!(router.calls(), vec!["graph"]);
+    }
+
+    #[tokio::test]
+    async fn public_audio_nodes_without_a_router_is_a_typed_503() {
+        let app = public_router(audio_state(None, None));
+
+        let (status, body) = get_json(&app, "/audio/nodes").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["available"], false);
+        assert_eq!(body["code"], "audio-graph-unavailable");
+        assert_eq!(body["nodes"], serde_json::json!([]));
+        assert_eq!(body["links"], serde_json::json!([]));
+        assert!(body["remediation"].is_string());
+    }
+
+    #[tokio::test]
+    async fn public_audio_sweep_returns_a_measured_profile() {
+        let router = Arc::new(FakeAudioRouter::new());
+        let app = public_router(audio_state(Some(router.clone()), Some("ozma-vm1")));
+
+        let (status, body) = post_json(
+            &app,
+            "/audio/sweep",
+            serde_json::json!({
+                "source": "ozma-vm1.monitor",
+                "sink": "ozma-vm1",
+                "start_hz": 30,
+                "end_hz": 16000,
+                "duration": 3,
+                "room_name": "Office",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["available"], true);
+        assert_eq!(body["profile"]["id"], "sweep-test");
+        assert_eq!(body["profile"]["name"], "Office");
+        assert_eq!(body["profile"]["band_count"], 0);
+        assert_eq!(body["profile"]["active"], false);
+        assert_eq!(body["measurement"]["captured_frames"], 48_000);
+        assert_eq!(body["measurement"]["sweep"]["start_hz"], 30.0);
+        assert_eq!(
+            router.calls(),
+            vec!["sweep:ozma-vm1.monitor:ozma-vm1:30.0-16000.0:3.0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn public_audio_sweep_rejects_missing_or_invalid_requests() {
+        let router = Arc::new(FakeAudioRouter::new());
+        let app = public_router(audio_state(Some(router.clone()), Some("ozma-vm1")));
+
+        for (body, code) in [
+            (
+                serde_json::json!({"sink": "ozma-vm1"}),
+                "audio-missing-source",
+            ),
+            (
+                serde_json::json!({"source": "ozma-vm1.monitor"}),
+                "audio-missing-sink",
+            ),
+        ] {
+            let (status, response) = post_json(&app, "/audio/sweep", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+            assert_eq!(response["ok"], false);
+            assert_eq!(response["profile"], serde_json::Value::Null);
+            assert_eq!(response["code"], code);
+        }
+
+        let (status, response) = post_json(
+            &app,
+            "/audio/sweep",
+            serde_json::json!({"source": "bad source", "sink": "ozma-vm1"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["code"], audio_codes::AUDIO_INVALID_SPEC);
+        assert!(router.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_audio_sweep_without_a_router_is_a_typed_503() {
+        let app = public_router(audio_state(None, None));
+        let (status, body) = post_json(
+            &app,
+            "/audio/sweep",
+            serde_json::json!({"source": "monitor", "sink": "sink"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["available"], false);
+        assert_eq!(body["profile"], serde_json::Value::Null);
+        assert_eq!(body["code"], audio_codes::AUDIO_UNAVAILABLE);
     }
 
     #[tokio::test]

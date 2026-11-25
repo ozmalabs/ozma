@@ -182,6 +182,31 @@ hold fds on the default virtual card (`modprobe -r vkms` → “Module vkms is i
 use”). It was loaded by this run and remains loaded; no real display or mode
 was changed.
 
+## Follow-on: KMS scanout proof
+
+The lease handoff above is unchanged, but a follow-on opt-in proof now shows
+that a vkms lease can actually scan out. `ozma-multiseat/src/drm_scanout.rs`
+adds `DrmScanoutBackend`, `DrmScanoutHandle`, `DrmScanoutStatus`, and typed
+`DrmScanoutError`. It acquires the same connector/CRTC lease, allocates a dumb
+buffer, fills a known XRGB8888 pattern, adds a framebuffer, programs the
+CRTC/connector, queues a page flip, re-reads CRTC/connector/framebuffer state,
+then clears the CRTC and destroys the framebuffer/buffer before revoking the
+lease.
+
+CLI entry point:
+
+```text
+ozma-multiseat --seat-drm-scanout [SEAT=]CARD:CONNECTOR \
+               [--seat-drm-scanout-mode WIDTHxHEIGHT] [--json]
+```
+
+The proof runs and exits before any X display/plan work, so the default
+supervisor/planning path is unchanged. `auto`/`vkms` still selects only a vkms
+card; a real output requires an explicit `/dev/dri/cardN`. Status always keeps
+the `scanout_proof_only` note: this is one static framebuffer, not a compositor.
+See `docs/phase4-kms-scanout-report.md` for design, live evidence, and the
+remaining compositor gaps.
+
 ## Verification
 
 ```text
@@ -197,10 +222,13 @@ rustfmt --edition 2021 --check <touched files>
 
 ## Remaining gaps
 
-- **No compositor or scanout.** The lessee fd is a kernel object handoff. No
-  compositor is started, no framebuffer is allocated, no CRTC/plane mode is
-  programmed, and no physical output is isolated. The `lease_only_no_scanout`
-  note is always attached.
+- **No compositor.** The lease itself is a kernel object handoff. The opt-in
+  `--seat-drm-scanout` proof (see the follow-on section above) allocates a dumb
+  buffer, programs one CRTC/connector, verifies it, and tears it down, so
+  scanout is no longer unproven. It still starts no compositor, accepts no
+  client surfaces, performs no window management or damage tracking, and does
+  not isolate the host desktop. The `lease_only_no_scanout` note stays on a
+  plain lease; the proof carries `scanout_proof_only` instead.
 - **`ozma-node` does not consume the fd yet.** It receives `OZMA_DRM_*` but has
   no KMS/Wayland/DRM compositor code, so a lease is prepared for a future
   consumer, not end-to-end seat graphics. `ozma-node` was not modified.

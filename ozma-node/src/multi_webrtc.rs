@@ -41,7 +41,9 @@ use ozma_display::vm::{VmConsoleBackend, MAX_VM_CONSOLES};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::display_control::{open_first_source, ConsoleSelectionObserver, ConsoleSourceFactory};
+use crate::display_control::{
+    open_selected_source, ConsoleSelectionObserver, ConsoleSourceFactory,
+};
 use crate::display_outputs::{DisplayOutput, DisplayOutputSelection};
 use crate::webrtc::{WebRtcAnswer, WebRtcConfig, WebRtcError, WebRtcHelper, WebRtcStatus};
 
@@ -253,10 +255,11 @@ impl ConsoleWebRtcFactory for ControllerWebRtcFactory {
         geometry: Option<(u32, u32)>,
     ) -> Result<Arc<dyn ConsoleWebRtcSession>, String> {
         let factory = self.console_factory.clone();
+        let source_id = self.console_factory.source_id().map(str::to_owned);
         let config = self.config_for(console, geometry);
         tokio::task::spawn_blocking(move || {
             let registry = factory.registry(console)?;
-            let source = open_first_source(&registry)?;
+            let source = open_selected_source(&registry, source_id.as_deref())?;
             let helper = WebRtcHelper::start(source, config).map_err(|error| error.to_string())?;
             Ok(Arc::new(HelperSession::new(helper)) as Arc<dyn ConsoleWebRtcSession>)
         })

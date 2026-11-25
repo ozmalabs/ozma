@@ -1,5 +1,5 @@
 {
-  "_baseline": "Current compatibility surface expected by the Python controller. /health mirrors the node's native health document consumed by the controller's node probes; /api/v1/connection mirrors the controller-facing compatibility status endpoint. Type names are checked by ozma-node/tests/parity.rs. The connection document also reports input sink availability/injection, codec state (current_encoder, override, available, receipt, pending_restart, applied), and audio routing state: 'not-configured' without --audio-router, 'running' with a healthy router, 'failed' plus audio_error when the backend could not initialise. HLS is opt-in and honest: 'not-configured' without --hls, 'running' only once stream.m3u8 exists, 'failed' plus hls_error otherwise. WebRTC is helper-first: 'not-configured' without --webrtc-helper, 'running' only after the helper socket connects, 'failed' plus webrtc_error otherwise; /webrtc/offer and /webrtc/bitrate answer typed 503s rather than 404s. POST /codec validates codec/bitrate/hw_accel and restarts the running HLS pipeline with the mapped software or verified hardware encoder, reporting applied:true only after that restart; an explicit hardware request never silently becomes software, and an allowed fallback is reported with fallback:true plus requested_encoder. With HLS off it stores the override and reports applied:false/pending_restart:true. Hardware availability comes from ffmpeg -encoders, not from the encoder name. WebRTC keeps its existing encoder and is never reported as switched. agent_metrics is the flat host metrics document served unauthenticated for controller/device_metrics.py; audio_nodes_unsupported and audio_sweep_unsupported are the public typed 501 shapes for the two audio routes the Rust AudioRouter cannot serve.",
+  "_baseline": "Current compatibility surface expected by the Python controller. /health mirrors the node's native health document consumed by the controller's node probes; /api/v1/connection mirrors the controller-facing compatibility status endpoint. Type names are checked by ozma-node/tests/parity.rs. The connection document also reports input sink availability/injection, codec state (current_encoder, override, available, receipt, pending_restart, applied), and audio routing state: 'not-configured' without --audio-router, 'running' with a healthy router, 'failed' plus audio_error when the backend could not initialise. HLS is opt-in and honest: 'not-configured' without --hls, 'running' only once stream.m3u8 exists, 'failed' plus hls_error otherwise. WebRTC is helper-first: 'not-configured' without --webrtc-helper, 'running' only after the helper socket connects, 'failed' plus webrtc_error otherwise; /webrtc/offer and /webrtc/bitrate answer typed 503s rather than 404s. POST /codec validates codec/bitrate/hw_accel and restarts the running HLS pipeline with the mapped software or verified hardware encoder, reporting applied:true only after that restart; an explicit hardware request never silently becomes software, and an allowed fallback is reported with fallback:true plus requested_encoder. With HLS off it stores the override and reports applied:false/pending_restart:true. Hardware availability comes from ffmpeg -encoders, not from the encoder name. WebRTC keeps its existing encoder and is never reported as switched. agent_metrics is the flat host metrics document served unauthenticated for controller/device_metrics.py; audio_nodes_unavailable and audio_sweep_unavailable are the public typed 503 shapes when no audio router is configured; with a router, /audio/nodes returns a real bounded pactl JSON graph snapshot and /audio/sweep returns a measured profile or a typed error.",
   "health": {
     "ok": "bool",
     "node_id": "string",
@@ -60,7 +60,7 @@
     "unavailable": "array",
     "notes": "string"
   },
-  "audio_nodes_unsupported": {
+  "audio_nodes_unavailable": {
     "ok": "bool",
     "available": "bool",
     "code": "string",
@@ -71,7 +71,7 @@
     "default_sink": "string-or-null",
     "default_source": "string-or-null"
   },
-  "audio_sweep_unsupported": {
+  "audio_sweep_unavailable": {
     "ok": "bool",
     "available": "bool",
     "code": "string",

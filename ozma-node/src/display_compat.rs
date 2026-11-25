@@ -810,6 +810,42 @@ mod tests {
         assert_eq!(info.capability_max_height, Some(240));
     }
 
+    fn multi_source_registry() -> CaptureRegistry {
+        CaptureRegistry::new()
+            .with(
+                FakeCaptureProvider::new()
+                    .with_identity("/dev/video0", "Creative Live! Cam")
+                    .with_format(FrameFormat::rgb24(64, 48)),
+            )
+            .with(
+                FakeCaptureProvider::new()
+                    .with_identity("/dev/video42", "ozma-capture-test")
+                    .with_format(FrameFormat::rgb24(32, 24)),
+            )
+    }
+
+    #[tokio::test]
+    async fn snapshot_uses_the_selected_capture_device_not_the_first_camera() {
+        let control = SnapshotControl::new(multi_source_registry()).with_source_id("/dev/video42");
+        let snapshot = control.capture().await.expect("selected snapshot");
+        assert_eq!(snapshot.source_id, "/dev/video42");
+        assert_eq!((snapshot.format.width, snapshot.format.height), (32, 24));
+        assert_eq!(snapshot.format.pixel_format, PixelFormat::Rgb24);
+
+        let info = control.info().await;
+        assert_eq!(info.source_id.as_deref(), Some("/dev/video42"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_missing_selected_device_is_typed_and_does_not_fall_back() {
+        let control = SnapshotControl::new(multi_source_registry()).with_source_id("/dev/video99");
+        let error = control.capture().await.expect_err("missing device");
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let api = error.api_error();
+        assert_eq!(api.code, codes::CAPTURE_UNAVAILABLE);
+        assert!(api.message.contains("/dev/video99"), "{}", api.message);
+    }
+
     #[tokio::test]
     async fn bgra_source_is_encoded() {
         let registry = CaptureRegistry::new().with(

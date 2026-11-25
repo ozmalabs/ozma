@@ -2370,6 +2370,11 @@ impl crate::drm_lease::DrmLeaseHandle for FakeDrmLeaseHandle {
         self.fd.as_ref().map(AsRawFd::as_raw_fd)
     }
 
+    fn as_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        self.fd.as_ref().map(AsFd::as_fd)
+    }
+
     fn set_inheritable(&self, _inheritable: bool) -> Result<(), crate::drm_lease::DrmLeaseError> {
         Ok(())
     }
@@ -2430,4 +2435,520 @@ impl Drop for FakeDrmLeaseHandle {
             state.dropped.push(self.record.lessee_id);
         }
     }
+}
+
+/// One in-memory card configured for [`FakeDrmScanoutBackend`].
+#[derive(Clone, Debug)]
+pub struct FakeDrmScanoutCard {
+    /// Card name.
+    pub name: String,
+    /// Card path.
+    pub path: std::path::PathBuf,
+    /// Driver name.
+    pub driver: String,
+    /// Whether automatic selection may use this card.
+    pub virtual_card: bool,
+    /// Connector name.
+    pub connector: String,
+    /// Connector object id.
+    pub connector_id: u32,
+    /// CRTC object id.
+    pub crtc_id: u32,
+    /// Advertised mode names.
+    pub modes: Vec<String>,
+}
+
+/// Injected one-shot scanout failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeDrmScanoutFailure {
+    /// No card is available.
+    NoDrm,
+    /// Opening the card is denied.
+    NoPermission,
+    /// The caller is not master / lacks CAP_SYS_ADMIN.
+    CapabilityRequired,
+    /// The driver is not vkms.
+    UnsupportedVkms,
+    /// The connector is missing or has no modes.
+    UnsupportedConnector,
+    /// The requested mode does not exist / the modeset failed.
+    ModeFailure,
+    /// Dumb-buffer allocation failed.
+    BufferFailure,
+    /// Framebuffer creation failed.
+    FramebufferFailure,
+    /// Post-modeset verification fails.
+    VerificationFailure,
+    /// Page flip is rejected after a successful commit.
+    PageFlipUnavailable,
+}
+
+#[derive(Debug, Default)]
+struct FakeDrmScanoutState {
+    cards: Vec<FakeDrmScanoutCard>,
+    failure: Option<FakeDrmScanoutFailure>,
+    events: Vec<String>,
+    active: bool,
+    next_lessee: u32,
+    next_framebuffer: u32,
+    next_buffer: u32,
+    verification_fails: bool,
+}
+
+/// Test-only KMS scanout backend.
+///
+/// It models lease creation, dumb-buffer allocation/fill, framebuffer creation,
+/// `set_crtc`, page flip, verification, and teardown in memory. It never opens
+/// `/dev/dri`, mmaps a real buffer, or changes any display.
+#[derive(Clone, Debug)]
+pub struct FakeDrmScanoutBackend {
+    state: Arc<Mutex<FakeDrmScanoutState>>,
+}
+
+impl Default for FakeDrmScanoutBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeDrmScanoutBackend {
+    /// A fake with one vkms card (`card9`), connector `Virtual-1` (101), CRTC
+    /// 201, and modes `1024x768` and `800x600`.
+    pub fn new() -> Self {
+        let mut backend = Self {
+            state: Arc::new(Mutex::new(FakeDrmScanoutState {
+                next_lessee: 7,
+                next_framebuffer: 51,
+                next_buffer: 41,
+                ..FakeDrmScanoutState::default()
+            })),
+        };
+        backend.add_vkms_card(
+            "card9",
+            "/dev/dri/card9",
+            "Virtual-1",
+            101,
+            201,
+            &["1024x768", "800x600"],
+        );
+        backend
+    }
+
+    /// Add a virtual vkms card.
+    pub fn add_vkms_card(
+        &mut self,
+        name: &str,
+        path: &str,
+        connector: &str,
+        connector_id: u32,
+        crtc_id: u32,
+        modes: &[&str],
+    ) -> &mut Self {
+        self.add_card(
+            name,
+            path,
+            "vkms",
+            true,
+            connector,
+            connector_id,
+            crtc_id,
+            modes,
+        )
+    }
+
+    /// Add a card with explicit virtual/real policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_card(
+        &mut self,
+        name: &str,
+        path: &str,
+        driver: &str,
+        virtual_card: bool,
+        connector: &str,
+        connector_id: u32,
+        crtc_id: u32,
+        modes: &[&str],
+    ) -> &mut Self {
+        let card = FakeDrmScanoutCard {
+            name: name.to_owned(),
+            path: std::path::PathBuf::from(path),
+            driver: driver.to_owned(),
+            virtual_card,
+            connector: connector.to_owned(),
+            connector_id,
+            crtc_id,
+            modes: modes.iter().map(|mode| (*mode).to_owned()).collect(),
+        };
+        let mut state = self.state.lock().expect("fake scanout lock");
+        state.cards.retain(|existing| existing.name != name);
+        state.cards.push(card);
+        drop(state);
+        self
+    }
+
+    /// Remove all cards (simulates a host with no DRM).
+    pub fn without_cards(&mut self) -> &mut Self {
+        self.state.lock().expect("fake scanout lock").cards.clear();
+        self
+    }
+
+    /// Inject one typed failure on the next start.
+    pub fn fail_next(&self, failure: FakeDrmScanoutFailure) {
+        self.state.lock().expect("fake scanout lock").failure = Some(failure);
+    }
+
+    /// Events recorded so far, in order.
+    pub fn events(&self) -> Vec<String> {
+        self.state.lock().expect("fake scanout lock").events.clone()
+    }
+
+    /// Whether a scanout is currently active.
+    pub fn active(&self) -> bool {
+        self.state.lock().expect("fake scanout lock").active
+    }
+}
+
+impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
+    fn start(
+        &self,
+        request: &crate::drm_scanout::DrmScanoutRequest,
+    ) -> Result<Box<dyn crate::drm_scanout::DrmScanoutHandle>, crate::drm_scanout::DrmScanoutError>
+    {
+        use crate::drm_lease::DrmCardSelector;
+        use crate::drm_scanout::{
+            DrmScanoutError, DrmScanoutNote, DrmScanoutNoteKind, DrmScanoutStatus, SCANOUT_PATTERN,
+        };
+        let mut state = self.state.lock().expect("fake scanout lock");
+        state.events.push(format!(
+            "start {}:{}",
+            request.lease.card.display_name(),
+            request.lease.connector
+        ));
+        let failure = state.failure.take();
+        let mut page_flip_unavailable = false;
+        if let Some(failure) = failure {
+            let card = request.lease.card.display_name();
+            match failure {
+                FakeDrmScanoutFailure::PageFlipUnavailable => {
+                    // Keep the commit: the real backend records this as a
+                    // non-fatal note rather than a start failure.
+                    page_flip_unavailable = true;
+                }
+                FakeDrmScanoutFailure::NoDrm => {
+                    return Err(DrmScanoutError::NoDrm {
+                        reason: "injected no-DRM failure".to_owned(),
+                    })
+                }
+                FakeDrmScanoutFailure::NoPermission => {
+                    return Err(DrmScanoutError::NoPermission {
+                        path: card,
+                        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                    })
+                }
+                FakeDrmScanoutFailure::CapabilityRequired => {
+                    return Err(DrmScanoutError::CapabilityRequired {
+                        card,
+                        reason: "injected missing master".to_owned(),
+                    })
+                }
+                FakeDrmScanoutFailure::UnsupportedVkms => {
+                    return Err(DrmScanoutError::UnsupportedVkms {
+                        card,
+                        driver: "xe".to_owned(),
+                    })
+                }
+                FakeDrmScanoutFailure::UnsupportedConnector => {
+                    return Err(DrmScanoutError::UnsupportedConnector {
+                        card,
+                        connector: request.lease.connector.clone(),
+                        reason: "injected missing connector".to_owned(),
+                    })
+                }
+                FakeDrmScanoutFailure::ModeFailure => {
+                    return Err(DrmScanoutError::ModeFailed {
+                        card,
+                        connector: request.lease.connector.clone(),
+                        mode: request.mode.clone().unwrap_or_else(|| "auto".to_owned()),
+                        reason: "injected modeset failure".to_owned(),
+                    })
+                }
+                FakeDrmScanoutFailure::BufferFailure => {
+                    return Err(DrmScanoutError::BufferFailed {
+                        card,
+                        reason: "injected dumb-buffer failure".to_owned(),
+                    })
+                }
+                FakeDrmScanoutFailure::FramebufferFailure => {
+                    return Err(DrmScanoutError::FramebufferFailed {
+                        card,
+                        reason: "injected framebuffer failure".to_owned(),
+                    })
+                }
+                FakeDrmScanoutFailure::VerificationFailure => {
+                    state.verification_fails = true;
+                }
+            }
+        }
+
+        let card = match &request.lease.card {
+            DrmCardSelector::AutoVirtual => state
+                .cards
+                .iter()
+                .find(|card| card.virtual_card)
+                .cloned()
+                .ok_or_else(|| DrmScanoutError::NoDrm {
+                    reason: "fake backend has no virtual card".to_owned(),
+                })?,
+            DrmCardSelector::Explicit(path) => state
+                .cards
+                .iter()
+                .find(|card| card.path == *path)
+                .cloned()
+                .ok_or_else(|| DrmScanoutError::NoDrm {
+                    reason: format!("unknown DRM card {}", path.display()),
+                })?,
+        };
+        crate::drm_scanout::ensure_scanout_card(
+            &crate::drm_lease::DrmCard {
+                name: card.name.clone(),
+                path: card.path.clone(),
+                sysfs_path: std::path::PathBuf::from(format!("/sys/class/drm/{}", card.name)),
+                driver: card.driver.clone(),
+                virtual_card: card.virtual_card,
+                connectors: Vec::new(),
+                crtcs: vec![card.crtc_id],
+            },
+            &request.lease.card,
+        )?;
+        if card.connector != request.lease.connector {
+            return Err(DrmScanoutError::UnsupportedConnector {
+                card: card.path.display().to_string(),
+                connector: request.lease.connector.clone(),
+                reason: format!("fake card has connector {:?}", card.connector),
+            });
+        }
+        let mode = match request.mode.as_deref() {
+            Some(requested) => card
+                .modes
+                .iter()
+                .find(|mode| mode.eq_ignore_ascii_case(requested.trim()))
+                .cloned()
+                .ok_or_else(|| DrmScanoutError::ModeFailed {
+                    card: card.path.display().to_string(),
+                    connector: card.connector.clone(),
+                    mode: requested.to_owned(),
+                    reason: "mode is not advertised".to_owned(),
+                })?,
+            None => card.modes.first().cloned().ok_or_else(|| {
+                DrmScanoutError::UnsupportedConnector {
+                    card: card.path.display().to_string(),
+                    connector: card.connector.clone(),
+                    reason: "connector advertises no modes".to_owned(),
+                }
+            })?,
+        };
+        let (width, height) =
+            parse_mode_size(&mode).ok_or_else(|| DrmScanoutError::ModeFailed {
+                card: card.path.display().to_string(),
+                connector: card.connector.clone(),
+                mode: mode.clone(),
+                reason: "fake mode name is not WIDTHxHEIGHT".to_owned(),
+            })?;
+        let pitch = width * 4;
+        let mut bytes = vec![0u8; (pitch * height) as usize];
+        let checksum = crate::drm_scanout::fill_pattern(&mut bytes, width, height, pitch);
+
+        state.next_lessee = state.next_lessee.saturating_add(1);
+        state.next_framebuffer = state.next_framebuffer.saturating_add(1);
+        state.next_buffer = state.next_buffer.saturating_add(1);
+        let lessee_id = state.next_lessee;
+        let framebuffer_id = state.next_framebuffer;
+        let buffer_handle = state.next_buffer;
+        state.events.push(format!("lease {lessee_id}"));
+        state
+            .events
+            .push(format!("buffer {buffer_handle} {width}x{height}"));
+        state.events.push(format!("fill {checksum}"));
+        state.events.push(format!("framebuffer {framebuffer_id}"));
+        state
+            .events
+            .push(format!("set_crtc {} {framebuffer_id} {mode}", card.crtc_id));
+        state
+            .events
+            .push(format!("page_flip {} {framebuffer_id}", card.crtc_id));
+        state.active = true;
+
+        let mut status = DrmScanoutStatus {
+            card: card.path.display().to_string(),
+            connector: card.connector.clone(),
+            connector_id: Some(card.connector_id),
+            crtc_id: Some(card.crtc_id),
+            lessee_id: Some(lessee_id),
+            lessee_fd: Some(30 + i32::try_from(lessee_id).unwrap_or(0)),
+            mode,
+            width,
+            height,
+            pitch,
+            framebuffer_id: Some(framebuffer_id),
+            buffer_handle: Some(buffer_handle),
+            pattern: SCANOUT_PATTERN.to_owned(),
+            pattern_checksum: Some(checksum),
+            page_flipped: !page_flip_unavailable,
+            verification: None,
+            applied: true,
+            released: false,
+            notes: Vec::new(),
+            error: None,
+        };
+        status.push_proof_note();
+        status.push_note(DrmScanoutNote::new(
+            DrmScanoutNoteKind::LesseeFd,
+            format!("fake scanout uses lessee fd {}", 30 + lessee_id),
+        ));
+        if !card.virtual_card {
+            status.push_note(DrmScanoutNote::new(
+                DrmScanoutNoteKind::RealGpuNamed,
+                format!(
+                    "fake real card {} was named explicitly",
+                    card.path.display()
+                ),
+            ));
+        }
+        let verification_fails = state.verification_fails;
+        state.verification_fails = false;
+        drop(state);
+        let mode_for_record = status.mode.clone();
+
+        Ok(Box::new(FakeDrmScanoutHandle {
+            status,
+            record: FakeScanoutRecord {
+                card: card.path.clone(),
+                connector: card.connector.clone(),
+                crtc_id: card.crtc_id,
+                mode: mode_for_record,
+                width,
+                height,
+                pitch,
+                framebuffer_id,
+                buffer_handle,
+                lessee_id,
+                checksum,
+            },
+            verification_fails,
+            active: true,
+            state: Arc::clone(&self.state),
+        }))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FakeScanoutRecord {
+    card: std::path::PathBuf,
+    connector: String,
+    crtc_id: u32,
+    mode: String,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    framebuffer_id: u32,
+    buffer_handle: u32,
+    lessee_id: u32,
+    checksum: u32,
+}
+
+struct FakeDrmScanoutHandle {
+    status: crate::drm_scanout::DrmScanoutStatus,
+    record: FakeScanoutRecord,
+    verification_fails: bool,
+    active: bool,
+    state: Arc<Mutex<FakeDrmScanoutState>>,
+}
+
+impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
+    fn status(&self) -> &crate::drm_scanout::DrmScanoutStatus {
+        &self.status
+    }
+
+    fn verify(
+        &mut self,
+    ) -> Result<crate::drm_scanout::DrmScanoutVerification, crate::drm_scanout::DrmScanoutError>
+    {
+        use crate::drm_scanout::{DrmScanoutError, DrmScanoutVerification};
+        if !self.active {
+            return Err(DrmScanoutError::Released(
+                self.record.card.display().to_string(),
+            ));
+        }
+        if self.verification_fails {
+            let error = DrmScanoutError::VerificationFailed {
+                card: self.record.card.display().to_string(),
+                connector: self.record.connector.clone(),
+                message: "injected verification mismatch".to_owned(),
+            };
+            self.status.mark_error(&error);
+            return Err(error);
+        }
+        let verification = DrmScanoutVerification {
+            crtc_id: self.record.crtc_id,
+            crtc_mode: Some(self.record.mode.clone()),
+            crtc_framebuffer: Some(self.record.framebuffer_id),
+            crtc_position: (0, 0),
+            connector_state: "connected".to_owned(),
+            connector_crtc: Some(self.record.crtc_id),
+            framebuffer_id: self.record.framebuffer_id,
+            framebuffer_size: (self.record.width, self.record.height),
+            framebuffer_pitch: self.record.pitch,
+            framebuffer_bpp: 32,
+            framebuffer_depth: 24,
+            framebuffer_buffer_handle: Some(self.record.buffer_handle),
+            buffer_size: (self.record.width, self.record.height),
+            buffer_pitch: self.record.pitch,
+            buffer_handle: self.record.buffer_handle,
+            pattern_checksum: self.record.checksum,
+            ok: true,
+            mismatch: None,
+        };
+        self.status.verification = Some(verification.clone());
+        Ok(verification)
+    }
+
+    fn teardown(&mut self) -> Result<(), crate::drm_scanout::DrmScanoutError> {
+        if !self.active {
+            return Ok(());
+        }
+        let mut state = self.state.lock().expect("fake scanout lock");
+        state
+            .events
+            .push(format!("clear_crtc {}", self.record.crtc_id));
+        state.events.push(format!(
+            "destroy_framebuffer {}",
+            self.record.framebuffer_id
+        ));
+        state
+            .events
+            .push(format!("destroy_buffer {}", self.record.buffer_handle));
+        state
+            .events
+            .push(format!("revoke {}", self.record.lessee_id));
+        state.active = false;
+        drop(state);
+        self.active = false;
+        self.status.mark_released();
+        Ok(())
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+impl Drop for FakeDrmScanoutHandle {
+    fn drop(&mut self) {
+        let _ = crate::drm_scanout::DrmScanoutHandle::teardown(self);
+    }
+}
+
+fn parse_mode_size(mode: &str) -> Option<(u32, u32)> {
+    let (width, height) = mode.split_once('x')?;
+    Some((width.parse().ok()?, height.parse().ok()?))
 }

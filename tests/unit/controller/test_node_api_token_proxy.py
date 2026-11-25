@@ -188,6 +188,13 @@ PROXY_CASES = [
     ("get", f"/api/v1/nodes/{NODE_ID}/storage", None, "/storage"),
     ("get", f"/api/v1/nodes/{NODE_ID}/apps", None, "/apps"),
     ("get", f"/api/v1/nodes/{NODE_ID}/self", None, "/self"),
+    ("get", f"/api/v1/audio/nodes?node_id={NODE_ID}", None, "/audio/nodes"),
+    (
+        "post",
+        "/api/v1/audio/room-correction/sweep",
+        {"node_id": NODE_ID, "source": "ozma-vm1.monitor", "sink": "ozma-vm1"},
+        "/audio/sweep",
+    ),
 ]
 
 
@@ -922,3 +929,101 @@ def test_backup_init_proxy_preserves_typed_missing_binary(fake_node, tmp_path):
     assert response.json() == expected
     assert TOKEN not in response.text
     assert fake_node.requests[-1]["path"] == "/backup/init"
+
+
+def test_audio_nodes_proxy_preserves_real_graph_json(fake_node, tmp_path):
+    expected = {
+        "ok": True,
+        "available": True,
+        "backend": "pipewire",
+        "nodes": [
+            {
+                "id": 42,
+                "name": "ozma-vm1",
+                "description": "Ozma VM 1",
+                "media_class": "Audio/Sink",
+                "default": True,
+                "state": "RUNNING",
+                "mute": False,
+                "volume_percent": 75.0,
+                "monitor_source": "ozma-vm1.monitor",
+                "monitor_of_sink": None,
+            }
+        ],
+        "streams": [],
+        "links": [],
+        "default_sink": "ozma-vm1",
+        "default_source": "ozma-vm1.monitor",
+        "truncated": False,
+        "links_available": False,
+    }
+    fake_node.responder = lambda _method, _record: (200, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(f"/api/v1/audio/nodes?node_id={NODE_ID}")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "GET"
+    assert record["path"] == "/audio/nodes"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_audio_sweep_proxy_passes_typed_error_and_forwards_bounds(fake_node, tmp_path):
+    expected = {
+        "ok": False,
+        "available": False,
+        "profile": None,
+        "code": "audio.missing_command",
+        "error": "audio routing command `pw-play` was not found",
+        "remediation": "Install pipewire-bin.",
+    }
+    fake_node.responder = lambda _method, _record: (503, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        "/api/v1/audio/room-correction/sweep",
+        json={
+            "node_id": NODE_ID,
+            "source": "ozma-vm1.monitor",
+            "sink": "ozma-vm1",
+            "start_hz": 30,
+            "end_hz": 16000,
+            "duration_secs": 3,
+            "room_name": "Office",
+        },
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "POST"
+    assert record["path"] == "/audio/sweep"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+    assert record["body"] == {
+        "source": "ozma-vm1.monitor",
+        "sink": "ozma-vm1",
+        "start_hz": 30,
+        "end_hz": 16000,
+        "duration_secs": 3,
+        "room_name": "Office",
+    }
+
+
+def test_audio_sweep_proxy_surfaces_node_disconnect_as_typed_502(fake_node, tmp_path):
+    app, _ = _build_app(_unused_port(), tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        "/api/v1/audio/room-correction/sweep",
+        json={"node_id": NODE_ID, "source": "monitor", "sink": "sink"},
+    )
+
+    assert response.status_code == 502, response.text
+    body = response.json()
+    assert body["ok"] is False
+    assert body["available"] is False
+    assert body["code"] == "audio.proxy_failed"
+    assert TOKEN not in response.text

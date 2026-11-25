@@ -24,16 +24,16 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use ozma_multiseat::{
-    detect_drm, render_metrics, DrmDetection, DrmLeaseRequest, DrmLeaseStatus, EvdevGrabRouter,
-    HelperClient, HelperClientConfig, HostTopology, HotplugDebounce, HotplugOptions,
-    HttpHealthProbe, InputTargetingMode, MultiseatPlan, MultiseatPlanner, MultiseatStatus,
-    OzmaAudioRouter, PlannerOptions, PortProbe, ProcessCommandRunner, ProcessLauncher,
-    ProcessSeatDisplayLauncher, ProcessSeatInputTargeter, ProcessSeatSupervisor, ReadinessProbe,
-    RealDrmLeaseBackend, SeatDisplayBackend, SeatDisplayOptions, SeatDisplaySize,
-    SeatDisplayStatus, SeatProfile, SeatReconciler, SeatResourceStatus, SeatState, SeatStore,
-    SeatSupervisor, SupervisorOptions, SysfsHotplugMonitor, SysfsInputBackend, XInputRouter,
-    XrandrDisplayBackend, XrandrOwnershipController, DEFAULT_DEBOUNCE, DEFAULT_HEALTH_PATH,
-    DEFAULT_NODE_BIN,
+    detect_drm, render_metrics, DrmDetection, DrmLeaseRequest, DrmLeaseStatus, DrmScanoutBackend,
+    DrmScanoutRequest, DrmScanoutStatus, EvdevGrabRouter, HelperClient, HelperClientConfig,
+    HostTopology, HotplugDebounce, HotplugOptions, HttpHealthProbe, InputTargetingMode,
+    MultiseatPlan, MultiseatPlanner, MultiseatStatus, OzmaAudioRouter, PlannerOptions, PortProbe,
+    ProcessCommandRunner, ProcessLauncher, ProcessSeatDisplayLauncher, ProcessSeatInputTargeter,
+    ProcessSeatSupervisor, ReadinessProbe, RealDrmLeaseBackend, RealDrmScanoutBackend,
+    SeatDisplayBackend, SeatDisplayOptions, SeatDisplaySize, SeatDisplayStatus, SeatProfile,
+    SeatReconciler, SeatResourceStatus, SeatState, SeatStore, SeatSupervisor, SupervisorOptions,
+    SysfsHotplugMonitor, SysfsInputBackend, XInputRouter, XrandrDisplayBackend,
+    XrandrOwnershipController, DEFAULT_DEBOUNCE, DEFAULT_HEALTH_PATH, DEFAULT_NODE_BIN,
 };
 
 /// Plan and supervise one `ozma-node` per seat on this host.
@@ -199,6 +199,20 @@ struct Args {
     #[arg(long, value_name = "[SEAT=]CARD:CONNECTOR", action = clap::ArgAction::Append)]
     seat_drm_lease: Vec<String>,
 
+    /// Run the opt-in KMS scanout proof for `[SEAT=]CARD:CONNECTOR` and exit.
+    /// It acquires a DRM lease, allocates a dumb buffer, fills a known pattern,
+    /// programs one CRTC/connector, verifies the result, prints status, and
+    /// tears everything down. This proves scanout; it does not start a
+    /// compositor. `auto`/`vkms` only selects a vkms card; a real output must
+    /// be named as an explicit `/dev/dri/cardN`.
+    #[arg(long, value_name = "[SEAT=]CARD:CONNECTOR")]
+    seat_drm_scanout: Option<String>,
+
+    /// Exact connector mode for `--seat-drm-scanout` (default: the
+    /// connector's first advertised mode).
+    #[arg(long, value_name = "WIDTHxHEIGHT")]
+    seat_drm_scanout_mode: Option<String>,
+
     /// Create per-seat null sinks through ozma-audio before start and remove
     /// them after stop. Optional value: pipewire (default) or pulseaudio.
     #[arg(
@@ -229,6 +243,9 @@ struct Args {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
     let args = Args::parse();
+    if let Some(selector) = args.seat_drm_scanout.clone() {
+        return run_scanout_proof(&args, &selector);
+    }
     validate(&args)?;
 
     let display = resolve_display(&args)?;
@@ -624,6 +641,152 @@ fn parse_drm_leases(
     Ok(leases)
 }
 
+fn split_seat_prefix(value: &str) -> (&str, Option<&str>) {
+    match value.split_once('=') {
+        Some((prefix, rest)) if !prefix.trim().is_empty() && !prefix.contains(':') => {
+            (rest, Some(prefix.trim()))
+        }
+        _ => (value, None),
+    }
+}
+
+fn run_scanout_proof(args: &Args, selector: &str) -> Result<(), ozma_multiseat::MultiseatError> {
+    let (raw, seat) = split_seat_prefix(selector.trim());
+    let mut request: DrmScanoutRequest = raw.trim().parse().map_err(|error| {
+        ozma_multiseat::MultiseatError::DrmScanout(format!(
+            "invalid --seat-drm-scanout value {selector:?}: {error}"
+        ))
+    })?;
+    if let Some(mode) = args.seat_drm_scanout_mode.as_deref() {
+        request = request.with_mode(mode);
+    }
+    if let Some(seat) = seat {
+        eprintln!(
+            "note: --seat-drm-scanout is a standalone single-output proof; ignoring seat prefix \
+             {seat:?}"
+        );
+    }
+
+    let backend = RealDrmScanoutBackend::new();
+    let mut handle = match backend.start(&request) {
+        Ok(handle) => handle,
+        Err(error) => {
+            if args.json {
+                let report = serde_json::json!({
+                    "ok": false,
+                    "seat": seat,
+                    "request": &request,
+                    "error": {
+                        "kind": error.code(),
+                        "message": error.to_string(),
+                    },
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .unwrap_or_else(|_| "{\"ok\":false}".to_owned())
+                );
+            } else {
+                eprintln!("scanout failed [{}]: {error}", error.code());
+            }
+            return Err(ozma_multiseat::MultiseatError::DrmScanout(
+                error.to_string(),
+            ));
+        }
+    };
+
+    let verification = handle.verify();
+    let verify_error = verification.err();
+    let teardown_error = handle.teardown().err();
+    let status: DrmScanoutStatus = handle.status().clone();
+
+    if args.json {
+        let report = serde_json::json!({
+            "ok": verify_error.is_none() && teardown_error.is_none(),
+            "seat": seat,
+            "request": &request,
+            "scanout": &status,
+            "notes": &status.notes,
+            "verification": &status.verification,
+            "error": verify_error.as_ref().map(|error| serde_json::json!({
+                "kind": error.code(),
+                "message": error.to_string(),
+            })),
+            "teardown_error": teardown_error.as_ref().map(|error| serde_json::json!({
+                "kind": error.code(),
+                "message": error.to_string(),
+            })),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{\"ok\":false}".to_owned())
+        );
+    } else {
+        print_scanout_status(&status);
+    }
+
+    match (verify_error, teardown_error) {
+        (None, None) => Ok(()),
+        (verify, teardown) => {
+            let message = [
+                verify.map(|error| error.to_string()),
+                teardown.map(|error| error.to_string()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ");
+            Err(ozma_multiseat::MultiseatError::DrmScanout(message))
+        }
+    }
+}
+
+fn print_scanout_status(status: &DrmScanoutStatus) {
+    println!(
+        "scanout: {}:{} connector_id={:?} crtc={:?} lessee={:?} fd={:?}",
+        status.card,
+        status.connector,
+        status.connector_id,
+        status.crtc_id,
+        status.lessee_id,
+        status.lessee_fd
+    );
+    println!(
+        "  mode={} {}x{} pitch={} framebuffer={:?} buffer={:?} pattern={} checksum={:?} \
+         page_flipped={}",
+        status.mode,
+        status.width,
+        status.height,
+        status.pitch,
+        status.framebuffer_id,
+        status.buffer_handle,
+        status.pattern,
+        status.pattern_checksum,
+        status.page_flipped
+    );
+    if let Some(verification) = &status.verification {
+        println!(
+            "  verify: ok={} crtc_mode={:?} crtc_framebuffer={:?} connector={} \
+             connector_crtc={:?} framebuffer_buffer={:?} buffer_size={}x{}",
+            verification.ok,
+            verification.crtc_mode,
+            verification.crtc_framebuffer,
+            verification.connector_state,
+            verification.connector_crtc,
+            verification.framebuffer_buffer_handle,
+            verification.buffer_size.0,
+            verification.buffer_size.1
+        );
+    }
+    for note in &status.notes {
+        println!("  note[{}]: {}", note.kind.as_str(), note.message);
+    }
+    println!(
+        "  scanout applied={} released={}",
+        status.applied, status.released
+    );
+}
+
 fn validate(args: &Args) -> Result<(), ozma_multiseat::MultiseatError> {
     if args.base_port == 0 || args.base_http_port == 0 {
         return Err(ozma_multiseat::MultiseatError::Supervisor(
@@ -688,6 +851,11 @@ fn validate(args: &Args) -> Result<(), ozma_multiseat::MultiseatError> {
             "unknown input targeting {:?}; expected off, warn, or strict",
             args.input_targeting
         )));
+    }
+    if args.seat_drm_scanout.is_none() && args.seat_drm_scanout_mode.is_some() {
+        return Err(ozma_multiseat::MultiseatError::DrmScanout(
+            "--seat-drm-scanout-mode is only valid with --seat-drm-scanout".to_owned(),
+        ));
     }
     let _: SeatDisplaySize = args.seat_display_size.parse()?;
     if args.input_isolation == "helper" && args.apply_routing {

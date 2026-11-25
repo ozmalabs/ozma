@@ -257,6 +257,10 @@ pub enum MultiseatError {
     /// The lease-only layer never claims scanout or compositor isolation.
     #[error("DRM lease error: {0}")]
     DrmLease(String),
+
+    /// The opt-in KMS scanout proof failed. It never claims a compositor.
+    #[error("DRM scanout error: {0}")]
+    DrmScanout(String),
 }
 
 impl MultiseatError {
@@ -311,6 +315,7 @@ impl MultiseatError {
             Self::SeatDisplayCrashed { .. } => "seat_display_crashed",
             Self::SeatDisplay(_) => "seat_display",
             Self::DrmLease(_) => "drm_lease",
+            Self::DrmScanout(_) => "drm_scanout",
         }
     }
 }

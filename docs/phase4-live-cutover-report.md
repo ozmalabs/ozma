@@ -2083,3 +2083,71 @@ Cleanup: container image and target, worktree target, venv, netns/veth,
 libvirt domain/ISO, demo logs/cache, transient unit, and scratch files were
 removed; no unit was enabled, no service left running, and the worktree was
 removed after this section was written.
+
+## Live V4L2 capture validation (2026-11-25)
+
+A dedicated `v4l2loopback` device (`video_nr=42`, `card_label=ozma-capture-test`,
+`exclusive_caps=1`) was fed by ffmpeg and captured by a real hardware-profile
+`ozma-node`. Full detail and evidence are in
+[`phase4-v4l2-live-report.md`](phase4-v4l2-live-report.md).
+
+**Result: PARTIAL PASS / HLS blocked.**
+
+- **PASS:** V4L2 discovery/open of `/dev/video42`; `/display/info` reported
+  `0x0`/`unknown` before the first frame and real `640x480`/`last-frame` after
+  it; `/display/snapshot` returned a real 24,644-byte 640x480 JPEG with
+  testsrc2 content; `/video` produced 20 real JPEG frames in 4 s at `fps=5`.
+  Changing the producer to 320x240 red and then 640x480 green changed the
+  snapshot geometry/content, `/video`, and `/display/info` accordingly.
+- **PASS (typed errors):** a capture-less loopback returned
+  `503 capture.unavailable` ("does not expose video capture"); a busy format
+  returned `503 capture.unavailable` (`EBUSY`). No frames were fabricated.
+- **FAIL / blocker — HLS over V4L2:** `--hls` started as `failed` with
+  `HLS cannot feed 'mjpeg' frames ... only rgb24 and bgra are supported`, and
+  wrote no `stream.m3u8` or segments. `ozma-capture` negotiates only
+  MJPEG/NV12/YUYV/H264; the HLS feeder accepts only RGB24/BGRA/P010. The format
+  sets do not intersect, so no V4L2 source can feed HLS today. YUYV snapshots
+  also fail with `display.unsupported_format`; RGB3 is deliberately rejected.
+- **FAIL / not wired — `--capture-device`:** the flag is registration metadata
+  only. The hardware registry always enumerates the host and HLS/WebRTC/snapshot
+  take the first source; snapshot's `with_source_id` is never called. On this
+  host the first source is the real `/dev/video0`, so the run used a private
+  mount namespace that hid `/dev/video0-1` and exposed only `/dev/video42`.
+  There is no command-line source-id selector for the hardware profile.
+- **Cleanup:** node and producer stopped, the loopback module unloaded,
+  `/dev/video42` removed, and both real cameras (`/dev/video0-1`,
+  `81,0`/`81,1`, root:video, same names) were unchanged. No persistent module
+  configuration was added, no product code changed, and no commit was created.
+
+## Desktop live runtime (2026-11-26)
+
+A dedicated throwaway Xorg `:90` (`dummy`, 800x600) with an `xterm` client was
+used to validate `ozma-node --profile desktop` with real X11 (`x11grab`) capture,
+`--input-provider uinput`, `--hls`, `--audio-router pipewire`, and a bearer
+token. The final X server ran in a private mount namespace with only
+`ozma-keyboard`/`ozma-mouse` InputClasses, so the final server admitted no
+physical input and never addressed the real display.
+
+**Result: PARTIAL PASS / FAIL on two desktop controls.** Real capture and
+`/video` returned the magenta test window; HLS produced decodable 800x600 h264
+segments; `/input/type` and `/input/key` reached the xterm through uinput;
+geometry get/set/restore, wallpaper, audio apply/play/stop, and graceful
+SIGTERM all passed. Two real bugs remain:
+
+1. **`/clipboard` write returns 502 and leaks `xclip`.** `xclip -i` forks a
+   selection owner that inherits stdout/stderr; the node waits for pipe EOF,
+   times out after 5 s, and reports `clipboard.write_failed`, although the text
+   is actually readable. An `xclip` process with PPID 1 survived node shutdown.
+2. **`--x11-display` is not applied to clipboard/wallpaper tools.** With
+   `DISPLAY` unset, `desktop_controls` advertised both controls available and
+   geometry worked, but clipboard write returned 503 `desktop.no_display`
+   (`Can't open display: (null)`) and wallpaper set returned 502
+   (`feh ERROR: Can't open X display`). Ambient `DISPLAY` would be used
+   instead of the configured display.
+
+Full commands, per-route evidence, and the proposed fixes are in
+[`phase4-desktop-live-report.md`](phase4-desktop-live-report.md). Test packages
+`xclip`, `feh`, and `xterm` were installed for the run and left installed. The
+throwaway Xorg, xterm, null sink, temp files, orphan `xclip`, and `~/.fehbg`
+created by the run were removed; no persistent udev/permission/service change
+was made and no commit was created.

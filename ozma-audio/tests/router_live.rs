@@ -12,7 +12,7 @@
 //!
 //! The test never touches the default sink/source and never plays audio.
 
-use ozma_audio::{AudioRouter, AudioSinkSpec, AudioTarget, PipeWireAudioRouter};
+use ozma_audio::{AudioRouter, AudioSinkSpec, AudioTarget, PipeWireAudioRouter, SweepRequest};
 
 fn live() -> bool {
     std::env::var("OZMA_AUDIO_LIVE").as_deref() == Ok("1")
@@ -66,4 +66,102 @@ async fn ensure_sink_reuses_then_remove_unloads_live() {
         .remove_sink(&name)
         .await
         .expect("second remove is a no-op");
+}
+
+/// Read-only graph enumeration against the live server.
+#[tokio::test]
+#[ignore = "requires a live PipeWire/PulseAudio server; set OZMA_AUDIO_LIVE=1"]
+async fn graph_lists_the_live_server_read_only() {
+    if !live() {
+        eprintln!("skipped: set OZMA_AUDIO_LIVE=1 to run against the live audio server");
+        return;
+    }
+
+    let router = PipeWireAudioRouter::production();
+    let graph = router.graph().await.expect("live graph snapshot");
+    assert!(!graph.nodes.is_empty(), "the live server must report nodes");
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| node.media_class == "Audio/Sink"),
+        "at least one sink is expected"
+    );
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| node.media_class == "Audio/Source"),
+        "at least one source is expected"
+    );
+    assert!(!graph.links_available);
+    assert!(graph.links.is_empty());
+    println!(
+        "live graph: {} nodes, {} streams, default sink {:?}, default source {:?}",
+        graph.nodes.len(),
+        graph.streams.len(),
+        graph.default_sink,
+        graph.default_source
+    );
+}
+
+/// A generated sweep, played to a disposable null sink and captured from its
+/// monitor. It never opens a microphone and never changes the default devices.
+#[tokio::test]
+#[ignore = "requires a live PipeWire/PulseAudio server; set OZMA_AUDIO_LIVE=1"]
+async fn sweep_measures_a_disposable_null_sink_monitor_live() {
+    if !live() {
+        eprintln!("skipped: set OZMA_AUDIO_LIVE=1 to run against the live audio server");
+        return;
+    }
+
+    let name = format!("ozma-sweep-live-{}", std::process::id());
+    let spec = AudioSinkSpec::new(name.clone(), format!("OzmaSweepLive{}", std::process::id()))
+        .expect("valid sink spec")
+        .with_channels(2)
+        .expect("valid channels")
+        .with_rate(48_000)
+        .expect("valid rate");
+    let router = PipeWireAudioRouter::production();
+
+    router.remove_sink(&name).await.expect("clean start");
+    router.ensure_sink(spec).await.expect("create sweep sink");
+
+    let mut request = SweepRequest::new(format!("{name}.monitor"), name.clone());
+    request.start_hz = 100.0;
+    request.end_hz = 8_000.0;
+    request.duration_secs = 1.0;
+    request.tail_secs = 0.3;
+    request.start_delay_ms = 250;
+    request.amplitude = 0.5;
+
+    let outcome = router.sweep(request).await.expect("live measured sweep");
+    let measurement = &outcome.profile.measurement;
+    assert!(
+        measurement.captured_frames > 48_000,
+        "captured {} frames",
+        measurement.captured_frames
+    );
+    assert!(
+        measurement.peak_dbfs > -40.0,
+        "sweep monitor peak was {:.1} dBFS",
+        measurement.peak_dbfs
+    );
+    assert!(
+        measurement.rms_dbfs > -40.0,
+        "sweep monitor RMS was {:.1} dBFS",
+        measurement.rms_dbfs
+    );
+    assert!(outcome.profile.bands.is_empty());
+    assert!(!outcome.profile.active);
+    println!(
+        "live sweep: {} frames, peak {:.1} dBFS, rms {:.1} dBFS, noise {:.1} dBFS, rt60 {:?}",
+        measurement.captured_frames,
+        measurement.peak_dbfs,
+        measurement.rms_dbfs,
+        measurement.noise_floor_dbfs,
+        measurement.rt60_secs
+    );
+
+    router.remove_sink(&name).await.expect("remove sweep sink");
 }

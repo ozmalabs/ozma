@@ -997,11 +997,11 @@ mod tests {
             );
         }
 
-        // Audio discovery/sweep are public typed 501 stubs, never 401 and never
-        // a success-shaped no-op.
+        // Audio discovery/sweep are public typed 503s without a configured
+        // router, never 401 and never a success-shaped no-op.
         for (method, uri, code) in [
-            ("GET", "/audio/nodes", "audio-nodes-unsupported"),
-            ("POST", "/audio/sweep", "audio-sweep-unsupported"),
+            ("GET", "/audio/nodes", "audio-graph-unavailable"),
+            ("POST", "/audio/sweep", "audio.unavailable"),
         ] {
             let response = app
                 .clone()
@@ -1014,7 +1014,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{uri}");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["ok"], false, "{uri}");

@@ -23,13 +23,13 @@ import logging
 import secrets
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import asyncio
 import json
@@ -2612,7 +2612,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": True, "scenario": s.to_dict()}
 
     @app.post("/api/v1/scenarios/{scenario_id}/bind")
-    async def bind_node(scenario_id: str, req: BindNodeRequest) -> dict[str, Any]:
+    async def bind_node(
+        request: Request, scenario_id: str, req: BindNodeRequest
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
         try:
             s = await scenarios.bind_node(scenario_id, req.node_id)
         except KeyError:
@@ -2620,7 +2623,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return s.to_dict()
 
     @app.delete("/api/v1/scenarios/{scenario_id}")
-    async def delete_scenario(scenario_id: str) -> dict[str, Any]:
+    async def delete_scenario(request: Request, scenario_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
         try:
             await scenarios.delete(scenario_id)
         except KeyError:
@@ -2632,9 +2636,24 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Audio endpoints ---
 
     @app.get("/api/v1/audio/nodes")
-    async def list_audio_nodes(request: Request) -> dict[str, Any]:
-        """List PipeWire audio nodes (sinks + sources) with volume/mute state."""
+    async def list_audio_nodes(request: Request, node_id: str = "") -> Any:
+        """List PipeWire audio nodes (sinks + sources) with volume/mute state.
+
+        Without ``node_id`` this is the controller's own watcher snapshot, as
+        before. With ``node_id`` it proxies that node's real
+        ``GET /audio/nodes`` body (and its typed error status), so the
+        dashboard can show the actual graph the audio hardware lives on.
+        """
         _require_scope(request, SCOPE_READ)
+        if node_id:
+            node = state.nodes.get(node_id)
+            if not node:
+                raise HTTPException(status_code=404, detail="Node not found")
+            if not (
+                getattr(node, "api_port", 0) or getattr(node, "stream_port", 0)
+            ):
+                raise HTTPException(status_code=503, detail="Node has no API port")
+            return await _proxy_audio_node("GET", node, "/audio/nodes")
         if not audio:
             return {"nodes": {}, "links": []}
         return audio.watcher.snapshot()
@@ -2723,29 +2742,21 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Room correction endpoints ---
 
     @app.get("/api/v1/audio/room-correction/node-audio")
-    async def get_node_audio_devices(node_id: str = "") -> dict[str, Any]:
+    async def get_node_audio_devices(node_id: str = "") -> Any:
         """
         Fetch PipeWire audio devices from a node.
 
         The controller proxies this — the browser never talks to nodes directly.
+        The node's real JSON and typed HTTP error are passed through unchanged;
+        no empty list is invented for an unreachable or unconfigured node.
         """
         node = state.nodes.get(node_id)
         if not node:
             raise HTTPException(status_code=404, detail="Node not found")
         port = node.api_port or node.stream_port
         if not port:
-            return {"nodes": []}
-        import urllib.request
-        try:
-            url = f"http://{node.host}:{port}/audio/nodes"
-            loop = asyncio.get_running_loop()
-            def _fetch():
-                with urllib.request.urlopen(url, timeout=5) as r:
-                    return json.loads(r.read())
-            result = await loop.run_in_executor(None, _fetch)
-            return result
-        except Exception as e:
-            return {"nodes": [], "error": str(e)}
+            raise HTTPException(status_code=503, detail="Node has no API port")
+        return await _proxy_audio_node("GET", node, "/audio/nodes")
 
     @app.get("/api/v1/audio/room-correction/usb-mics")
     async def list_usb_mics(q: str = "") -> dict[str, Any]:
@@ -2787,31 +2798,19 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         node = state.nodes.get(node_id) if node_id else None
 
         if node and node.api_port:
-            # Proxy sweep to the node
-            import urllib.request
-            url = f"http://{node.host}:{node.api_port}/audio/sweep"
-            try:
-                loop = asyncio.get_running_loop()
-                payload = json.dumps({
-                    "source": source, "sink": sink,
-                    "phone_model": body.get("phone_model", "generic"),
-                    "target_curve": body.get("target_curve", "harman"),
-                    "room_name": body.get("room_name", ""),
-                    "mic_type": body.get("mic_type", "phone"),
-                    "mic_model": body.get("mic_model", ""),
-                }).encode()
-                def _proxy():
-                    req = urllib.request.Request(
-                        url, data=payload,
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(req, timeout=30) as r:
-                        return json.loads(r.read())
-                result = await loop.run_in_executor(None, _proxy)
-                return result
-            except Exception as e:
-                return {"ok": False, "error": f"Node sweep failed: {e}"}
+            # Proxy the bounded sweep request to the node. Forward the
+            # frequency/duration fields too, and pass the node's measured
+            # profile or typed error through unchanged.
+            forward = (
+                "source", "sink", "phone_model", "target_curve", "room_name",
+                "mic_type", "mic_model", "start_hz", "end_hz", "duration_secs",
+                "sample_rate", "channels", "amplitude", "start_delay_ms",
+                "tail_secs",
+            )
+            payload = {key: body[key] for key in forward if body.get(key) is not None}
+            payload["source"] = source
+            payload["sink"] = sink
+            return await _proxy_audio_node("POST", node, "/audio/sweep", payload)
 
         # Local sweep (controller has audio hardware)
         if not room_correction:
@@ -2969,30 +2968,70 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=400, detail="node_id with api_port required")
         return await _proxy_to_audio_node(node, "/audio/stop", {})
 
-    async def _proxy_to_audio_node(node: Any, path: str, body: dict) -> dict:
+    async def _proxy_to_audio_node(node: Any, path: str, body: dict) -> Any:
         """Proxy a JSON POST request to a node's HTTP API."""
+        return await _proxy_audio_node("POST", node, path, body)
+
+    async def _proxy_audio_node(
+        method: str, node: Any, path: str, body: dict | None = None
+    ) -> Any:
+        """Proxy an audio request and preserve the node's real body and status.
+
+        Success returns the node's parsed JSON. A typed node error is returned
+        as a ``JSONResponse`` with the same status and body, so the dashboard
+        sees ``audio.missing_command``/``audio-graph-unavailable`` instead of a
+        controller-invented ``ok:false`` with no code. A transport failure is a
+        typed 502; a node bearer-token rejection is a typed 502 that never
+        includes the token.
+        """
         import urllib.error
         import urllib.request
-        url = f"http://{node.host}:{node.api_port}{path}"
+
+        port = getattr(node, "api_port", 0) or getattr(node, "stream_port", 0)
+        if not port:
+            raise HTTPException(status_code=503, detail="Node has no API port")
+        url = f"http://{node.host}:{port}{path}"
         headers = {"Content-Type": "application/json", **_node_headers(node)}
         try:
             loop = asyncio.get_running_loop()
-            payload = json.dumps(body).encode()
+            payload = json.dumps(body).encode() if body is not None else None
+
             def _do():
                 req = urllib.request.Request(
-                    url, data=payload,
-                    headers=headers,
-                    method="POST",
+                    url, data=payload, headers=headers, method=method
                 )
                 with urllib.request.urlopen(req, timeout=30) as r:
                     return json.loads(r.read())
+
             return await loop.run_in_executor(None, _do)
         except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                error_body = json.loads(raw)
+                if not isinstance(error_body, dict):
+                    raise ValueError("node error body is not an object")
+            except Exception:
+                message = raw.decode("utf-8", "replace").strip()[:500]
+                error_body = {
+                    "ok": False,
+                    "status": e.code,
+                    "error": message or f"Node returned HTTP {e.code}",
+                }
             if e.code in (401, 403):
-                return {"ok": False, "status": e.code, "error": _node_auth_error(e.code)}
-            return {"ok": False, "status": e.code, "error": f"Node returned HTTP {e.code}"}
+                error_body.setdefault("error", _node_auth_error(e.code))
+                error_body.setdefault("code", "node.unauthorized")
+            error_body.setdefault("ok", False)
+            return JSONResponse(status_code=e.code, content=error_body)
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "ok": False,
+                    "available": False,
+                    "code": "audio.proxy_failed",
+                    "error": str(e),
+                },
+            )
 
     @app.get("/api/v1/audio/room-correction/profiles")
     async def list_correction_profiles() -> dict[str, Any]:

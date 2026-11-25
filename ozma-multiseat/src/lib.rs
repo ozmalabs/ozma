@@ -9,6 +9,9 @@
 //!   free DRM connector detector in [`drm`]. [`drm_lease`] is the opt-in
 //!   lease-only handoff: it validates connector/CRTC object ids and returns an
 //!   owned lessee fd, but creates no scanout or compositor isolation.
+//!   [`drm_scanout`] is the opt-in KMS proof layered on that lease: it fills one
+//!   dumb buffer, programs one connector/CRTC, verifies the modeset, and tears
+//!   it down. It is not a compositor.
 //! * [`input`] reads evdev capability bits and groups devices by USB hub.
 //! * [`planner`] assigns one seat per display, allocates sequential UDP/HTTP
 //!   ports, attaches input groups, and emits the per-seat
@@ -69,6 +72,7 @@ pub mod audio;
 pub mod display;
 pub mod drm;
 pub mod drm_lease;
+pub mod drm_scanout;
 pub mod error;
 pub mod fake;
 pub mod host;
@@ -107,13 +111,22 @@ pub use drm_lease::{
     DRM_LEASE_CONNECTOR_ID_ENV, DRM_LEASE_CRTC_ID_ENV, DRM_LEASE_ENV, DRM_LEASE_FD_ENV,
     DRM_LEASE_ID_ENV, VIRTUAL_DRM_DRIVER,
 };
+#[cfg(target_os = "linux")]
+pub use drm_scanout::RealDrmScanoutBackend;
+pub use drm_scanout::{
+    ensure_scanout_card, fill_pattern, pattern_checksum, DrmScanoutBackend, DrmScanoutError,
+    DrmScanoutErrorStatus, DrmScanoutHandle, DrmScanoutNote, DrmScanoutNoteKind, DrmScanoutRequest,
+    DrmScanoutStatus, DrmScanoutVerification, SCANOUT_BPP, SCANOUT_DEPTH, SCANOUT_FOURCC,
+    SCANOUT_PATTERN,
+};
 pub use error::MultiseatError;
 pub use fake::{
     FakeCommandRunner, FakeDeviceNameResolver, FakeDisplayBackend, FakeDrmLeaseBackend,
-    FakeDrmLeaseCard, FakeDrmLeaseFailure, FakeEvdevGrabBackend, FakeGrabAction, FakeGrabEvent,
-    FakeHelperBackend, FakeHotplugMonitor, FakeInputBackend, FakeLeaseRecord, FakeNodeLauncher,
-    FakeReadinessProbe, FakeSeatAudioRouter, FakeSeatDisplayLauncher, FakeSeatInputHelper,
-    FakeSeatInputTargeter, FakeSeatSupervisor,
+    FakeDrmLeaseCard, FakeDrmLeaseFailure, FakeDrmScanoutBackend, FakeDrmScanoutCard,
+    FakeDrmScanoutFailure, FakeEvdevGrabBackend, FakeGrabAction, FakeGrabEvent, FakeHelperBackend,
+    FakeHotplugMonitor, FakeInputBackend, FakeLeaseRecord, FakeNodeLauncher, FakeReadinessProbe,
+    FakeSeatAudioRouter, FakeSeatDisplayLauncher, FakeSeatInputHelper, FakeSeatInputTargeter,
+    FakeSeatSupervisor,
 };
 pub use host::HostTopology;
 pub use hotplug::{

@@ -13,6 +13,7 @@ alsa = { workspace = true }
 async-trait = "0.1"
 audiopus = "0.3.0-rc.0"
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = "1"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "process", "io-util"] }
 tracing = "0.1"

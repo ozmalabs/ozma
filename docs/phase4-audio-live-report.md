@@ -88,10 +88,13 @@ All control routes were sent with `Authorization: Bearer <token>`.
 | `POST /audio/stop` | empty body | 200 | no `pw-play`; sink-input list back to the original Chrome stream only |
 | `POST /audio/remove` | `{}` (empty body) | 200 for remembered `live-final` | volume back to `100%`, `Mute: no` |
 
-`GET /audio/nodes` and `POST /audio/sweep` are public and remained typed 501
-(`audio-nodes-unsupported`, `audio-sweep-unsupported`) with the documented
-soft-node shapes (`nodes: []`, `links: []`, `default_sink/source: null`,
-`profile: null`). Neither claims a graph or a sweep.
+`GET /audio/nodes` and `POST /audio/sweep` are public. They were typed 501 in
+this routing pass; the follow-up now returns a real bounded `pactl -f json`
+graph snapshot and a measured generated-sweep profile, or a typed 503/502/400.
+See [`phase4-audio-sweep-report.md`](phase4-audio-sweep-report.md) for the
+graph/sweep implementation, live null-sink measurement, and remaining gaps
+(no EQ fitting or DSP). Without `--audio-router` both routes return typed 503s
+and still fabricate nothing.
 
 ### Captured audio proof
 
@@ -225,8 +228,11 @@ Covered by `main::tests::probe_failure_detail_does_not_repeat_the_status_prefix`
 
 ```text
 cargo test -p ozma-audio -p ozma-node --lib
-# ozma-audio: 88 passed, 1 ignored
-# ozma-node: 604 passed, 4 ignored
+# ozma-audio: 99 passed, 1 ignored
+# ozma-node: 635 passed, 4 ignored
+
+cargo test -p ozma-node --lib public_
+# 6 passed
 
 cargo test -p ozma-node --bin ozma-node probe_failure_detail
 # 1 passed
@@ -234,11 +240,11 @@ cargo test -p ozma-node --bin ozma-node probe_failure_detail
 cargo check -p ozma-audio -p ozma-node --all-targets
 # Finished
 
-OZMA_AUDIO_LIVE=1 cargo test -p ozma-audio --test router_live -- --ignored
-# 1 passed
+OZMA_AUDIO_LIVE=1 cargo test -p ozma-audio --test router_live -- --ignored --nocapture
+# 3 passed (live bounded graph; disposable null sink create/reuse/remove; measured sweep)
 
 python3 -m pytest tests/unit/controller/test_node_api_token_proxy.py -q
-# 65 passed
+# 87 passed
 ```
 
 `rustfmt --edition 2021` was run on every touched Rust file.
@@ -263,9 +269,14 @@ python3 -m pytest tests/unit/controller/test_node_api_token_proxy.py -q
    `AudioRouter::ensure_sink` / `ozma-softnode --provision-audio`
    (`<prefix><vm>`, default `ozma-<vm>`). The live route test therefore
    pre-created the null sink with `pactl`.
-2. **No graph enumeration or sweep.** `GET /audio/nodes` and
-   `POST /audio/sweep` are still typed 501; no PipeWire node/link listing and no
-   room-correction engine exist in the Rust node.
+2. **Graph enumeration and sweep are read-only/basic.** `GET /audio/nodes` now
+   lists sinks, sources, sink-inputs, and source-outputs from `pactl -f json`
+   with bounded counts; `pactl` exposes no graph links, so `links` stays empty
+   and `links_available` is false. `POST /audio/sweep` generates and plays a
+   log sweep, captures the named source, and reports peak/RMS/noise/impulse and
+   a best-effort RT60. It does **not** fit or apply EQ bands, and RT60 is `null`
+   when the captured decay does not span enough range. See
+   [`phase4-audio-sweep-report.md`](phase4-audio-sweep-report.md).
 3. **No route for source creation or stream moves.** `ensure_source`,
    `remove_source`, `move_stream` and `move_source_output` exist on the router
    and are unit-tested with fakes, but the controller surface only exposes
