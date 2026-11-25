@@ -9,6 +9,30 @@ Configuration comes from `controller/display_config.py`. The repository itself
 is in `controller/asset_repository.py`, and the HTTP router is wired into the
 controller API.
 
+## Rollout profile
+
+`OZMA_DISPLAY_PROFILE` selects the default feature set; individual
+`OZMA_DISPLAY_*` flags override it.
+
+| Profile | IR / fonts | Local repository | Importers | Sync |
+|---|---|---|---|---|
+| `off` | off | off | off | `offline` |
+| `local` (default) | on | on | off | `offline` |
+| `full` | on | on | on | `offline` unless explicitly set |
+
+The shipped default is `local`: the local repository and IR work without
+network access, but importers remain private-by-default and switched off.
+Select `full` when the controller should accept imports; it still does not enable
+network sync. Set `OZMA_DISPLAY_SYNC_MODE` explicitly (for example `installed`)
+and configure `OZMA_DISPLAY_ASSET_INDEX_URL` if you want the controller to fetch
+a remote index. Set `OZMA_DISPLAY_PROFILE=off` to restore the previous all-off
+deployment.
+
+The profile does not weaken trust policy. Unsigned first-party packs still need
+`OZMA_DISPLAY_ALLOW_UNSIGNED_PACKS=1`, or a configured verifier/trusted key and
+a signature. Invalid profile values fail startup with a typed
+`DisplayConfigError`.
+
 ## Sync modes
 
 `OZMA_DISPLAY_SYNC_MODE` (or `AssetSyncPolicy.mode`) selects how much metadata
@@ -21,9 +45,10 @@ the controller keeps:
 | `manual` | Opt-in | Sync on an explicit operator action; no automatic polling. |
 | `full` | Opt-in | Sync the full index, subject to cache and policy limits. |
 
-`offline` is the default. A mode other than `offline` still falls back to the
-cache when a sync fails; the controller does not lose its last known index
-because the network is unavailable. The policy also controls
+`offline` is the default for every rollout profile, including `local` and
+`full`. A mode other than `offline` still falls back to the cache when a sync
+fails; the controller does not lose its last known index because the network is
+unavailable. The policy also controls
 `sync_interval_hours`, `cache_size_mb`, `include_previews`,
 `include_external_imports`, and `verify_signatures`.
 
@@ -103,14 +128,26 @@ Postgres, key generation, TLS, and backup/restore.
 ## Configuration example
 
 ```bash
-export OZMA_DISPLAY_ASSET_REPOSITORY_ENABLED=1
+# Default: local IR/fonts/repository, importers off, sync offline.
+export OZMA_DISPLAY_PROFILE=local
+
+# Opt into private importers; sync remains offline until set explicitly.
+# export OZMA_DISPLAY_PROFILE=full
+
+# Opt into network index sync for this deployment.
 export OZMA_DISPLAY_SYNC_MODE=installed
 export OZMA_DISPLAY_ASSET_INDEX_URL=https://assets.example.test/index.json
+
 export OZMA_DISPLAY_CACHE_DIR=/var/lib/ozma/asset-cache
 export OZMA_DISPLAY_ALLOW_UNSIGNED_PACKS=0
 export OZMA_DISPLAY_MAX_PACK_BYTES=67108864
 export OZMA_DISPLAY_MAX_IMPORT_BYTES=33554432
 ```
+
+Explicit feature flags override the profile; for example,
+`OZMA_DISPLAY_ASSET_REPOSITORY_ENABLED=0` disables the repository even under
+`local`. To keep an older deployment fully off, use
+`OZMA_DISPLAY_PROFILE=off`.
 
 Resolved values can be inspected without touching the network:
 
@@ -174,6 +211,7 @@ and known caveats, and [publishing](publishing.md) for the manifest contract.
 
 | Symptom | Likely cause | Action |
 |---|---|---|
+| `OZMA_DISPLAY_PROFILE must be one of ...` | Bad rollout profile | Use `off`, `local`, or `full` |
 | `unknown sync mode` | Bad `OZMA_DISPLAY_SYNC_MODE` | Use `offline`, `installed`, `manual`, or `full` |
 | `has no SHA-256` / `SHA-256 mismatch` | Manifest or payload changed | Recompute the hash from the intended file; do not install until they match |
 | `declared asset missing` | Manifest references a file not shipped | Add the file or remove the declaration |

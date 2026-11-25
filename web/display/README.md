@@ -30,6 +30,7 @@ the reusable Python client in [`controller/display_client.py`](../../controller/
 | `style.css` | Responsive dark display styling. |
 | `protocol.test.mjs` | `node:test` codec tests with handcrafted frames. |
 | `package.json` | Marks the directory as an ES module package for Node tests. |
+| [`editor/`](editor/README.md) | Optional dependency-free `ScreenLayout` layout editor (WGT-067). |
 
 ## Run the controller screen server
 

@@ -40,6 +40,7 @@ controller/static/streams/
 
 # Site dependencies (install with npm install)
 site/node_modules/
+renderer/node_modules/
 site/package-lock.json
 
 # Dev secrets / local overrides

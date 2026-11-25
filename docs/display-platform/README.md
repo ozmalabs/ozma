@@ -39,19 +39,38 @@ Adaptive Cards / Ozma    ─┘                               ├─> controller
 Feature status is tracked in the execution plan (§6.1). Treat "partial" as
 usable contracts and foundations, not as a finished end-user workflow.
 
-## Feature flags
+## Feature flags and rollout profile
 
-All display features are opt-in until their milestone is stable. The controller
-reads `OZMA_DISPLAY_*` environment variables through
+The display platform is controlled by `OZMA_DISPLAY_PROFILE` plus individual
+`OZMA_DISPLAY_*` flags. The controller reads them through
 `controller/display_config.py`.
+
+| Profile | IR | Font translation | Local repository | Importers | Sync |
+|---|---|---|---|---|---|
+| `off` | off | off | off | off | `offline` |
+| `local` (default) | on | on | on | off | `offline` |
+| `full` | on | on | on | on | `offline` unless explicitly set |
+
+`local` is the shipped default: lossless IR, font translation, and the local
+asset repository work out of the box. It does not enable private importers and
+does not make network calls. `full` additionally enables importers, but still
+leaves sync at `offline`; set `OZMA_DISPLAY_SYNC_MODE` explicitly if you intend
+the controller to fetch a remote index. `off` restores the legacy all-off
+behaviour.
+
+Explicit variables override the selected profile, so
+`OZMA_DISPLAY_PROFILE=local OZMA_DISPLAY_IMPORTERS_ENABLED=1` enables importers
+without changing the rest of the local profile. Invalid profile values raise a
+typed `DisplayConfigError`.
 
 | Plan flag | Environment variable | Default |
 |---|---|---|
-| `display.ir.enabled` | `OZMA_DISPLAY_IR_ENABLED` | `false` |
-| `display.asset_repository.enabled` | `OZMA_DISPLAY_ASSET_REPOSITORY_ENABLED` | `false` |
-| `display.asset_sync.mode` | `OZMA_DISPLAY_SYNC_MODE` | `offline` |
-| `display.fonts.translation` | `OZMA_DISPLAY_FONTS_TRANSLATION_ENABLED` | `false` |
-| `display.importers.enabled` | `OZMA_DISPLAY_IMPORTERS_ENABLED` | `false` |
+| `display.profile` | `OZMA_DISPLAY_PROFILE` (`off`, `local`, `full`) | `local` |
+| `display.ir.enabled` | `OZMA_DISPLAY_IR_ENABLED` | on under `local`/`full` |
+| `display.asset_repository.enabled` | `OZMA_DISPLAY_ASSET_REPOSITORY_ENABLED` | on under `local`/`full` |
+| `display.asset_sync.mode` | `OZMA_DISPLAY_SYNC_MODE` | `offline` for every profile |
+| `display.fonts.translation` | `OZMA_DISPLAY_FONTS_TRANSLATION_ENABLED` | on under `local`/`full` |
+| `display.importers.enabled` | `OZMA_DISPLAY_IMPORTERS_ENABLED` | on only under `full` |
 
 Related settings:
 
@@ -60,6 +79,8 @@ Related settings:
 | `OZMA_DISPLAY_ASSET_INDEX_URL` | Remote index URL for opt-in sync | empty |
 | `OZMA_DISPLAY_CACHE_DIR` | Offline cache directory | empty (repository default) |
 | `OZMA_DISPLAY_ALLOW_UNSIGNED_PACKS` | Accept unsigned local packs | `false` |
+| `OZMA_DISPLAY_SIGNATURE_REQUIRED` | Require signed indexes/packs | `false` |
+| `OZMA_DISPLAY_TRUSTED_KEYS` | Trusted signing keys (JSON) | empty |
 | `OZMA_DISPLAY_MAX_PACK_BYTES` | Maximum pack payload | 64 MiB |
 | `OZMA_DISPLAY_MAX_IMPORT_BYTES` | Maximum import payload | 32 MiB |
 
@@ -68,19 +89,33 @@ Any other value raises a typed `DisplayConfigError` rather than silently
 falling back to a default. Sync mode must be one of `offline`, `installed`,
 `manual`, or `full`.
 
-The plan calls for local repository and IR to become default-on when M0–M3 are
-complete. That has not happened yet: this slice keeps every flag opt-in and
-keeps Connect/importers opt-in permanently per deployment.
+**Unsigned and signature policy is unchanged.** A profile never relaxes package
+trust. Under `local` or `full`, an unsigned first-party pack still fails unless
+you deliberately set `OZMA_DISPLAY_ALLOW_UNSIGNED_PACKS=1` or configure
+`OZMA_DISPLAY_TRUSTED_KEYS`/a verifier and sign the pack. The default-on local
+repository is not an unsigned-package exception.
+
+**Migrating from all-off.** A deployment that relied on every display feature
+being off should set `OZMA_DISPLAY_PROFILE=off`, or set the individual
+`OZMA_DISPLAY_*_ENABLED=0` flags explicitly. Explicit flags always win, so old
+environments that set individual flags keep the same resolved behaviour for
+those flags; only unset flags follow the new `local` default.
 
 ## Quick start
 
-1. Enable the local, offline-safe subset:
+1. No exports are required for the safe default. To pin the legacy all-off
+   behaviour, or to opt into importers without network sync, choose a profile:
 
    ```bash
-   export OZMA_DISPLAY_IR_ENABLED=1
-   export OZMA_DISPLAY_ASSET_REPOSITORY_ENABLED=1
+   # Legacy all-off behaviour.
+   export OZMA_DISPLAY_PROFILE=off
+
+   # Local default (also the implicit default).
+   export OZMA_DISPLAY_PROFILE=local
+
+   # Importers on, network sync still explicitly offline.
+   export OZMA_DISPLAY_PROFILE=full
    export OZMA_DISPLAY_SYNC_MODE=offline
-   export OZMA_DISPLAY_ALLOW_UNSIGNED_PACKS=0
    ```
 
 2. Inspect the resolved configuration:

@@ -1,7 +1,9 @@
 # Display platform release notes
 
-**Status:** M0–M6 landed; M7 hardening is partially landed. This document is
-the release-facing summary for the display platform work tracked in
+**Status:** M0–M7 landed, including the default-on `local` rollout profile:
+IR, fonts, and the local repository are on, while importers and network sync
+remain off. This document is the release-facing summary for the display platform
+work tracked in
 [`../display-platform-execution-plan.md`](../display-platform-execution-plan.md)
 (§6.1, §7, and §13). The authoritative task ledger remains the execution plan.
 
@@ -17,23 +19,36 @@ the release-facing summary for the display platform work tracked in
 | M4 — Font subsystem | **Done** | Font metadata, shape/intent matching, TTF/OTF subsetting, BDF/LVGL export, previews, `fsType`/OFL licence checks, and a Latin/CJK/Arabic/Indic/icon golden corpus. WOFF2 writing needs optional `brotli`. |
 | M5 — Render adapters and themes | **Done** | Five original themes, SVG gauge/bar/dual/threshold, VU meters with attack/release, dB/s falloff, peak hold, clip latch, RMS and stereo, sparkline/history widgets, sandboxed third-party widgets, PNG render plans, LVGL C/JSON, Adaptive Cards export, and AIDA64 `/panel` generated from `WidgetIR`. Optional editor only. |
 | M6 — Importers | **Done** | AIDA64/SensorPanel, Rainmeter, Home Assistant, MagicMirror, Grafana, and Adaptive Cards import/export with lossless capture and private-by-default storage. |
-| M7 — Hardening and rollout | **Done** | Licence/checksum/sandbox gate, Ed25519 trust store and signing CLI, browser sandbox/CSP, bounded fuzz regression, migration tooling, performance benchmarks, targeted CI, environment bootstrap for Connect, operator docs, and these release notes. Default-on rollout and marketplace/review UI remain product decisions. |
+| M7 — Hardening and rollout | **Done** | Licence/checksum/sandbox gate, Ed25519 trust store and signing CLI, browser sandbox/CSP, bounded fuzz regression, migration tooling, performance benchmarks, targeted CI, environment bootstrap for Connect, operator docs, and these release notes. The default-on `local` rollout profile is shipped: IR, fonts, and the local repository are on; importers and network sync remain opt-in. Marketplace/review UI remains a product decision. |
 
 Treat “mostly done” as usable contracts and foundations, not a finished
 end-user workflow. See the execution plan §6.1 for the live gap list.
 
-## Feature flags
+## Feature flags and rollout profile
 
-All display features remain opt-in in this release. Flags are read by
+The default-on `local` profile is shipped. A profile selects defaults; explicit
+`OZMA_DISPLAY_*` flags override it. Flags are read by
 `controller/display_config.py`.
+
+| Profile | IR | Font translation | Local repository | Importers | Sync |
+|---|---|---|---|---|---|
+| `off` | off | off | off | off | `offline` |
+| `local` (default) | on | on | on | off | `offline` |
+| `full` | on | on | on | on | `offline` unless explicitly set |
+
+`local` enables IR, font translation, and the local asset repository without
+network access or importer endpoints. `full` adds importers but still leaves
+sync at `offline`; select `OZMA_DISPLAY_SYNC_MODE` explicitly to opt into
+network sync. `off` preserves the previous all-off behaviour.
 
 | Plan flag | Environment variable | Default |
 |---|---|---|
-| `display.ir.enabled` | `OZMA_DISPLAY_IR_ENABLED` | `false` |
-| `display.asset_repository.enabled` | `OZMA_DISPLAY_ASSET_REPOSITORY_ENABLED` | `false` |
-| `display.asset_sync.mode` | `OZMA_DISPLAY_SYNC_MODE` (`offline`, `installed`, `manual`, `full`) | `offline` |
-| `display.fonts.translation` | `OZMA_DISPLAY_FONTS_TRANSLATION_ENABLED` | `false` |
-| `display.importers.enabled` | `OZMA_DISPLAY_IMPORTERS_ENABLED` | `false` |
+| `display.profile` | `OZMA_DISPLAY_PROFILE` (`off`, `local`, `full`) | `local` |
+| `display.ir.enabled` | `OZMA_DISPLAY_IR_ENABLED` | on under `local`/`full` |
+| `display.asset_repository.enabled` | `OZMA_DISPLAY_ASSET_REPOSITORY_ENABLED` | on under `local`/`full` |
+| `display.asset_sync.mode` | `OZMA_DISPLAY_SYNC_MODE` (`offline`, `installed`, `manual`, `full`) | `offline` for every profile |
+| `display.fonts.translation` | `OZMA_DISPLAY_FONTS_TRANSLATION_ENABLED` | on under `local`/`full` |
+| `display.importers.enabled` | `OZMA_DISPLAY_IMPORTERS_ENABLED` | on only under `full` |
 
 Related settings:
 
@@ -47,10 +62,14 @@ Related settings:
 | `OZMA_DISPLAY_MAX_PACK_BYTES` | Maximum pack payload | 64 MiB |
 | `OZMA_DISPLAY_MAX_IMPORT_BYTES` | Maximum import payload | 32 MiB |
 
-Booleans are strict (`1/0`, `true/false`, `yes/no`, `on/off`); invalid values
-raise `DisplayConfigError` instead of falling back silently. The plan’s
-“default-on” milestone has not been reached: local repository and IR remain
-opt-in, and Connect/importers are opt-in per deployment.
+Booleans are strict (`1/0`, `true/false`, `yes/no`, `on/off`); invalid profile or
+boolean values raise `DisplayConfigError` instead of falling back silently.
+
+The profile never weakens package trust. Unsigned first-party packs still require
+the explicit `OZMA_DISPLAY_ALLOW_UNSIGNED_PACKS=1` opt-in (or a configured
+verifier and a signature). Deployments migrating from all-off should set
+`OZMA_DISPLAY_PROFILE=off`; deployments that already set individual flags keep
+those explicit choices.
 
 ## Behavioural and compatibility notes
 
@@ -78,6 +97,10 @@ opt-in, and Connect/importers are opt-in per deployment.
 - **Local installs are more permissive than publication.** Local mode permits
   first-party AGPL (`retro-gauges`); published mode enforces the community
   allowlist. Executable assets require a sandbox declaration.
+- **The default profile is local and offline.** IR, fonts, and the local asset
+  repository are on; importers are off and sync remains `offline`. Use
+  `OZMA_DISPLAY_PROFILE=full` for importers, and set a sync mode explicitly
+  before enabling network index access.
 - **Offline is the default sync mode.** Enabling any other mode opts the
   deployment into index network access. Sync failures fall back to the last
   cached index.
@@ -182,6 +205,8 @@ network services.
 - **Signature verification is policy-driven.** The licence gate checks licences,
   hashes, and sandbox declarations only. Deployments that require signatures
   must configure a verifier; a signed manifest without a verifier fails closed.
+  The default-on local profile does not set `ALLOW_UNSIGNED_PACKS`, so unsigned
+  local packs still need that explicit flag or a verifier.
 - **The migration script is metadata-only.** It does not rewrite pack payloads,
   sign manifests, publish to Connect, or validate renderer semantics.
 

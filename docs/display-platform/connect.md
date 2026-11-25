@@ -17,6 +17,8 @@ are bundled with the application.
 | `OZMA_CONNECT_ASSET_SIGNING_KEY` | no | Ed25519 private key as raw base64/hex or PEM. Production deployments should set this so the index is signed. HMAC keys are not accepted by the bootstrap path. |
 | `OZMA_CONNECT_ASSET_SIGNING_KEY_ID` | no | Key identifier recorded in the signed index. Default `connect`; must match the controller's trust store. |
 | `OZMA_CONNECT_ASSET_INDEX_CHANNEL` | no | Default channel recorded on `app.state.asset_index_channel`. Default `stable`. |
+| `OZMA_CONNECT_REVIEW_REQUIRED` | no | When `1`/`true`/`yes`/`on`, new public submissions are held as `pending` and excluded from public search, stats, and indexes until approved. Default off keeps today's behaviour and approves public submissions automatically. |
+| `OZMA_CONNECT_REVIEW_TOKEN` | no | Shared secret for the admin review API. Unset means `/assets/review*` returns `503 review_unavailable`; review is never open by default. |
 
 A minimal SQLite deployment:
 
@@ -26,6 +28,8 @@ export OZMA_CONNECT_ASSET_STORAGE="/var/lib/ozma/connect/objects"
 export OZMA_CONNECT_ASSET_INDEX_CHANNEL="stable"
 export OZMA_CONNECT_ASSET_SIGNING_KEY="$(cat /etc/ozma/connect-private.pem)"
 export OZMA_CONNECT_ASSET_SIGNING_KEY_ID="connect-prod-1"
+export OZMA_CONNECT_REVIEW_REQUIRED="1"
+export OZMA_CONNECT_REVIEW_TOKEN="$(cat /etc/ozma/connect-review-token)"
 ```
 
 Invalid database URLs or keys raise a typed `BootstrapError`. Connect logs a
@@ -54,8 +58,16 @@ the object directory on durable local storage.
   `postgresql+psycopg://connect:password@db.example.test/ozma_connect`.
 
 The service creates the portable schema on startup (idempotent) and also ships
-the SQL migration in `connect/assets/migrations/001_asset_db.sql` for managed
-databases that prefer an out-of-band migration step.
+the SQL migrations in `connect/assets/migrations/` for managed databases that
+prefer an out-of-band migration step:
+
+- `001_asset_db.sql` creates the core asset tables;
+- `002_asset_review.sql` adds the optional review and audit tables.
+
+Both migrations use `IF NOT EXISTS`, so applying them after startup or
+re-applying them is safe on SQLite and Postgres. A version with no row in
+`asset_review` is treated as approved, so deploying review support does not
+retroactively hide existing public packs.
 
 ## Signing keys
 
@@ -87,9 +99,56 @@ location /assets/ {
 }
 ```
 
-Do not expose the database or the object directory. Keep admin/review surfaces
-behind authentication when they are added. Controllers must use the public
+Do not expose the database or the object directory. Review endpoints are
+authenticated with `X-Ozma-Review-Token` and should additionally be restricted
+at the proxy to trusted operator networks. Controllers must use the public
 HTTPS URL, for example `https://connect.example.test/assets/index/stable`.
+
+## Review workflow and gallery
+
+Review is optional and backward compatible:
+
+- private submissions and first-party public submissions are approved
+  automatically;
+- with `OZMA_CONNECT_REVIEW_REQUIRED` off, public submissions are approved
+  automatically, exactly as before;
+- with it on, new public submissions start as `pending` and are excluded from
+  `/assets/search`, `/assets/stats`, `/assets/categories`, `/assets/versions`,
+  `/assets/entry`, and every signed index until approved;
+- rejected versions stay excluded; private packs remain excluded from public
+  views regardless of review state.
+
+The review API requires `OZMA_CONNECT_REVIEW_TOKEN` and the matching
+`X-Ozma-Review-Token` request header. Missing header returns `401`; a wrong
+token returns `403`; an unset deployment token returns `503 review_unavailable`.
+The token is never logged.
+
+```http
+GET  /assets/review?status=pending&limit=50&offset=0
+POST /assets/review/{pack_id}/approve
+POST /assets/review/{pack_id}/reject
+X-Ozma-Review-Token: <token>
+Content-Type: application/json
+
+{"version": "1.2.0", "note": "licence and provenance checked"}
+```
+
+`version` is optional and defaults to the newest version. `note` is required
+for rejection. Decisions are idempotent: repeating an approval or rejection
+returns the existing state without adding another audit row. Every real
+transition writes an append-only `asset_review_event` row with the previous
+status, reviewer, note, and timestamp. An optional
+`X-Ozma-Review-Reviewer` header records an operator name (default `admin`).
+Unknown packs or versions return `404`; private or yanked review targets return
+`409`; malformed bodies and a missing rejection note return `400`.
+
+`GET /assets/gallery` is a public, read-only HTML page listing approved public
+packs with name, author, version, tags, licence, and links to
+`/assets/entry/{id}`. It accepts optional `q`, `type`, and `tag` query filters.
+The page is self-contained: no scripts, external styles, images, or network
+requests. It sends a strict `default-src 'none'; style-src 'unsafe-inline'`
+CSP as both a meta tag and a response header, and HTML-escapes every
+manifest-derived value. It never lists private, pending, or rejected packs.
 
 ## Backup and restore
 

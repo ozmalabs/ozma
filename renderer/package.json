@@ -10,8 +10,11 @@
   "dependencies": {
     "@napi-rs/canvas": "^0.1.44",
     "express": "^4.18.2",
-    "ws": "^8.14.2",
-    "sharp": "^0.33.0"
+    "ws": "8.21.0",
+    "sharp": "^0.34.5"
+  },
+  "overrides": {
+    "path-to-regexp": "0.1.12"
   },
   "engines": {
     "node": ">=18"

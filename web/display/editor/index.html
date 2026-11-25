@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'"
+  >
+  <meta name="color-scheme" content="dark">
+  <title>Ozma Layout Editor</title>
+  <link rel="stylesheet" href="editor.css">
+</head>
+<body>
+  <a class="skip-link" href="#editor-canvas">Skip to canvas</a>
+
+  <header class="editor-topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <h1>Ozma Layout Editor</h1>
+        <p class="muted small">Offline ScreenLayout editor · no third-party code</p>
+      </div>
+    </div>
+
+    <div class="toolbar" role="toolbar" aria-label="Editor toolbar">
+      <div class="toolbar-group">
+        <label for="widget-kind">Widget</label>
+        <select id="widget-kind" name="widget-kind">
+          <option value="gauge">gauge</option>
+          <option value="bar">bar</option>
+          <option value="number">number</option>
+          <option value="text">text</option>
+          <option value="sparkline">sparkline</option>
+          <option value="vu_meter">vu_meter</option>
+          <option value="status">status</option>
+          <option value="icon">icon</option>
+          <option value="table">table</option>
+          <option value="card">card</option>
+        </select>
+        <button id="add-widget" type="button" class="primary">Add</button>
+      </div>
+
+      <div class="toolbar-group" aria-label="Selection actions">
+        <button id="duplicate-widget" type="button">Duplicate</button>
+        <button id="delete-widget" type="button">Delete</button>
+        <button id="raise-widget" type="button">Forward</button>
+        <button id="lower-widget" type="button">Backward</button>
+      </div>
+
+      <div class="toolbar-group" aria-label="History">
+        <button id="undo" type="button">Undo</button>
+        <button id="redo" type="button">Redo</button>
+      </div>
+
+      <div class="toolbar-group">
+        <label for="grid-size">Grid</label>
+        <input id="grid-size" type="number" min="1" max="200" step="1" value="10" inputmode="numeric">
+        <label for="zoom">Zoom</label>
+        <input id="zoom" type="range" min="0.25" max="2" step="0.05" value="1">
+        <output id="zoom-output" for="zoom">100%</output>
+      </div>
+
+      <div class="toolbar-group" aria-label="Document actions">
+        <button id="import-button" type="button">Import</button>
+        <button id="export-button" type="button">Export</button>
+        <button id="reset-button" type="button">Reset</button>
+        <input id="file-input" type="file" accept=".json,application/json" hidden>
+      </div>
+    </div>
+  </header>
+
+  <main class="editor-main">
+    <aside class="panel" aria-labelledby="layout-heading">
+      <h2 id="layout-heading">Layout</h2>
+      <div class="field">
+        <label for="layout-id">ID</label>
+        <input id="layout-id" type="text" spellcheck="false" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="layout-name">Name</label>
+        <input id="layout-name" type="text" autocomplete="off">
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="layout-width">Width</label>
+          <input id="layout-width" type="number" min="1" max="8192" step="1">
+        </div>
+        <div class="field">
+          <label for="layout-height">Height</label>
+          <input id="layout-height" type="number" min="1" max="8192" step="1">
+        </div>
+      </div>
+      <div class="field">
+        <label for="layout-background">Background</label>
+        <input id="layout-background" type="text" spellcheck="false" placeholder="#0a0a0f">
+      </div>
+      <div class="field">
+        <label for="layout-refresh">Refresh (Hz)</label>
+        <input id="layout-refresh" type="number" min="0.1" max="120" step="0.1">
+      </div>
+
+      <h2 id="palette-heading">Widgets</h2>
+      <div id="palette" class="palette" role="group" aria-labelledby="palette-heading">
+        <button type="button" data-kind="gauge">Gauge</button>
+        <button type="button" data-kind="bar">Bar</button>
+        <button type="button" data-kind="number">Number</button>
+        <button type="button" data-kind="text">Text</button>
+        <button type="button" data-kind="sparkline">Sparkline</button>
+        <button type="button" data-kind="vu_meter">VU meter</button>
+        <button type="button" data-kind="status">Status</button>
+        <button type="button" data-kind="icon">Icon</button>
+        <button type="button" data-kind="table">Table</button>
+        <button type="button" data-kind="card">Card</button>
+      </div>
+      <p class="hint">
+        Drag a widget to move it. Drag a handle to resize. Snapping and bounds
+        clamping use the grid setting.
+      </p>
+    </aside>
+
+    <section class="canvas-panel" aria-labelledby="canvas-heading">
+      <div class="panel-head">
+        <h2 id="canvas-heading">Canvas</h2>
+        <p class="muted small">ScreenLayout coordinates, not third-party editor state.</p>
+      </div>
+      <div id="canvas-scroll" class="canvas-scroll">
+        <div
+          id="editor-canvas"
+          class="editor-canvas"
+          role="application"
+          tabindex="0"
+          aria-label="Layout canvas"
+          aria-describedby="canvas-help"
+        >
+          <p id="canvas-empty" class="canvas-empty">
+            No widgets yet. Add one from the palette or import a layout.
+          </p>
+        </div>
+      </div>
+      <p id="canvas-help" class="hint">
+        Keyboard: Tab to a widget, Enter or Space selects, arrows nudge, Delete
+        removes, and Ctrl/Cmd+Z undoes. Shift+arrows nudge by five grid steps.
+      </p>
+    </section>
+
+    <aside class="panel" aria-labelledby="properties-heading">
+      <h2 id="properties-heading">Properties</h2>
+      <p id="selection-empty" class="muted">Select a widget to edit its properties.</p>
+
+      <form id="properties-form" hidden>
+        <div class="field">
+          <label for="prop-type">Type</label>
+          <select id="prop-type">
+            <option value="gauge">gauge</option>
+            <option value="bar">bar</option>
+            <option value="number">number</option>
+            <option value="text">text</option>
+            <option value="sparkline">sparkline</option>
+            <option value="vu_meter">vu_meter</option>
+            <option value="status">status</option>
+            <option value="icon">icon</option>
+            <option value="table">table</option>
+            <option value="card">card</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="prop-label">Label</label>
+          <input id="prop-label" type="text" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="prop-text">Text</label>
+          <input id="prop-text" type="text" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="prop-metric">Metric</label>
+          <input id="prop-metric" type="text" spellcheck="false" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="prop-unit">Unit</label>
+          <input id="prop-unit" type="text" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="prop-color">Colour</label>
+          <input id="prop-color" type="text" spellcheck="false" placeholder="#5b6fff">
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="prop-min">Min</label>
+            <input id="prop-min" type="number" step="any">
+          </div>
+          <div class="field">
+            <label for="prop-max">Max</label>
+            <input id="prop-max" type="number" step="any">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="prop-warn">Warn</label>
+            <input id="prop-warn" type="number" step="any">
+          </div>
+          <div class="field">
+            <label for="prop-crit">Crit</label>
+            <input id="prop-crit" type="number" step="any">
+          </div>
+        </div>
+        <div class="field">
+          <label for="prop-decimals">Decimals</label>
+          <input id="prop-decimals" type="number" min="0" max="6" step="1">
+        </div>
+
+        <fieldset>
+          <legend>Geometry</legend>
+          <div class="field-row">
+            <div class="field">
+              <label for="prop-x">X</label>
+              <input id="prop-x" type="number" step="1">
+            </div>
+            <div class="field">
+              <label for="prop-y">Y</label>
+              <input id="prop-y" type="number" step="1">
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="prop-w">Width</label>
+              <input id="prop-w" type="number" step="1">
+            </div>
+            <div class="field">
+              <label for="prop-h">Height</label>
+              <input id="prop-h" type="number" step="1">
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset id="spark-fields" hidden>
+          <legend>Sparkline</legend>
+          <div class="field-row">
+            <div class="field">
+              <label for="prop-history-points">History points</label>
+              <input id="prop-history-points" type="number" min="1" max="4096" step="1">
+            </div>
+            <div class="field">
+              <label for="prop-history-seconds">History seconds</label>
+              <input id="prop-history-seconds" type="number" min="0" max="3600" step="1">
+            </div>
+          </div>
+          <label class="check">
+            <input id="prop-fill" type="checkbox">
+            Fill under the curve
+          </label>
+        </fieldset>
+
+        <fieldset id="vu-fields" hidden>
+          <legend>VU meter ballistics</legend>
+          <div class="field-row">
+            <div class="field">
+              <label for="prop-attack">Attack (ms)</label>
+              <input id="prop-attack" type="number" min="0" step="1">
+            </div>
+            <div class="field">
+              <label for="prop-release">Release (ms)</label>
+              <input id="prop-release" type="number" min="0" step="1">
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="prop-falloff">Falloff (dB/s)</label>
+              <input id="prop-falloff" type="number" min="0" step="0.1">
+            </div>
+            <div class="field">
+              <label for="prop-peak-hold">Peak hold (ms)</label>
+              <input id="prop-peak-hold" type="number" min="0" step="1">
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="prop-peak-falloff">Peak falloff (dB/s)</label>
+              <input id="prop-peak-falloff" type="number" min="0" step="0.1">
+            </div>
+            <div class="field">
+              <label for="prop-segments">Segments</label>
+              <input id="prop-segments" type="number" min="1" max="128" step="1">
+            </div>
+          </div>
+        </fieldset>
+      </form>
+    </aside>
+  </main>
+
+  <footer class="editor-footer">
+    <p id="status" class="status" role="status" aria-live="polite" data-tone="info">Ready.</p>
+    <p id="error" class="error" role="alert" hidden></p>
+  </footer>
+
+  <dialog id="import-dialog" aria-labelledby="import-heading">
+    <form id="import-form" method="dialog">
+      <h2 id="import-heading">Import layout</h2>
+      <p class="hint">
+        Paste a <code>ScreenLayout</code> or display-definition JSON document.
+        Unknown fields are preserved; nothing is executed.
+      </p>
+      <div class="field">
+        <label for="import-text">Layout JSON</label>
+        <textarea id="import-text" spellcheck="false" autocomplete="off"></textarea>
+      </div>
+      <p id="import-error" class="error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button id="import-file" type="button">Choose file…</button>
+        <button id="import-cancel" type="button">Cancel</button>
+        <button id="import-apply" type="submit" class="primary">Import</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="editor.js"></script>
+</body>
+</html>

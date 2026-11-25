@@ -125,14 +125,16 @@ M0 must land before B/C/D/E merge to avoid schema churn.
 | M4 Font subsystem | **Done** | Rust + Python metadata, PANOSE/metrics/scripts/features, `fsType` gate, deterministic matching, reports; TTF/OTF subsetting, BDF, LVGL C, previews; Latin/CJK/Arabic/Indic/icon golden corpus | WOFF2 write path requires optional `brotli`; live shaping render comparison |
 | M5 Render adapters/themes | **Done** | Five original themes + hashed pack; gauge/bar/dual/threshold, VU ballistics (attack/release, dB/s falloff, peak hold, clip latch, RMS), and sparkline/history widgets; sandboxed third-party widgets; PNG render plans; LVGL C/JSON; Adaptive Cards; AIDA64 `/panel` generated from `WidgetIR` | Optional uPlot/gridstack editor; AIDA64 native Windows shared-memory/registry emulation |
 | M6 Importers | **Done** | AIDA64/SensorPanel, Rainmeter, Home Assistant, MagicMirror, Grafana, Adaptive Cards import/export; private import store + API; lossless capture and IR validation | Native AIDA64 `.rslcd` remains best-effort/opaque (`WGT-070`) |
-| M7 Hardening | **Done** | Feature flags/runtime, licence/checksum/sandbox gate, Ed25519 trust + signing CLI, browser sandbox/CSP, bounded fuzz regression, migration tooling, perf benchmarks, targeted CI, Connect bootstrap, release notes | Default-on rollout decision; marketplace/review UI |
+| M7 Hardening | **Done** | Feature flags/runtime with default-on `local` profile (IR/fonts/repository on; importers and network sync off), licence/checksum/sandbox gate, Ed25519 trust + signing CLI, browser sandbox/CSP, bounded fuzz regression, migration tooling, perf benchmarks, targeted CI, Connect bootstrap, release notes | Marketplace/review UI; optional field validation |
 
 Known gaps for the next slice:
 
 1. Real raster PNG/JPEG runs on a host with `@napi-rs/canvas`; current tests
    cover the canvas contract with an injected recording factory.
 2. Optional uPlot/gridstack editor and AIDA64 native Windows exporters.
-3. Default-on rollout after field validation; Connect review UI/marketplace.
+3. Optional field validation of the shipped default-on `local` profile; Connect
+   review UI/marketplace. The local profile is on by default, while sync stays
+   `offline` and importers require `OZMA_DISPLAY_PROFILE=full`.
 4. Live font shaping/render comparison and WOFF2 writing with `brotli`.
 
 ## 7. Task backlog
@@ -351,23 +353,32 @@ python3 -m pytest tests/unit/connect/test_assets.py
 
 ## 13. Rollout
 
-1. **Local-only:** IR + local asset repository + existing packs; no Connect.
+1. **Local default (shipped):** IR + font translation + local asset repository +
+   existing packs; no Connect, no importers, sync stays `offline`.
 2. **Connect opt-in:** shared index/category packs; offline cache.
 3. **Fonts:** ship original OFL themes; font substitution reports.
 4. **Importers:** private imports; no public submission until licence attestation.
 5. **Community:** submission/review workflow, reports, curated categories.
-6. **Default-on:** local repo/IR when M0–M3 pass; Connect/importers remain opt-in
-   per deployment.
+6. **Default-on (shipped):** `OZMA_DISPLAY_PROFILE=local` enables local repo/IR
+   by default; `full` adds importers; `off` preserves the legacy all-off mode.
+   Sync remains `offline` unless set explicitly, and Connect stays opt-in per
+   deployment. Unsigned local packs still require the explicit
+   `OZMA_DISPLAY_ALLOW_UNSIGNED_PACKS=1` flag or a verifier.
 
 Feature flags:
 
 ```text
+display.profile=off|local|full
 display.ir.enabled
 display.asset_repository.enabled
 display.asset_sync.mode=offline|installed|full|manual
 display.fonts.translation=enabled
 display.importers.enabled
 ```
+
+Individual `OZMA_DISPLAY_*` variables override the profile. Invalid profile
+values raise `DisplayConfigError`. No profile implies network sync; `full` also
+defaults sync to `offline`.
 
 ## 14. Definition of done
 

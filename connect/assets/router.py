@@ -8,10 +8,13 @@ not open a database connection.
 
 from __future__ import annotations
 
-from typing import Any
+import hmac
+from typing import Any, Mapping
 
 from fastapi import APIRouter, Body, Header, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
 
+from connect.assets.gallery import CSP, render_gallery
 from connect.assets.index import AssetService, index_bytes
 from connect.assets.models import AssetError
 
@@ -43,8 +46,113 @@ def _service_for(
     return found
 
 
-def build_router(service: AssetService | None = None) -> APIRouter:
-    """Build the ``/assets`` router around a service instance."""
+def _review_config(
+    service: AssetService,
+    override: str | None,
+) -> str:
+    token = override if override is not None else getattr(
+        service,
+        "review_token",
+        None,
+    )
+    return str(token).strip() if token else ""
+
+
+def _require_review(
+    service: AssetService,
+    override: str | None,
+    supplied: str | None,
+) -> None:
+    """Fail closed: 503 when unconfigured, 401 missing, 403 invalid."""
+    expected = _review_config(service, override)
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "review_unavailable",
+                "message": "review token is not configured",
+            },
+        )
+    if supplied is None or not str(supplied):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "review_token_missing",
+                "message": "X-Ozma-Review-Token header is required",
+            },
+        )
+    if not hmac.compare_digest(str(supplied), expected):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "review_token_invalid",
+                "message": "review token is invalid",
+            },
+        )
+
+
+def _review_body(
+    payload: Any,
+    reviewer_header: str | None,
+) -> tuple[str | None, str, str]:
+    if payload is None:
+        data: Mapping[str, Any] = {}
+    elif isinstance(payload, Mapping):
+        data = payload
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_review_body",
+                "message": "review body must be a JSON object",
+            },
+        )
+    version = data.get("version")
+    if version is not None and not isinstance(version, str):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_review_body",
+                "message": "version must be a string",
+            },
+        )
+    note = data.get("note", "")
+    if note is None:
+        note = ""
+    if not isinstance(note, str):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_review_body",
+                "message": "note must be a string",
+            },
+        )
+    reviewer = data.get("reviewer") or reviewer_header or "admin"
+    if not isinstance(reviewer, str):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_review_body",
+                "message": "reviewer must be a string",
+            },
+        )
+    return (
+        version.strip() if isinstance(version, str) and version.strip() else None,
+        note.strip(),
+        reviewer.strip() or "admin",
+    )
+
+
+def build_router(
+    service: AssetService | None = None,
+    review_token: str | None = None,
+) -> APIRouter:
+    """Build the ``/assets`` router around a service instance.
+
+    ``review_token`` overrides the service's configured token, which is useful
+    for tests and small embeddings.  The default remains the token on the
+    service so ``build_router(service)`` keeps working unchanged.
+    """
     router = APIRouter(prefix="/assets", tags=["assets"])
 
     @router.get("/search")
@@ -125,6 +233,104 @@ def build_router(service: AssetService | None = None) -> APIRouter:
         current = _service_for(service, request)
         try:
             return current.stats()
+        except AssetError as exc:
+            raise _http_error(exc) from exc
+
+    @router.get("/gallery", response_class=HTMLResponse)
+    def get_gallery(
+        request: Request,
+        q: str | None = None,
+        type: str | None = None,
+        tag: str | None = None,
+    ) -> HTMLResponse:
+        current = _service_for(service, request)
+        try:
+            page = render_gallery(current, q=q, type=type, tag=tag)
+        except AssetError as exc:
+            raise _http_error(exc) from exc
+        return HTMLResponse(
+            content=page,
+            headers={
+                "Content-Security-Policy": CSP,
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+                "Cache-Control": "public, max-age=60",
+            },
+        )
+
+    @router.get("/review")
+    def list_reviews(
+        request: Request,
+        status: str | None = "pending",
+        limit: int = 50,
+        offset: int = 0,
+        review_header: str | None = Header(
+            default=None,
+            alias="X-Ozma-Review-Token",
+        ),
+    ) -> dict[str, Any]:
+        current = _service_for(service, request)
+        _require_review(current, review_token, review_header)
+        try:
+            return current.reviews.list_reviews(
+                status,
+                limit=limit,
+                offset=offset,
+            )
+        except AssetError as exc:
+            raise _http_error(exc) from exc
+
+    @router.post("/review/{pack_id}/approve")
+    def approve_pack(
+        request: Request,
+        pack_id: str,
+        payload: Any = Body(default=None),
+        review_header: str | None = Header(
+            default=None,
+            alias="X-Ozma-Review-Token",
+        ),
+        reviewer_header: str | None = Header(
+            default=None,
+            alias="X-Ozma-Review-Reviewer",
+        ),
+    ) -> dict[str, Any]:
+        current = _service_for(service, request)
+        _require_review(current, review_token, review_header)
+        version, note, reviewer = _review_body(payload, reviewer_header)
+        try:
+            return current.reviews.approve(
+                pack_id,
+                version=version,
+                note=note,
+                reviewer=reviewer,
+            )
+        except AssetError as exc:
+            raise _http_error(exc) from exc
+
+    @router.post("/review/{pack_id}/reject")
+    def reject_pack(
+        request: Request,
+        pack_id: str,
+        payload: Any = Body(default=None),
+        review_header: str | None = Header(
+            default=None,
+            alias="X-Ozma-Review-Token",
+        ),
+        reviewer_header: str | None = Header(
+            default=None,
+            alias="X-Ozma-Review-Reviewer",
+        ),
+    ) -> dict[str, Any]:
+        current = _service_for(service, request)
+        _require_review(current, review_token, review_header)
+        version, note, reviewer = _review_body(payload, reviewer_header)
+        try:
+            return current.reviews.reject(
+                pack_id,
+                version=version,
+                note=note,
+                reviewer=reviewer,
+            )
         except AssetError as exc:
             raise _http_error(exc) from exc
 

@@ -34,20 +34,21 @@ from connect.assets.models import (
     AssetFile,
     AssetNotFoundError,
     AssetPack,
-    AssetProvenance,
-    AssetTag,
+    AssetReview,
     AssetVersion,
     InvalidAssetError,
+    apply_pack_summary,
     as_bool,
     as_mapping,
     as_str_list,
-    flatten_text,
     json_dumps,
     license_is_allowed,
+    manifest_summary,
     normalize_license,
     utc_now_iso,
     version_key,
 )
+from connect.assets.review import ReviewService
 from connect.assets.storage import (
     ObjectStore,
     put_content,
@@ -322,8 +323,13 @@ def build_index(
     generated_at: str | datetime,
     signer: Signer | None = None,
     include_private: bool = False,
+    review_required: bool = False,
 ) -> dict[str, Any]:
-    """Build a deterministic, optionally signed index for ``channel``."""
+    """Build a deterministic, optionally signed index for ``channel``.
+
+    When ``review_required`` is true, only approved versions are included.
+    Versions without a review row count as approved for backward compatibility.
+    """
     requested = str(channel or "stable").strip().lower()
     with Session(engine) as session:
         statement = select(AssetPack).options(
@@ -332,6 +338,12 @@ def build_index(
             selectinload(AssetPack.provenance),
         )
         packs = session.execute(statement).scalars().all()
+        statuses: dict[tuple[str, str], str] = {}
+        if review_required:
+            statuses = {
+                (row.pack_id, row.version): row.status
+                for row in session.execute(select(AssetReview)).scalars()
+            }
         entries: list[dict[str, Any]] = []
         for pack in packs:
             if pack.private and not include_private:
@@ -340,6 +352,13 @@ def build_index(
                 pack.versions,
                 key=lambda item: version_key(item.version),
             ):
+                if review_required:
+                    status = statuses.get(
+                        (pack.id, version.version),
+                        "approved",
+                    )
+                    if status != "approved":
+                        continue
                 manifest = version.manifest()
                 declared = _declared_channel(manifest, pack)
                 if requested != "all":
@@ -529,6 +548,8 @@ class AssetService:
         signer: Signer | None = None,
         verifier: Verifier | None = None,
         allowed_licenses: frozenset[str] | set[str] | None = None,
+        review_required: bool = False,
+        review_token: str | None = None,
     ) -> None:
         self.engine = engine
         self.store = store
@@ -537,6 +558,9 @@ class AssetService:
         self.allowed_licenses = frozenset(
             allowed_licenses or DEFAULT_ALLOWED_LICENSES
         )
+        self.review_required = bool(review_required)
+        self.review_token = str(review_token).strip() if review_token else None
+        self.reviews = ReviewService(engine, required=self.review_required)
 
     # Submission ---------------------------------------------------------
 
@@ -657,6 +681,13 @@ class AssetService:
 
         assets = self._normalise_assets(manifest.get("assets", []))
 
+        if is_private or first_party:
+            review_status = "approved"
+        elif self.review_required:
+            review_status = "pending"
+        else:
+            review_status = "approved"
+
         now = utc_now_iso()
         published_at = str(manifest.get("published_at") or now)
         yanked = as_bool(manifest.get("yanked", False))
@@ -710,53 +741,7 @@ class AssetService:
             for asset in assets
             if asset["sha256"]
         }
-        search_blob = " ".join(sorted(
-            flatten_text(tags)
-            | flatten_text(manifest.get("vibe"))
-            | flatten_text(manifest.get("shape"))
-            | flatten_text(manifest.get("coherence"))
-            | flatten_text(capabilities)
-            | flatten_text(permissions)
-            | {
-                pack_id.lower(),
-                str(stored["name"]).lower(),
-                str(stored["description"]).lower(),
-                str(stored["author"]).lower(),
-                licence.lower(),
-            }
-        ))
-        extra = {
-            key: value for key, value in manifest.items()
-            if key not in {
-                "id",
-                "type",
-                "name",
-                "version",
-                "schema",
-                "author",
-                "description",
-                "license",
-                "licence",
-                "source_url",
-                "tags",
-                "capabilities",
-                "permissions",
-                "min_ozma_version",
-                "min_display_schema",
-                "assets",
-                "preview",
-                "provenance",
-                "confidence",
-                "vibe",
-                "shape",
-                "coherence",
-                "signature",
-                "published_at",
-                "yanked",
-                "private",
-                "public",
-            }
-        }
+        summary = manifest_summary(pack_id, stored)
 
         try:
             with Session(self.engine) as session:
@@ -782,22 +767,18 @@ class AssetService:
                 summary_is_current = (
                     latest_key is None or version_key(version) >= latest_key
                 )
-                if summary_is_current:
-                    pack.type = pack_type
-                    pack.name = stored["name"]
-                    pack.description = stored["description"]
-                    pack.license = licence
-                    pack.source_url = stored["source_url"]
-                    pack.author = stored["author"]
-                    pack.confidence = stored["confidence"]
-                    pack.published_at = published_at
-                    pack.yanked = yanked
+                summary_visible = summary_is_current and (
+                    not self.review_required
+                    or review_status == "approved"
+                    or latest_key is None
+                )
+                if summary_visible:
+                    apply_pack_summary(pack, summary, now=now)
+                else:
+                    # A pending version must still be publicly recognised as a
+                    # submission (otherwise reviewers cannot find it), but it
+                    # must not replace the metadata of an older approved version.
                     pack.private = is_private
-                    pack.search_text = search_blob
-                    pack.capabilities_json = json_dumps(capabilities)
-                    pack.permissions_json = json_dumps(permissions)
-                    pack.extra_json = json_dumps(extra)
-                    pack.updated_at = now
 
                 version_row = AssetVersion(
                     pack_id=pack_id,
@@ -826,20 +807,20 @@ class AssetService:
                     for asset in assets
                 ]
                 session.add(version_row)
-
-                if summary_is_current:
-                    pack.tags = [AssetTag(tag=tag) for tag in tags]
-                    pack.provenance = [
-                        AssetProvenance(
-                            pack_id=pack_id,
-                            type=str(provenance.get("type") or ""),
-                            source=str(provenance.get("source") or ""),
-                            author=str(provenance.get("author") or ""),
-                            method=str(provenance.get("method") or ""),
-                            notes=str(provenance.get("notes") or ""),
-                            first_party=first_party,
-                        )
-                    ]
+                session.add(AssetReview(
+                    pack_id=pack_id,
+                    version=version,
+                    status=review_status,
+                    reviewer="system" if review_status == "approved" else "",
+                    note=(
+                        "automatic approval"
+                        if review_status == "approved"
+                        else ""
+                    ),
+                    reviewed_at=now if review_status == "approved" else "",
+                    created_at=now,
+                    updated_at=now,
+                ))
 
                 session.commit()
         except AssetError:
@@ -859,6 +840,8 @@ class AssetService:
             "version": version,
             "status": "private" if is_private else "pending_review",
             "private": is_private,
+            "review_status": review_status,
+            "review_required": self.review_required,
             "license": licence,
             "manifest_sha256": manifest_hash,
             "manifest_key": manifest_key,
@@ -888,11 +871,21 @@ class AssetService:
 
     # Queries ------------------------------------------------------------
 
-    @staticmethod
+    def _review_statuses(
+        self,
+        session: Session,
+    ) -> dict[tuple[str, str], str]:
+        if not self.review_required:
+            return {}
+        rows = session.execute(select(AssetReview)).scalars().all()
+        return {(row.pack_id, row.version): row.status for row in rows}
+
     def _latest_version(
+        self,
         pack: AssetPack,
         *,
         include_yanked: bool,
+        review_statuses: Mapping[tuple[str, str], str] | None = None,
     ) -> AssetVersion | None:
         versions = sorted(
             pack.versions,
@@ -901,6 +894,14 @@ class AssetService:
         )
         if not include_yanked:
             versions = [item for item in versions if not item.yanked]
+        if self.review_required:
+            statuses = review_statuses or {}
+            versions = [
+                item
+                for item in versions
+                if statuses.get((pack.id, item.version), "approved")
+                == "approved"
+            ]
         return versions[0] if versions else None
 
     @staticmethod
@@ -947,6 +948,7 @@ class AssetService:
                 selectinload(AssetPack.provenance),
             )
             packs = session.execute(statement).scalars().all()
+            review_statuses = self._review_statuses(session)
             for pack in packs:
                 if pack.private and not include_private:
                     continue
@@ -969,6 +971,7 @@ class AssetService:
                 version = self._latest_version(
                     pack,
                     include_yanked=include_yanked,
+                    review_statuses=review_statuses,
                 )
                 if version is None:
                     continue
@@ -1015,6 +1018,7 @@ class AssetService:
             pack = session.execute(statement).scalar_one_or_none()
             if pack is None or (pack.private and not include_private):
                 raise AssetNotFoundError(f"unknown pack {pack_id!r}")
+            review_statuses = self._review_statuses(session)
             if version is not None:
                 found = next(
                     (item for item in pack.versions
@@ -1025,10 +1029,25 @@ class AssetService:
                     raise AssetNotFoundError(
                         f"unknown pack {pack_id!r} version {version!r}"
                     )
+                if self.review_required and review_statuses.get(
+                    (pack.id, found.version),
+                    "approved",
+                ) != "approved":
+                    raise AssetNotFoundError(
+                        f"unknown pack {pack_id!r} version {version!r}"
+                    )
                 return _entry_payload(pack, found)
-            latest = self._latest_version(pack, include_yanked=False)
+            latest = self._latest_version(
+                pack,
+                include_yanked=False,
+                review_statuses=review_statuses,
+            )
             if latest is None:
-                latest = self._latest_version(pack, include_yanked=True)
+                latest = self._latest_version(
+                    pack,
+                    include_yanked=True,
+                    review_statuses=review_statuses,
+                )
             if latest is None:
                 raise AssetNotFoundError(f"unknown pack {pack_id!r}")
             return _entry_payload(pack, latest)
@@ -1050,11 +1069,19 @@ class AssetService:
             pack = session.execute(statement).scalar_one_or_none()
             if pack is None or pack.private:
                 raise AssetNotFoundError(f"unknown pack {pack_id!r}")
+            review_statuses = self._review_statuses(session)
             versions = sorted(
                 pack.versions,
                 key=lambda item: version_key(item.version),
                 reverse=True,
             )
+            if self.review_required:
+                versions = [
+                    item
+                    for item in versions
+                    if review_statuses.get((pack.id, item.version), "approved")
+                    == "approved"
+                ]
             if not include_yanked:
                 versions = [item for item in versions if not item.yanked]
             if not versions:
@@ -1078,10 +1105,15 @@ class AssetService:
                 selectinload(AssetPack.tags),
             )
             packs = session.execute(statement).scalars().all()
+            review_statuses = self._review_statuses(session)
             for pack in packs:
                 if pack.private:
                     continue
-                if self._latest_version(pack, include_yanked=False) is None:
+                if self._latest_version(
+                    pack,
+                    include_yanked=False,
+                    review_statuses=review_statuses,
+                ) is None:
                     continue
                 type_counts[pack.type] = type_counts.get(pack.type, 0) + 1
                 licence_key = normalize_license(pack.license) or "unknown"
@@ -1130,10 +1162,23 @@ class AssetService:
                 selectinload(AssetPack.tags),
             )
             packs = session.execute(statement).scalars().all()
+            review_statuses = self._review_statuses(session)
             for pack in packs:
                 if pack.private:
                     private_packs += 1
                     continue
+                versions = list(pack.versions)
+                if self.review_required:
+                    versions = [
+                        item
+                        for item in versions
+                        if review_statuses.get(
+                            (pack.id, item.version),
+                            "approved",
+                        ) == "approved"
+                    ]
+                    if not versions:
+                        continue
                 pack_ids.add(pack.id)
                 licence_key = normalize_license(pack.license) or "unknown"
                 licence_counts[licence_key] = (
@@ -1145,7 +1190,7 @@ class AssetService:
                     permission_counts[permission] = (
                         permission_counts.get(permission, 0) + 1
                     )
-                for version in pack.versions:
+                for version in versions:
                     total_versions += 1
                     type_counts[pack.type] = type_counts.get(pack.type, 0) + 1
                     if version.yanked:
@@ -1184,6 +1229,7 @@ class AssetService:
             generated_at=utc_now_iso(),
             signer=self.signer,
             include_private=False,
+            review_required=self.review_required,
         )
         etag = str(index["etag"])
         not_modified = _etag_matches(if_none_match, etag)

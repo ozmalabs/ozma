@@ -119,7 +119,8 @@ jobs:
             tests/unit/controller/test_display_license_gate.py \
             tests/unit/connect/test_assets.py \
             tests/unit/connect/test_asset_sync.py \
-            tests/unit/connect/test_asset_bootstrap.py -q
+            tests/unit/connect/test_asset_bootstrap.py \
+            tests/unit/connect/test_asset_review.py -q
       - name: Lint display Python
         run: |
           ruff check connect/assets controller/display_config.py \
@@ -175,8 +176,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: renderer/package-lock.json
       - name: Node version
         run: node --version
+      - name: Install renderer dependencies
+        run: npm ci --prefix renderer
       - name: Syntax check
         run: |
           find web/display renderer -name '*.js' \
@@ -186,4 +194,9 @@ jobs:
         run: |
           node --test web/display/*.test.mjs \
             web/display/widgets/*.test.mjs \
-            renderer/*.test.mjs
+            web/display/editor/*.test.mjs \
+            renderer/display_ir.test.mjs \
+            renderer/golden.test.mjs \
+            renderer/render_png.test.mjs
+      - name: Real canvas raster tests
+        run: node --test renderer/raster.test.mjs

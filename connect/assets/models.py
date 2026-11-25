@@ -75,6 +75,43 @@ _LICENSE_ALIASES = {
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+#: Review states for a public pack version.  A missing row means "approved" so
+#: databases created before review support keep their existing public packs.
+REVIEW_STATUSES = frozenset({"pending", "approved", "rejected"})
+DEFAULT_REVIEW_STATUS = "approved"
+
+#: Manifest fields that have authoritative columns or a dedicated serializer.
+#: Everything else is retained verbatim in ``asset_pack.extra_json``.
+MANIFEST_KNOWN_FIELDS = frozenset({
+    "id",
+    "type",
+    "name",
+    "version",
+    "schema",
+    "author",
+    "description",
+    "license",
+    "licence",
+    "source_url",
+    "tags",
+    "capabilities",
+    "permissions",
+    "min_ozma_version",
+    "min_display_schema",
+    "assets",
+    "preview",
+    "provenance",
+    "confidence",
+    "vibe",
+    "shape",
+    "coherence",
+    "signature",
+    "published_at",
+    "yanked",
+    "private",
+    "public",
+})
+
 Base = declarative_base()
 
 
@@ -299,6 +336,20 @@ class AssetPack(Base):
         passive_deletes=True,
         order_by="AssetReport.created_at",
     )
+    reviews = relationship(
+        "AssetReview",
+        back_populates="pack",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="AssetReview.version",
+    )
+    review_events = relationship(
+        "AssetReviewEvent",
+        back_populates="pack",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="AssetReviewEvent.created_at",
+    )
 
     def capabilities(self) -> list[str]:
         value = json_loads(self.capabilities_json, [])
@@ -479,11 +530,165 @@ class AssetReport(Base):
     pack = relationship("AssetPack", back_populates="reports")
 
 
+class AssetReview(Base):
+    """Current review decision for a pack version.
+
+    Rows are intentionally optional: a version without a row is treated as
+    ``approved`` so pre-review databases remain public.  Public submissions
+    created while review is required get an explicit ``pending`` row.
+    """
+
+    __tablename__ = "asset_review"
+
+    pack_id = Column(
+        String(255),
+        ForeignKey("asset_pack.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    version = Column(String(128), primary_key=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    reviewer = Column(String(255), nullable=False, default="")
+    note = Column(Text, nullable=False, default="")
+    reviewed_at = Column(String(64), nullable=False, default="")
+    created_at = Column(String(64), nullable=False, default=utc_now_iso)
+    updated_at = Column(String(64), nullable=False, default=utc_now_iso)
+
+    pack = relationship("AssetPack", back_populates="reviews")
+
+
+class AssetReviewEvent(Base):
+    """Append-only audit log for review decisions."""
+
+    __tablename__ = "asset_review_event"
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    pack_id = Column(
+        String(255),
+        ForeignKey("asset_pack.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    version = Column(String(128), nullable=False, default="")
+    status = Column(String(32), nullable=False, default="", index=True)
+    previous_status = Column(String(32), nullable=False, default="")
+    reviewer = Column(String(255), nullable=False, default="")
+    note = Column(Text, nullable=False, default="")
+    created_at = Column(String(64), nullable=False, default=utc_now_iso)
+
+    pack = relationship("AssetPack", back_populates="review_events")
+
+
+# ── Manifest summaries ───────────────────────────────────────────────────────
+
+
+def manifest_summary(
+    pack_id: str,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive the pack-level summary columns from a stored manifest.
+
+    Submission and review approval share this function so approving a pending
+    version cannot leave public metadata pointing at unapproved content.
+    """
+    tags = as_str_list(manifest.get("tags"))
+    capabilities = as_str_list(manifest.get("capabilities"))
+    permissions = as_str_list(manifest.get("permissions"))
+    provenance = as_mapping(manifest.get("provenance"))
+    first_party = as_bool(provenance.get("first_party")) or as_bool(
+        manifest.get("first_party")
+    )
+    licence = normalize_license(
+        str(manifest.get("license", manifest.get("licence", "")) or "")
+    )
+    name = str(manifest.get("name") or pack_id)
+    description = str(manifest.get("description") or "")
+    search_text = " ".join(sorted(
+        flatten_text(tags)
+        | flatten_text(manifest.get("vibe"))
+        | flatten_text(manifest.get("shape"))
+        | flatten_text(manifest.get("coherence"))
+        | flatten_text(capabilities)
+        | flatten_text(permissions)
+        | {
+            pack_id.lower(),
+            name.lower(),
+            description.lower(),
+            str(manifest.get("author") or "").lower(),
+            licence.lower(),
+        }
+    ))
+    extra = {
+        key: value
+        for key, value in manifest.items()
+        if key not in MANIFEST_KNOWN_FIELDS
+    }
+    return {
+        "type": str(manifest.get("type") or "widget_pack"),
+        "name": name,
+        "description": description,
+        "license": licence,
+        "source_url": str(manifest.get("source_url") or ""),
+        "author": str(manifest.get("author") or ""),
+        "confidence": str(manifest.get("confidence") or ""),
+        "published_at": str(manifest.get("published_at") or ""),
+        "yanked": as_bool(manifest.get("yanked", False)),
+        "private": as_bool(manifest.get("private"), True),
+        "search_text": search_text,
+        "capabilities_json": json_dumps(capabilities),
+        "permissions_json": json_dumps(permissions),
+        "extra_json": json_dumps(extra),
+        "tags": tags,
+        "capabilities": capabilities,
+        "permissions": permissions,
+        "provenance": provenance,
+        "first_party": first_party,
+    }
+
+
+def apply_pack_summary(pack: AssetPack, summary: Mapping[str, Any], *, now: str) -> None:
+    """Write summary columns and relationship rows onto ``pack``."""
+    pack.type = str(summary["type"])
+    pack.name = str(summary["name"])
+    pack.description = str(summary["description"])
+    pack.license = str(summary["license"])
+    pack.source_url = str(summary["source_url"])
+    pack.author = str(summary["author"])
+    pack.confidence = str(summary["confidence"])
+    pack.published_at = str(summary["published_at"])
+    pack.yanked = bool(summary["yanked"])
+    pack.private = bool(summary["private"])
+    pack.search_text = str(summary["search_text"])
+    pack.capabilities_json = str(summary["capabilities_json"])
+    pack.permissions_json = str(summary["permissions_json"])
+    pack.extra_json = str(summary["extra_json"])
+    provenance = summary.get("provenance")
+    provenance = dict(provenance) if isinstance(provenance, Mapping) else {}
+    pack.tags = [AssetTag(tag=tag) for tag in summary["tags"]]
+    pack.provenance = [
+        AssetProvenance(
+            pack_id=pack.id,
+            type=str(provenance.get("type") or ""),
+            source=str(provenance.get("source") or ""),
+            author=str(provenance.get("author") or ""),
+            method=str(provenance.get("method") or ""),
+            notes=str(provenance.get("notes") or ""),
+            first_party=bool(summary.get("first_party")),
+        )
+    ]
+    pack.updated_at = now
+
+
 # ── Schema creation ──────────────────────────────────────────────────────────
 
 
 def migration_path() -> Path:
     return Path(__file__).resolve().parent / "migrations" / "001_asset_db.sql"
+
+
+def migration_paths() -> list[Path]:
+    """Return every checked-in migration, in lexical (apply) order."""
+    directory = Path(__file__).resolve().parent / "migrations"
+    return sorted(directory.glob("*.sql"))
 
 
 def _sql_statements(script: str) -> list[str]:
@@ -504,20 +709,20 @@ def _sql_statements(script: str) -> list[str]:
 
 
 def create_schema(engine) -> None:
-    """Create all asset tables, then apply the portable SQL migration.
+    """Create all asset tables, then apply the portable SQL migrations.
 
     ``metadata.create_all`` keeps the ORM and the SQL in lockstep for tests.
-    The migration itself uses ``IF NOT EXISTS`` so applying it afterwards is a
-    safe no-op on a freshly created schema and remains usable by operators.
+    Every migration uses ``IF NOT EXISTS`` so applying it afterwards is a safe
+    no-op on a freshly created schema and remains usable by operators.
     """
     Base.metadata.create_all(engine)
-    path = migration_path()
-    if not path.exists():
-        return
-    statements = _sql_statements(path.read_text(encoding="utf-8"))
-    with engine.begin() as connection:
-        for statement in statements:
-            connection.exec_driver_sql(statement)
+    for path in migration_paths():
+        if not path.exists():
+            continue
+        statements = _sql_statements(path.read_text(encoding="utf-8"))
+        with engine.begin() as connection:
+            for statement in statements:
+                connection.exec_driver_sql(statement)
 
 
 def create_sqlite_engine(path: str | Path) -> Any:
@@ -539,14 +744,20 @@ __all__ = [
     "AssetPack",
     "AssetProvenance",
     "AssetReport",
+    "AssetReview",
+    "AssetReviewEvent",
     "AssetTag",
     "AssetVersion",
     "Base",
+    "DEFAULT_REVIEW_STATUS",
     "InvalidAssetError",
+    "MANIFEST_KNOWN_FIELDS",
+    "REVIEW_STATUSES",
     "StorageError",
     "StorageLimitError",
     "StorageNotFoundError",
     "UnsafeStorageKey",
+    "apply_pack_summary",
     "as_bool",
     "as_mapping",
     "as_str_list",
@@ -556,7 +767,9 @@ __all__ = [
     "json_dumps",
     "json_loads",
     "license_is_allowed",
+    "manifest_summary",
     "migration_path",
+    "migration_paths",
     "normalize_license",
     "utc_now_iso",
     "version_key",

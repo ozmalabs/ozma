@@ -124,6 +124,7 @@ class DisplayRuntime:
             pass
 
         return {
+            "profile": self.config.profile,
             "features": {
                 "ir": self.enabled("ir"),
                 "asset_repository": self.enabled("asset_repository"),

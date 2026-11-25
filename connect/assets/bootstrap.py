@@ -15,6 +15,10 @@ Configuration is deliberately boring and fail-closed:
   the deployment path.
 * ``OZMA_CONNECT_ASSET_INDEX_CHANNEL`` records the deployment's default index
   channel on ``app.state``.
+* ``OZMA_CONNECT_REVIEW_REQUIRED`` (default off) holds new public submissions
+  as ``pending`` until an operator approves them.
+* ``OZMA_CONNECT_REVIEW_TOKEN`` is the shared secret for the admin review
+  endpoints.  When unset those endpoints return ``503 review_unavailable``.
 
 Errors are raised as :class:`BootstrapError` with operator-safe messages.  The
 original URL or key material is never included in an error string or log line.
@@ -50,6 +54,10 @@ STORAGE_ENV = "OZMA_CONNECT_ASSET_STORAGE"
 SIGNING_KEY_ENV = "OZMA_CONNECT_ASSET_SIGNING_KEY"
 SIGNING_KEY_ID_ENV = "OZMA_CONNECT_ASSET_SIGNING_KEY_ID"
 INDEX_CHANNEL_ENV = "OZMA_CONNECT_ASSET_INDEX_CHANNEL"
+REVIEW_REQUIRED_ENV = "OZMA_CONNECT_REVIEW_REQUIRED"
+REVIEW_TOKEN_ENV = "OZMA_CONNECT_REVIEW_TOKEN"
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
@@ -82,6 +90,14 @@ def _database_url(environ: Mapping[str, str]) -> str:
 
 def _index_channel(environ: Mapping[str, str]) -> str:
     return _value(environ, INDEX_CHANNEL_ENV) or DEFAULT_INDEX_CHANNEL
+
+
+def _review_required(environ: Mapping[str, str]) -> bool:
+    return _value(environ, REVIEW_REQUIRED_ENV).lower() in _TRUTHY
+
+
+def _review_token(environ: Mapping[str, str]) -> str | None:
+    return _value(environ, REVIEW_TOKEN_ENV) or None
 
 
 def _build_engine(url: str) -> Any:
@@ -272,7 +288,13 @@ def configure_assets(
             store = _build_store(env)
         if signer is None:
             signer = _build_signer(env)
-        service = AssetService(engine, store=store, signer=signer)
+        service = AssetService(
+            engine,
+            store=store,
+            signer=signer,
+            review_required=_review_required(env),
+            review_token=_review_token(env),
+        )
     except BootstrapError:
         if created_engine:
             _dispose(engine)
@@ -297,6 +319,8 @@ __all__ = [
     "DEFAULT_STORAGE_DIR",
     "INDEX_CHANNEL_ENV",
     "LEGACY_DATABASE_ENV",
+    "REVIEW_REQUIRED_ENV",
+    "REVIEW_TOKEN_ENV",
     "SIGNING_KEY_ENV",
     "SIGNING_KEY_ID_ENV",
     "STORAGE_ENV",

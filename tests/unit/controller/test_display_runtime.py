@@ -27,6 +27,7 @@ FIXTURES = Path(__file__).parents[2] / "fixtures" / "display_imports"
 HA_SOURCE = FIXTURES / "ha_dashboard.yaml"
 
 _DISPLAY_ENV_KEYS = (
+    "OZMA_DISPLAY_PROFILE",
     "OZMA_DISPLAY_IR_ENABLED",
     "OZMA_DISPLAY_ASSET_REPOSITORY_ENABLED",
     "OZMA_DISPLAY_SYNC_MODE",
@@ -91,7 +92,7 @@ def _build_app(tmp_path: Path, *, display_config=None):
 # ── Runtime assembly ────────────────────────────────────────────────────────
 
 
-def test_runtime_defaults_from_env_are_offline_and_conservative(
+def test_runtime_defaults_from_env_use_local_profile_and_stay_offline(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr("asset_repository.urlopen", _no_network)
@@ -99,9 +100,10 @@ def test_runtime_defaults_from_env_are_offline_and_conservative(
     runtime = build_runtime(config, cache_dir=tmp_path / "cache")
 
     assert runtime.config == config
-    assert runtime.enabled("ir") is False
-    assert runtime.enabled("asset_repository") is False
-    assert runtime.enabled("fonts_translation") is False
+    assert runtime.config.profile == "local"
+    assert runtime.enabled("ir") is True
+    assert runtime.enabled("asset_repository") is True
+    assert runtime.enabled("fonts_translation") is True
     assert runtime.enabled("importers") is False
     assert runtime.config.sync_mode == "offline"
     assert runtime.asset_repository.policy.mode == "offline"
@@ -161,6 +163,7 @@ def test_runtime_mapping_overrides_apply_to_repository_and_store(
     cache = tmp_path / "cache"
     runtime = build_runtime(
         {
+            "OZMA_DISPLAY_PROFILE": "off",
             "OZMA_DISPLAY_ASSET_REPOSITORY_ENABLED": "yes",
             "OZMA_DISPLAY_IMPORTERS_ENABLED": "on",
             "OZMA_DISPLAY_SYNC_MODE": "manual",
@@ -174,6 +177,9 @@ def test_runtime_mapping_overrides_apply_to_repository_and_store(
         cache_dir=cache,
     )
 
+    assert runtime.config.profile == "off"
+    assert runtime.enabled("ir") is False
+    assert runtime.enabled("fonts_translation") is False
     assert runtime.enabled("asset_repository") is True
     assert runtime.enabled("importers") is True
     assert runtime.asset_repository.packs_dir == packs
@@ -197,6 +203,7 @@ def test_status_is_sanitized_and_reports_counts(tmp_path: Path) -> None:
             importers_enabled=True,
             asset_index_url=f"https://assets.example.test/index.json?token={secret}",
             cache_dir=str(tmp_path / "cache"),
+            profile="local",
             trusted_keys=json.dumps(
                 {
                     "default_key_id": "status-key",
@@ -218,10 +225,11 @@ def test_status_is_sanitized_and_reports_counts(tmp_path: Path) -> None:
     status = runtime.status()
     rendered = json.dumps(status)
 
+    assert status["profile"] == "local"
     assert status["features"] == {
-        "ir": False,
+        "ir": True,
         "asset_repository": True,
-        "fonts_translation": False,
+        "fonts_translation": True,
         "importers": True,
     }
     assert status["feature_flags"]["display.asset_sync.mode"] == "offline"
@@ -241,7 +249,9 @@ def test_status_is_sanitized_and_reports_counts(tmp_path: Path) -> None:
 
 
 def test_require_raises_typed_disabled_error(tmp_path: Path) -> None:
-    runtime = build_runtime(DisplayConfig(cache_dir=str(tmp_path / "cache")))
+    runtime = build_runtime(
+        DisplayConfig(profile="off", cache_dir=str(tmp_path / "cache"))
+    )
 
     assert runtime.enabled("asset_repository_enabled") is False
     with pytest.raises(DisplayDisabledError) as excinfo:
@@ -283,7 +293,7 @@ def test_invalid_env_is_a_typed_configuration_error(
 
 def test_config_router_is_available_regardless_of_flags(tmp_path: Path) -> None:
     runtime = build_runtime(
-        DisplayConfig(cache_dir=str(tmp_path / "cache"))
+        DisplayConfig(profile="off", cache_dir=str(tmp_path / "cache"))
     )
     app = FastAPI()
     app.include_router(build_config_router(runtime))
@@ -292,6 +302,7 @@ def test_config_router_is_available_regardless_of_flags(tmp_path: Path) -> None:
 
     assert response.status_code == 200, response.text
     payload = response.json()
+    assert payload["profile"] == "off"
     assert payload["features"]["asset_repository"] is False
     assert payload["features"]["importers"] is False
     assert payload["limits"]["max_pack_bytes"] > 0
@@ -382,13 +393,50 @@ def test_enabled_importers_accept_a_fixture(tmp_path: Path) -> None:
 # ── build_app smoke and wiring ──────────────────────────────────────────────
 
 
-def test_build_app_default_env_starts_with_flags_off(tmp_path: Path) -> None:
+def test_build_app_default_env_is_local_with_importers_off(tmp_path: Path) -> None:
     client = _client(_build_app(tmp_path))
 
     config = client.get("/api/v1/display/config")
     assert config.status_code == 200, config.text
-    assert config.json()["features"]["asset_repository"] is False
-    assert config.json()["features"]["importers"] is False
+    payload = config.json()
+    assert payload["profile"] == "local"
+    assert payload["features"] == {
+        "ir": True,
+        "asset_repository": True,
+        "fonts_translation": True,
+        "importers": False,
+    }
+    assert payload["sync_mode"] == "offline"
+
+    # The local repository is enabled, but private importers are not.
+    assert client.get("/api/v1/asset-db/search").status_code == 200
+    assert client.get("/api/v1/display/importers").json() == {
+        "enabled": False,
+        "importers": [],
+    }
+    _assert_disabled(
+        client.post(
+            "/api/v1/display/import",
+            json={"name": "x.yaml", "format": "home_assistant", "text": "cards: []"},
+        )
+    )
+
+
+def test_build_app_profile_off_disables_repository_and_importers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OZMA_DISPLAY_PROFILE", "off")
+    client = _client(_build_app(tmp_path))
+
+    payload = client.get("/api/v1/display/config").json()
+    assert payload["profile"] == "off"
+    assert payload["features"] == {
+        "ir": False,
+        "asset_repository": False,
+        "fonts_translation": False,
+        "importers": False,
+    }
+    assert payload["sync_mode"] == "offline"
 
     _assert_disabled(client.get("/api/v1/asset-db/search"))
     _assert_disabled(
@@ -399,11 +447,32 @@ def test_build_app_default_env_starts_with_flags_off(tmp_path: Path) -> None:
     )
 
 
+def test_build_app_profile_full_enables_importers_without_network(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OZMA_DISPLAY_PROFILE", "full")
+    monkeypatch.setenv("OZMA_DISPLAY_CACHE_DIR", str(tmp_path / "cache"))
+    client = _client(_build_app(tmp_path))
+
+    payload = client.get("/api/v1/display/config").json()
+    assert payload["profile"] == "full"
+    assert payload["features"] == {
+        "ir": True,
+        "asset_repository": True,
+        "fonts_translation": True,
+        "importers": True,
+    }
+    assert payload["sync_mode"] == "offline"
+    assert client.get("/api/v1/asset-db/search").status_code == 200
+    assert client.get("/api/v1/display/importers").json()["enabled"] is True
+
+
 def test_build_app_enabled_flags_reach_runtime_routers(tmp_path: Path) -> None:
     config = DisplayConfig(
         asset_repository_enabled=True,
         importers_enabled=True,
         cache_dir=str(tmp_path / "cache"),
+        profile="full",
     )
     client = _client(_build_app(tmp_path, display_config=config))
 

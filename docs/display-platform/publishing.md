@@ -134,8 +134,8 @@ yanking the version.
 
 ## Review workflow
 
-The Connect submission/review workflow is not live yet. When it lands, the
-expected flow is:
+Connect implements the submission/review workflow behind
+`OZMA_CONNECT_REVIEW_REQUIRED` (default off). The flow is:
 
 1. **Local validation.** The author runs the repository tests and the licence
    gate in local mode.
@@ -147,11 +147,41 @@ expected flow is:
    auto-publishes it.
 4. **Review.** A reviewer checks licence compatibility, provenance, bundled
    assets, executable content, sandboxing, and whether the preview is
-   representative.
-5. **Publication.** The index entry is signed and versioned. Published versions
-   are immutable; fixes use a new version.
+   representative. Connect records the decision as `approved`, `rejected`, or
+   `pending` per pack version, together with the reviewer, note, and timestamp.
+5. **Publication.** An approved version becomes visible in public search, stats,
+   and the signed index. Published versions are immutable; fixes use a new
+   version.
 6. **Post-publication.** Reports, yanks, and security takedowns are recorded
    against the version.
+
+Review decisions are made with an operator token:
+
+```bash
+# `status` defaults to pending; omit it to list every reviewed version.
+curl -H "X-Ozma-Review-Token: $OZMA_CONNECT_REVIEW_TOKEN" \
+  https://connect.example.test/assets/review?status=pending
+
+curl -X POST \
+  -H "X-Ozma-Review-Token: $OZMA_CONNECT_REVIEW_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"version":"1.0.0","note":"licence and provenance checked"}' \
+  https://connect.example.test/assets/review/example-gauges/approve
+```
+
+Rejection requires a non-empty `note`. Repeating the same decision is
+idempotent and does not create a duplicate audit event. If
+`OZMA_CONNECT_REVIEW_TOKEN` is unset, the review endpoints return
+`503 review_unavailable` rather than opening up. Public submissions remain
+`pending` only while `OZMA_CONNECT_REVIEW_REQUIRED=1`; with review off they are
+approved automatically, preserving existing behaviour. Private submissions and
+first-party public submissions are approved automatically.
+
+`GET /assets/gallery` renders an approved-only public HTML gallery with name,
+author, version, tags, licence, and entry links. It accepts `q`, `type`, and
+`tag` filters, uses no scripts or third-party assets, applies a strict CSP, and
+escapes every manifest-derived value. Pending, rejected, and private packs never
+appear there.
 
 Run the gate with:
 
