@@ -277,8 +277,10 @@ rustfmt --edition 2021 --check <touched files>
   physical output handoff, or session manager is launched.
 - **Xephyr availability.** Xephyr was not installed on this host, so the nested
   window path is covered by typed-unsupported and command-construction tests,
-  not a live window. `weston` was also absent; there is no Wayland compositor
-  backend. The real Xorg path was validated instead with dummy video/libinput.
+  not a live window. `weston` was also absent at the time of this run; there was
+  no Wayland compositor backend. The real Xorg path was validated instead with
+  dummy video/libinput. A follow-up added and live-tested an opt-in headless
+  Weston backend; see `phase4-wayland-seat-report.md`.
 - **Xorg privilege and config.** The distro `Xorg` wrapper allows only console
   users; the live smoke uses `sudo -n /usr/lib/Xorg`. Production still needs a
   privileged launcher/helper and generated Xorg configs with helper uinput
