@@ -27,13 +27,13 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use ozma_mesh::dataplane::{
     CommandRunner, DataplaneConfig, DataplaneError, DataplaneState, DataplaneStatus, MeshDataplane,
@@ -49,8 +49,9 @@ use ozma_mesh::pump::{
 use ozma_mesh::pump::{PumpStats, TunIo};
 use ozma_mesh::{
     DiscoveryAction, DiscoveryConfig, DiscoveryEngine, DiscoveryStatus, KernelWgSettings,
-    KernelWgStatus, KernelWireguard, MdnsBrowser, MeshManager, MeshNode, PeerChange, PeerOrigin,
-    RawAdvertisement, WgPrivateKey,
+    KernelWgStatus, KernelWireguard, KeyRotation, MdnsBrowser, MeshManager, MeshNode, PeerChange,
+    PeerOrigin, RawAdvertisement, RotationSchedule, RotationScheduleStatus, RotationStatus,
+    WgPrivateKey,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -66,6 +67,7 @@ pub const MESH_SURFACES: &[&str] = &[
     "/api/v1/connect/status",
     "/api/v1/connect/peers",
     "/api/v1/connect/events",
+    "/api/v1/connect/rotate",
 ];
 
 /// Typed prerequisite/runtime failure.
@@ -107,6 +109,8 @@ impl MeshServiceError {
                 | "mesh.dataplane-not-configured"
                 | "mesh.tun-unsupported"
                 | "mesh.discovery-invalid"
+                | "mesh.rotation-invalid"
+                | "mesh.rotation-unsupported"
         )
     }
 }
@@ -212,6 +216,7 @@ pub enum MeshEventKind {
     Dataplane,
     Route,
     Conflict,
+    Rotation,
     Error,
     Surface,
 }
@@ -334,6 +339,8 @@ pub struct MeshServiceConfig {
     pub capabilities: Vec<String>,
     /// Opt-in mDNS peer discovery policy. `None` keeps discovery disabled.
     pub discovery: Option<DiscoveryConfig>,
+    /// Optional automatic key rotation (`--mesh-rotate-hours`). Off by default.
+    pub rotation_schedule: Option<RotationSchedule>,
     /// Optional kernel dataplane (TUN, routes, forwarding, NAT). `None` keeps
     /// the service at the userspace WireGuard layer only.
     pub dataplane: Option<DataplaneConfig>,
@@ -355,6 +362,7 @@ impl Default for MeshServiceConfig {
             peer_endpoints: BTreeMap::new(),
             capabilities: Vec::new(),
             discovery: None,
+            rotation_schedule: None,
             dataplane: None,
             event_capacity: None,
         }
@@ -553,6 +561,11 @@ impl MeshServiceConfig {
                 MeshServiceError::new("mesh.discovery-invalid", error.to_string())
             })?;
         }
+        if let Some(schedule) = &self.rotation_schedule {
+            schedule
+                .validate()
+                .map_err(|reason| MeshServiceError::new("mesh.rotation-invalid", reason))?;
+        }
         Ok(())
     }
 }
@@ -587,6 +600,37 @@ pub trait MeshBackend: Send + Sync {
     async fn initiate_handshake(&self, _peer_id: &str) -> Result<(), MeshServiceError> {
         Ok(())
     }
+
+    /// Update a discovered peer whose public key rotated during a grace
+    /// window. Backends that cannot prove the rotation keep the default
+    /// conflict behavior.
+    async fn add_discovered_peer_rotated(
+        &self,
+        node: MeshNode,
+        capabilities: Vec<String>,
+        underlay_ip: Option<Ipv4Addr>,
+        previous_public_keys: Vec<String>,
+    ) -> Result<PeerChange, MeshServiceError> {
+        let _ = previous_public_keys;
+        self.add_discovered_peer(node, capabilities, underlay_ip)
+            .await
+    }
+
+    /// Rotate the local WireGuard key. A backend without rotation support
+    /// returns a typed error rather than pretending it changed the key.
+    async fn rotate_keys(&self, grace: Duration) -> Result<RotationStatus, MeshServiceError> {
+        let _ = grace;
+        Err(MeshServiceError::new(
+            "mesh.rotation-unsupported",
+            "this mesh backend does not support key rotation",
+        ))
+    }
+
+    /// Secret-free rotation status, when the backend supports it.
+    fn rotation_status(&self) -> Option<RotationStatus> {
+        None
+    }
+
     async fn peers(&self) -> Vec<MeshPeerView>;
     fn identity(&self) -> Option<MeshIdentity>;
     fn state(&self) -> MeshState;
@@ -647,8 +691,8 @@ impl MeshBackend for UnsupportedMeshBackend {
 
 /// Real backend around [`ozma_mesh::MeshManager`] (userspace boringtun).
 pub struct BoringtunMeshBackend {
-    identity: MeshNode,
-    private_key: WgPrivateKey,
+    identity: Mutex<MeshNode>,
+    private_key: Mutex<WgPrivateKey>,
     configured_peers: Vec<MeshNode>,
     capabilities: Vec<String>,
     /// `MeshManager` is `Send` but not `Sync` (libmdns uses an internal
@@ -660,6 +704,8 @@ pub struct BoringtunMeshBackend {
     state: Mutex<MeshState>,
     error: Mutex<Option<MeshServiceError>>,
     peer_states: Mutex<BTreeMap<String, MeshTunnelState>>,
+    /// Last rotation snapshot, also available while the manager is stopped.
+    rotation: Mutex<Option<RotationStatus>>,
     log: MeshEventLog,
 }
 
@@ -672,8 +718,8 @@ impl BoringtunMeshBackend {
         log: MeshEventLog,
     ) -> Self {
         Self {
-            identity,
-            private_key,
+            identity: Mutex::new(identity),
+            private_key: Mutex::new(private_key),
             configured_peers,
             capabilities,
             manager: Arc::new(tokio::sync::Mutex::new(None)),
@@ -681,8 +727,16 @@ impl BoringtunMeshBackend {
             state: Mutex::new(MeshState::Stopped),
             error: Mutex::new(None),
             peer_states: Mutex::new(BTreeMap::new()),
+            rotation: Mutex::new(None),
             log,
         }
+    }
+
+    fn identity_snapshot(&self) -> MeshNode {
+        self.identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     fn set_state(&self, state: MeshState) {
@@ -734,9 +788,15 @@ impl MeshBackend for BoringtunMeshBackend {
 
         let mut manager = self.manager.lock().await;
         if manager.is_none() {
+            let identity = self.identity_snapshot();
+            let private_key = self
+                .private_key
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
             match MeshManager::new_with_capabilities(
-                self.identity.clone(),
-                self.private_key.clone(),
+                identity,
+                private_key,
                 self.capabilities.clone(),
             )
             .await
@@ -898,6 +958,87 @@ impl MeshBackend for BoringtunMeshBackend {
             .map_err(map_mesh_peer_error)
     }
 
+    async fn add_discovered_peer_rotated(
+        &self,
+        node: MeshNode,
+        capabilities: Vec<String>,
+        underlay_ip: Option<Ipv4Addr>,
+        previous_public_keys: Vec<String>,
+    ) -> Result<PeerChange, MeshServiceError> {
+        let manager = self.manager.lock().await;
+        let Some(manager) = manager.as_ref() else {
+            return Err(MeshServiceError::new(
+                "mesh.not-running",
+                "mesh service is not running; there is no peer table to change",
+            ));
+        };
+        manager
+            .add_discovered_peer_rotated(node, capabilities, underlay_ip, previous_public_keys)
+            .await
+            .map_err(map_mesh_peer_error)
+    }
+
+    async fn rotate_keys(&self, grace: Duration) -> Result<RotationStatus, MeshServiceError> {
+        let manager = self.manager.lock().await;
+        let Some(manager) = manager.as_ref() else {
+            return Err(MeshServiceError::new(
+                "mesh.not-running",
+                "mesh service is not running; there is no key to rotate",
+            ));
+        };
+        let status = manager.rotate_keys(grace).await.map_err(|error| {
+            let code = match error {
+                ozma_mesh::MeshError::RotationInvalid(_) => "mesh.rotation-invalid",
+                ozma_mesh::MeshError::RotationFailed(_) => "mesh.rotation-failed",
+                _ => "mesh.rotation-failed",
+            };
+            MeshServiceError::new(code, error.to_string())
+        })?;
+        // Persist the new identity/key for a future stop/start cycle.
+        {
+            let mut identity = self
+                .identity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            identity.wg_pubkey = ozma_mesh::WgPublicKey(status.public_key.clone());
+        }
+        *self
+            .private_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = manager.private_key_for_restart();
+        *self
+            .rotation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(status.clone());
+        Ok(status)
+    }
+
+    fn rotation_status(&self) -> Option<RotationStatus> {
+        if let Ok(manager) = self.manager.try_lock() {
+            if let Some(manager) = manager.as_ref() {
+                return Some(manager.rotation_status());
+            }
+        }
+        let identity = self.identity_snapshot();
+        let mut status = match self
+            .rotation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            Some(status) => status,
+            None => ozma_mesh::KeyRotation::new(
+                self.private_key
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone(),
+            )
+            .status(Instant::now()),
+        };
+        status.public_key = identity.wg_pubkey.0;
+        Some(status)
+    }
+
     async fn peers(&self) -> Vec<MeshPeerView> {
         let manager = self.manager.lock().await;
         let Some(manager) = manager.as_ref() else {
@@ -930,11 +1071,12 @@ impl MeshBackend for BoringtunMeshBackend {
     }
 
     fn identity(&self) -> Option<MeshIdentity> {
+        let identity = self.identity_snapshot();
         Some(MeshIdentity {
-            id: self.identity.id.clone(),
-            mesh_ip: self.identity.mesh_ip.clone(),
-            wg_port: self.identity.wg_port,
-            wg_pubkey: self.identity.wg_pubkey.0.clone(),
+            id: identity.id.clone(),
+            mesh_ip: identity.mesh_ip.clone(),
+            wg_port: identity.wg_port,
+            wg_pubkey: identity.wg_pubkey.0.clone(),
             wireguard: "userspace-boringtun".to_owned(),
         })
     }
@@ -960,7 +1102,7 @@ impl MeshBackend for BoringtunMeshBackend {
 
 /// Real backend around [`ozma_mesh::KernelWireguard`] (Linux kernel module).
 pub struct KernelMeshBackend {
-    identity: MeshNode,
+    identity: Mutex<MeshNode>,
     capabilities: Vec<String>,
     kernel: KernelWireguard,
     advertiser: Mutex<Option<ozma_mesh::MeshAdvertiser>>,
@@ -984,7 +1126,7 @@ impl KernelMeshBackend {
         log: MeshEventLog,
     ) -> Self {
         Self {
-            identity,
+            identity: Mutex::new(identity),
             capabilities,
             kernel: KernelWireguard::new_with_peer_endpoints(
                 settings,
@@ -1000,6 +1142,13 @@ impl KernelMeshBackend {
             peer_states: Mutex::new(BTreeMap::new()),
             log,
         }
+    }
+
+    fn identity_snapshot(&self) -> MeshNode {
+        self.identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     fn set_state(&self, state: MeshState) {
@@ -1058,7 +1207,8 @@ impl MeshBackend for KernelMeshBackend {
         };
 
         let port = status.listen_port;
-        match ozma_mesh::MeshAdvertiser::new(&self.identity, port, &self.capabilities) {
+        let identity = self.identity_snapshot();
+        match ozma_mesh::MeshAdvertiser::new(&identity, port, &self.capabilities) {
             Ok(advertiser) => {
                 *self
                     .advertiser
@@ -1142,6 +1292,62 @@ impl MeshBackend for KernelMeshBackend {
             .map_err(MeshServiceError::from)
     }
 
+    async fn add_discovered_peer_rotated(
+        &self,
+        node: MeshNode,
+        capabilities: Vec<String>,
+        underlay_ip: Option<Ipv4Addr>,
+        previous_public_keys: Vec<String>,
+    ) -> Result<PeerChange, MeshServiceError> {
+        self.kernel
+            .add_discovered_peer_rotated(node, capabilities, underlay_ip, previous_public_keys)
+            .map_err(MeshServiceError::from)
+    }
+
+    async fn rotate_keys(&self, grace: Duration) -> Result<RotationStatus, MeshServiceError> {
+        let old_public = self.identity_snapshot().wg_pubkey.0;
+        let status = self
+            .kernel
+            .rotate_keys(grace)
+            .map_err(MeshServiceError::from)?;
+        let mut identity = self.identity_snapshot();
+        identity.wg_pubkey = ozma_mesh::WgPublicKey(status.public_key.clone());
+        let port = self.kernel.settings().listen_port;
+        // Drop the old responder before binding a replacement on port 5353.
+        self.advertiser
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let advertiser = ozma_mesh::MeshAdvertiser::new_with_previous(
+            &identity,
+            &[old_public],
+            port,
+            &self.capabilities,
+        )
+        .map_err(|error| {
+            MeshServiceError::new(
+                "mesh.rotation-failed",
+                format!(
+                    "the kernel key rotated but its mDNS advertisement could not be \
+                     re-registered: {error}"
+                ),
+            )
+        })?;
+        *self
+            .advertiser
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(advertiser);
+        *self
+            .identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = identity;
+        Ok(status)
+    }
+
+    fn rotation_status(&self) -> Option<RotationStatus> {
+        Some(self.kernel.rotation_status())
+    }
+
     async fn peers(&self) -> Vec<MeshPeerView> {
         self.kernel
             .peer_statuses()
@@ -1169,11 +1375,12 @@ impl MeshBackend for KernelMeshBackend {
     }
 
     fn identity(&self) -> Option<MeshIdentity> {
+        let identity = self.identity_snapshot();
         Some(MeshIdentity {
-            id: self.identity.id.clone(),
-            mesh_ip: self.identity.mesh_ip.clone(),
-            wg_port: self.identity.wg_port,
-            wg_pubkey: self.identity.wg_pubkey.0.clone(),
+            id: identity.id.clone(),
+            mesh_ip: identity.mesh_ip.clone(),
+            wg_port: identity.wg_port,
+            wg_pubkey: identity.wg_pubkey.0.clone(),
             wireguard: "kernel".to_owned(),
         })
     }
@@ -1197,7 +1404,9 @@ impl MeshBackend for KernelMeshBackend {
 /// In-memory backend used by tests. It never binds a socket, touches root, or
 /// invents a handshake.
 pub struct FakeMeshBackend {
-    identity: MeshNode,
+    identity: Mutex<MeshNode>,
+    rotation: Mutex<KeyRotation>,
+    rotation_failure: Mutex<Option<MeshServiceError>>,
     state: Mutex<MeshState>,
     peers: Mutex<BTreeMap<String, MeshPeerView>>,
     error: Mutex<Option<MeshServiceError>>,
@@ -1209,8 +1418,15 @@ pub struct FakeMeshBackend {
 
 impl FakeMeshBackend {
     pub fn new(identity: MeshNode, log: MeshEventLog) -> Self {
+        // Align the fake identity with a real generated key so rotation and
+        // identity assertions behave like both production backends.
+        let private_key = WgPrivateKey::generate();
+        let mut identity = identity;
+        identity.wg_pubkey = private_key.public_key();
         Self {
-            identity,
+            identity: Mutex::new(identity),
+            rotation: Mutex::new(KeyRotation::new(private_key)),
+            rotation_failure: Mutex::new(None),
             state: Mutex::new(MeshState::Stopped),
             peers: Mutex::new(BTreeMap::new()),
             error: Mutex::new(None),
@@ -1219,6 +1435,21 @@ impl FakeMeshBackend {
             handshakes: Mutex::new(Vec::new()),
             log,
         }
+    }
+
+    fn identity_snapshot(&self) -> MeshNode {
+        self.identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Force the next rotation to fail with a typed error (tests).
+    pub fn set_rotation_failure(&self, error: MeshServiceError) {
+        *self
+            .rotation_failure
+            .lock()
+            .unwrap_or_else(|value| value.into_inner()) = Some(error);
     }
 
     /// Handshake initiations requested by the discovery reconciler (tests).
@@ -1274,6 +1505,90 @@ impl FakeMeshBackend {
             Some(peer_id.to_owned()),
         );
         Ok(())
+    }
+
+    async fn upsert_discovered(
+        &self,
+        node: MeshNode,
+        capabilities: Vec<String>,
+        underlay_ip: Option<Ipv4Addr>,
+        allowed_previous_keys: &[String],
+    ) -> Result<PeerChange, MeshServiceError> {
+        if self.state() != MeshState::Running {
+            return Err(MeshServiceError::new(
+                "mesh.not-running",
+                "mesh service is not running; start it before adding peers",
+            ));
+        }
+        let mut peers = self.peers.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(existing) = peers.get(&node.id) {
+            if existing.origin == PeerOrigin::Static {
+                return Err(MeshServiceError::new(
+                    "mesh.peer-conflict",
+                    format!("static peer {} is authoritative", node.id),
+                ));
+            }
+            if existing.wg_pubkey != node.wg_pubkey.0
+                && !allowed_previous_keys
+                    .iter()
+                    .any(|key| key == &existing.wg_pubkey)
+            {
+                return Err(MeshServiceError::new(
+                    "mesh.peer-conflict",
+                    format!("discovered peer {} changed public key", node.id),
+                ));
+            }
+            let endpoint = underlay_ip
+                .map(|ip| format!("{ip}:{}", node.wg_port))
+                .or_else(|| Some(format!("{}:{}", node.mesh_ip, node.wg_port)));
+            if existing.mesh_ip == node.mesh_ip
+                && existing.wg_port == node.wg_port
+                && existing.wg_pubkey == node.wg_pubkey.0
+                && existing.capabilities == capabilities
+                && existing.endpoint == endpoint
+            {
+                return Ok(PeerChange::Unchanged);
+            }
+            let previous = MeshNode {
+                id: existing.id.clone(),
+                mesh_ip: existing.mesh_ip.clone(),
+                wg_port: existing.wg_port,
+                wg_pubkey: ozma_mesh::WgPublicKey(existing.wg_pubkey.clone()),
+            };
+            let view = peers.get_mut(&node.id).expect("peer was present");
+            view.mesh_ip = node.mesh_ip;
+            view.wg_port = node.wg_port;
+            view.wg_pubkey = node.wg_pubkey.0;
+            view.capabilities = capabilities;
+            view.endpoint = endpoint;
+            view.tunnel = MeshTunnelState::Idle;
+            view.established = false;
+            view.last_handshake_age_secs = None;
+            view.rtt_ms = None;
+            return Ok(PeerChange::Updated { previous });
+        }
+        peers.insert(
+            node.id.clone(),
+            MeshPeerView {
+                id: node.id.clone(),
+                mesh_ip: node.mesh_ip.clone(),
+                wg_port: node.wg_port,
+                wg_pubkey: node.wg_pubkey.0,
+                origin: PeerOrigin::Discovered,
+                capabilities,
+                endpoint: underlay_ip
+                    .map(|ip| format!("{ip}:{}", node.wg_port))
+                    .or_else(|| Some(format!("{}:{}", node.mesh_ip, node.wg_port))),
+                tunnel: MeshTunnelState::Idle,
+                established: false,
+                last_handshake_age_secs: None,
+                tx_bytes: 0,
+                rx_bytes: 0,
+                loss: 0.0,
+                rtt_ms: None,
+            },
+        );
+        Ok(PeerChange::Added)
     }
 }
 
@@ -1345,75 +1660,68 @@ impl MeshBackend for FakeMeshBackend {
         capabilities: Vec<String>,
         underlay_ip: Option<Ipv4Addr>,
     ) -> Result<PeerChange, MeshServiceError> {
+        self.upsert_discovered(node, capabilities, underlay_ip, &[])
+            .await
+    }
+
+    async fn add_discovered_peer_rotated(
+        &self,
+        node: MeshNode,
+        capabilities: Vec<String>,
+        underlay_ip: Option<Ipv4Addr>,
+        previous_public_keys: Vec<String>,
+    ) -> Result<PeerChange, MeshServiceError> {
+        self.upsert_discovered(node, capabilities, underlay_ip, &previous_public_keys)
+            .await
+    }
+
+    async fn rotate_keys(&self, grace: Duration) -> Result<RotationStatus, MeshServiceError> {
         if self.state() != MeshState::Running {
             return Err(MeshServiceError::new(
                 "mesh.not-running",
-                "mesh service is not running; start it before adding peers",
+                "mesh service is not running; there is no key to rotate",
             ));
         }
-        let mut peers = self.peers.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(existing) = peers.get(&node.id) {
-            if existing.origin == PeerOrigin::Static {
-                return Err(MeshServiceError::new(
-                    "mesh.peer-conflict",
-                    format!("static peer {} is authoritative", node.id),
-                ));
-            }
-            if existing.wg_pubkey != node.wg_pubkey.0 {
-                return Err(MeshServiceError::new(
-                    "mesh.peer-conflict",
-                    format!("discovered peer {} changed public key", node.id),
-                ));
-            }
-            let endpoint = underlay_ip
-                .map(|ip| format!("{ip}:{}", node.wg_port))
-                .or_else(|| Some(format!("{}:{}", node.mesh_ip, node.wg_port)));
-            if existing.mesh_ip == node.mesh_ip
-                && existing.wg_port == node.wg_port
-                && existing.capabilities == capabilities
-                && existing.endpoint == endpoint
-            {
-                return Ok(PeerChange::Unchanged);
-            }
-            let previous = MeshNode {
-                id: existing.id.clone(),
-                mesh_ip: existing.mesh_ip.clone(),
-                wg_port: existing.wg_port,
-                wg_pubkey: ozma_mesh::WgPublicKey(existing.wg_pubkey.clone()),
-            };
-            let view = peers.get_mut(&node.id).expect("peer was present");
-            view.mesh_ip = node.mesh_ip;
-            view.wg_port = node.wg_port;
-            view.capabilities = capabilities;
-            view.endpoint = endpoint;
-            view.tunnel = MeshTunnelState::Idle;
-            view.established = false;
-            view.last_handshake_age_secs = None;
-            view.rtt_ms = None;
-            return Ok(PeerChange::Updated { previous });
+        if let Some(error) = self
+            .rotation_failure
+            .lock()
+            .unwrap_or_else(|value| value.into_inner())
+            .clone()
+        {
+            return Err(error);
         }
-        peers.insert(
-            node.id.clone(),
-            MeshPeerView {
-                id: node.id.clone(),
-                mesh_ip: node.mesh_ip.clone(),
-                wg_port: node.wg_port,
-                wg_pubkey: node.wg_pubkey.0,
-                origin: PeerOrigin::Discovered,
-                capabilities,
-                endpoint: underlay_ip
-                    .map(|ip| format!("{ip}:{}", node.wg_port))
-                    .or_else(|| Some(format!("{}:{}", node.mesh_ip, node.wg_port))),
-                tunnel: MeshTunnelState::Idle,
-                established: false,
-                last_handshake_age_secs: None,
-                tx_bytes: 0,
-                rx_bytes: 0,
-                loss: 0.0,
-                rtt_ms: None,
-            },
-        );
-        Ok(PeerChange::Added)
+        let new_key = WgPrivateKey::generate();
+        let status = self
+            .rotation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .begin(new_key, grace, Instant::now(), std::time::SystemTime::now());
+        {
+            let mut identity = self
+                .identity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            identity.wg_pubkey = ozma_mesh::WgPublicKey(status.public_key.clone());
+        }
+        // A rotated key invalidates established sessions; report idle until a
+        // real handshake completes again.
+        let mut peers = self.peers.lock().unwrap_or_else(|error| error.into_inner());
+        for peer in peers.values_mut() {
+            peer.tunnel = MeshTunnelState::Idle;
+            peer.established = false;
+            peer.last_handshake_age_secs = None;
+            peer.rtt_ms = None;
+        }
+        Ok(status)
+    }
+
+    fn rotation_status(&self) -> Option<RotationStatus> {
+        Some(
+            self.rotation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .status(Instant::now()),
+        )
     }
 
     async fn remove_discovered_peer(
@@ -1479,11 +1787,12 @@ impl MeshBackend for FakeMeshBackend {
     }
 
     fn identity(&self) -> Option<MeshIdentity> {
+        let identity = self.identity_snapshot();
         Some(MeshIdentity {
-            id: self.identity.id.clone(),
-            mesh_ip: self.identity.mesh_ip.clone(),
-            wg_port: self.identity.wg_port,
-            wg_pubkey: self.identity.wg_pubkey.0.clone(),
+            id: identity.id.clone(),
+            mesh_ip: identity.mesh_ip.clone(),
+            wg_port: identity.wg_port,
+            wg_pubkey: identity.wg_pubkey.0.clone(),
             wireguard: "fake".to_owned(),
         })
     }
@@ -1535,6 +1844,14 @@ pub struct MeshService {
     /// Whether `start()` should spawn the real mDNS browser. Tests inject
     /// advertisements directly and never open a network socket.
     discovery_browse: bool,
+    /// Optional scheduled rotation policy (off by default).
+    rotation_schedule: Option<RotationSchedule>,
+    /// Automatic rotation task handle.
+    rotation_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Wall-clock time of the next scheduled rotation (status only).
+    next_rotation: Arc<Mutex<Option<SystemTime>>>,
+    /// Test/diagnostic override for the scheduler delay.
+    rotation_interval_override: Option<Duration>,
     log: MeshEventLog,
 }
 
@@ -1651,14 +1968,26 @@ impl MeshService {
                 log.clone(),
             )),
         };
-        Self::with_backend_dataplane_and_discovery(
+        let mut service = Self::with_backend_dataplane_and_discovery(
             backend,
             dataplane,
             log,
             tun_provider.filter(|_| config.dataplane.is_some() && !kernel_requested),
             discovery,
             true,
-        )
+        );
+        service.rotation_schedule = config.rotation_schedule.clone();
+        if let Some(schedule) = &config.rotation_schedule {
+            service.log.record(
+                MeshEventKind::Started,
+                format!(
+                    "scheduled key rotation every {}h (+{}s jitter, grace {}s)",
+                    schedule.interval_hours, schedule.jitter_secs, schedule.grace_secs
+                ),
+                None,
+            );
+        }
+        service
     }
 
     /// Explicit unsupported service for a preflight failure.
@@ -1677,6 +2006,10 @@ impl MeshService {
             discovery_started: Arc::new(AtomicBool::new(false)),
             discovery_task: Arc::new(Mutex::new(None)),
             discovery_browse: false,
+            rotation_schedule: None,
+            rotation_task: Arc::new(Mutex::new(None)),
+            next_rotation: Arc::new(Mutex::new(None)),
+            rotation_interval_override: None,
             log,
         }
     }
@@ -1738,6 +2071,10 @@ impl MeshService {
             discovery_started: Arc::new(AtomicBool::new(false)),
             discovery_task: Arc::new(Mutex::new(None)),
             discovery_browse: auto_browse,
+            rotation_schedule: None,
+            rotation_task: Arc::new(Mutex::new(None)),
+            next_rotation: Arc::new(Mutex::new(None)),
+            rotation_interval_override: None,
             log,
         }
     }
@@ -2008,6 +2345,7 @@ impl MeshService {
         }
 
         self.start_discovery();
+        self.start_rotation_scheduler();
         self.log
             .record(MeshEventKind::Started, "mesh service started", None);
         Ok(())
@@ -2017,6 +2355,7 @@ impl MeshService {
     /// reverse start order.
     pub async fn stop(&self) -> Result<(), MeshServiceError> {
         self.stop_discovery();
+        self.stop_rotation_scheduler();
         let pump_stopped = self.stop_packet_pump();
         let dataplane_result = match &self.dataplane {
             Some(dataplane) => dataplane.stop().map_err(MeshServiceError::from),
@@ -2143,6 +2482,101 @@ impl MeshService {
 
     pub fn events(&self, limit: usize) -> Vec<MeshEvent> {
         self.log.snapshot(limit)
+    }
+
+    /// Rotate the local WireGuard key through the active backend.
+    ///
+    /// Refuses when the service is not running so a stopped node never reports
+    /// a key change it did not install. No private key material is logged.
+    pub async fn rotate(&self, grace: Duration) -> Result<RotationStatus, MeshServiceError> {
+        if self.state() != MeshState::Running {
+            return Err(MeshServiceError::new(
+                "mesh.not-running",
+                "mesh service is not running; there is no key to rotate",
+            ));
+        }
+        let status = self.backend.rotate_keys(grace).await?;
+        self.log.record(
+            MeshEventKind::Rotation,
+            format!(
+                "WireGuard key rotated to key {} (fingerprint {}, grace {}s)",
+                status.key_id, status.fingerprint, status.grace_secs
+            ),
+            None,
+        );
+        Ok(status)
+    }
+
+    /// Current key lifecycle plus the configured schedule, if any.
+    pub fn rotation_status(&self) -> Option<RotationStatus> {
+        let mut status = self.backend.rotation_status()?;
+        if let Some(schedule) = &self.rotation_schedule {
+            let next = *self
+                .next_rotation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            status.scheduled = Some(RotationScheduleStatus::from_schedule(schedule, next));
+        }
+        Some(status)
+    }
+
+    fn start_rotation_scheduler(&self) {
+        let Some(schedule) = self.rotation_schedule.clone() else {
+            return;
+        };
+        let mut guard = self
+            .rotation_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if guard.is_some() {
+            return;
+        }
+        let service = self.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let delay = service
+                    .rotation_interval_override
+                    .unwrap_or_else(|| schedule.next_delay());
+                let next = std::time::SystemTime::now()
+                    .checked_add(delay)
+                    .unwrap_or_else(std::time::SystemTime::now);
+                *service
+                    .next_rotation
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(next);
+                tokio::time::sleep(delay).await;
+                match service.rotate(schedule.grace()).await {
+                    Ok(status) => tracing::info!(
+                        key_id = status.key_id,
+                        fingerprint = %status.fingerprint,
+                        "scheduled mesh key rotation completed"
+                    ),
+                    Err(error) => {
+                        service.log.record(
+                            MeshEventKind::Error,
+                            format!("scheduled key rotation failed: {}", error.reason),
+                            None,
+                        );
+                    }
+                }
+            }
+        });
+        *guard = Some(handle);
+    }
+
+    fn stop_rotation_scheduler(&self) {
+        if let Some(handle) = self
+            .rotation_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+        *self
+            .next_rotation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     /// Discovery status, present only when discovery is configured.
@@ -2289,6 +2723,60 @@ impl MeshService {
                                 "route reconciled for discovered peer {} ({}/32)",
                                 peer.node.id, peer.node.mesh_ip
                             ),
+                        );
+                        self.initiate_discovered_handshake(&peer.node.id).await;
+                    }
+                    Err(error) => {
+                        self.forget_discovered(&peer.node.id);
+                        self.record_discovery_refusal(Some(peer.node.id.clone()), &error);
+                    }
+                }
+            }
+            DiscoveryAction::KeyRotated { peer, previous } => {
+                let previous_route = previous.mesh_ip.parse::<Ipv4Addr>().ok();
+                match self
+                    .backend
+                    .add_discovered_peer_rotated(
+                        peer.node.clone(),
+                        peer.capabilities.clone(),
+                        peer.underlay_ip,
+                        vec![previous.wg_pubkey.0.clone()],
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        let new_route = peer.node.mesh_ip.parse::<Ipv4Addr>().ok();
+                        if previous_route != new_route {
+                            if let Err(error) = self.add_discovered_route(&peer.node) {
+                                let _ = self
+                                    .backend
+                                    .add_discovered_peer_rotated(
+                                        previous.clone(),
+                                        peer.capabilities.clone(),
+                                        peer.underlay_ip,
+                                        vec![peer.node.wg_pubkey.0.clone()],
+                                    )
+                                    .await;
+                                self.forget_discovered(&peer.node.id);
+                                self.log.record(
+                                    MeshEventKind::Error,
+                                    error.reason,
+                                    Some(peer.node.id.clone()),
+                                );
+                                return;
+                            }
+                            if let Some(route) = previous_route {
+                                self.remove_discovered_route(route, &peer.node.id);
+                            }
+                        }
+                        self.log.record(
+                            MeshEventKind::Rotation,
+                            format!(
+                                "discovered peer {} rotated its public key to {}",
+                                peer.node.id,
+                                ozma_mesh::fingerprint(&peer.node.wg_pubkey)
+                            ),
+                            Some(peer.node.id.clone()),
                         );
                         self.initiate_discovered_handshake(&peer.node.id).await;
                     }
@@ -2561,6 +3049,7 @@ impl MeshService {
             kernel: self.backend.kernel_status(),
             pump: self.pump_status(),
             discovery: self.discovery_status(),
+            rotation: self.rotation_status(),
             peer_count: peers.as_ref().map(Vec::len),
             peers,
             event_count: Some(self.log.len()),
@@ -2660,6 +3149,10 @@ pub struct MeshStatus {
     /// Opt-in mDNS discovery policy, counters, and discovered peers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discovery: Option<DiscoveryStatus>,
+    /// Current key id/fingerprint, last rotation, and grace remaining. Contains
+    /// no private key material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<RotationStatus>,
     /// Omitted unless the service is running; `Some(0)` is a real empty table.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_count: Option<usize>,
@@ -2690,6 +3183,7 @@ impl MeshStatus {
             kernel: None,
             pump: None,
             discovery: None,
+            rotation: None,
             peer_count: None,
             peers: None,
             event_count: None,
@@ -2714,6 +3208,7 @@ pub fn router(service: Option<MeshService>) -> Router {
         .route("/api/v1/connect/status", get(mesh_status))
         .route("/api/v1/connect/peers", get(mesh_peers))
         .route("/api/v1/connect/events", get(mesh_events))
+        .route("/api/v1/connect/rotate", post(mesh_rotate))
         .with_state(MeshRouteState { service })
 }
 
@@ -2739,6 +3234,103 @@ async fn mesh_status(State(state): State<MeshRouteState>) -> Response {
 struct EventsQuery {
     #[serde(default)]
     limit: Option<usize>,
+}
+
+/// Explicit confirmation body for `POST /api/v1/connect/rotate`.
+#[derive(Debug, Default, Deserialize)]
+struct RotateRequest {
+    /// Must be exactly `true`; rotation is never implicit.
+    #[serde(default)]
+    confirm: bool,
+    /// Grace window in seconds (default 90, bounded 5..=600).
+    #[serde(default)]
+    grace_secs: Option<u64>,
+}
+
+async fn mesh_rotate(
+    State(state): State<MeshRouteState>,
+    Json(body): Json<RotateRequest>,
+) -> Response {
+    let Some(service) = state.service else {
+        return unsupported_response(
+            "/api/v1/connect/rotate",
+            "mesh.not-configured",
+            "mesh service is not enabled (--mesh / OZMA_MESH)",
+        );
+    };
+    let status = service.status().await;
+    if status.state == MeshState::Unsupported {
+        return unsupported_response(
+            "/api/v1/connect/rotate",
+            status.code.as_deref().unwrap_or("mesh.unsupported"),
+            status
+                .reason
+                .as_deref()
+                .unwrap_or("mesh is unsupported on this node"),
+        );
+    }
+    if !body.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "capability": MESH_CAPABILITY,
+                "code": "mesh.rotation-unconfirmed",
+                "reason": "key rotation requires {\"confirm\":true}",
+                "surface": "/api/v1/connect/rotate",
+                "rotation": service.rotation_status(),
+            })),
+        )
+            .into_response();
+    }
+    let grace = Duration::from_secs(
+        body.grace_secs
+            .unwrap_or(ozma_mesh::DEFAULT_GRACE.as_secs()),
+    );
+    if let Err(reason) = ozma_mesh::validate_grace(grace) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "capability": MESH_CAPABILITY,
+                "code": "mesh.rotation-invalid",
+                "reason": reason,
+                "surface": "/api/v1/connect/rotate",
+                "rotation": service.rotation_status(),
+            })),
+        )
+            .into_response();
+    }
+    match service.rotate(grace).await {
+        Ok(rotation) => Json(json!({
+            "ok": true,
+            "capability": MESH_CAPABILITY,
+            "rotation": rotation,
+            "identity": service.identity(),
+            "capabilities": MESH_SURFACES,
+        }))
+        .into_response(),
+        Err(error) => {
+            let http = match error.code.as_str() {
+                "mesh.rotation-unsupported" => StatusCode::NOT_IMPLEMENTED,
+                "mesh.rotation-invalid" => StatusCode::BAD_REQUEST,
+                "mesh.not-running" => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                http,
+                Json(json!({
+                    "ok": false,
+                    "capability": MESH_CAPABILITY,
+                    "code": error.code,
+                    "reason": error.reason,
+                    "surface": "/api/v1/connect/rotate",
+                    "rotation": service.rotation_status(),
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn mesh_peers(State(state): State<MeshRouteState>) -> Response {
@@ -3232,7 +3824,10 @@ mod tests {
         assert!(body.get("peer_count").is_none());
         assert!(body.get("peers").is_none());
         assert_eq!(body["capability"], MESH_CAPABILITY);
-        assert_eq!(body["capabilities"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            body["capabilities"].as_array().unwrap().len(),
+            MESH_SURFACES.len()
+        );
 
         let peers = app
             .clone()
@@ -4115,6 +4710,46 @@ mod tests {
         (backend, service, runner)
     }
 
+    #[tokio::test]
+    async fn discovery_key_rotation_updates_the_peer_and_rehandshakes() {
+        let old = peer("peer-a", "10.200.9.2");
+        let (backend, service, _runner) = discovery_service(
+            Vec::new(),
+            vec![ozma_mesh::TrustedPeer::new(&old.id, &old.wg_pubkey.0)],
+            Duration::from_secs(30),
+        );
+        service.start().await.unwrap();
+        let actions = service
+            .apply_discovery_advertisement(advertisement(&old, &["video"]))
+            .await;
+        assert!(
+            matches!(actions.as_slice(), [DiscoveryAction::Add(_)]),
+            "the initial advertisement is added: {actions:?}"
+        );
+
+        let mut rotated = peer("peer-a", "10.200.9.2");
+        rotated.wg_pubkey = WgPrivateKey::generate().public_key();
+        let mut raw = advertisement(&rotated, &["video"]);
+        raw.previous_pubkeys = vec![old.wg_pubkey.0.clone()];
+        let actions = service.apply_discovery_advertisement(raw).await;
+        assert!(
+            matches!(actions.as_slice(), [DiscoveryAction::KeyRotated { .. }]),
+            "a grace advertisement rotates the peer: {actions:?}"
+        );
+        let peers = service.peers().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].wg_pubkey, rotated.wg_pubkey.0);
+        assert!(
+            backend
+                .handshakes()
+                .iter()
+                .filter(|id| id.as_str() == "peer-a")
+                .count()
+                >= 2,
+            "the rotated tunnel gets a fresh handshake"
+        );
+    }
+
     fn advertisement(peer: &MeshNode, capabilities: &[&str]) -> RawAdvertisement {
         RawAdvertisement {
             id: Some(peer.id.clone()),
@@ -4341,6 +4976,167 @@ mod tests {
             "a restarted service must re-add the peer, not deduplicate a stale entry"
         );
         assert_eq!(service.peers().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rotation_updates_identity_and_logs_without_private_material() {
+        let (_backend, service) = fake_service(16);
+        service.start().await.unwrap();
+        service
+            .add_peer(peer("peer-a", "10.200.9.2"))
+            .await
+            .unwrap();
+        let before = service.identity().unwrap().wg_pubkey;
+
+        let status = service.rotate(Duration::from_secs(30)).await.unwrap();
+        assert_eq!(status.key_id, 2);
+        assert_ne!(status.public_key, before);
+        assert_eq!(service.identity().unwrap().wg_pubkey, status.public_key);
+        assert_eq!(service.rotation_status().unwrap().key_id, 2);
+        assert!(service
+            .events(16)
+            .iter()
+            .any(|event| event.kind == MeshEventKind::Rotation));
+
+        let document = serde_json::to_string(&service.status().await).unwrap();
+        let events = serde_json::to_string(&service.events(16)).unwrap();
+        for text in [&document, &events] {
+            assert!(!text.contains("private_key"));
+            assert!(!text.contains("private-key"));
+            assert!(!text.contains("secret"));
+        }
+        assert!(document.contains(&status.fingerprint));
+    }
+
+    #[tokio::test]
+    async fn rotation_failure_keeps_the_old_identity() {
+        let (backend, service) = fake_service(16);
+        service.start().await.unwrap();
+        let before = service.identity().unwrap().wg_pubkey;
+        backend.set_rotation_failure(MeshServiceError::new(
+            "mesh.rotation-failed",
+            "peer peer-a could not be updated",
+        ));
+
+        let error = service
+            .rotate(Duration::from_secs(30))
+            .await
+            .expect_err("the injected peer failure rejects rotation");
+        assert_eq!(error.code, "mesh.rotation-failed");
+        assert_eq!(service.identity().unwrap().wg_pubkey, before);
+        assert_eq!(service.rotation_status().unwrap().key_id, 1);
+        assert!(service
+            .events(16)
+            .iter()
+            .all(|event| event.kind != MeshEventKind::Rotation));
+    }
+
+    #[tokio::test]
+    async fn rotation_route_requires_confirmation_and_reports_status() {
+        let (_backend, service) = fake_service(8);
+        service.start().await.unwrap();
+        let app = router(Some(service));
+
+        let unconfirmed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connect/rotate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"confirm":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unconfirmed.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(unconfirmed).await;
+        assert_eq!(body["code"], "mesh.rotation-unconfirmed");
+
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connect/rotate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"confirm":true,"grace_secs":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(invalid).await["code"], "mesh.rotation-invalid");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connect/rotate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"confirm":true,"grace_secs":30}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["rotation"]["key_id"], 2);
+        assert_eq!(body["rotation"]["grace_secs"], 30);
+        assert!(body["rotation"].get("public_key").is_some());
+        assert!(body["rotation"].get("fingerprint").is_some());
+        assert!(body.get("private_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn rotation_route_is_conflict_while_stopped() {
+        let (_backend, service) = fake_service(8);
+        let app = router(Some(service));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connect/rotate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"confirm":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(response).await["code"], "mesh.not-running");
+    }
+
+    #[tokio::test]
+    async fn scheduled_rotation_fires_and_reports_next_time() {
+        let (_backend, mut service) = fake_service(16);
+        service.rotation_schedule = Some(
+            RotationSchedule::new(1)
+                .with_jitter_secs(0)
+                .with_grace_secs(30),
+        );
+        service.rotation_interval_override = Some(Duration::from_millis(15));
+        service.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let status = service
+            .rotation_status()
+            .expect("fake backend reports rotation status");
+        assert!(
+            status.key_id >= 2,
+            "the scheduled task must rotate at least once, got key_id {}",
+            status.key_id
+        );
+        assert!(status.scheduled.is_some());
+        assert!(status
+            .scheduled
+            .as_ref()
+            .unwrap()
+            .next_rotation_unix_ms
+            .is_some());
+        service.stop().await.unwrap();
+        assert!(service.rotation_status().is_some());
     }
 
     async fn body_json(response: Response) -> serde_json::Value {

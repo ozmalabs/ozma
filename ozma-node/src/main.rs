@@ -886,6 +886,37 @@ pub struct Args {
     #[arg(long, env = "OZMA_MESH_NAT_OUT", value_name = "IFACE")]
     pub mesh_nat_out: Option<String>,
 
+    /// Automatic WireGuard key rotation interval in hours (`0` disables it).
+    ///
+    /// Off by default. A non-zero value must be `1..=720`; each rotation uses
+    /// `--mesh-rotate-grace-secs` and adds up to
+    /// `--mesh-rotate-jitter-secs` of random jitter.
+    #[arg(
+        long,
+        env = "OZMA_MESH_ROTATE_HOURS",
+        requires = "mesh",
+        default_value_t = 0
+    )]
+    pub mesh_rotate_hours: u64,
+
+    /// Random jitter added to each scheduled rotation.
+    #[arg(
+        long,
+        env = "OZMA_MESH_ROTATE_JITTER_SECS",
+        requires = "mesh",
+        default_value_t = 300
+    )]
+    pub mesh_rotate_jitter_secs: u64,
+
+    /// Grace window during which the previous key stays usable after rotation.
+    #[arg(
+        long,
+        env = "OZMA_MESH_ROTATE_GRACE_SECS",
+        requires = "mesh",
+        default_value_t = 90
+    )]
+    pub mesh_rotate_grace_secs: u64,
+
     /// Report the persisted multiseat plan/status at `GET /api/v1/seats`.
     ///
     /// Opt-in and read-only. `--multiseat` (alias `--multiseat-plan`) loads the
@@ -4025,6 +4056,14 @@ async fn build_audio_control(config: &NodeConfig) -> Option<AudioControl> {
         .clone()
         .map(RoomProfileStore::new)
         .map(Arc::new);
+    // A fresh process cannot own a filter-chain child from an earlier run. Clear
+    // any stale active record before a new apply can write one; the child itself
+    // disappears when its PipeWire client disconnects.
+    if let Some(store) = &profile_store {
+        if let Err(error) = store.clear_active() {
+            warn!(error = %error, "could not clear the stale active room-EQ state");
+        }
+    }
     if !command_on_path("pactl") {
         return Some(
             AudioControl::failed(format!(
@@ -4326,6 +4365,22 @@ fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
         .filter(|capability| !capability.is_empty())
         .map(str::to_owned)
         .collect();
+
+    let rotation_schedule = if args.mesh_rotate_hours == 0 {
+        None
+    } else {
+        let schedule = ozma_mesh::RotationSchedule::new(args.mesh_rotate_hours)
+            .with_jitter_secs(args.mesh_rotate_jitter_secs)
+            .with_grace_secs(args.mesh_rotate_grace_secs);
+        if let Err(reason) = schedule.validate() {
+            return Some(mesh_service::MeshService::unsupported(
+                mesh_service::MeshServiceError::new("mesh.rotation-invalid", reason),
+                log(),
+            ));
+        }
+        Some(schedule)
+    };
+
     let discovery = args.mesh_discover.then(|| {
         ozma_mesh::DiscoveryConfig::new(args.name.clone(), peers.clone(), trusted.clone())
             .with_max_peers(args.mesh_discover_max_peers)
@@ -4361,6 +4416,7 @@ fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
         peer_endpoints,
         capabilities,
         discovery,
+        rotation_schedule,
         // Kernel mode owns its link and routes; a TUN dataplane/pump would be
         // a competing second interface, so it is not built.
         dataplane: if args.mesh_kernel {
@@ -5217,5 +5273,37 @@ mod tests {
             config.nat.is_none(),
             "NAT must never be implicit when --mesh-dataplane is set"
         );
+    }
+
+    #[test]
+    fn mesh_rotation_is_off_by_default_and_bounded_when_enabled() {
+        let defaults = Args::parse_from(["ozma-node"]);
+        assert_eq!(defaults.mesh_rotate_hours, 0);
+        assert_eq!(defaults.mesh_rotate_jitter_secs, 300);
+        assert_eq!(defaults.mesh_rotate_grace_secs, 90);
+
+        let enabled = Args::parse_from([
+            "ozma-node",
+            "--mesh",
+            "--mesh-rotate-hours",
+            "6",
+            "--mesh-rotate-jitter-secs",
+            "30",
+            "--mesh-rotate-grace-secs",
+            "45",
+        ]);
+        assert_eq!(enabled.mesh_rotate_hours, 6);
+        assert_eq!(enabled.mesh_rotate_jitter_secs, 30);
+        assert_eq!(enabled.mesh_rotate_grace_secs, 45);
+
+        let schedule = ozma_mesh::RotationSchedule::new(enabled.mesh_rotate_hours)
+            .with_jitter_secs(enabled.mesh_rotate_jitter_secs)
+            .with_grace_secs(enabled.mesh_rotate_grace_secs);
+        schedule.validate().unwrap();
+        assert!(ozma_mesh::RotationSchedule::new(0).validate().is_err());
+        assert!(ozma_mesh::RotationSchedule::new(1)
+            .with_grace_secs(1)
+            .validate()
+            .is_err());
     }
 }

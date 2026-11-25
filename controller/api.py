@@ -3006,7 +3006,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         node_id = body.get("node_id", "")
         node = state.nodes.get(node_id) if node_id else None
         if node and node.api_port:
-            return await _proxy_to_audio_node(node, "/audio/apply", {"profile_id": profile_id})
+            payload: dict[str, Any] = {}
+            if profile_id:
+                payload["profile_id"] = profile_id
+            if body.get("profile") is not None:
+                payload["profile"] = body["profile"]
+            for key in ("sink", "target_sink", "rate", "channels"):
+                if body.get(key) is not None:
+                    payload[key] = body[key]
+            return await _proxy_to_audio_node(
+                node, "/audio/room-correction/apply", payload
+            )
         if not room_correction:
             raise HTTPException(status_code=503, detail="Room correction not available")
         ok = await room_correction.apply_correction(profile_id)
@@ -3020,7 +3030,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         node_id = body.get("node_id", "") if body else ""
         node = state.nodes.get(node_id) if node_id else None
         if node and node.api_port:
-            return await _proxy_to_audio_node(node, "/audio/remove", {})
+            return await _proxy_audio_node(
+                "DELETE", node, "/audio/room-correction/apply"
+            )
         if not room_correction:
             raise HTTPException(status_code=503, detail="Room correction not available")
         await room_correction.remove_correction()
@@ -4547,6 +4559,40 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def node_storage(node_id: str) -> Any:
         """Proxy a node's bounded mounted-block-filesystem report."""
         return await _proxy_node_surface(node_id, "/storage")
+
+    @app.get("/api/v1/nodes/{node_id}/storage/health")
+    async def node_storage_health(
+        node_id: str, serials: bool = False, attributes: bool = False
+    ) -> Any:
+        """Proxy bounded per-device SMART and mdraid health.
+
+        Serials and arbitrary SMART attributes stay hidden unless the caller
+        explicitly asks for them; the node applies its own bounds.
+        """
+        params = []
+        if serials:
+            params.append("serials=true")
+        if attributes:
+            params.append("attributes=true")
+        suffix = f"?{'&'.join(params)}" if params else ""
+        return await _proxy_node_surface(node_id, f"/storage/health{suffix}")
+
+    @app.get("/api/v1/nodes/{node_id}/storage/smart")
+    async def node_storage_smart(
+        node_id: str,
+        device: str,
+        serials: bool = False,
+        attributes: bool = False,
+    ) -> Any:
+        """Proxy one explicitly named block device's normalized SMART report."""
+        from urllib.parse import quote
+
+        params = [f"device={quote(device, safe='')}"]
+        if serials:
+            params.append("serials=true")
+        if attributes:
+            params.append("attributes=true")
+        return await _proxy_node_surface(node_id, f"/storage/smart?{'&'.join(params)}")
 
     @app.get("/api/v1/nodes/{node_id}/apps")
     async def node_apps(node_id: str, limit: int | None = None) -> Any:

@@ -93,6 +93,7 @@
 #![forbid(unsafe_code)]
 
 pub mod alsa;
+pub mod eq;
 pub mod error;
 pub mod fake;
 pub mod frame;
@@ -110,6 +111,12 @@ pub use alsa::{
     AlsaCapture, AlsaCaptureConfig, DEFAULT_BUFFER_PERIODS, DEFAULT_PERIOD_FRAMES,
     DEFAULT_START_TIMEOUT, FRAME_CHANNEL_CAPACITY,
 };
+pub use eq::{
+    eq_sink_name, eq_unsupported, next_eq_sink_name, validate_bands, RoomEqApplication, RoomEqSpec,
+    TempEqConfig, DEFAULT_EQ_CHANNELS, DEFAULT_EQ_RATE, EQ_INSERTION, EQ_LOAD_TIMEOUT,
+    EQ_MODULE_NAME, EQ_POLL_INTERVAL, EQ_SINK_PREFIX, MAX_ACTIVE_EQ_STATE_BYTES, MAX_EQ_CHANNELS,
+    MAX_EQ_RATE, MIN_EQ_RATE, PIPEWIRE,
+};
 pub use error::{audio_codes, AudioError};
 pub use fake::{FakeAudioSource, DEFAULT_FRAME_LIMIT, DEFAULT_TONE_HZ};
 pub use frame::{
@@ -124,7 +131,7 @@ pub use opus::{default_config, OpusDecoder, OpusEncoder, MAX_OPUS_PACKET_BYTES, 
 pub use pipewire::PipeWireCapture;
 pub use room::{
     validate_profile, RoomProfileStore, MAX_ROOM_PROFILE_BYTES, MAX_ROOM_PROFILE_TEXT,
-    ROOM_PROFILE_FILE,
+    ROOM_EQ_STATE_FILE, ROOM_PROFILE_FILE,
 };
 pub use router::{
     AudioPlaybackSpec, AudioProfile, AudioRouter, AudioSinkSpec, AudioSinkState,

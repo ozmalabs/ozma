@@ -24,6 +24,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::eq::{RoomEqApplication, MAX_ACTIVE_EQ_STATE_BYTES};
 use crate::error::AudioError;
 use crate::sweep::{
     SweepMeasurement, SweepProfile, MAX_SUGGESTED_GAIN_DB, MAX_SWEEP_BANDS,
@@ -33,6 +34,8 @@ use crate::sweep::{
 
 /// Fixed file name used inside the configured profile directory.
 pub const ROOM_PROFILE_FILE: &str = "room-correction-profile.json";
+/// Fixed file name for the active EQ record.
+pub const ROOM_EQ_STATE_FILE: &str = "room-correction-eq-active.json";
 /// Largest profile JSON accepted or written.
 pub const MAX_ROOM_PROFILE_BYTES: u64 = 256 * 1024;
 /// Largest accepted text field in a stored profile.
@@ -60,6 +63,11 @@ impl RoomProfileStore {
     /// The fixed profile path.
     pub fn path(&self) -> PathBuf {
         self.root.join(ROOM_PROFILE_FILE)
+    }
+
+    /// The fixed active-EQ state path.
+    pub fn active_path(&self) -> PathBuf {
+        self.root.join(ROOM_EQ_STATE_FILE)
     }
 
     /// Validate and atomically store one profile.
@@ -188,14 +196,123 @@ impl RoomProfileStore {
         }
     }
 
+    /// Persist the active filter-chain record after the module was observed
+    /// loaded. This is a separate file from the measured profile so `active`
+    /// remains a runtime fact rather than a claim inside a measurement.
+    pub fn store_active(&self, application: &RoomEqApplication) -> Result<(), AudioError> {
+        application.validate()?;
+        let json = serde_json::to_vec(application).map_err(|error| AudioError::Process {
+            command: self.active_path().display().to_string(),
+            message: format!("could not serialise the active room EQ state: {error}"),
+        })?;
+        if json.len() as u64 > MAX_ACTIVE_EQ_STATE_BYTES {
+            return Err(invalid(
+                "active state",
+                format!(
+                    "serialised state is {} bytes; the limit is {}",
+                    json.len(),
+                    MAX_ACTIVE_EQ_STATE_BYTES
+                ),
+            ));
+        }
+        fs::create_dir_all(&self.root)
+            .map_err(|error| self.io_error("create the directory", error))?;
+        let path = self.active_path();
+        let temporary = self.temporary_path_for(ROOM_EQ_STATE_FILE);
+        let write = || -> std::io::Result<()> {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            file.write_all(&json)?;
+            file.flush()?;
+            file.sync_all()?;
+            fs::rename(&temporary, &path)?;
+            Ok(())
+        };
+        if let Err(error) = write() {
+            let _ = fs::remove_file(&temporary);
+            return Err(self.io_error("write the active EQ state", error));
+        }
+        Ok(())
+    }
+
+    /// Load and validate the active filter-chain record, or `None`.
+    pub fn load_active(&self) -> Result<Option<RoomEqApplication>, AudioError> {
+        let path = self.active_path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(self.io_error("inspect the active EQ state", error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(invalid(
+                "active state file",
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+        if metadata.len() > MAX_ACTIVE_EQ_STATE_BYTES {
+            return Err(invalid(
+                "active state file",
+                format!(
+                    "{} is {} bytes; the limit is {}",
+                    path.display(),
+                    metadata.len(),
+                    MAX_ACTIVE_EQ_STATE_BYTES
+                ),
+            ));
+        }
+        let file =
+            File::open(&path).map_err(|error| self.io_error("open the active EQ state", error))?;
+        let mut bytes = Vec::new();
+        let mut limited = file.take(MAX_ACTIVE_EQ_STATE_BYTES + 1);
+        limited
+            .read_to_end(&mut bytes)
+            .map_err(|error| self.io_error("read the active EQ state", error))?;
+        if bytes.len() as u64 > MAX_ACTIVE_EQ_STATE_BYTES {
+            return Err(invalid("active state file", "grew past the byte limit"));
+        }
+        let application: RoomEqApplication =
+            serde_json::from_slice(&bytes).map_err(|error| AudioError::OutputParse {
+                command: path.display().to_string(),
+                output: String::new(),
+                reason: format!("stored active EQ state is not valid JSON: {error}"),
+            })?;
+        application
+            .validate()
+            .map_err(|error| AudioError::OutputParse {
+                command: path.display().to_string(),
+                output: String::new(),
+                reason: format!("stored active EQ state failed validation: {error}"),
+            })?;
+        Ok(Some(application))
+    }
+
+    /// Remove the active-EQ record. `Ok(false)` means nothing was stored.
+    pub fn clear_active(&self) -> Result<bool, AudioError> {
+        match fs::remove_file(self.active_path()) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(self.io_error("remove the active EQ state", error)),
+        }
+    }
+
     fn temporary_path(&self) -> PathBuf {
+        self.temporary_path_for(ROOM_PROFILE_FILE)
+    }
+
+    fn temporary_path_for(&self, file: &str) -> PathBuf {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         self.root.join(format!(
-            ".{ROOM_PROFILE_FILE}.{}.{}.{}.tmp",
+            ".{file}.{}.{}.{}.tmp",
             std::process::id(),
             nanos,
             sequence
@@ -562,6 +679,67 @@ mod tests {
         assert_eq!(store.load().unwrap(), Some(profile));
         assert!(store.clear().unwrap());
         assert_eq!(store.load().unwrap(), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn sample_application() -> RoomEqApplication {
+        RoomEqApplication {
+            profile_id: "sweep-1790000000000".to_owned(),
+            target_sink: "ozma-vm1".to_owned(),
+            eq_sink: "ozma-eq-sweep-1790000000000-1".to_owned(),
+            module_id: 77,
+            module_name: "libpipewire-module-filter-chain".to_owned(),
+            band_count: 1,
+            active_bands: 1,
+            bands: vec![SweepBand {
+                freq: 1_000.0,
+                gain: -3.0,
+                q: 1.4,
+                band_type: "peaking".to_owned(),
+            }],
+            rate: 48_000,
+            channels: 2,
+            applied_at: 1_790_000_100.0,
+            backend: "pipewire".to_owned(),
+            insertion: "pipewire-filter-chain-smart-sink".to_owned(),
+        }
+    }
+
+    #[test]
+    fn active_state_round_trips_and_is_separate_from_the_profile() {
+        let root = temporary_root("active");
+        let store = RoomProfileStore::new(&root);
+        assert_eq!(store.load_active().unwrap(), None);
+        assert!(!store.clear_active().unwrap());
+
+        let application = sample_application();
+        store.store_active(&application).unwrap();
+        assert_eq!(store.load_active().unwrap(), Some(application));
+        assert!(store.active_path().exists());
+        assert!(!store.path().exists(), "active state is not a profile");
+        assert!(store.clear_active().unwrap());
+        assert_eq!(store.load_active().unwrap(), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrupt_or_unsafe_active_state_is_rejected() {
+        let root = temporary_root("active-corrupt");
+        let store = RoomProfileStore::new(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(store.active_path(), b"not json").unwrap();
+        assert!(matches!(
+            store.load_active(),
+            Err(AudioError::OutputParse { .. })
+        ));
+
+        let mut invalid = sample_application();
+        invalid.active_bands = 0;
+        fs::write(store.active_path(), serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(matches!(
+            store.load_active(),
+            Err(AudioError::OutputParse { .. })
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 

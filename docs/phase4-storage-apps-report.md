@@ -8,11 +8,16 @@ agent exposed through `agent/storage_manager.py`, `agent/app_monitor.py`, and
 `node/self_management.py`. The routes are deliberately observational: they do
 not mount, format, scrub, kill, or reconfigure anything.
 
+Read-only SMART and mdraid visibility lives next to these routes and is
+documented in [`phase4-storage-health-report.md`](phase4-storage-health-report.md).
+
 ## Endpoints
 
 | Route | Auth | Source | Bound |
 |---|---|---|---|
 | `GET /storage` (alias `GET /api/v1/storage`) | node bearer guard | `/proc/mounts` + `statvfs` | 64 filesystems |
+| `GET /storage/health` (alias `GET /api/v1/storage/health`) | node bearer guard | `/sys/block`, `smartctl -j -H -A`, `/proc/mdstat`, optional `mdadm --detail --scan` | 32 devices, 32 arrays, 64 members/array |
+| `GET /storage/smart?device=/dev/nvme0n1` (alias `GET /api/v1/storage/smart`) | node bearer guard | `/sys/block` + one bounded `smartctl -j -H -A` | one device |
 | `GET /apps?limit=N` (alias `GET /api/v1/apps`) | node bearer guard | numeric `/proc/<pid>/{comm,stat,status}`, `/proc/uptime`, `/etc/passwd` | `limit` 1–100, default 20 |
 | `GET /self` (alias `GET /api/v1/self`) | node bearer guard | `/proc/self/{stat,statm,cgroup}`, `/proc/uptime`, crate metadata | fixed document |
 
@@ -54,8 +59,63 @@ An unreadable mount table is a typed `503`:
 {"ok": false, "available": false, "code": "storage.proc-unavailable", "error": "..."}
 ```
 
-No device is opened, no SMART/IOCTL call is made, and no ZFS/md/multipath
-administration route is added.
+`/storage` itself does not open a device or make a SMART/IOCTL call, and no
+ZFS/md/multipath administration route is added. SMART and mdraid visibility
+is the separate read-only `/storage/health` and `/storage/smart` surface
+described below.
+
+### `GET /storage/health`
+
+Per-device block inventory and health, bounded to 32 devices:
+
+- model, size, rotational flag, and (only with `?serials=true`) serial;
+- normalized SMART availability/health, temperature, NVMe percentage-used and
+  spare, and SATA reallocated/pending/uncorrectable counts;
+- md array state, level, members, slot map, degraded flag, sync progress, and
+  optional UUID/metadata.
+
+SMART and mdraid are optional enrichment. A missing `smartctl` or a host
+without `/proc/mdstat` keeps the health document a `200` and reports typed
+`storage.smart-unavailable` / `storage.md-unavailable` sections. An unreadable
+`/sys/block` is a typed `503 storage.block-unavailable`.
+
+```json
+{
+  "ok": true,
+  "count": 1,
+  "limit": 32,
+  "truncated": false,
+  "serials_included": false,
+  "attributes_included": false,
+  "smart": {"available": true},
+  "md": {"available": false, "code": "storage.md-unavailable", "arrays": []},
+  "unavailable": ["md"],
+  "devices": [
+    {
+      "name": "nvme0n1",
+      "device": "/dev/nvme0n1",
+      "model": "Fanxiang S880E 1TB",
+      "size_bytes": 1000204886016,
+      "rotational": false,
+      "smart": {"available": true, "passed": true, "temperature_c": 49, "percentage_used": 21}
+    }
+  ]
+}
+```
+
+Serials and arbitrary SMART attributes are **not** returned by default. Both
+are explicit opt-ins (`?serials=true`, `?attributes=true`) and remain bounded.
+See the storage-health report for the full privacy policy, mdstat grammar, and
+errors.
+
+### `GET /storage/smart?device=/dev/nvme0n1`
+
+One validated block device's normalized SMART document. `device` must be
+`/dev/<basename>`, must exist under `/sys/block` or `/dev`, and is rejected
+with a typed `400 storage.invalid-device` for traversal, slashes, control
+characters, or a missing device. Smartctl is run with a 5 s deadline and a
+1 MiB stdout bound; raw smartctl JSON is never returned. A missing tool or
+unusable device is a typed `503 storage.smart-unavailable`.
 
 ### `GET /apps?limit=N`
 
@@ -147,6 +207,22 @@ An unreadable `/proc/self/stat` is a typed `503`
     "reason": "Reads mounted /dev block filesystems and statvfs capacity; read-only, no secrets, at most 64 entries.",
     "limit": 64
   },
+  "health": {
+    "supported": true,
+    "path": "/storage/health",
+    "available": true,
+    "guarded": true,
+    "reason": "Reports bounded /sys/block inventory, normalized SMART health, and /proc/mdstat arrays; read-only, serials opt-in, at most 32 devices.",
+    "limit": 32
+  },
+  "smart": {
+    "supported": true,
+    "path": "/storage/smart",
+    "available": true,
+    "guarded": true,
+    "reason": "Runs bounded smartctl -j -H -A for one validated /dev block device; no tests, no raw output, serials opt-in.",
+    "limit": 1
+  },
   "apps": {"supported": true, "path": "/apps", "available": true, "guarded": true, "limit": 100, "...": "..."},
   "self": {"supported": true, "path": "/self", "available": true, "guarded": true, "...": "..."}
 }
@@ -168,13 +244,17 @@ The controller now exposes minimal pass-throughs next to its hardware proxies:
 | Controller route | Node path |
 |---|---|
 | `GET /api/v1/nodes/{node_id}/storage` | `/storage` |
+| `GET /api/v1/nodes/{node_id}/storage/health?serials=&attributes=` | `/storage/health?...` |
+| `GET /api/v1/nodes/{node_id}/storage/smart?device=&serials=&attributes=` | `/storage/smart?device=...` |
 | `GET /api/v1/nodes/{node_id}/apps?limit=N` | `/apps?limit=N` |
 | `GET /api/v1/nodes/{node_id}/self` | `/self` |
 
 They use `_proxy_node_surface`, so a node's typed error (`storage.*`,
-`apps.*`, `self.*`) survives as JSON with its 503 status, and the node bearer
+`apps.*`, `self.*`) survives as JSON with its status, and the node bearer
 token is forwarded. The `limit` query is passed through; the node remains
-responsible for clamping it to 100.
+responsible for clamping it to 100. The health/smart proxies forward the
+explicit privacy flags and URL-encode `device`; the node still validates the
+device and applies its own bounds.
 
 No Python agent route used these paths: `agent/storage_manager.py` and
 `agent/app_monitor.py` were libraries, and `node/self_management.py` served its
@@ -210,14 +290,26 @@ Rust (`cargo test -p ozma-node --lib host_surfaces::`):
   typed `503` body;
 - a live Linux host test calls `/storage`, `/apps`, and `/self` collectors
   directly and checks bounds, capacity consistency, memory presence, and the
-  absence of `cmdline`.
+  absence of `cmdline`;
+- storage-health tests cover NVMe/SATA SMART normalization, serial/attribute
+  redaction and opt-in, mdstat healthy/degraded/malformed parsing,
+  `mdadm --detail --scan`, traversal/missing-device validation, the 32-device
+  bound, and typed `storage.block-unavailable`, `storage.smart-unavailable`,
+  `storage.md-unavailable`, and `storage.invalid-device` responses;
+- a live Linux test exercises `/storage/health` and `/storage/smart` against
+  the host NVMe and asserts bounds, default serial redaction, and honest typed
+  unavailability when the process lacks device permissions.
 
 Controller
 (`python3 -m pytest tests/unit/controller/test_node_api_token_proxy.py`):
 
-- `/storage`, `/apps`, and `/self` are added to the bearer-token proxy matrix;
+- `/storage`, `/storage/health`, `/storage/smart`, `/apps`, and `/self` are in
+  the bearer-token proxy matrix;
 - `test_apps_proxy_forwards_limit_to_the_node` proves the `limit` query and
-  token reach the node.
+  token reach the node;
+- the health/smart proxy test proves flag forwarding, device URL-encoding, and
+  preservation of typed `400 storage.invalid-device` /
+  `503 storage.smart-unavailable` bodies without a token leak.
 
 ## Live evidence
 
@@ -228,13 +320,23 @@ storage report is honestly empty (no `/dev`-backed mount); on a host with
 only the requested window; `/self` always resolves this test process's pid and
 memory.
 
+The reference host has `smartctl 7.5` and one physical NVMe device
+(`/dev/nvme0n1`); `/sys/block` also contains `zram0`, which the health
+inventory filters out. `/proc/mdstat` is absent, so the live health document
+reports a typed `storage.md-unavailable` while still returning the NVMe
+inventory and SMART data. As a non-root process, smartctl cannot open the
+device and the same route reports per-device `storage.smart-unavailable`
+instead of inventing health; as root the live test asserts the real
+temperature/percentage-used values with serials omitted.
+
 ## Remaining gaps
 
-- **No storage administration.** ZFS pools/vdevs, md arrays, multipath,
-  enclosure LEDs, SMART scheduling/results, replication, iSCSI, ACLs, secure
-  wipe, capacity history, and S3 gateway helpers from
-  `storage_manager.py`/`storage_admin.py` are not ported. `/backup/*` remains a
-  typed `501`.
+- **No storage administration.** ZFS pools/vdevs, md assembly/start/stop/add/
+  remove, multipath, enclosure LEDs, SMART self-tests/scheduling, replication,
+  iSCSI, ACLs, secure wipe, capacity history, and S3 gateway helpers from
+  `storage_manager.py`/`storage_admin.py` are not ported. `/storage/health`
+  and `/storage/smart` are observational only. `/backup/*` remains a typed
+  `501`.
 - **No app enforcement.** `app_monitor.py` blocked/killed processes, enforced
   whitelist/blacklist/kiosk policy, timers/breaks, screen locking, and usage
   reporting. The node only lists processes; it never reads `cmdline`, kills,
@@ -251,4 +353,6 @@ memory.
   nested `self_management`) is a controller follow-up.
 - **No privileged mount/devices.** The route cannot see a block device that the
   node process is not allowed to `statvfs`, and it deliberately does not use
-  elevated privileges to inspect one.
+  elevated privileges to inspect one. `/storage/smart` inherits the same
+  policy: an unprivileged node returns typed `storage.smart-unavailable`
+  rather than invoking sudo.

@@ -41,8 +41,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream;
 use ozma_audio::{
-    AudioError, AudioPlaybackSpec, AudioProfile, AudioRouter, AudioSourceProfile, RoomProfileStore,
-    SweepOutcome, SweepProfile, SweepRequest,
+    next_eq_sink_name, validate_profile, AudioError, AudioPlaybackSpec, AudioProfile, AudioRouter,
+    AudioSourceProfile, RoomEqSpec, RoomProfileStore, SweepOutcome, SweepProfile, SweepRequest,
+    DEFAULT_EQ_CHANNELS, DEFAULT_EQ_RATE,
 };
 use ozma_encode::{
     backend_name, CodecOverrideState, CodecPreference, EncoderOverride, EncoderRegistry,
@@ -4462,7 +4463,7 @@ pub fn audio_router(state: ConnectionState) -> Router {
         )
         .route(
             "/audio/room-correction/apply",
-            post(audio_room_correction_apply),
+            post(audio_room_correction_apply).delete(audio_room_correction_delete),
         )
         .with_state(state)
 }
@@ -7393,22 +7394,286 @@ async fn audio_profile_delete(State(state): State<ConnectionState>) -> Response 
     }
 }
 
-/// `POST /audio/room-correction/apply` — explicitly unsupported.
+/// `POST /audio/room-correction/apply` — insert a reversible filter chain.
 ///
-/// Measurement and persistence are implemented, but inserting a parametric EQ
-/// or PipeWire filter-chain would change the graph. Nothing is applied and the
-/// response is a typed 501.
-async fn audio_room_correction_apply() -> Response {
+/// The body may carry a full `profile` object (or be the profile itself), or
+/// omit it to apply the stored profile. `profile_id` selects/checks the stored
+/// profile. `sink` (or `target_sink`) is the explicit target; when omitted the
+/// node's configured `--audio-sink` is used. Nothing is moved onto the new EQ
+/// sink and no default device is changed.
+async fn audio_room_correction_apply(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let Some(control) = state.audio.as_ref() else {
+        return audio_eq_application_unsupported();
+    };
+    let Some(store) = control.profile_store() else {
+        return audio_eq_application_unsupported();
+    };
+    let router = match control.router() {
+        Ok(router) => router.clone(),
+        Err(response) => return response,
+    };
+    let Json(body) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    let Some(body) = body.as_object() else {
+        return audio_eq_error_response(AudioError::InvalidSpec {
+            field: "room eq request".to_owned(),
+            reason: "must be a JSON object".to_owned(),
+        });
+    };
+    let requested_id = match body.get("profile_id") {
+        Some(Value::String(id)) => {
+            let id = id.trim();
+            if id.is_empty() {
+                return audio_eq_error_response(AudioError::InvalidSpec {
+                    field: "room eq profile_id".to_owned(),
+                    reason: "must not be empty".to_owned(),
+                });
+            }
+            Some(id.to_owned())
+        }
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            return audio_eq_error_response(AudioError::InvalidSpec {
+                field: "room eq profile_id".to_owned(),
+                reason: "must be a string".to_owned(),
+            })
+        }
+    };
+
+    let inline = body.get("profile").filter(|profile| !profile.is_null());
+    let profile = if let Some(value) = inline {
+        match serde_json::from_value::<SweepProfile>(value.clone()) {
+            Ok(profile) => profile,
+            Err(error) => return audio_eq_error_response(invalid_profile_json(error)),
+        }
+    } else if body.contains_key("bands") {
+        match serde_json::from_value::<SweepProfile>(Value::Object(body.clone())) {
+            Ok(profile) => profile,
+            Err(error) => return audio_eq_error_response(invalid_profile_json(error)),
+        }
+    } else {
+        match store.load() {
+            Ok(Some(profile)) => profile,
+            Ok(None) => return audio_eq_missing_profile(),
+            Err(error) => return audio_eq_error_response(error),
+        }
+    };
+    if let Some(requested_id) = requested_id {
+        if requested_id != profile.id {
+            return audio_eq_error_response(AudioError::InvalidSpec {
+                field: "room eq profile_id".to_owned(),
+                reason: format!("`{requested_id}` does not match profile `{}`", profile.id),
+            });
+        }
+    }
+    if let Err(error) = validate_profile(&profile) {
+        return audio_eq_error_response(error);
+    }
+
+    let requested_sink = match body.get("sink").or_else(|| body.get("target_sink")) {
+        Some(Value::String(sink)) => Some(sink.clone()),
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            return audio_eq_error_response(AudioError::InvalidSpec {
+                field: "room eq sink".to_owned(),
+                reason: "must be a string".to_owned(),
+            })
+        }
+    };
+    let target_sink = match control.sink_or_default(requested_sink) {
+        Ok(sink) => sink,
+        Err(response) => return response,
+    };
+    let rate = match integer_field(body, "rate", u64::from(DEFAULT_EQ_RATE)) {
+        Ok(value) => value as u32,
+        Err(response) => return response,
+    };
+    let channels = match integer_field(body, "channels", u64::from(DEFAULT_EQ_CHANNELS)) {
+        Ok(value) => value as u16,
+        Err(response) => return response,
+    };
+
+    let spec = RoomEqSpec {
+        eq_sink: next_eq_sink_name(&profile.id),
+        profile_id: profile.id.clone(),
+        target_sink,
+        bands: profile.bands.clone(),
+        rate,
+        channels,
+    };
+    // A previous record describes a chain that the router is about to unload.
+    // Clear it first so a failed replacement cannot leave a stale "active"
+    // claim behind; the new record is written only after the sink is observed.
+    if let Err(error) = store.clear_active() {
+        return audio_eq_error_response(error);
+    }
+    let application = match router.apply_room_eq(spec).await {
+        Ok(application) => application,
+        Err(error) => return audio_eq_error_response(error),
+    };
+
+    // The state file is written only after the sink was observed loaded. If it
+    // cannot be persisted, tear the module down again rather than leaving an
+    // untracked filter chain in the graph.
+    if let Err(error) = store.store_active(&application) {
+        let _ = router.remove_room_eq().await;
+        return audio_eq_error_response(error);
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "available": true,
+        "active": true,
+        "backend": control.backend(),
+        "profile_id": application.profile_id,
+        "target_sink": application.target_sink,
+        "eq_sink": application.eq_sink,
+        "module_id": application.module_id,
+        "module_name": application.module_name,
+        "active_bands": application.active_bands,
+        "band_count": application.band_count,
+        "insertion": application.insertion,
+        "application": application,
+    }))
+    .into_response()
+}
+
+/// `DELETE /audio/room-correction/apply` — unload the active filter chain.
+async fn audio_room_correction_delete(State(state): State<ConnectionState>) -> Response {
+    let Some(control) = state.audio.as_ref() else {
+        return audio_eq_application_unsupported();
+    };
+    let Some(store) = control.profile_store() else {
+        return audio_eq_application_unsupported();
+    };
+    let router = match control.router() {
+        Ok(router) => router.clone(),
+        Err(response) => return response,
+    };
+    let removed = match router.remove_room_eq().await {
+        Ok(removed) => removed,
+        Err(error) => return audio_eq_error_response(error),
+    };
+    if let Err(error) = store.clear_active() {
+        return audio_eq_error_response(error);
+    }
+    let body = match removed {
+        Some(application) => serde_json::json!({
+            "ok": true,
+            "available": true,
+            "active": false,
+            "removed": true,
+            "backend": control.backend(),
+            "profile_id": application.profile_id,
+            "target_sink": application.target_sink,
+            "eq_sink": application.eq_sink,
+            "module_id": application.module_id,
+        }),
+        None => serde_json::json!({
+            "ok": true,
+            "available": true,
+            "active": false,
+            "removed": false,
+            "backend": control.backend(),
+        }),
+    };
+    Json(body).into_response()
+}
+
+fn integer_field(
+    body: &serde_json::Map<String, Value>,
+    field: &str,
+    default: u64,
+) -> Result<u64, Response> {
+    match body.get(field) {
+        Some(Value::Null) | None => Ok(default),
+        Some(Value::Number(number)) => number.as_u64().ok_or_else(|| {
+            audio_eq_error_response(AudioError::InvalidSpec {
+                field: format!("room eq {field}"),
+                reason: "must be a non-negative integer".to_owned(),
+            })
+        }),
+        Some(_) => Err(audio_eq_error_response(AudioError::InvalidSpec {
+            field: format!("room eq {field}"),
+            reason: "must be a non-negative integer".to_owned(),
+        })),
+    }
+}
+
+fn invalid_profile_json(error: serde_json::Error) -> AudioError {
+    AudioError::InvalidSpec {
+        field: "room profile".to_owned(),
+        reason: format!("invalid profile JSON: {error}"),
+    }
+}
+
+fn audio_eq_missing_profile() -> Response {
+    let body = serde_json::json!({
+        "ok": false,
+        "available": true,
+        "active": false,
+        "code": "audio-profile-missing",
+        "error": "No stored room-correction profile is available to apply.",
+        "remediation": "Measure with POST /audio/sweep first, store a profile with \
+                        /audio/room-correction/profile, or send a full `profile` object. \
+                        No filter chain was loaded.",
+    });
+    (StatusCode::NOT_FOUND, Json(body)).into_response()
+}
+
+fn audio_eq_application_unsupported() -> Response {
     compat_error_with_remediation(
         StatusCode::NOT_IMPLEMENTED,
         "audio-eq-application-unsupported",
-        "parametric EQ and filter-chain application are not implemented on this node",
+        "room-correction EQ application is not enabled on this node",
         Some(
-            "Measure with POST /audio/sweep and persist the measured profile with \
-             /audio/room-correction/profile. No filter node is inserted and no graph \
-             change is made; an unsupported EQ request must not report success.",
+            "Start ozma-node with --audio-router pipewire and --audio-profile-dir \
+             <path> (or OZMA_AUDIO_PROFILE_DIR). The active-state record needs the same \
+             opt-in directory as the measured profile. Nothing was loaded.",
         ),
     )
+}
+
+fn audio_eq_error_response(error: AudioError) -> Response {
+    let status = match &error {
+        AudioError::InvalidSpec { .. } | AudioError::InvalidTarget(_) => StatusCode::BAD_REQUEST,
+        AudioError::Refused { .. } => StatusCode::BAD_REQUEST,
+        AudioError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
+        AudioError::MissingCommand { .. }
+        | AudioError::Unavailable { .. }
+        | AudioError::Process { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        AudioError::OutputParse { .. }
+        | AudioError::CommandFailed { .. }
+        | AudioError::Capture { .. }
+        | AudioError::Closed { .. }
+        | AudioError::EndOfStream
+        | AudioError::InvalidFrame(_)
+        | AudioError::FormatMismatch { .. }
+        | AudioError::Encode { .. }
+        | AudioError::Decode { .. }
+        | AudioError::ChannelClosed => StatusCode::BAD_GATEWAY,
+        AudioError::TrackNotFound { .. } => StatusCode::BAD_REQUEST,
+    };
+    let api = error.to_api_error();
+    let mut body = serde_json::json!({
+        "ok": false,
+        "available": false,
+        "active": false,
+        "code": api.code,
+        "error": api.message,
+    });
+    if let Some(remediation) = api.remediation {
+        body["remediation"] = Value::String(remediation);
+    }
+    if !api.details.is_null() {
+        body["details"] = api.details;
+    }
+    (status, Json(body)).into_response()
 }
 
 fn audio_profile_store_unsupported() -> Response {
@@ -8499,12 +8764,13 @@ mod tests {
     use ozma_audio::{
         audio_codes, AudioGraphNode, AudioGraphSnapshot, AudioSinkSpec, AudioSinkState,
         AudioSourceProfile, AudioSourceRef, AudioSourceSpec, AudioSourceState, AudioStreamRef,
-        SweepDescriptor, SweepMeasurement, SweepProfile,
+        RoomEqApplication, RoomEqSpec, SweepBand, SweepDescriptor, SweepMeasurement, SweepProfile,
     };
 
     struct FakeAudioRouter {
         calls: Arc<Mutex<Vec<String>>>,
         failure: Option<AudioError>,
+        active_eq: Arc<Mutex<Option<RoomEqApplication>>>,
     }
 
     impl FakeAudioRouter {
@@ -8512,6 +8778,7 @@ mod tests {
             Self {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 failure: None,
+                active_eq: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -8519,11 +8786,16 @@ mod tests {
             Self {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 failure: Some(error),
+                active_eq: Arc::new(Mutex::new(None)),
             }
         }
 
         fn calls(&self) -> Vec<String> {
             lock(&self.calls).clone()
+        }
+
+        fn active_eq(&self) -> Option<RoomEqApplication> {
+            lock(&self.active_eq).clone()
         }
 
         fn record(&self, entry: String) -> Result<(), AudioError> {
@@ -8681,6 +8953,29 @@ mod tests {
                     },
                 },
             })
+        }
+
+        async fn apply_room_eq(&self, spec: RoomEqSpec) -> Result<RoomEqApplication, AudioError> {
+            self.record(format!(
+                "eq-apply:{}:{}:{}:{}:{}",
+                spec.profile_id,
+                spec.target_sink,
+                spec.eq_sink,
+                spec.bands.len(),
+                spec.channels
+            ))?;
+            let application = RoomEqApplication::from_spec(&spec, 4242);
+            *lock(&self.active_eq) = Some(application.clone());
+            Ok(application)
+        }
+
+        async fn remove_room_eq(&self) -> Result<Option<RoomEqApplication>, AudioError> {
+            self.record("eq-remove".to_owned())?;
+            Ok(lock(&self.active_eq).take())
+        }
+
+        async fn room_eq_application(&self) -> Result<Option<RoomEqApplication>, AudioError> {
+            Ok(lock(&self.active_eq).clone())
         }
     }
 
@@ -14520,6 +14815,203 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
         assert_eq!(body["code"], audio_codes::AUDIO_OUTPUT_PARSE);
         assert_eq!(body["profile"], Value::Null);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    fn eq_profile() -> SweepProfile {
+        SweepProfile {
+            id: "eq-test".to_owned(),
+            name: "Office".to_owned(),
+            created_at: 1_790_000_000.0,
+            bands: vec![SweepBand {
+                freq: 1_000.0,
+                gain: -3.0,
+                q: 1.4,
+                band_type: "peaking".to_owned(),
+            }],
+            band_count: 1,
+            mic_type: "phone".to_owned(),
+            phone_model: "generic".to_owned(),
+            mic_model: String::new(),
+            target_curve: "harman".to_owned(),
+            room_name: "Office".to_owned(),
+            node_id: "node-a".to_owned(),
+            active: false,
+            measurement: SweepMeasurement {
+                sample_rate: 48_000,
+                channels: 1,
+                captured_frames: 74_400,
+                captured_secs: 1.55,
+                peak: 0.5,
+                peak_dbfs: -6.0,
+                rms_dbfs: -12.0,
+                noise_floor_dbfs: -80.0,
+                impulse_peak: 0.5,
+                impulse_index: 18_000,
+                impulse_index_secs: 0.375,
+                rt60_secs: Some(0.4),
+                decay_db_per_sec: Some(-150.0),
+                sweep: SweepDescriptor {
+                    start_hz: 100.0,
+                    end_hz: 8_000.0,
+                    duration_secs: 1.0,
+                },
+            },
+            analysis: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_room_eq_applies_stored_profile_persists_and_deletes() {
+        let directory = profile_directory("eq-apply");
+        let store = RoomProfileStore::new(&directory);
+        store.store(&eq_profile()).unwrap();
+        let router = Arc::new(FakeAudioRouter::new());
+        let app = audio_router(audio_state_with_store(
+            Some(router.clone()),
+            Some("ozma-vm1"),
+            directory.clone(),
+        ));
+        let before = store.load_active().unwrap();
+        assert!(before.is_none());
+
+        let (status, body) = post_json(
+            &app,
+            "/audio/room-correction/apply",
+            serde_json::json!({"profile_id": "eq-test"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["active"], true);
+        assert_eq!(body["profile_id"], "eq-test");
+        assert_eq!(body["target_sink"], "ozma-vm1");
+        assert_eq!(body["module_id"], 4242);
+        assert_eq!(body["active_bands"], 1);
+        assert_eq!(body["band_count"], 1);
+        assert_eq!(body["insertion"], "pipewire-filter-chain-smart-sink");
+        let eq_sink = body["eq_sink"].as_str().unwrap();
+        assert!(eq_sink.starts_with("ozma-eq-eq-test-"), "{eq_sink}");
+
+        // State is written only after the router reported a loaded module.
+        let active = store
+            .load_active()
+            .expect("read active state")
+            .expect("active state after apply");
+        assert_eq!(active.profile_id, "eq-test");
+        assert_eq!(active.eq_sink, eq_sink);
+        assert_eq!(
+            router.active_eq().as_ref().map(|a| a.eq_sink.clone()),
+            Some(eq_sink.to_owned())
+        );
+        let calls = router.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].starts_with("eq-apply:eq-test:ozma-vm1:ozma-eq-eq-test-"),
+            "{calls:?}"
+        );
+
+        let (status, body) = delete_json(&app, "/audio/room-correction/apply").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active"], false);
+        assert_eq!(body["removed"], true);
+        assert_eq!(body["eq_sink"], eq_sink);
+        assert!(store.load_active().unwrap().is_none());
+        assert!(router.active_eq().is_none());
+        assert_eq!(router.calls().last().map(String::as_str), Some("eq-remove"));
+
+        let (status, body) = delete_json(&app, "/audio/room-correction/apply").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["removed"], false);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn audio_room_eq_rejects_missing_invalid_and_mismatched_profiles() {
+        let directory = profile_directory("eq-invalid");
+        let router = Arc::new(FakeAudioRouter::new());
+        let app = audio_router(audio_state_with_store(
+            Some(router.clone()),
+            Some("ozma-vm1"),
+            directory.clone(),
+        ));
+
+        // No stored profile and no inline profile: a typed 404, not a fake apply.
+        let (status, body) =
+            post_json(&app, "/audio/room-correction/apply", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["code"], "audio-profile-missing");
+        assert_eq!(body["active"], false);
+        assert!(router.calls().is_empty());
+
+        // An out-of-range gain is rejected before the router is asked.
+        let mut invalid = eq_profile();
+        invalid.bands[0].gain = 13.0;
+        let (status, body) = post_json(
+            &app,
+            "/audio/room-correction/apply",
+            serde_json::json!({"profile": invalid}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], audio_codes::AUDIO_INVALID_SPEC);
+        assert!(router.calls().is_empty());
+
+        // A stored profile exists, but the requested id does not match it.
+        RoomProfileStore::new(&directory)
+            .store(&eq_profile())
+            .unwrap();
+        let (status, body) = post_json(
+            &app,
+            "/audio/room-correction/apply",
+            serde_json::json!({"profile_id": "other-profile"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], audio_codes::AUDIO_INVALID_SPEC);
+        assert!(router.calls().is_empty());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn audio_room_eq_failure_does_not_persist_active_state() {
+        let directory = profile_directory("eq-failure");
+        let store = RoomProfileStore::new(&directory);
+        store.store(&eq_profile()).unwrap();
+        // Simulate a previous active chain: a failed replacement must not leave
+        // its stale record claiming that EQ is still loaded.
+        let previous = RoomEqApplication::from_spec(
+            &RoomEqSpec {
+                profile_id: "old-profile".to_owned(),
+                target_sink: "ozma-vm1".to_owned(),
+                eq_sink: "ozma-eq-old-profile-9".to_owned(),
+                bands: eq_profile().bands,
+                rate: 48_000,
+                channels: 2,
+            },
+            99,
+        );
+        store.store_active(&previous).unwrap();
+        let router = Arc::new(FakeAudioRouter::failing(AudioError::Process {
+            command: "pipewire -c".to_owned(),
+            message: "filter chain did not publish the sink".to_owned(),
+        }));
+        let app = audio_router(audio_state_with_store(
+            Some(router),
+            Some("ozma-vm1"),
+            directory.clone(),
+        ));
+
+        let (status, body) =
+            post_json(&app, "/audio/room-correction/apply", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["active"], false);
+        assert_eq!(body["code"], audio_codes::AUDIO_PROCESS_FAILED);
+        assert!(
+            store.load_active().unwrap().is_none(),
+            "a failed apply must not leave an active record"
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 

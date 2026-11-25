@@ -215,6 +215,10 @@ pub struct DiscoveredPeer {
     pub capabilities: Vec<String>,
     /// Underlay address observed in the SRV/A records (diagnostics only).
     pub underlay_ip: Option<Ipv4Addr>,
+    /// Public keys the advertiser says it rotated away from, bounded to the
+    /// current grace window. Used only to authorize a key change; never
+    /// trusted as proof on its own.
+    pub previous_pubkeys: Vec<String>,
 }
 
 /// Raw descriptor produced by an mDNS browse (or a test stream).
@@ -225,6 +229,8 @@ pub struct RawAdvertisement {
     pub mesh_ip: Option<String>,
     pub wg_port: Option<u16>,
     pub capabilities: Vec<String>,
+    /// Comma-separated `prev_pubkey` TXT value, split by the browser.
+    pub previous_pubkeys: Vec<String>,
     pub instance: Option<String>,
     pub underlay_ip: Option<Ipv4Addr>,
     pub source: Option<SocketAddr>,
@@ -239,6 +245,11 @@ pub enum DiscoveryAction {
     Add(DiscoveredPeer),
     /// Authorized peer whose mesh IP or WireGuard endpoint changed.
     Update {
+        peer: DiscoveredPeer,
+        previous: MeshNode,
+    },
+    /// Authorized peer whose public key changed during a proven grace window.
+    KeyRotated {
         peer: DiscoveredPeer,
         previous: MeshNode,
     },
@@ -267,6 +278,7 @@ pub struct DiscoveryCounters {
     pub authorized: u64,
     pub added: u64,
     pub updated: u64,
+    pub rotated: u64,
     pub removed: u64,
     pub duplicates: u64,
     pub expired: u64,
@@ -436,12 +448,12 @@ impl DiscoveryEngine {
             }];
         }
 
-        let Some(trusted) = self
+        let trusted_index = self
             .config
             .trusted
             .iter()
-            .find(|trusted| trusted.id == advertisement.node.id)
-        else {
+            .position(|trusted| trusted.id == advertisement.node.id);
+        let Some(trusted_index) = trusted_index else {
             self.counters.unauthorized += 1;
             return vec![DiscoveryAction::Unauthorized {
                 id: Some(id),
@@ -449,7 +461,14 @@ impl DiscoveryEngine {
             }];
         };
 
-        if trusted.wg_pubkey != advertisement.node.wg_pubkey.0 {
+        let trusted = &self.config.trusted[trusted_index];
+        let key_matches = trusted.wg_pubkey == advertisement.node.wg_pubkey.0;
+        let rotated_from_trust = !key_matches
+            && advertisement
+                .previous_pubkeys
+                .iter()
+                .any(|key| key == &trusted.wg_pubkey);
+        if !key_matches && !rotated_from_trust {
             self.counters.unauthorized += 1;
             return vec![DiscoveryAction::Unauthorized {
                 id: Some(id),
@@ -471,15 +490,30 @@ impl DiscoveryEngine {
         }
         self.counters.authorized += 1;
 
+        // Adopt the rotated key in memory so a later rotation chain is still
+        // authorized. This never rewrites the operator's trust file; a restart
+        // falls back to the configured key.
+        if rotated_from_trust {
+            self.config.trusted[trusted_index].wg_pubkey = advertisement.node.wg_pubkey.0.clone();
+        }
+
         let mesh_ip_owner = self.owner_of(&advertisement.node.mesh_ip);
         if let Some(existing) = self.peers.get_mut(&id) {
-            if existing.peer.node.wg_pubkey != advertisement.node.wg_pubkey {
-                self.counters.conflicts += 1;
-                return vec![DiscoveryAction::Conflict {
-                    id: Some(id),
-                    reason: "a discovered peer with this id already uses a different public key"
-                        .to_owned(),
-                }];
+            let key_changed = existing.peer.node.wg_pubkey != advertisement.node.wg_pubkey;
+            if key_changed {
+                let authorized_previous = advertisement
+                    .previous_pubkeys
+                    .iter()
+                    .any(|key| key == &existing.peer.node.wg_pubkey.0);
+                if !authorized_previous {
+                    self.counters.conflicts += 1;
+                    return vec![DiscoveryAction::Conflict {
+                        id: Some(id),
+                        reason:
+                            "a discovered peer with this id already uses a different public key"
+                                .to_owned(),
+                    }];
+                }
             }
             if existing.peer == advertisement {
                 existing.last_seen = now;
@@ -501,6 +535,13 @@ impl DiscoveryEngine {
             let previous = existing.peer.node.clone();
             existing.peer = advertisement.clone();
             existing.last_seen = now;
+            if key_changed {
+                self.counters.rotated += 1;
+                return vec![DiscoveryAction::KeyRotated {
+                    peer: advertisement,
+                    previous,
+                }];
+            }
             self.counters.updated += 1;
             return vec![DiscoveryAction::Update {
                 peer: advertisement,
@@ -638,6 +679,7 @@ pub fn validate_advertisement(raw: &RawAdvertisement) -> Result<DiscoveredPeer> 
     })?;
 
     let capabilities = normalize_capabilities(&raw.capabilities)?;
+    let previous_pubkeys = normalize_previous_pubkeys(&raw.previous_pubkeys, pubkey)?;
 
     Ok(DiscoveredPeer {
         node: MeshNode {
@@ -648,7 +690,36 @@ pub fn validate_advertisement(raw: &RawAdvertisement) -> Result<DiscoveredPeer> 
         },
         capabilities,
         underlay_ip: raw.underlay_ip,
+        previous_pubkeys,
     })
+}
+
+/// Bound and validate `prev_pubkey` grace entries.
+fn normalize_previous_pubkeys(raw: &[String], current: &str) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    for entry in raw {
+        for key in entry.split(',') {
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            if keys.len() >= 2 {
+                return Err(MeshError::DiscoveryInvalid(
+                    "advertisement lists more than two previous public keys".to_owned(),
+                ));
+            }
+            if key == current {
+                return Err(MeshError::DiscoveryInvalid(
+                    "advertisement lists its current public key as previous".to_owned(),
+                ));
+            }
+            WgPublicKey(key.to_owned()).to_bytes()?;
+            if !keys.iter().any(|existing| existing == key) {
+                keys.push(key.to_owned());
+            }
+        }
+    }
+    Ok(keys)
 }
 
 /// Validate a peer identity before it is installed in a tunnel table.
@@ -930,6 +1001,18 @@ impl MdnsBrowser {
                         .collect()
                 })
                 .unwrap_or_default();
+            let previous_pubkeys = pending
+                .txt
+                .get("prev_pubkey")
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
             // The response source is the interface address that actually
             // reached us; prefer it over an A record, which may list unrelated
             // bridge addresses on a multi-homed peer.
@@ -951,6 +1034,7 @@ impl MdnsBrowser {
                 mesh_ip: Some(mesh_ip),
                 wg_port: Some(wg_port),
                 capabilities,
+                previous_pubkeys,
                 instance: Some(instance.clone()),
                 underlay_ip,
                 source: pending.source,
@@ -1497,6 +1581,42 @@ mod tests {
         packet[7] = 1;
         packet.extend_from_slice(&[0xC0, 0xFF, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
         assert!(parse_dns_packet(&packet).is_err());
+    }
+
+    #[test]
+    fn key_rotation_requires_the_previous_trusted_key() {
+        let (peer, old_pubkey) = key(30);
+        let (_, new_pubkey) = key(31);
+        let mut engine = engine_with(vec![], vec![TrustedPeer::new(&peer.id, &old_pubkey)]);
+        let now = Instant::now();
+
+        let first = engine.observe(advertisement(&peer.id, &peer.mesh_ip, &old_pubkey), now);
+        assert!(matches!(first.as_slice(), [DiscoveryAction::Add(_)]));
+
+        let mut unrelated = advertisement(&peer.id, &peer.mesh_ip, &new_pubkey);
+        let actions = engine.observe(unrelated.clone(), now);
+        assert!(
+            matches!(actions.as_slice(), [DiscoveryAction::Unauthorized { .. }]),
+            "a key change without a previous key is not authorized: {actions:?}"
+        );
+
+        unrelated.previous_pubkeys = vec![old_pubkey.clone()];
+        let actions = engine.observe(unrelated, now);
+        assert!(
+            matches!(actions.as_slice(), [DiscoveryAction::KeyRotated { .. }]),
+            "a grace advertisement must rotate the peer: {actions:?}"
+        );
+        assert_eq!(engine.counters().rotated, 1);
+        assert_eq!(engine.peer(&peer.id).unwrap().node.wg_pubkey.0, new_pubkey);
+
+        // The in-memory trust entry follows the rotation, so a later
+        // advertisement of the new key needs no previous-key field. Dropping
+        // the grace field is an ordinary update, not another conflict.
+        let actions = engine.observe(advertisement(&peer.id, &peer.mesh_ip, &new_pubkey), now);
+        assert!(
+            matches!(actions.as_slice(), [DiscoveryAction::Update { .. }]),
+            "an advertisement without the grace field updates the peer: {actions:?}"
+        );
     }
 
     #[test]

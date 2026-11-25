@@ -28,7 +28,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -41,6 +41,7 @@ use crate::dataplane::{
 use crate::discovery::{normalize_capabilities, validate_peer_node};
 use crate::manager::{PeerChange, PeerOrigin, PeerStatus};
 use crate::node::{MeshNode, WgPrivateKey};
+use crate::rotation::{validate_grace, KeyRotation, RotationSchedule, RotationStatus};
 
 /// Default kernel WireGuard interface name.
 pub const DEFAULT_KERNEL_INTERFACE: &str = "ozma0";
@@ -278,7 +279,10 @@ struct Inner {
 /// Programmable kernel WireGuard link.
 pub struct KernelWireguard {
     settings: KernelWgSettings,
-    private_key: WgPrivateKey,
+    /// Local key lineage. Private keys never appear in `Debug` or status.
+    rotation: Mutex<KeyRotation>,
+    /// Serialises multi-command rotations.
+    rotation_op: Mutex<()>,
     /// Explicit underlay endpoints for static peers, keyed by node id. The
     /// mesh IP remains the overlay identity; this only selects transport.
     peer_endpoints: BTreeMap<String, SocketAddr>,
@@ -294,7 +298,7 @@ impl fmt::Debug for KernelWireguard {
         formatter
             .debug_struct("KernelWireguard")
             .field("settings", &self.settings)
-            .field("private_key", &"[redacted]")
+            .field("rotation", &self.rotation)
             .field("secret_path", &"[redacted]")
             .finish_non_exhaustive()
     }
@@ -364,7 +368,8 @@ impl KernelWireguard {
         }
         Self {
             settings,
-            private_key,
+            rotation: Mutex::new(KeyRotation::new(private_key)),
+            rotation_op: Mutex::new(()),
             peer_endpoints,
             configuration_error,
             runner,
@@ -552,6 +557,29 @@ impl KernelWireguard {
         capabilities: Vec<String>,
         underlay_ip: Option<Ipv4Addr>,
     ) -> Result<PeerChange, DataplaneError> {
+        self.add_discovered_peer_inner(node, capabilities, underlay_ip, &[])
+    }
+
+    /// Update a discovered peer whose advertised public key rotated during a
+    /// grace window.  The change is accepted only when the currently
+    /// registered key is listed as previous.
+    pub fn add_discovered_peer_rotated(
+        &self,
+        node: MeshNode,
+        capabilities: Vec<String>,
+        underlay_ip: Option<Ipv4Addr>,
+        previous_public_keys: Vec<String>,
+    ) -> Result<PeerChange, DataplaneError> {
+        self.add_discovered_peer_inner(node, capabilities, underlay_ip, &previous_public_keys)
+    }
+
+    fn add_discovered_peer_inner(
+        &self,
+        node: MeshNode,
+        capabilities: Vec<String>,
+        underlay_ip: Option<Ipv4Addr>,
+        allowed_previous_keys: &[String],
+    ) -> Result<PeerChange, DataplaneError> {
         if self.lock().state != DataplaneState::Running {
             return Err(DataplaneError::not_running(
                 "kernel WireGuard is not running; start it before adding peers",
@@ -577,13 +605,21 @@ impl KernelWireguard {
                 ));
             }
             if existing.node.wg_pubkey != node.wg_pubkey {
-                return Err(DataplaneError::new(
-                    "mesh.peer-conflict",
-                    format!(
-                        "discovered peer {} changed WireGuard public key while registered",
-                        node.id
-                    ),
-                ));
+                let authorized_previous = allowed_previous_keys
+                    .iter()
+                    .any(|key| key == &existing.node.wg_pubkey.0);
+                if !authorized_previous {
+                    return Err(DataplaneError::new(
+                        "mesh.peer-conflict",
+                        format!(
+                            "discovered peer {} changed WireGuard public key while registered",
+                            node.id
+                        ),
+                    ));
+                }
+                // A WireGuard peer entry is keyed by public key; remove the old
+                // key before programming the new one.
+                self.run_teardown(&peer_remove_spec(&self.settings.interface, &existing.node))?;
             }
             if existing.node == node
                 && existing.capabilities == capabilities
@@ -732,7 +768,13 @@ impl KernelWireguard {
             )
         };
         let running = state == DataplaneState::Running;
-        let mut public_key = self.private_key.public_key().0;
+        let mut public_key = self
+            .rotation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .current_public()
+            .0
+            .clone();
         let mut listen_port = self.settings.listen_port;
         let mut last_error = error;
         let mut peers = Vec::new();
@@ -898,8 +940,19 @@ impl KernelWireguard {
     }
 
     fn install_private_key(&self) -> Result<(), DataplaneError> {
+        let key = self
+            .rotation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .current_private()
+            .clone();
+        self.install_private_key_with(&key)
+    }
+
+    /// Program one explicit private key.  Used by rotation and rollback.
+    fn install_private_key_with(&self, private_key: &WgPrivateKey) -> Result<(), DataplaneError> {
         self.sysfs
-            .write_secret(&self.secret_path, &self.private_key.to_base64())
+            .write_secret(&self.secret_path, &private_key.to_base64())
             .map_err(|error| {
                 DataplaneError::unavailable(format!(
                     "cannot write the temporary WireGuard private-key file: {error}"
@@ -921,6 +974,106 @@ impl KernelWireguard {
             warn!("cannot remove temporary WireGuard private-key file: {error}");
         }
         result
+    }
+
+    /// Secret-free key rotation status.
+    pub fn rotation_status(&self) -> RotationStatus {
+        self.rotation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .status(Instant::now())
+    }
+
+    /// Report a scheduled-rotation policy (the node owns the timer).
+    pub fn set_rotation_schedule(&self, schedule: Option<RotationSchedule>) {
+        self.rotation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_schedule(schedule);
+    }
+
+    /// Rotate the kernel interface key and re-apply every peer configuration.
+    ///
+    /// Kernel WireGuard has one interface private key, so the old key cannot
+    /// stay simultaneously active for inbound packets.  It is retained for the
+    /// grace window and used for an automatic rollback if any `wg set` fails;
+    /// the userspace backend is the one that keeps both tunnels live.  A
+    /// failure leaves the old key installed and returns a typed
+    /// `mesh.rotation-failed`.
+    pub fn rotate_keys(&self, grace: Duration) -> Result<RotationStatus, DataplaneError> {
+        let grace = validate_grace(grace)
+            .map_err(|reason| DataplaneError::new("mesh.rotation-invalid", reason))?;
+        if self.lock().state != DataplaneState::Running {
+            return Err(DataplaneError::not_running(
+                "kernel WireGuard is not running; start it before rotating keys",
+            ));
+        }
+        let _operation = self
+            .rotation_op
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        {
+            let mut rotation = self
+                .rotation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            rotation.expire(Instant::now());
+        }
+
+        let records: Vec<PeerRecord> = self.lock().peers.values().cloned().collect();
+        let old_key = self
+            .rotation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .current_private()
+            .clone();
+        let new_key = WgPrivateKey::generate();
+        if new_key.public_key() == old_key.public_key() {
+            return Err(DataplaneError::new(
+                "mesh.rotation-failed",
+                "generated key equals the current key; rotation aborted",
+            ));
+        }
+
+        self.install_private_key_with(&new_key)?;
+
+        for record in &records {
+            if let Err(error) = self.run(&peer_set_spec(&self.settings, record)) {
+                // Roll back both the interface key and every peer we already
+                // re-applied. The interface stays running on the old key.
+                let rollback_key = self.install_private_key_with(&old_key);
+                for record in &records {
+                    let _ = self.run(&peer_set_spec(&self.settings, record));
+                }
+                let mut reason = format!(
+                    "peer {} could not be updated after the key change: {}",
+                    record.node.id, error.reason
+                );
+                if let Err(rollback) = rollback_key {
+                    reason.push_str(&format!("; rollback failed: {}", rollback.reason));
+                }
+                let failure = DataplaneError::new("mesh.rotation-failed", reason);
+                self.lock().error = Some(failure.clone());
+                warn!(%failure.reason, "kernel WireGuard key rotation rolled back");
+                return Err(failure);
+            }
+        }
+
+        let status = self
+            .rotation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .begin(new_key, grace, Instant::now(), SystemTime::now());
+        self.lock().error = None;
+        info!(
+            interface = %self.settings.interface,
+            key_id = status.key_id,
+            fingerprint = %status.fingerprint,
+            grace_secs = status.grace_secs,
+            "kernel WireGuard key rotated"
+        );
+        Ok(status)
     }
 
     fn wg_dump(&self) -> Result<WgDump, DataplaneError> {
@@ -1008,7 +1161,13 @@ impl KernelWireguard {
                 ),
             ));
         }
-        if candidate.wg_pubkey == self.private_key.public_key() {
+        if candidate.wg_pubkey
+            == *self
+                .rotation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .current_public()
+        {
             return Err(DataplaneError::new(
                 "mesh.peer-conflict",
                 "advertised public key is this node's own key",
@@ -1916,5 +2075,169 @@ mod tests {
         runner.clear();
         kernel.stop().unwrap();
         assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn rotate_reprograms_every_peer_and_reports_public_status() {
+        let (kernel, runner, sysfs) = kernel(
+            settings(),
+            vec![
+                peer("a", PEER_A, "10.200.9.2"),
+                peer("b", PEER_B, "10.200.9.3"),
+            ],
+            FakeSysfs::rooted(),
+        );
+        kernel.start().unwrap();
+        let before = kernel.status().public_key;
+        runner.clear();
+        sysfs.writes.lock().unwrap().clear();
+
+        let status = kernel.rotate_keys(Duration::from_secs(30)).unwrap();
+        assert_eq!(status.key_id, 2);
+        assert_ne!(status.public_key, before);
+        assert_eq!(status.grace_secs, 30);
+        assert!(status.grace_remaining_secs.is_some());
+        assert_eq!(kernel.rotation_status().public_key, status.public_key);
+
+        let calls = runner.calls();
+        let key_sets = calls
+            .iter()
+            .filter(|call| {
+                call.program == "wg"
+                    && call.args.first().map(String::as_str) == Some("set")
+                    && call.args.get(2).map(String::as_str) == Some("private-key")
+            })
+            .count();
+        assert_eq!(
+            key_sets, 1,
+            "rotation installs exactly one new interface key"
+        );
+        let peer_sets = calls
+            .iter()
+            .filter(|call| {
+                call.program == "wg" && call.args.get(2).map(String::as_str) == Some("peer")
+            })
+            .count();
+        assert_eq!(peer_sets, 2, "every static peer is re-applied");
+        for call in &calls {
+            assert!(!call.args.iter().any(|arg| arg.contains(TEST_PRIVATE)));
+        }
+        assert!(!format!("{kernel:?}").contains(TEST_PRIVATE));
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(!serialized.contains(TEST_PRIVATE));
+        assert!(!serialized.contains("private"));
+        assert!(
+            sysfs
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, contents)| contents != TEST_PRIVATE),
+            "rotation must never rewrite the previous key file"
+        );
+    }
+
+    #[test]
+    fn rotate_failure_reinstalls_the_old_key_and_peers() {
+        let (kernel, runner, sysfs) = kernel(
+            settings(),
+            vec![
+                peer("a", PEER_A, "10.200.9.2"),
+                peer("b", PEER_B, "10.200.9.3"),
+            ],
+            FakeSysfs::rooted(),
+        );
+        kernel.start().unwrap();
+        let before = kernel.rotation_status().public_key;
+        let failing = cmd(
+            "wg",
+            &[
+                "set",
+                "ozma0",
+                "peer",
+                PEER_B,
+                "allowed-ips",
+                "10.200.9.3/32",
+                "endpoint",
+                "10.200.9.3:51820",
+                "persistent-keepalive",
+                "25",
+            ],
+        );
+        runner.fail_on(failing);
+        let error = kernel.rotate_keys(Duration::from_secs(30)).unwrap_err();
+        assert_eq!(error.code, "mesh.rotation-failed");
+        assert_eq!(
+            kernel.rotation_status().public_key,
+            before,
+            "a failed peer update must roll the interface key back"
+        );
+        assert_eq!(kernel.rotation_status().key_id, 1);
+        let old_key_writes = sysfs
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, contents)| contents == TEST_PRIVATE)
+            .count();
+        assert!(
+            old_key_writes >= 2,
+            "start plus rollback must reinstall the previous key"
+        );
+    }
+
+    #[test]
+    fn kernel_grace_expiry_drops_the_previous_key() {
+        let (kernel, _runner, _sysfs) = kernel(
+            settings(),
+            vec![peer("a", PEER_A, "10.200.9.2")],
+            FakeSysfs::rooted(),
+        );
+        kernel.start().unwrap();
+        kernel.rotate_keys(Duration::from_secs(30)).unwrap();
+        assert!(kernel.rotation_status().grace_remaining_secs.is_some());
+        {
+            let mut rotation = kernel.rotation.lock().unwrap();
+            assert!(rotation.expire(Instant::now() + Duration::from_secs(31)));
+        }
+        let status = kernel.rotation_status();
+        assert_eq!(status.grace_remaining_secs, None);
+        assert_eq!(status.previous_fingerprint, None);
+    }
+
+    #[test]
+    fn kernel_discovered_key_rotation_replaces_the_peer_entry() {
+        let (kernel, runner, _sysfs) = kernel(settings(), Vec::new(), FakeSysfs::rooted());
+        kernel.start().unwrap();
+        let old = peer("a", PEER_A, "10.200.9.2");
+        kernel
+            .add_discovered_peer(old.clone(), Vec::new(), None)
+            .unwrap();
+
+        let error = kernel
+            .add_discovered_peer(peer("a", PEER_C, "10.200.9.2"), Vec::new(), None)
+            .unwrap_err();
+        assert_eq!(error.code, "mesh.peer-conflict");
+
+        let mut rotated = old.clone();
+        rotated.wg_pubkey = WgPublicKey(PEER_C.to_owned());
+        let change = kernel
+            .add_discovered_peer_rotated(
+                rotated.clone(),
+                Vec::new(),
+                None,
+                vec![old.wg_pubkey.0.clone()],
+            )
+            .unwrap();
+        assert!(matches!(change, PeerChange::Updated { .. }));
+        assert!(kernel
+            .peer_statuses()
+            .iter()
+            .any(|peer| peer.node.wg_pubkey == rotated.wg_pubkey));
+        assert!(runner.calls().iter().any(|call| {
+            call.args.first().map(String::as_str) == Some("set")
+                && call.args.get(3).map(String::as_str) == Some(PEER_A)
+                && call.args.last().map(String::as_str) == Some("remove")
+        }));
     }
 }

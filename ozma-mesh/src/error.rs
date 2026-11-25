@@ -35,6 +35,12 @@ pub enum MeshError {
     #[error("mesh peer discovery conflict: {0}")]
     DiscoveryConflict(String),
 
+    #[error("mesh key rotation failed: {0}")]
+    RotationFailed(String),
+
+    #[error("invalid mesh key rotation request: {0}")]
+    RotationInvalid(String),
+
     #[error("Mesh dataplane error: {0}")]
     Dataplane(String),
 

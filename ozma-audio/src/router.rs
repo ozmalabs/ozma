@@ -88,12 +88,17 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard, PoisonError,
     },
+    time::Instant,
 };
 
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::eq::{
+    eq_unsupported, RoomEqApplication, RoomEqSpec, TempEqConfig, EQ_LOAD_TIMEOUT, EQ_POLL_INTERVAL,
+    PIPEWIRE,
+};
 use crate::error::AudioError;
 use crate::graph::{read_graph, AudioGraphSnapshot};
 use crate::sweep::{run_sweep, sweep_unsupported, SweepIo, SweepOutcome, SweepRequest};
@@ -840,6 +845,27 @@ pub trait AudioRouter: Send + Sync {
         let _ = request;
         Err(sweep_unsupported())
     }
+
+    /// Insert a reversible room-correction filter chain targeting one sink.
+    ///
+    /// The default refuses without loading a module. The PipeWire router loads
+    /// a generated `libpipewire-module-filter-chain` inside a short-lived
+    /// `pipewire -c` client and reports the explicit EQ sink. Nothing is moved
+    /// onto it implicitly and no default device is changed.
+    async fn apply_room_eq(&self, spec: RoomEqSpec) -> Result<RoomEqApplication, AudioError> {
+        spec.validate()?;
+        Err(eq_unsupported("apply_room_eq"))
+    }
+
+    /// Remove the active filter chain. `Ok(None)` means none was loaded.
+    async fn remove_room_eq(&self) -> Result<Option<RoomEqApplication>, AudioError> {
+        Err(eq_unsupported("remove_room_eq"))
+    }
+
+    /// The in-process active filter-chain record, when one is loaded.
+    async fn room_eq_application(&self) -> Result<Option<RoomEqApplication>, AudioError> {
+        Err(eq_unsupported("room_eq_application"))
+    }
 }
 
 /// Configuration shared by both routers.
@@ -892,6 +918,13 @@ struct AppliedSourceProfile {
     mute_applied: bool,
 }
 
+struct ActiveEq {
+    application: RoomEqApplication,
+    child: ChildId,
+    /// Owns the generated config file and removes it on drop.
+    _config: TempEqConfig,
+}
+
 struct RouterCore {
     runner: Arc<dyn CommandRunner>,
     config: RouterConfig,
@@ -899,6 +932,7 @@ struct RouterCore {
     profiles: Mutex<HashMap<String, AppliedProfile>>,
     source_profiles: Mutex<HashMap<String, AppliedSourceProfile>>,
     playback: tokio::sync::Mutex<Option<ChildId>>,
+    active_eq: tokio::sync::Mutex<Option<ActiveEq>>,
 }
 
 impl RouterCore {
@@ -910,6 +944,7 @@ impl RouterCore {
             profiles: Mutex::new(HashMap::new()),
             source_profiles: Mutex::new(HashMap::new()),
             playback: tokio::sync::Mutex::new(None),
+            active_eq: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -1317,6 +1352,111 @@ impl RouterCore {
         };
         run_sweep(request, io.as_ref()).await
     }
+
+    async fn apply_room_eq(&self, spec: RoomEqSpec) -> Result<RoomEqApplication, AudioError> {
+        spec.validate()?;
+        if self.tool != PlaybackTool::PipeWire {
+            return Err(eq_unsupported("apply_room_eq"));
+        }
+        if !self.sink_exists(&spec.target_sink).await? {
+            return Err(AudioError::Refused {
+                operation: "apply_room_eq".to_owned(),
+                reason: format!("target sink `{}` does not exist", spec.target_sink),
+                remediation: "Create or select an existing sink first (for example with \
+                              AudioRouter::ensure_sink). No filter chain was loaded and no \
+                              graph change was made."
+                    .to_owned(),
+            });
+        }
+        if self.sink_exists(&spec.eq_sink).await? {
+            return Err(AudioError::Refused {
+                operation: "apply_room_eq".to_owned(),
+                reason: format!("EQ sink `{}` already exists", spec.eq_sink),
+                remediation: "Remove the existing Ozma EQ first, or retry; a filter chain is \
+                              never allowed to adopt or replace an unrelated sink. No module \
+                              was loaded."
+                    .to_owned(),
+            });
+        }
+
+        // Replacing an existing application is explicit and ordered: unload the
+        // old chain first so a failed new load cannot leave two filters behind.
+        let _previous = self.take_room_eq().await?;
+
+        let config = TempEqConfig::write(&spec.filter_chain_config()?)?;
+        let config_path = config.path().display().to_string();
+        let argv = vec![
+            PIPEWIRE.to_owned(),
+            "-c".to_owned(),
+            config.path().display().to_string(),
+        ];
+        let child = self.runner.spawn(&argv).await?;
+
+        let deadline = Instant::now() + EQ_LOAD_TIMEOUT;
+        loop {
+            match self.sink_exists(&spec.eq_sink).await {
+                Ok(true) => break,
+                Ok(false) if Instant::now() < deadline => {
+                    tokio::time::sleep(EQ_POLL_INTERVAL).await;
+                }
+                Ok(false) => {
+                    let _ = self.runner.kill(child).await;
+                    return Err(AudioError::Process {
+                        command: format!("{PIPEWIRE} -c {config_path}"),
+                        message: format!(
+                            "filter chain did not publish sink `{}` within {} seconds",
+                            spec.eq_sink,
+                            EQ_LOAD_TIMEOUT.as_secs_f64()
+                        ),
+                    });
+                }
+                Err(error) => {
+                    let _ = self.runner.kill(child).await;
+                    return Err(error);
+                }
+            }
+        }
+
+        let application = RoomEqApplication::from_spec(&spec, child.0);
+        *self.active_eq.lock().await = Some(ActiveEq {
+            application: application.clone(),
+            child,
+            _config: config,
+        });
+        Ok(application)
+    }
+
+    async fn take_room_eq(&self) -> Result<Option<ActiveEq>, AudioError> {
+        let active = self.active_eq.lock().await.take();
+        match active {
+            Some(active) => {
+                self.runner.kill(active.child).await?;
+                Ok(Some(active))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn remove_room_eq(&self) -> Result<Option<RoomEqApplication>, AudioError> {
+        if self.tool != PlaybackTool::PipeWire {
+            return Err(eq_unsupported("remove_room_eq"));
+        }
+        match self.take_room_eq().await? {
+            Some(active) => Ok(Some(active.application)),
+            None => Ok(None),
+        }
+    }
+
+    async fn room_eq_application(&self) -> Option<RoomEqApplication> {
+        if self.tool != PlaybackTool::PipeWire {
+            return None;
+        }
+        self.active_eq
+            .lock()
+            .await
+            .as_ref()
+            .map(|active| active.application.clone())
+    }
 }
 
 /// PipeWire-side router: `pactl` for graph management, `pw-play` for tracks.
@@ -1445,6 +1585,21 @@ macro_rules! impl_audio_router {
 
             async fn sweep(&self, request: SweepRequest) -> Result<SweepOutcome, AudioError> {
                 self.core.sweep(request).await
+            }
+
+            async fn apply_room_eq(
+                &self,
+                spec: RoomEqSpec,
+            ) -> Result<RoomEqApplication, AudioError> {
+                self.core.apply_room_eq(spec).await
+            }
+
+            async fn remove_room_eq(&self) -> Result<Option<RoomEqApplication>, AudioError> {
+                self.core.remove_room_eq().await
+            }
+
+            async fn room_eq_application(&self) -> Result<Option<RoomEqApplication>, AudioError> {
+                Ok(self.core.room_eq_application().await)
             }
         }
     };
@@ -1685,12 +1840,20 @@ mod tests {
         spawns: Mutex<Vec<Vec<String>>>,
         killed: Mutex<Vec<ChildId>>,
         next_child: AtomicU64,
+        spawn_error: Option<AudioError>,
     }
 
     impl FakeRunner {
         fn with_responses(responses: Vec<Result<CommandOutput, AudioError>>) -> Self {
             Self {
                 responses: Mutex::new(responses.into()),
+                ..Self::default()
+            }
+        }
+
+        fn with_spawn_error(error: AudioError) -> Self {
+            Self {
+                spawn_error: Some(error),
                 ..Self::default()
             }
         }
@@ -1727,6 +1890,9 @@ mod tests {
 
         async fn spawn(&self, argv: &[String]) -> Result<ChildId, AudioError> {
             lock(&self.spawns).push(argv.to_vec());
+            if let Some(error) = &self.spawn_error {
+                return Err(error.clone());
+            }
             let id = self.next_child.fetch_add(1, Ordering::Relaxed) + 1;
             Ok(ChildId(id))
         }
@@ -2528,6 +2694,156 @@ mod tests {
             fake.spawns().is_empty(),
             "a missing sink must not reach pw-play/paplay"
         );
+    }
+
+    fn eq_spec(eq_sink: &str) -> RoomEqSpec {
+        RoomEqSpec {
+            profile_id: "sweep-test".to_owned(),
+            target_sink: "ozma-vm1".to_owned(),
+            eq_sink: eq_sink.to_owned(),
+            bands: vec![
+                crate::sweep::SweepBand {
+                    freq: 63.0,
+                    gain: 3.0,
+                    q: 1.0,
+                    band_type: "low_shelf".to_owned(),
+                },
+                crate::sweep::SweepBand {
+                    freq: 1_000.0,
+                    gain: -2.5,
+                    q: 1.4,
+                    band_type: "peaking".to_owned(),
+                },
+            ],
+            rate: 48_000,
+            channels: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_room_eq_spawns_pipewire_and_removes_the_child() {
+        let fake = Arc::new(FakeRunner::with_responses(vec![
+            Ok(sink_list("ozma-vm1")),
+            Ok(CommandOutput::success("")),
+            Ok(sink_list("ozma-eq-sweep-test-1")),
+        ]));
+        let router = pipewire(fake.clone());
+        let spec = eq_spec("ozma-eq-sweep-test-1");
+
+        let application = router.apply_room_eq(spec.clone()).await.unwrap();
+
+        assert_eq!(application.profile_id, "sweep-test");
+        assert_eq!(application.target_sink, "ozma-vm1");
+        assert_eq!(application.eq_sink, "ozma-eq-sweep-test-1");
+        assert_eq!(application.module_id, 1);
+        assert_eq!(application.active_bands, 2);
+        assert_eq!(application.bands, spec.bands);
+        assert_eq!(application.insertion, crate::eq::EQ_INSERTION);
+        assert_eq!(
+            router.room_eq_application().await.unwrap(),
+            Some(application.clone())
+        );
+
+        let spawns = fake.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0][0], "pipewire");
+        assert_eq!(spawns[0][1], "-c");
+        let config_path = PathBuf::from(&spawns[0][2]);
+        assert!(
+            config_path.is_file(),
+            "the generated config must exist while active"
+        );
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(config.contains("filter.smart.target = { node.name = \"ozma-vm1\" }"));
+        assert!(config.contains("label = bq_peaking"));
+
+        let removed = router.remove_room_eq().await.unwrap();
+        assert_eq!(
+            removed.as_ref().map(|app| app.eq_sink.as_str()),
+            Some("ozma-eq-sweep-test-1")
+        );
+        assert_eq!(fake.killed(), vec![ChildId(1)]);
+        assert!(
+            !config_path.exists(),
+            "removal must delete the generated config"
+        );
+        assert_eq!(router.room_eq_application().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn apply_room_eq_spawn_failure_removes_the_config_and_leaves_no_state() {
+        let fake = Arc::new(FakeRunner::with_spawn_error(AudioError::MissingCommand {
+            command: "pipewire".to_owned(),
+            remediation: "install pipewire".to_owned(),
+        }));
+        fake.responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(sink_list("ozma-vm1")));
+        fake.responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(CommandOutput::success("")));
+        let router = pipewire(fake.clone());
+
+        let error = router
+            .apply_room_eq(eq_spec("ozma-eq-sweep-test-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AudioError::MissingCommand { .. }));
+        assert_eq!(router.room_eq_application().await.unwrap(), None);
+        assert!(fake.killed().is_empty(), "nothing was spawned to kill");
+        let spawns = fake.spawns();
+        assert_eq!(spawns.len(), 1);
+        let config_path = PathBuf::from(&spawns[0][2]);
+        assert!(
+            !config_path.exists(),
+            "a failed spawn must remove the generated config"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_room_eq_refuses_missing_targets_and_sink_collisions_without_spawning() {
+        // Missing target sink: one sink list, no spawn.
+        let fake = Arc::new(FakeRunner::with_responses(vec![Ok(
+            CommandOutput::success(""),
+        )]));
+        let router = pipewire(fake.clone());
+        let error = router
+            .apply_room_eq(eq_spec("ozma-eq-sweep-test-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AudioError::Refused { .. }));
+        assert!(fake.spawns().is_empty());
+
+        // Existing EQ sink: refuse to adopt or replace it, no spawn.
+        let fake = Arc::new(FakeRunner::with_responses(vec![
+            Ok(sink_list("ozma-vm1")),
+            Ok(sink_list("ozma-eq-sweep-test-1")),
+        ]));
+        let router = pipewire(fake.clone());
+        let error = router
+            .apply_room_eq(eq_spec("ozma-eq-sweep-test-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AudioError::Refused { .. }));
+        assert!(fake.spawns().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pulseaudio_does_not_claim_filter_chain_support() {
+        let fake = Arc::new(FakeRunner::default());
+        let router = PulseAudioAudioRouter::new(fake.clone());
+        let error = router
+            .apply_room_eq(eq_spec("ozma-eq-sweep-test-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AudioError::Unsupported { .. }));
+        assert!(fake.spawns().is_empty());
+        assert!(matches!(
+            router.remove_room_eq().await,
+            Err(AudioError::Unsupported { .. })
+        ));
     }
 
     #[test]

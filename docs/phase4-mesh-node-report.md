@@ -21,6 +21,11 @@ This change wires the existing `ozma-mesh` crate into `ozma-node` as an
   exact `ip`/`wg` argv, redacted key handling, `wg show dump` status parsing,
   peer add/remove, rollback, and typed root/module/tool failures. See
   [`phase4-mesh-kernel-report.md`](phase4-mesh-kernel-report.md).
+* `ozma-mesh` / `ozma-node`: WireGuard key rotation with a bounded grace
+  window, peer/link updates for every static and discovered peer, rollback on
+  failure, `POST /api/v1/connect/rotate`, rotation status, and optional
+  scheduled rotation. See
+  [`phase4-mesh-rotation-report.md`](phase4-mesh-rotation-report.md).
 * `controller/api.py`: node-scoped mesh/Connect passthrough routes that send the
   node bearer token and preserve typed `supported:false` responses.
 * Tests: in-memory fake mesh backend, fake dataplane command/sysfs seams, node
@@ -68,6 +73,9 @@ the controller only adds new node-scoped routes and returns the node's plain
 | `--mesh-prefix-len` | `OZMA_MESH_PREFIX_LEN` | Mesh prefix length (default `24`). |
 | `--mesh-dataplane-nat` | `OZMA_MESH_DATAPLANE_NAT` | Explicitly opt in to nftables masquerade (requires `nft`). |
 | `--mesh-nat-out` | `OZMA_MESH_NAT_OUT` | NAT egress interface; without it, non-mesh egress is masqueraded. |
+| `--mesh-rotate-hours` | `OZMA_MESH_ROTATE_HOURS` | Scheduled key rotation interval. `0` (default) disables it; a non-zero value must be `1..=720` hours. |
+| `--mesh-rotate-jitter-secs` | `OZMA_MESH_ROTATE_JITTER_SECS` | Random jitter added to each scheduled rotation (default `300`, max `3600`). |
+| `--mesh-rotate-grace-secs` | `OZMA_MESH_ROTATE_GRACE_SECS` | Grace window for the previous key after a rotation (default `90`, bounded `5..=600`). |
 
 The private key is only read from the key file; it is never serialized, logged,
 or included in any status document. `MeshIdentity` contains the public key only.
@@ -203,6 +211,64 @@ Discovery status appears next to the dataplane/pump documents:
 Discovery events use the bounded event log: `peer-discovered`, `peer-removed`,
 `route`, and `conflict` (refusals), plus `error` for programming failures.
 
+### Key rotation and grace window
+
+`POST /api/v1/connect/rotate` (bearer-guarded like the other control routes)
+requires an explicit `{"confirm":true}` body. An optional `grace_secs` selects a
+window bounded to `5..=600` seconds; the default is 90. Rotation also runs
+automatically only when `--mesh-rotate-hours` is non-zero; the scheduler adds
+`0..=--mesh-rotate-jitter-secs` and stops with the service.
+
+Userspace backend:
+
+1. a fresh X25519 keypair is generated;
+2. every static/discovered peer gets a new boringtun tunnel under the new local
+   key; if any tunnel cannot be created, nothing is committed and
+   `mesh.rotation-failed` is returned;
+3. the advertisement is re-registered with the new `pubkey` and the old key as
+   `prev_pubkey`; an mDNS failure also rolls back;
+4. the old tunnels are retained as grace tunnels. Datagrams/handshakes that the
+   new tunnel rejects are retried on the old tunnel until the window expires;
+5. expiry drops the old tunnels and re-advertises without `prev_pubkey`.
+
+Kernel backend: the interface key is replaced and every `wg set peer` entry is
+re-applied. A peer failure reinstalls the previous key and peer configuration
+and returns `mesh.rotation-failed`. Kernel WireGuard has one interface key, so
+the previous key is retained for rollback/status rather than kept concurrently
+usable for inbound packets; the userspace backend is the one with true dual-key
+grace. The kernel `KernelWireguard::rotation_status` and node status never
+include private material.
+
+Rotation status is exposed as `rotation` in `/api/v1/connect/status`:
+
+```json
+"rotation": {
+  "key_id": 2,
+  "public_key": "8yIK...sDA=",
+  "fingerprint": "wg:5114a2e59eee9610",
+  "last_rotation_unix_ms": 1795621408539,
+  "grace_remaining_secs": 56,
+  "previous_fingerprint": "wg:66313a5af39cba92",
+  "grace_secs": 60,
+  "scheduled": {
+    "interval_hours": 24,
+    "jitter_secs": 300,
+    "grace_secs": 90,
+    "next_rotation_unix_ms": 1795707800000
+  }
+}
+```
+
+Only public keys/fingerprints, generation, timestamps, and schedule bounds are
+reported. Private keys are absent from status, events, argv, and logs.
+
+For discovery, a peer may change its WireGuard public key only when its mDNS
+TXT record carries a `prev_pubkey` matching the currently trusted/known key.
+The discovery engine emits `DiscoveryAction::KeyRotated`, which updates the peer
+entry and re-initiates the handshake. A key change without that proof remains a
+`mesh.peer-conflict`. A static `--mesh-peer` entry is still authoritative and is
+never replaced by a rotation advertisement.
+
 Typed prerequisites (`MeshServiceError.code`):
 
 | Code | Meaning |
@@ -216,6 +282,10 @@ Typed prerequisites (`MeshServiceError.code`):
 | `mesh.wireguard-unavailable` | No usable userspace or kernel backend. |
 | `mesh.peer-invalid` | Configured peer JSON/address or `--mesh-peer-endpoint` entry is invalid. |
 | `mesh.discovery-invalid` | Discovery bounds or a `--mesh-trust` entry is invalid. |
+| `mesh.rotation-invalid` | Rotation grace/interval/jitter is outside its bounds, or the request grace is invalid. |
+| `mesh.rotation-failed` | A peer/link could not be updated; the backend rolled back to the old key. |
+| `mesh.rotation-unconfirmed` | The rotate route was called without `{"confirm":true}`. |
+| `mesh.rotation-unsupported` | The selected backend does not implement rotation. |
 | `mesh.peer-conflict` | A discovered advertisement conflicts with a static/other peer. |
 | `mesh.peer-unauthorized` | An advertisement lacks a matching key/host authorization. |
 | `mesh.peer-already-exists` / `mesh.peer-not-found` | Typed peer-table errors. |
@@ -234,23 +304,29 @@ not fabricate peers.
 
 ## Node routes
 
-All three routes are merged into `controller_compat::compat_router` **before**
+All four routes are merged into `controller_compat::compat_router` **before**
 the node API bearer layer, so they use the same `--api-token` guard as
 `/input/*`, `/power/*`, `/codec`, and `/usb`.
 
 * `GET /api/v1/connect/status`
 * `GET /api/v1/connect/peers`
 * `GET /api/v1/connect/events?limit=N`
+* `POST /api/v1/connect/rotate` (`{"confirm":true,"grace_secs":90}`)
+
+Rotation responses are `200` on success (`rotation` object), `400` for an
+unconfirmed/invalid request, `409` while the service is stopped, `501` for an
+unsupported backend, and `500` with a typed `mesh.rotation-failed` when a peer
+update was rolled back.
 
 Status includes:
 
 * `capability:"mesh"`, `capabilities:["/api/v1/connect/status",
-  "/api/v1/connect/peers","/api/v1/connect/events"]` (discoverable even while
-  disabled);
+  "/api/v1/connect/peers","/api/v1/connect/events",
+  "/api/v1/connect/rotate"]` (discoverable even while disabled);
 * `enabled`, `state`, `available`, `wireguard` (`userspace-boringtun`, `kernel`,
   `not-configured`, `fake`, or `unavailable`);
-* optional `identity`, `dataplane`, `kernel`, `pump`, `discovery`, `peer_count`,
-  `peers`, `event_count`, `event_capacity`;
+* optional `identity`, `dataplane`, `kernel`, `pump`, `discovery`, `rotation`,
+  `peer_count`, `peers`, `event_count`, `event_capacity`;
 * typed `code`/`reason` when unavailable.
 
 Typed 501 body:
@@ -291,10 +367,10 @@ proxied; a test asserts it still returns the Connect account/tier document.
 
 Run for this change:
 
-* `cargo test -p ozma-mesh -p ozma-node --lib` — **645 passed, 6 ignored**
-  (`ozma-mesh`: 61 passed, 2 ignored; `ozma-node`: 584 passed, 4 ignored).
-* `cargo test -p ozma-node --bin ozma-node mesh_` — **2 passed** (CLI defaults
-  and trust parsing).
+* `cargo test -p ozma-mesh -p ozma-node --lib` — **785 passed, 7 ignored**
+  (`ozma-mesh`: 74 passed, 2 ignored; `ozma-node`: 711 passed, 5 ignored).
+* `cargo test -p ozma-node --bin ozma-node mesh_` — **3 passed** (CLI defaults,
+  trust parsing, and rotation flag bounds).
 * `cargo check -p ozma-mesh -p ozma-node --all-targets` — passes (pre-existing
   warnings only).
 * `rustfmt --edition 2021 --check` on every touched Rust file — passes.
@@ -326,7 +402,10 @@ Coverage includes:
   underlay endpoint override, and node kernel-backend selection/preflight;
 * controller token forwarding, status/capability discovery, typed 501
   passthrough, Python-node 404, auth-failure mapping, and unchanged global
-  Connect status.
+  Connect status;
+* key rotation: userspace rotate/grace/rollback, kernel key reinstall and peer
+  re-apply with rollback, status/API confirmation and bounds, no private-key
+  leakage, authorized discovery key rotation, and scheduled rotation.
 
 No default test requires root, a real WireGuard interface, a real TUN device, a
 network namespace, or a real peer. The live dataplane and live TUN-attach tests
@@ -366,8 +445,24 @@ of the default suite.
   in-memory seams. There is no live multi-node encrypted packet-flow test, and
   the pump is single-queue IPv4-only with no PMTU/ICMP handling. See
   [`phase4-mesh-dataplane-report.md`](phase4-mesh-dataplane-report.md).
-* **No key generation/persistence/rotation.** The operator supplies a key file;
-  the node neither creates one nor persists a generated identity.
+* **Rotation does not persist the key file.** The node rotates its in-memory
+  identity and advertises the new key, but the operator-provided
+  `--mesh-key-file` is not rewritten. A restart resumes the original file key
+  (the key id counter resets); either rewrite the file out of band or rotate
+  again after restart. No generated identity is persisted by this change.
+* **Kernel grace is rollback-only.** Kernel WireGuard exposes one interface
+  private key. A kernel rotation switches that key immediately; the previous
+  key stays in memory for rollback/status until grace expiry but cannot accept
+  old-key handshakes in parallel. Userspace boringtun keeps both tunnels live
+  for the window.
+* **No preshared keys yet.** The grace machinery retains the previous local
+  private key (and the old tunnel). A future PSK would need the same retention
+  point; today every tunnel is created with `preshared_key: None`.
+* **Rotation advertisements are still unauthenticated mDNS.** A key change is
+  accepted only when `prev_pubkey` matches the existing trusted/known key, but
+  mDNS itself has no signature. Trust entries are updated in memory as
+  rotations are observed; a peer restart falls back to the configured key and
+  may reject a later rotation until its trust file is updated.
 * **No controller cloud relay integration.** This wires node-local mesh state
   only. Ozma Connect relay registration, relay mesh IP assignment, controller
   mesh CA pairing, and cloud failover remain Python-side/cloud concerns.

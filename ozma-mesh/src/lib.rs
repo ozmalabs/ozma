@@ -49,6 +49,7 @@ pub mod keys;
 pub mod manager;
 pub mod node;
 pub mod pump;
+pub mod rotation;
 pub mod tunnel;
 
 // Convenience re-exports — `use ozma_mesh::{MeshManager, MeshNode, ...}`.
@@ -71,5 +72,10 @@ pub use node::{MeshNode, WgPrivateKey, WgPublicKey};
 pub use pump::{
     ManagerPacketIo, PacketPump, PumpConfig, PumpError, PumpState, PumpStats, PumpStatus,
     SystemTunProvider, TunIo, TunProvider, TunnelIo,
+};
+pub use rotation::{
+    fingerprint, validate_grace, KeyRotation, RotationSchedule, RotationScheduleStatus,
+    RotationStatus, DEFAULT_GRACE, DEFAULT_ROTATE_JITTER_SECS, MAX_GRACE, MAX_ROTATE_HOURS,
+    MAX_ROTATE_JITTER_SECS, MIN_GRACE, MIN_ROTATE_HOURS,
 };
 pub use tunnel::WgTunnel;

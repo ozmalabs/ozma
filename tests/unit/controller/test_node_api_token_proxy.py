@@ -186,6 +186,13 @@ PROXY_CASES = [
     ("get", f"/api/v1/nodes/{NODE_ID}/hardware/summary", None, "/hardware/summary"),
     ("get", f"/api/v1/nodes/{NODE_ID}/hardware/sensors", None, "/hardware/sensors"),
     ("get", f"/api/v1/nodes/{NODE_ID}/storage", None, "/storage"),
+    ("get", f"/api/v1/nodes/{NODE_ID}/storage/health", None, "/storage/health"),
+    (
+        "get",
+        f"/api/v1/nodes/{NODE_ID}/storage/smart?device=/dev/nvme0n1",
+        None,
+        "/storage/smart",
+    ),
     ("get", f"/api/v1/nodes/{NODE_ID}/apps", None, "/apps"),
     ("get", f"/api/v1/nodes/{NODE_ID}/self", None, "/self"),
     ("get", f"/api/v1/nodes/{NODE_ID}/bluetooth/status", None, "/bluetooth/status"),
@@ -412,6 +419,62 @@ def test_host_surface_proxies_preserve_typed_errors(
     record = fake_node.requests[-1]
     assert record["path"].startswith(node_path)
     assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_storage_health_and_smart_proxies_forward_bounds_and_preserve_typed_errors(
+    fake_node, tmp_path
+):
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+    client = _client(app)
+
+    response = client.get(
+        f"/api/v1/nodes/{NODE_ID}/storage/health?serials=true&attributes=true"
+    )
+    assert response.status_code == 200, response.text
+    record = fake_node.requests[-1]
+    assert record["path"].startswith("/storage/health?serials=true&attributes=true")
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+    response = client.get(
+        f"/api/v1/nodes/{NODE_ID}/storage/smart",
+        params={"device": "/dev/nvme0n1", "serials": "true"},
+    )
+    assert response.status_code == 200, response.text
+    record = fake_node.requests[-1]
+    assert record["path"].startswith("/storage/smart?device=%2Fdev%2Fnvme0n1")
+    assert "serials=true" in record["path"]
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+    invalid = {
+        "ok": False,
+        "available": False,
+        "code": "storage.invalid-device",
+        "error": "the device must name one block device as /dev/<name>",
+    }
+    fake_node.responder = lambda _method, _record: (400, invalid, "application/json")
+    response = client.get(
+        f"/api/v1/nodes/{NODE_ID}/storage/smart?device=/dev/../etc/passwd"
+    )
+    assert response.status_code == 400, response.text
+    assert response.json() == invalid
+    record = fake_node.requests[-1]
+    assert record["path"].startswith("/storage/smart")
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+    unavailable = {
+        "ok": False,
+        "available": False,
+        "code": "storage.smart-unavailable",
+        "error": "smartctl was not found on PATH",
+    }
+    fake_node.responder = lambda _method, _record: (
+        503,
+        unavailable,
+        "application/json",
+    )
+    response = client.get(f"/api/v1/nodes/{NODE_ID}/storage/smart?device=/dev/sda")
+    assert response.status_code == 503, response.text
+    assert response.json() == unavailable
 
 
 def test_rpa_screenshot_still_returns_real_jpeg_bytes(fake_node, tmp_path):
@@ -1347,4 +1410,63 @@ def test_audio_profile_delete_proxies_delete_and_returns_body(fake_node, tmp_pat
     record = fake_node.requests[-1]
     assert record["method"] == "DELETE"
     assert record["path"] == "/audio/room-correction/profile"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_audio_room_eq_apply_proxies_to_the_node_and_preserves_typed_errors(
+    fake_node, tmp_path
+):
+    expected = {
+        "ok": False,
+        "available": False,
+        "active": False,
+        "code": "audio-eq-application-unsupported",
+        "error": "room-correction EQ application is not enabled on this node",
+        "remediation": "Start ozma-node with --audio-router pipewire and --audio-profile-dir.",
+    }
+    fake_node.responder = lambda _method, _record: (501, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        "/api/v1/audio/room-correction/apply",
+        json={"node_id": NODE_ID, "profile_id": "sweep-test", "sink": "ozma-vm1"},
+    )
+
+    assert response.status_code == 501, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "POST"
+    assert record["path"] == "/audio/room-correction/apply"
+    assert record["body"] == {"profile_id": "sweep-test", "sink": "ozma-vm1"}
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_audio_room_eq_remove_proxies_delete_and_returns_the_node_body(
+    fake_node, tmp_path
+):
+    expected = {
+        "ok": True,
+        "available": True,
+        "active": False,
+        "removed": True,
+        "backend": "pipewire",
+        "profile_id": "sweep-test",
+        "eq_sink": "ozma-eq-sweep-test-1",
+        "module_id": 7,
+    }
+    fake_node.responder = lambda _method, _record: (200, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        "/api/v1/audio/room-correction/remove", json={"node_id": NODE_ID}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "DELETE"
+    assert record["path"] == "/audio/room-correction/apply"
+    assert record["body"] is None
     assert record["headers"]["authorization"] == f"Bearer {TOKEN}"

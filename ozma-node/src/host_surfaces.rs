@@ -29,9 +29,10 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
@@ -39,12 +40,22 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
 /// Controller-facing storage surface.
 pub const STORAGE_PATH: &str = "/storage";
 /// Versioned alias for the storage surface.
 pub const STORAGE_API_PATH: &str = "/api/v1/storage";
+/// Per-device SMART and mdraid health.
+pub const STORAGE_HEALTH_PATH: &str = "/storage/health";
+/// Versioned alias for the storage-health surface.
+pub const STORAGE_HEALTH_API_PATH: &str = "/api/v1/storage/health";
+/// One explicitly named block device's normalized SMART health.
+pub const STORAGE_SMART_PATH: &str = "/storage/smart";
+/// Versioned alias for the per-device SMART surface.
+pub const STORAGE_SMART_API_PATH: &str = "/api/v1/storage/smart";
 /// Controller-facing process surface.
 pub const APPS_PATH: &str = "/apps";
 /// Versioned alias for the process surface.
@@ -74,6 +85,41 @@ const MAX_PROCESS_NAME_CHARS: usize = 64;
 const MAX_PROC_FILE_BYTES: u64 = 16 * 1024;
 /// Maximum mount-list read.
 const MAX_MOUNT_BYTES: u64 = 512 * 1024;
+
+/// Largest number of block devices reported by `/storage/health`.
+pub const MAX_BLOCK_DEVICES: usize = 32;
+/// Largest number of md arrays reported by `/storage/health`.
+pub const MAX_MD_ARRAYS: usize = 32;
+/// Largest number of member devices reported per md array.
+pub const MAX_MD_MEMBERS: usize = 64;
+/// Largest number of normalized SMART attributes returned when explicitly
+/// requested with `?attributes=true`.
+pub const MAX_SMART_ATTRIBUTES: usize = 64;
+/// Longest accepted `/dev/<name>` query value.
+const MAX_DEVICE_PATH_CHARS: usize = 128;
+/// Longest accepted block-device basename.
+const MAX_DEVICE_NAME_CHARS: usize = 64;
+/// Longest model string emitted.
+const MAX_MODEL_CHARS: usize = 64;
+/// Longest serial string emitted, and only with explicit `?serials=true`.
+const MAX_SERIAL_CHARS: usize = 64;
+/// Maximum read from one small sysfs fact file.
+const MAX_SYSFS_BYTES: u64 = 4096;
+/// Maximum `/proc/mdstat` read.
+const MAX_MDSTAT_BYTES: u64 = 256 * 1024;
+/// Maximum `mdadm --detail --scan` read.
+const MAX_MDADM_BYTES: usize = 64 * 1024;
+/// Maximum `smartctl` JSON read.
+const MAX_SMART_BYTES: usize = 1024 * 1024;
+/// Maximum `smartctl` stderr retained for a bounded error message.
+const MAX_SMART_STDERR_BYTES: usize = 2048;
+/// `smartctl -j -H -A` deadline per device.
+const SMART_TIMEOUT: Duration = Duration::from_secs(5);
+/// `mdadm --detail --scan` deadline.
+const MDADM_TIMEOUT: Duration = Duration::from_secs(3);
+/// Kernel block devices that are RAM/loop pseudo-disks, not storage health
+/// candidates.
+const PSEUDO_BLOCK_PREFIXES: &[&str] = &["loop", "ram", "zram"];
 
 /// Filesystems that are backed by `/dev` but are still virtual/pseudo mounts.
 const PSEUDO_FILESYSTEMS: &[&str] = &[
@@ -129,6 +175,17 @@ struct HostPaths {
     mounts: PathBuf,
     passwd: PathBuf,
     cgroup: PathBuf,
+    /// `/sys/block` or a fixture equivalent.
+    sys_block: PathBuf,
+    /// `/dev` or a fixture equivalent. Smartctl is always invoked on a path
+    /// rebuilt from a validated basename under this directory.
+    dev_root: PathBuf,
+    /// `/proc/mdstat` or a fixture equivalent.
+    mdstat: PathBuf,
+    /// `smartctl` binary (bare name, looked up on PATH, or absolute).
+    smartctl: PathBuf,
+    /// `mdadm` binary (bare name, looked up on PATH, or absolute).
+    mdadm: PathBuf,
 }
 
 impl HostPaths {
@@ -139,6 +196,11 @@ impl HostPaths {
             passwd: PathBuf::from("/etc/passwd"),
             cgroup: proc_root.join("self/cgroup"),
             proc_root,
+            sys_block: PathBuf::from("/sys/block"),
+            dev_root: PathBuf::from("/dev"),
+            mdstat: PathBuf::from("/proc/mdstat"),
+            smartctl: PathBuf::from("smartctl"),
+            mdadm: PathBuf::from("mdadm"),
         }
     }
 }
@@ -146,6 +208,9 @@ impl HostPaths {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Availability {
     storage: bool,
+    storage_health: bool,
+    smart: bool,
+    md: bool,
     apps: bool,
     self_management: bool,
 }
@@ -207,6 +272,10 @@ fn env_string(name: &str) -> Option<String> {
 pub struct HostSurfaceAdvertisement {
     /// Mounted block filesystems.
     pub storage: HostSurfaceCapability,
+    /// Per-device SMART and mdraid health.
+    pub health: HostSurfaceCapability,
+    /// One explicitly named block device's normalized SMART report.
+    pub smart: HostSurfaceCapability,
     /// Bounded process list.
     pub apps: HostSurfaceCapability,
     /// This process's own status.
@@ -259,6 +328,9 @@ impl HostSurfacesState {
     fn with_paths_and_identity(paths: HostPaths, identity: HostIdentity) -> Self {
         let availability = Availability {
             storage: File::open(&paths.mounts).is_ok(),
+            storage_health: paths.sys_block.is_dir(),
+            smart: paths.sys_block.is_dir() && resolve_program(&paths.smartctl).is_some(),
+            md: File::open(&paths.mdstat).is_ok(),
             apps: paths.proc_root.is_dir() && fs::read_dir(&paths.proc_root).is_ok(),
             self_management: File::open(paths.proc_root.join("self/stat")).is_ok(),
         };
@@ -283,7 +355,12 @@ impl HostSurfacesState {
             mounts: proc_root.join("mounts"),
             passwd: root.join("passwd"),
             cgroup: proc_root.join("self/cgroup"),
+            mdstat: proc_root.join("mdstat"),
             proc_root,
+            sys_block: root.join("sys/block"),
+            dev_root: root.join("dev"),
+            smartctl: root.join("bin/smartctl"),
+            mdadm: root.join("bin/mdadm"),
         })
     }
 
@@ -303,6 +380,32 @@ impl HostSurfacesState {
                         .to_owned()
                 },
                 limit: Some(MAX_STORAGE_FILESYSTEMS),
+            },
+            health: HostSurfaceCapability {
+                supported: true,
+                path: STORAGE_HEALTH_PATH,
+                available: availability.storage_health,
+                guarded: true,
+                reason: if availability.storage_health {
+                    "Reports bounded /sys/block inventory, normalized SMART health, and /proc/mdstat arrays; read-only, serials opt-in, at most 32 devices.".to_owned()
+                } else {
+                    "/sys/block could not be read at startup; /storage/health returns a typed 503."
+                        .to_owned()
+                },
+                limit: Some(MAX_BLOCK_DEVICES),
+            },
+            smart: HostSurfaceCapability {
+                supported: true,
+                path: STORAGE_SMART_PATH,
+                available: availability.smart,
+                guarded: true,
+                reason: if availability.smart {
+                    "Runs bounded smartctl -j -H -A for one validated /dev block device; no tests, no raw output, serials opt-in.".to_owned()
+                } else {
+                    "smartctl or /sys/block was unavailable at startup; /storage/smart returns a typed 503."
+                        .to_owned()
+                },
+                limit: Some(1),
             },
             apps: HostSurfaceCapability {
                 supported: true,
@@ -345,6 +448,232 @@ impl HostSurfacesState {
             MAX_STORAGE_FILESYSTEMS,
             statvfs_usage,
         ))
+    }
+
+    /// Collect bounded block-device and mdraid health.
+    ///
+    /// SMART and mdraid are optional enrichment: when `smartctl` is absent or
+    /// the kernel has no md support the report stays a `200` and names the
+    /// unavailable section with a stable `storage.smart-unavailable` /
+    /// `storage.md-unavailable` code. An unreadable `/sys/block` is a typed
+    /// `503` because it is the required inventory source.
+    pub async fn storage_health(
+        &self,
+        include_serials: bool,
+        include_attributes: bool,
+    ) -> Result<StorageHealthReport, HostError> {
+        let paths = &self.inner.paths;
+        let names = read_block_device_names(&paths.sys_block).map_err(|error| {
+            HostError::new(
+                "storage.block-unavailable",
+                format!("could not read /sys/block: {error}"),
+            )
+        })?;
+        let smart_tool = resolve_program(&paths.smartctl);
+        let smart_tool_present = smart_tool.is_some();
+
+        let mut devices = Vec::with_capacity(names.len().min(MAX_BLOCK_DEVICES));
+        for name in names.iter().take(MAX_BLOCK_DEVICES) {
+            let device_path = paths.dev_root.join(name);
+            let smart = if smart_tool_present {
+                if device_path.exists() {
+                    match run_smartctl(
+                        smart_tool.as_deref().unwrap_or(&paths.smartctl),
+                        &device_path,
+                    )
+                    .await
+                    {
+                        Ok(document) => {
+                            parse_smart_document(&document, include_serials, include_attributes)
+                        }
+                        Err(reason) => SmartHealth::unavailable(reason),
+                    }
+                } else {
+                    SmartHealth::unavailable(format!("no /dev node exists for block device {name}"))
+                }
+            } else {
+                SmartHealth::unavailable(
+                    "smartctl was not found on PATH; install smartmontools to read SMART health",
+                )
+            };
+            let model = read_sysfs_text(&paths.sys_block.join(name).join("device/model"))
+                .map(|value| bounded_label(&value, MAX_MODEL_CHARS))
+                .filter(|value| !value.is_empty())
+                .or_else(|| smart.model.clone());
+            let serial = include_serials
+                .then(|| {
+                    read_sysfs_text(&paths.sys_block.join(name).join("device/serial"))
+                        .map(|value| bounded_label(&value, MAX_SERIAL_CHARS))
+                        .filter(|value| !value.is_empty())
+                        .or_else(|| smart.serial.clone())
+                })
+                .flatten();
+            devices.push(BlockDeviceHealth {
+                name: name.clone(),
+                device: format!("/dev/{name}"),
+                model,
+                serial,
+                size_bytes: read_sysfs_u64(&paths.sys_block.join(name).join("size"))
+                    .map(|sectors| sectors.saturating_mul(512)),
+                rotational: read_sysfs_u64(&paths.sys_block.join(name).join("queue/rotational"))
+                    .map(|value| value != 0),
+                smart,
+            });
+        }
+
+        let md = self.md_status().await;
+        let smart_available = devices.iter().any(|device| device.smart.available);
+        let smart_error = if smart_available {
+            None
+        } else if smart_tool_present {
+            Some(
+                "smartctl was found but returned no usable SMART health for any block device"
+                    .to_owned(),
+            )
+        } else {
+            Some(
+                "smartctl was not found on PATH; install smartmontools to read SMART health"
+                    .to_owned(),
+            )
+        };
+        let mut unavailable = Vec::new();
+        if !smart_available {
+            unavailable.push("smart");
+        }
+        if !md.available {
+            unavailable.push("md");
+        }
+        Ok(StorageHealthReport {
+            ok: true,
+            available: true,
+            source: "/sys/block + smartctl + /proc/mdstat",
+            count: devices.len(),
+            matched: names.len(),
+            limit: MAX_BLOCK_DEVICES,
+            truncated: names.len() > devices.len(),
+            serials_included: include_serials,
+            attributes_included: include_attributes,
+            smart: SourceStatus {
+                available: smart_available,
+                code: (!smart_available).then_some("storage.smart-unavailable"),
+                error: smart_error,
+            },
+            md,
+            unavailable,
+            devices,
+        })
+    }
+
+    /// Read normalized SMART health for one explicitly named block device.
+    pub async fn smart(
+        &self,
+        device: &str,
+        include_serials: bool,
+        include_attributes: bool,
+    ) -> Result<SmartReport, HostError> {
+        let paths = &self.inner.paths;
+        let name = validate_block_device(device, &paths.sys_block, &paths.dev_root)?;
+        let device_path = paths.dev_root.join(&name);
+        let tool = resolve_program(&paths.smartctl).ok_or_else(|| {
+            HostError::new(
+                "storage.smart-unavailable",
+                "smartctl was not found on PATH; install smartmontools to read SMART health",
+            )
+        })?;
+        let document = run_smartctl(&tool, &device_path)
+            .await
+            .map_err(|reason| HostError::new("storage.smart-unavailable", reason))?;
+        let smart = parse_smart_document(&document, include_serials, include_attributes);
+        if !smart.available {
+            return Err(HostError::new(
+                "storage.smart-unavailable",
+                smart.error.clone().unwrap_or_else(|| {
+                    "smartctl returned no SMART health for this device".to_owned()
+                }),
+            ));
+        }
+        let model = read_sysfs_text(&paths.sys_block.join(&name).join("device/model"))
+            .map(|value| bounded_label(&value, MAX_MODEL_CHARS))
+            .filter(|value| !value.is_empty())
+            .or_else(|| smart.model.clone());
+        let serial = include_serials
+            .then(|| {
+                read_sysfs_text(&paths.sys_block.join(&name).join("device/serial"))
+                    .map(|value| bounded_label(&value, MAX_SERIAL_CHARS))
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| smart.serial.clone())
+            })
+            .flatten();
+        Ok(SmartReport {
+            ok: true,
+            available: true,
+            source: "/sys/block + smartctl",
+            device: format!("/dev/{name}"),
+            name: name.clone(),
+            model,
+            serial,
+            serials_included: include_serials,
+            attributes_included: include_attributes,
+            size_bytes: read_sysfs_u64(&paths.sys_block.join(&name).join("size"))
+                .map(|sectors| sectors.saturating_mul(512)),
+            rotational: read_sysfs_u64(&paths.sys_block.join(&name).join("queue/rotational"))
+                .map(|value| value != 0),
+            protocol: smart.protocol.clone(),
+            smart,
+        })
+    }
+
+    /// Read mdraid arrays from `/proc/mdstat`, optionally enriched by
+    /// `mdadm --detail --scan`.
+    async fn md_status(&self) -> MdStatus {
+        let paths = &self.inner.paths;
+        let mdadm_present = resolve_program(&paths.mdadm).is_some();
+        let text = match read_bounded(&paths.mdstat, MAX_MDSTAT_BYTES) {
+            Ok(text) => text,
+            Err(error) => {
+                return MdStatus {
+                    available: false,
+                    code: Some("storage.md-unavailable"),
+                    error: Some(bounded_error(&format!(
+                        "could not read /proc/mdstat: {error}"
+                    ))),
+                    source: "/proc/mdstat",
+                    mdadm_available: mdadm_present,
+                    mdadm_error: None,
+                    count: 0,
+                    arrays: Vec::new(),
+                };
+            }
+        };
+        let mut arrays = parse_mdstat(&text);
+        let (mdadm_available, mdadm_error, scan) = match resolve_program(&paths.mdadm) {
+            Some(program) => match run_mdadm_scan(&program).await {
+                Ok(scan) => (true, None, scan),
+                Err(reason) => (false, Some(reason), Vec::new()),
+            },
+            None => (
+                false,
+                Some("mdadm was not found on PATH".to_owned()),
+                Vec::new(),
+            ),
+        };
+        for array in &mut arrays {
+            if let Some(scanned) = scan.iter().find(|scanned| scanned.device == array.device) {
+                array.uuid = scanned.uuid.clone();
+                array.metadata = scanned.metadata.clone();
+            }
+        }
+        arrays.truncate(MAX_MD_ARRAYS);
+        MdStatus {
+            available: true,
+            code: None,
+            error: None,
+            source: "/proc/mdstat",
+            mdadm_available,
+            mdadm_error,
+            count: arrays.len(),
+            arrays,
+        }
     }
 
     /// Collect the bounded process report.
@@ -582,11 +911,68 @@ pub fn router(state: HostSurfacesState) -> Router {
     Router::new()
         .route(STORAGE_PATH, get(storage_handler))
         .route(STORAGE_API_PATH, get(storage_handler))
+        .route(STORAGE_HEALTH_PATH, get(storage_health_handler))
+        .route(STORAGE_HEALTH_API_PATH, get(storage_health_handler))
+        .route(STORAGE_SMART_PATH, get(storage_smart_handler))
+        .route(STORAGE_SMART_API_PATH, get(storage_smart_handler))
         .route(APPS_PATH, get(apps_handler))
         .route(APPS_API_PATH, get(apps_handler))
         .route(SELF_PATH, get(self_handler))
         .route(SELF_API_PATH, get(self_handler))
         .with_state(state)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StorageHealthQuery {
+    #[serde(default)]
+    serials: Option<bool>,
+    #[serde(default)]
+    attributes: Option<bool>,
+}
+
+async fn storage_health_handler(
+    State(state): State<HostSurfacesState>,
+    Query(query): Query<StorageHealthQuery>,
+) -> Response {
+    let serials = query.serials.unwrap_or(false);
+    let attributes = query.attributes.unwrap_or(false);
+    match state.storage_health(serials, attributes).await {
+        Ok(report) => json_response(report),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StorageSmartQuery {
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    serials: Option<bool>,
+    #[serde(default)]
+    attributes: Option<bool>,
+}
+
+async fn storage_smart_handler(
+    State(state): State<HostSurfacesState>,
+    Query(query): Query<StorageSmartQuery>,
+) -> Response {
+    let Some(device) = query.device.as_deref().filter(|value| !value.is_empty()) else {
+        return error_response(HostError::invalid(
+            "storage.invalid-device",
+            "the device query parameter is required and must be /dev/<block-device>",
+        ));
+    };
+    match state
+        .smart(
+            device,
+            query.serials.unwrap_or(false),
+            query.attributes.unwrap_or(false),
+        )
+        .await
+    {
+        Ok(report) => json_response(report),
+        Err(error) => error_response(error),
+    }
 }
 
 async fn storage_handler(State(state): State<HostSurfacesState>) -> Response {
@@ -647,7 +1033,7 @@ fn json_response<T: Serialize>(value: T) -> Response {
 
 fn error_response(error: HostError) -> Response {
     (
-        StatusCode::SERVICE_UNAVAILABLE,
+        error.status,
         Json(json!({
             "ok": false,
             "available": false,
@@ -665,6 +1051,8 @@ pub struct HostError {
     pub code: &'static str,
     /// Operator-facing explanation; contains no secret or environment value.
     pub message: String,
+    /// HTTP status: `503` for an unavailable source, `400` for invalid input.
+    pub status: StatusCode,
 }
 
 impl HostError {
@@ -672,6 +1060,15 @@ impl HostError {
         Self {
             code,
             message: message.into(),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    fn invalid(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            status: StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -871,6 +1268,901 @@ fn statvfs_usage(path: &str) -> Option<RawUsage> {
         total_bytes,
         free_bytes: free_bytes.min(total_bytes),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Storage health: block inventory, SMART, mdraid
+// ---------------------------------------------------------------------------
+
+/// Normalized SMART health for one device.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct SmartHealth {
+    /// Smartctl returned usable health fields.
+    pub available: bool,
+    /// Stable code when `available` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+    /// Bounded explanation when `available` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// `smart_status.passed` when the device reports overall health.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passed: Option<bool>,
+    /// Current temperature in degrees Celsius.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<i64>,
+    /// NVMe percentage of endurance consumed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percentage_used: Option<u64>,
+    /// NVMe available spare percentage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_spare_percent: Option<u64>,
+    /// NVMe media/integrity errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_errors: Option<u64>,
+    /// NVMe critical-warning bit field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub critical_warning: Option<u64>,
+    /// ATA attribute 5, reallocated sector count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reallocated_sectors: Option<u64>,
+    /// ATA attribute 197, current pending sector count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_sectors: Option<u64>,
+    /// ATA attribute 198, offline uncorrectable sector count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncorrectable_sectors: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power_on_hours: Option<u64>,
+    /// Device model from smartctl, when it reported one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Serial number; present only when the caller explicitly asked for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Bounded normalized ATA attributes; present only with `?attributes=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<Vec<SmartAttribute>>,
+}
+
+impl SmartHealth {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        let reason: String = reason.into();
+        Self {
+            available: false,
+            code: Some("storage.smart-unavailable"),
+            error: Some(bounded_error(&reason)),
+            ..Self::default()
+        }
+    }
+}
+
+/// One normalized ATA SMART attribute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SmartAttribute {
+    pub id: u64,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worst: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_value: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_text: Option<String>,
+}
+
+/// Availability of one optional health source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceStatus {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One block device in `/storage/health`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BlockDeviceHealth {
+    /// Sysfs basename (`nvme0n1`).
+    pub name: String,
+    /// Controller-facing device path (`/dev/nvme0n1`).
+    pub device: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Present only with `?serials=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotational: Option<bool>,
+    pub smart: SmartHealth,
+}
+
+/// `GET /storage/health` response.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StorageHealthReport {
+    pub ok: bool,
+    pub available: bool,
+    pub source: &'static str,
+    pub count: usize,
+    /// Block devices found before the bound was applied.
+    pub matched: usize,
+    pub limit: usize,
+    pub truncated: bool,
+    pub serials_included: bool,
+    pub attributes_included: bool,
+    pub smart: SourceStatus,
+    pub md: MdStatus,
+    /// Optional sections that could not be read.
+    pub unavailable: Vec<&'static str>,
+    pub devices: Vec<BlockDeviceHealth>,
+}
+
+/// `GET /storage/smart` response.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SmartReport {
+    pub ok: bool,
+    pub available: bool,
+    pub source: &'static str,
+    pub device: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Present only with `?serials=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    pub serials_included: bool,
+    pub attributes_included: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotational: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    pub smart: SmartHealth,
+}
+
+/// mdraid section of `/storage/health`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MdStatus {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub source: &'static str,
+    pub mdadm_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mdadm_error: Option<String>,
+    pub count: usize,
+    pub arrays: Vec<MdArray>,
+}
+
+/// One md array parsed from `/proc/mdstat`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MdArray {
+    pub name: String,
+    pub device: String,
+    pub state: String,
+    pub level: String,
+    pub degraded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_devices: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_devices: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// Bounded `[UU]`-style slot map from `/proc/mdstat`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_map: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+    pub members: Vec<MdMember>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync: Option<MdSync>,
+}
+
+/// One md member device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MdMember {
+    pub device: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+    /// `active`, `failed`, or `spare`.
+    pub state: &'static str,
+}
+
+/// In-progress md resync/recovery/reshape.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MdSync {
+    pub operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed_kib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_minutes: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScannedArray {
+    device: String,
+    uuid: Option<String>,
+    metadata: Option<String>,
+}
+
+fn resolve_program(program: &Path) -> Option<PathBuf> {
+    if program.is_absolute() || program.components().count() > 1 {
+        return executable(program);
+    }
+    let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
+    std::env::split_paths(&path).find_map(|directory| executable(&directory.join(program)))
+}
+
+fn executable(path: &Path) -> Option<PathBuf> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    Some(path.to_path_buf())
+}
+
+fn read_block_device_names(sys_block: &Path) -> std::io::Result<Vec<String>> {
+    let mut names: Vec<String> = Vec::new();
+    for entry in fs::read_dir(sys_block)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.is_empty()
+            || name.len() > MAX_DEVICE_NAME_CHARS
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.:".contains(character))
+        {
+            continue;
+        }
+        if PSEUDO_BLOCK_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn read_sysfs_text(path: &Path) -> Option<String> {
+    read_bounded(path, MAX_SYSFS_BYTES)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_sysfs_u64(path: &Path) -> Option<u64> {
+    read_sysfs_text(path)?.parse::<u64>().ok()
+}
+
+fn bounded_label(value: &str, limit: usize) -> String {
+    sanitize_label(value.trim()).chars().take(limit).collect()
+}
+
+fn bounded_error(value: &str) -> String {
+    sanitize_label(value.trim())
+        .chars()
+        .take(240)
+        .collect::<String>()
+}
+
+fn valid_block_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_DEVICE_NAME_CHARS
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.:".contains(character))
+}
+
+/// Validate `device` as `/dev/<basename>` and confirm the basename is a block
+/// device known to sysfs or a real `/dev` node. The returned basename is the
+/// only value passed on to `smartctl`; the caller-supplied string is never
+/// used as a filesystem path.
+fn validate_block_device(
+    device: &str,
+    sys_block: &Path,
+    dev_root: &Path,
+) -> Result<String, HostError> {
+    let invalid = || {
+        HostError::invalid(
+            "storage.invalid-device",
+            "the device must name one block device as /dev/<name>",
+        )
+    };
+    if device.len() > MAX_DEVICE_PATH_CHARS || device.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    let name = device.strip_prefix("/dev/").ok_or_else(invalid)?;
+    if !valid_block_name(name) {
+        return Err(invalid());
+    }
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(invalid());
+    }
+    if !sys_block.join(name).exists() && !dev_root.join(name).exists() {
+        return Err(HostError::invalid(
+            "storage.invalid-device",
+            "no such block device under /sys/block or /dev",
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+async fn run_smartctl(program: &Path, device: &Path) -> Result<Value, String> {
+    let mut command = Command::new(program);
+    command
+        .args(["-j", "-H", "-A"])
+        .arg(device)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(match error.kind() {
+                std::io::ErrorKind::NotFound => {
+                    "smartctl was not found on PATH; install smartmontools".to_owned()
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    "smartctl could not be executed; permission denied".to_owned()
+                }
+                _ => format!("smartctl could not be started: {error}"),
+            });
+        }
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "smartctl stdout was not captured".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "smartctl stderr was not captured".to_owned())?;
+
+    let read = async {
+        let (stdout, stdout_truncated) = read_limited_async(stdout, MAX_SMART_BYTES).await?;
+        let (stderr, _) = read_limited_async(stderr, MAX_SMART_STDERR_BYTES).await?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((stdout, stdout_truncated, stderr, status))
+    };
+    let (stdout, stdout_truncated, stderr, _status) =
+        match tokio::time::timeout(SMART_TIMEOUT, read).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => return Err(format!("smartctl I/O failed: {error}")),
+            Err(_) => return Err("smartctl timed out while reading SMART health".to_owned()),
+        };
+    if stdout_truncated {
+        return Err("smartctl output exceeded the 1 MiB bound".to_owned());
+    }
+    if stdout.is_empty() {
+        let detail = String::from_utf8_lossy(&stderr);
+        return Err(if detail.trim().is_empty() {
+            "smartctl returned no output".to_owned()
+        } else {
+            bounded_error(detail.as_ref())
+        });
+    }
+    serde_json::from_slice(&stdout).map_err(|_| {
+        let detail = String::from_utf8_lossy(&stderr);
+        if detail.trim().is_empty() {
+            "smartctl did not return valid JSON".to_owned()
+        } else {
+            bounded_error(detail.as_ref())
+        }
+    })
+}
+
+async fn read_limited_async<R>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buffer = [0u8; 8192];
+    let mut output = Vec::new();
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        if output.len() < limit {
+            let take = read.min(limit - output.len());
+            output.extend_from_slice(&buffer[..take]);
+            truncated |= take < read;
+        } else {
+            truncated = true;
+        }
+    }
+    Ok((output, truncated))
+}
+
+async fn run_mdadm_scan(program: &Path) -> Result<Vec<ScannedArray>, String> {
+    let mut command = Command::new(program);
+    command
+        .args(["--detail", "--scan"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(match error.kind() {
+                std::io::ErrorKind::NotFound => {
+                    "mdadm was not found on PATH; md state comes from /proc/mdstat only".to_owned()
+                }
+                _ => format!("mdadm could not be started: {error}"),
+            });
+        }
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "mdadm stdout was not captured".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "mdadm stderr was not captured".to_owned())?;
+    let read = async {
+        let (stdout, stdout_truncated) = read_limited_async(stdout, MAX_MDADM_BYTES).await?;
+        let (stderr, _) = read_limited_async(stderr, MAX_MDADM_BYTES).await?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((stdout, stdout_truncated, stderr, status))
+    };
+    let (stdout, stdout_truncated, stderr, status) =
+        match tokio::time::timeout(MDADM_TIMEOUT, read).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => return Err(format!("mdadm I/O failed: {error}")),
+            Err(_) => return Err("mdadm timed out reading array metadata".to_owned()),
+        };
+    if stdout_truncated {
+        return Err("mdadm output exceeded the 64 KiB bound".to_owned());
+    }
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr);
+        return Err(if detail.trim().is_empty() {
+            format!("mdadm exited with status {}", status.code().unwrap_or(-1))
+        } else {
+            bounded_error(detail.as_ref())
+        });
+    }
+    Ok(parse_mdadm_scan(&String::from_utf8_lossy(&stdout)))
+}
+
+fn parse_mdadm_scan(text: &str) -> Vec<ScannedArray> {
+    let mut arrays = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("ARRAY ") else {
+            continue;
+        };
+        let tokens: Vec<&str> = rest.split_whitespace().collect();
+        let Some(device) = tokens.first() else {
+            continue;
+        };
+        if !device.starts_with("/dev/") {
+            continue;
+        }
+        let uuid = tokens.iter().find_map(|token| token.strip_prefix("UUID="));
+        let metadata = tokens
+            .iter()
+            .find_map(|token| token.strip_prefix("metadata="));
+        arrays.push(ScannedArray {
+            device: bounded_label(device, MAX_DEVICE_PATH_CHARS),
+            uuid: uuid.map(|value| bounded_label(value, MAX_SERIAL_CHARS)),
+            metadata: metadata.map(|value| bounded_label(value, MAX_SERIAL_CHARS)),
+        });
+        if arrays.len() >= MAX_MD_ARRAYS {
+            break;
+        }
+    }
+    arrays
+}
+
+fn parse_mdstat(text: &str) -> Vec<MdArray> {
+    let mut arrays: Vec<MdArray> = Vec::new();
+    let mut current: Option<MdArray> = None;
+    for line in text.lines() {
+        if let Some((name, rest)) = line.split_once(':') {
+            let name = name.trim();
+            if is_md_name(name) {
+                if let Some(array) = current.take() {
+                    push_md_array(&mut arrays, array);
+                }
+                if arrays.len() >= MAX_MD_ARRAYS {
+                    current = None;
+                    continue;
+                }
+                let tokens: Vec<&str> = rest.split_whitespace().collect();
+                let state = tokens.first().copied().unwrap_or("unknown");
+                let level = tokens
+                    .iter()
+                    .find(|token| is_md_level(token))
+                    .copied()
+                    .unwrap_or("unknown");
+                let members = tokens
+                    .iter()
+                    .filter_map(|token| parse_md_member(token))
+                    .take(MAX_MD_MEMBERS)
+                    .collect();
+                current = Some(MdArray {
+                    name: bounded_label(name, MAX_DEVICE_NAME_CHARS),
+                    device: format!("/dev/{}", bounded_label(name, MAX_DEVICE_NAME_CHARS)),
+                    state: bounded_label(state, 32),
+                    level: bounded_label(level, 32),
+                    degraded: false,
+                    total_devices: None,
+                    active_devices: None,
+                    size_bytes: None,
+                    slot_map: None,
+                    uuid: None,
+                    metadata: None,
+                    members,
+                    sync: None,
+                });
+                continue;
+            }
+        }
+        let Some(array) = current.as_mut() else {
+            continue;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some((total, active)) = parse_md_counts(line) {
+            array.total_devices = Some(total);
+            array.active_devices = Some(active);
+            array.degraded |= active < total;
+        }
+        if let Some(blocks) = parse_md_blocks(line) {
+            array.size_bytes = Some(blocks.saturating_mul(1024));
+        }
+        if let Some(slot_map) = parse_slot_map(line) {
+            array.degraded |= slot_map.contains('_');
+            array.slot_map = Some(slot_map);
+        }
+        if let Some(sync) = parse_md_sync(line) {
+            array.sync = Some(sync);
+        }
+        if array.members.len() < MAX_MD_MEMBERS {
+            for token in line.split_whitespace() {
+                if let Some(member) = parse_md_member(token) {
+                    if array.members.len() >= MAX_MD_MEMBERS {
+                        break;
+                    }
+                    array.members.push(member);
+                }
+            }
+        }
+    }
+    if let Some(array) = current.take() {
+        push_md_array(&mut arrays, array);
+    }
+    for array in &mut arrays {
+        if array.members.iter().any(|member| member.state == "failed") {
+            array.degraded = true;
+        }
+    }
+    arrays
+}
+
+fn push_md_array(arrays: &mut Vec<MdArray>, array: MdArray) {
+    if arrays.len() < MAX_MD_ARRAYS {
+        arrays.push(array);
+    }
+}
+
+fn is_md_name(name: &str) -> bool {
+    name.strip_prefix("md").is_some_and(|rest| {
+        !rest.is_empty() && rest.chars().all(|character| character.is_ascii_digit())
+    })
+}
+
+fn is_md_level(token: &str) -> bool {
+    token.starts_with("raid") || matches!(token, "linear" | "multipath" | "faulty" | "container")
+}
+
+fn parse_md_member(token: &str) -> Option<MdMember> {
+    let open = token.find('[')?;
+    let close = token[open + 1..].find(']')? + open + 1;
+    let base = &token[..open];
+    if !valid_block_name(base) || base.starts_with("md") {
+        return None;
+    }
+    let slot = token[open + 1..close].parse::<u32>().ok()?;
+    let flags = &token[close + 1..];
+    let state = if flags.contains("(F)") {
+        "failed"
+    } else if flags.contains("(S)") {
+        "spare"
+    } else {
+        "active"
+    };
+    Some(MdMember {
+        device: bounded_label(base, MAX_DEVICE_NAME_CHARS),
+        slot: Some(slot),
+        state,
+    })
+}
+
+fn parse_md_counts(line: &str) -> Option<(usize, usize)> {
+    for token in line.split_whitespace() {
+        let Some(inner) = token
+            .strip_prefix('[')
+            .and_then(|token| token.strip_suffix(']'))
+        else {
+            continue;
+        };
+        let Some((total, active)) = inner.split_once('/') else {
+            continue;
+        };
+        if let (Ok(total), Ok(active)) = (total.parse::<usize>(), active.parse::<usize>()) {
+            return Some((total, active));
+        }
+    }
+    None
+}
+
+fn parse_md_blocks(line: &str) -> Option<u64> {
+    let mut tokens = line.split_whitespace();
+    let blocks = tokens.next()?.parse::<u64>().ok()?;
+    (tokens.next()? == "blocks").then_some(blocks)
+}
+
+fn parse_slot_map(line: &str) -> Option<String> {
+    line.split_whitespace().find_map(|token| {
+        let inner = token.strip_prefix('[')?.strip_suffix(']')?;
+        (!inner.is_empty()
+            && !inner.contains('/')
+            && inner
+                .chars()
+                .all(|character| character == 'U' || character == '_'))
+        .then(|| bounded_label(inner, MAX_MD_MEMBERS))
+    })
+}
+
+fn parse_md_sync(line: &str) -> Option<MdSync> {
+    let operation = if line.contains("resync") {
+        "resync"
+    } else if line.contains("recovery") {
+        "recovery"
+    } else if line.contains("reshape") {
+        "reshape"
+    } else if line.contains("check") {
+        "check"
+    } else {
+        return None;
+    };
+    let mut percent = None;
+    let mut speed_kib = None;
+    let mut finish_minutes = None;
+    for token in line.split_whitespace() {
+        if let Some(value) = token.strip_suffix('%') {
+            percent = value.parse::<f64>().ok().map(round2);
+        } else if let Some(value) = token.strip_prefix("speed=") {
+            speed_kib = parse_md_speed(value);
+        } else if let Some(value) = token.strip_prefix("finish=") {
+            finish_minutes = value
+                .trim_end_matches("min")
+                .parse::<f64>()
+                .ok()
+                .map(round2);
+        }
+    }
+    if percent.is_none() && speed_kib.is_none() && finish_minutes.is_none() {
+        return None;
+    }
+    Some(MdSync {
+        operation,
+        percent,
+        speed_kib,
+        finish_minutes,
+    })
+}
+
+fn parse_md_speed(value: &str) -> Option<u64> {
+    let (number, factor) = if let Some(number) = value.strip_suffix("G/sec") {
+        (number, 1024.0 * 1024.0)
+    } else if let Some(number) = value.strip_suffix("M/sec") {
+        (number, 1024.0)
+    } else if let Some(number) = value.strip_suffix("K/sec") {
+        (number, 1.0)
+    } else {
+        (value, 1.0)
+    };
+    number
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite() && *number >= 0.0)
+        .map(|number| (number * factor) as u64)
+}
+
+fn json_u64(value: Option<&Value>) -> Option<u64> {
+    let value = value?;
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .map(|value| value as u64)
+        })
+}
+
+fn json_i64(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+}
+
+fn json_string<'a>(value: Option<&'a Value>) -> Option<&'a str> {
+    value?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_smart_document(
+    value: &Value,
+    include_serials: bool,
+    include_attributes: bool,
+) -> SmartHealth {
+    let mut smart = SmartHealth::default();
+    smart.protocol = value
+        .get("device")
+        .and_then(|device| device.get("protocol").or_else(|| device.get("type")))
+        .and_then(Value::as_str)
+        .map(|value| bounded_label(value, 32))
+        .filter(|value| !value.is_empty());
+    smart.model = json_string(value.get("model_name"))
+        .map(|value| bounded_label(value, MAX_MODEL_CHARS))
+        .filter(|value| !value.is_empty());
+    if include_serials {
+        smart.serial = json_string(value.get("serial_number"))
+            .map(|value| bounded_label(value, MAX_SERIAL_CHARS))
+            .filter(|value| !value.is_empty());
+    }
+    smart.passed = value
+        .get("smart_status")
+        .and_then(|status| status.get("passed"))
+        .and_then(Value::as_bool);
+
+    if let Some(log) = value.get("nvme_smart_health_information_log") {
+        smart.temperature_c = json_i64(log.get("temperature"));
+        smart.percentage_used = json_u64(log.get("percentage_used"));
+        smart.available_spare_percent = json_u64(log.get("available_spare"));
+        smart.media_errors = json_u64(log.get("media_errors"));
+        smart.critical_warning = json_u64(log.get("critical_warning"));
+        smart.power_on_hours = json_u64(log.get("power_on_hours"));
+    }
+    smart.temperature_c = smart
+        .temperature_c
+        .or_else(|| json_i64(value.pointer("/temperature/current")));
+    smart.percentage_used = smart
+        .percentage_used
+        .or_else(|| json_u64(value.pointer("/endurance_used/current_percent")));
+    smart.available_spare_percent = smart
+        .available_spare_percent
+        .or_else(|| json_u64(value.pointer("/spare_available/current_percent")));
+    smart.power_on_hours = smart
+        .power_on_hours
+        .or_else(|| json_u64(value.pointer("/power_on_time/hours")));
+
+    if let Some(table) = value
+        .pointer("/ata_smart_attributes/table")
+        .and_then(Value::as_array)
+    {
+        smart.reallocated_sectors = ata_raw_value(table, 5);
+        smart.pending_sectors = ata_raw_value(table, 197);
+        smart.uncorrectable_sectors = ata_raw_value(table, 198);
+        if include_attributes {
+            smart.attributes = Some(collect_smart_attributes(table));
+        }
+    }
+
+    let has_data = smart.passed.is_some()
+        || smart.temperature_c.is_some()
+        || smart.percentage_used.is_some()
+        || smart.available_spare_percent.is_some()
+        || smart.media_errors.is_some()
+        || smart.reallocated_sectors.is_some()
+        || smart.pending_sectors.is_some()
+        || smart.uncorrectable_sectors.is_some()
+        || smart.attributes.is_some();
+    if !has_data {
+        let message = value
+            .pointer("/smartctl/messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| {
+                messages.iter().find_map(|message| {
+                    (message.get("severity").and_then(Value::as_str) == Some("error"))
+                        .then(|| json_string(message.get("string")))
+                        .flatten()
+                })
+            })
+            .unwrap_or("smartctl returned no SMART health for this device");
+        smart.available = false;
+        smart.code = Some("storage.smart-unavailable");
+        smart.error = Some(bounded_error(message));
+        return smart;
+    }
+    smart.available = true;
+    smart.code = None;
+    smart.error = None;
+    smart
+}
+
+fn ata_raw_value(table: &[Value], id: u64) -> Option<u64> {
+    let attribute = table
+        .iter()
+        .find(|attribute| json_u64(attribute.get("id")) == Some(id))?;
+    let raw = attribute.get("raw")?;
+    json_u64(raw.get("value")).or_else(|| {
+        json_string(raw.get("string")).and_then(|value| {
+            let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u64>().ok()
+        })
+    })
+}
+
+fn collect_smart_attributes(table: &[Value]) -> Vec<SmartAttribute> {
+    table
+        .iter()
+        .take(MAX_SMART_ATTRIBUTES)
+        .filter_map(|attribute| {
+            let id = json_u64(attribute.get("id"))?;
+            let raw = attribute.get("raw");
+            Some(SmartAttribute {
+                id,
+                name: json_string(attribute.get("name"))
+                    .map(|value| bounded_label(value, MAX_MODEL_CHARS))
+                    .unwrap_or_else(|| format!("attr-{id}")),
+                value: json_u64(attribute.get("value")),
+                worst: json_u64(attribute.get("worst")),
+                threshold: json_u64(attribute.get("thresh")),
+                raw_value: raw.and_then(|raw| json_u64(raw.get("value"))),
+                raw_text: raw
+                    .and_then(|raw| json_string(raw.get("string")))
+                    .map(|value| bounded_label(value, MAX_MODEL_CHARS)),
+            })
+        })
+        .collect()
 }
 
 /// One process before sorting/truncation.
@@ -1172,6 +2464,73 @@ mod tests {
             &dir.join("status"),
             &format!("Name:\t{name}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
         );
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        write(path, contents);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(path).expect("fixture metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("fixture executable");
+        }
+    }
+
+    fn add_block(
+        root: &Path,
+        name: &str,
+        model: &str,
+        serial: &str,
+        sectors: u64,
+        rotational: u64,
+    ) {
+        let dir = root.join("sys/block").join(name);
+        write(&dir.join("device/model"), &format!("{model}\n"));
+        write(&dir.join("device/serial"), &format!("{serial}\n"));
+        write(&dir.join("size"), &format!("{sectors}\n"));
+        write(&dir.join("queue/rotational"), &format!("{rotational}\n"));
+        write(&root.join("dev").join(name), "");
+    }
+
+    fn smartctl_fixture(root: &Path) {
+        write_executable(
+            &root.join("bin/smartctl"),
+            r#"#!/bin/sh
+device="$4"
+case "$device" in
+  *nvme0n1)
+    cat <<'JSON'
+{"device":{"type":"nvme","protocol":"NVMe"},"model_name":"Fixture NVMe","serial_number":"SERIAL-NVME-123","smart_status":{"passed":true},"temperature":{"current":41},"nvme_smart_health_information_log":{"temperature":41,"percentage_used":7,"available_spare":100,"media_errors":0,"critical_warning":0,"power_on_hours":123},"endurance_used":{"current_percent":7}}
+JSON
+    ;;
+  *sda)
+    cat <<'JSON'
+{"device":{"type":"sat","protocol":"ATA"},"model_name":"Fixture SATA","serial_number":"SERIAL-SATA-999","smart_status":{"passed":false},"temperature":{"current":45},"power_on_time":{"hours":999},"ata_smart_attributes":{"table":[{"id":5,"name":"Reallocated_Sector_Ct","value":100,"worst":100,"thresh":10,"raw":{"value":8,"string":"8"}},{"id":197,"name":"Current_Pending_Sector","value":99,"worst":99,"thresh":0,"raw":{"value":2,"string":"2"}},{"id":198,"name":"Offline_Uncorrectable","value":98,"worst":98,"thresh":0,"raw":{"value":3,"string":"3"}}]}}
+JSON
+    ;;
+  *bad0)
+    echo 'this is not json'
+    ;;
+  *)
+    echo '{"device":{"type":"scsi"},"smart_status":{"passed":true},"temperature":{"current":30}}'
+    ;;
+esac
+"#,
+        );
+    }
+
+    fn mdstat_fixture() -> &'static str {
+        "Personalities : [raid1] [raid6]\n\
+md0 : active raid1 sda1[0] sdb1[1]\n\
+      1953260928 blocks super 1.2 [2/2] [UU]\n\
+      bitmap: 0/1 pages [0KB], 65536KB chunk\n\
+\n\
+md1 : active raid6 sdc1[0] sdd1[1] sde1[2] sdf1[3]\n\
+      3907028992 blocks super 1.2 level 6, 512k chunk, algorithm 2 [4/3] [UUU_]\n\
+      [===>....]  resync = 42.5% (123/456) finish=12.3min speed=150000K/sec\n\
+\n\
+unused devices: <none>\n"
     }
 
     #[test]
@@ -1516,6 +2875,11 @@ nas:/export /mnt/nas nfs4 rw 0 0
         assert_eq!(advertised.storage.path, STORAGE_PATH);
         assert_eq!(advertised.storage.limit, Some(MAX_STORAGE_FILESYSTEMS));
         assert!(advertised.storage.guarded);
+        assert!(advertised.health.supported);
+        assert_eq!(advertised.health.path, STORAGE_HEALTH_PATH);
+        assert_eq!(advertised.health.limit, Some(MAX_BLOCK_DEVICES));
+        assert!(advertised.smart.supported);
+        assert_eq!(advertised.smart.path, STORAGE_SMART_PATH);
         assert!(advertised.apps.supported);
         assert_eq!(advertised.apps.limit, Some(MAX_APPS));
         assert!(advertised.self_management.supported);
@@ -1605,6 +2969,525 @@ nas:/export /mnt/nas nfs4 rw 0 0
         assert_eq!(report.node_id, "live-node");
         assert_eq!(report.profile, "hardware");
         assert!(report.memory.is_some());
+    }
+
+    #[test]
+    fn smart_nvme_document_is_normalized_and_serial_is_opt_in() {
+        let value: Value = serde_json::from_str(
+            r#"{
+                "device": {"type": "nvme", "protocol": "NVMe"},
+                "model_name": "Fixture NVMe",
+                "serial_number": "SERIAL-NVME-123",
+                "smart_status": {"passed": true},
+                "temperature": {"current": 41},
+                "nvme_smart_health_information_log": {
+                    "temperature": 41,
+                    "percentage_used": 7,
+                    "available_spare": 100,
+                    "media_errors": 0,
+                    "critical_warning": 0,
+                    "power_on_hours": 123
+                },
+                "endurance_used": {"current_percent": 7}
+            }"#,
+        )
+        .expect("fixture json");
+        let smart = parse_smart_document(&value, false, false);
+        assert!(smart.available);
+        assert_eq!(smart.passed, Some(true));
+        assert_eq!(smart.temperature_c, Some(41));
+        assert_eq!(smart.percentage_used, Some(7));
+        assert_eq!(smart.available_spare_percent, Some(100));
+        assert_eq!(smart.media_errors, Some(0));
+        assert_eq!(smart.power_on_hours, Some(123));
+        assert_eq!(smart.model.as_deref(), Some("Fixture NVMe"));
+        assert_eq!(smart.protocol.as_deref(), Some("NVMe"));
+        assert_eq!(smart.serial, None);
+        assert_eq!(smart.attributes, None);
+
+        let with_serial = parse_smart_document(&value, true, false);
+        assert_eq!(with_serial.serial.as_deref(), Some("SERIAL-NVME-123"));
+    }
+
+    #[test]
+    fn smart_sata_failing_document_reports_defect_counts_and_bounded_attributes() {
+        let value: Value = serde_json::from_str(
+            r#"{
+                "device": {"type": "sat", "protocol": "ATA"},
+                "model_name": "Fixture SATA",
+                "serial_number": "SERIAL-SATA-999",
+                "smart_status": {"passed": false},
+                "temperature": {"current": 45},
+                "power_on_time": {"hours": 999},
+                "ata_smart_attributes": {
+                    "table": [
+                        {"id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "worst": 100, "thresh": 10, "raw": {"value": 8, "string": "8"}},
+                        {"id": 197, "name": "Current_Pending_Sector", "value": 99, "worst": 99, "thresh": 0, "raw": {"value": 2, "string": "2"}},
+                        {"id": 198, "name": "Offline_Uncorrectable", "value": 98, "worst": 98, "thresh": 0, "raw": {"value": 3, "string": "3"}}
+                    ]
+                }
+            }"#,
+        )
+        .expect("fixture json");
+        let smart = parse_smart_document(&value, false, true);
+        assert!(smart.available);
+        assert_eq!(smart.passed, Some(false));
+        assert_eq!(smart.temperature_c, Some(45));
+        assert_eq!(smart.reallocated_sectors, Some(8));
+        assert_eq!(smart.pending_sectors, Some(2));
+        assert_eq!(smart.uncorrectable_sectors, Some(3));
+        assert_eq!(smart.power_on_hours, Some(999));
+        let attributes = smart.attributes.expect("explicit attributes");
+        assert_eq!(attributes.len(), 3);
+        assert_eq!(attributes[0].id, 5);
+        assert_eq!(attributes[0].raw_value, Some(8));
+        assert_eq!(attributes[0].raw_text.as_deref(), Some("8"));
+
+        let redacted = parse_smart_document(&value, false, false);
+        assert_eq!(redacted.attributes, None);
+    }
+
+    #[test]
+    fn smart_error_messages_become_typed_unavailability() {
+        let value: Value = serde_json::from_str(
+            r#"{
+                "smartctl": {
+                    "messages": [
+                        {"string": "Smartctl open device: /dev/nvme0n1 failed: Permission denied", "severity": "error"}
+                    ],
+                    "exit_status": 2
+                }
+            }"#,
+        )
+        .expect("fixture json");
+        let smart = parse_smart_document(&value, false, false);
+        assert!(!smart.available);
+        assert_eq!(smart.code, Some("storage.smart-unavailable"));
+        assert!(smart
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Permission denied"));
+    }
+
+    #[test]
+    fn mdstat_parses_healthy_and_degraded_arrays() {
+        let arrays = parse_mdstat(mdstat_fixture());
+        assert_eq!(arrays.len(), 2);
+
+        let healthy = &arrays[0];
+        assert_eq!(healthy.name, "md0");
+        assert_eq!(healthy.device, "/dev/md0");
+        assert_eq!(healthy.state, "active");
+        assert_eq!(healthy.level, "raid1");
+        assert!(!healthy.degraded);
+        assert_eq!(healthy.total_devices, Some(2));
+        assert_eq!(healthy.active_devices, Some(2));
+        assert_eq!(healthy.size_bytes, Some(1953260928 * 1024));
+        assert_eq!(healthy.slot_map.as_deref(), Some("UU"));
+        assert_eq!(healthy.members.len(), 2);
+        assert_eq!(healthy.members[0].device, "sda1");
+        assert_eq!(healthy.members[0].slot, Some(0));
+        assert_eq!(healthy.members[0].state, "active");
+
+        let degraded = &arrays[1];
+        assert_eq!(degraded.level, "raid6");
+        assert!(degraded.degraded);
+        assert_eq!(degraded.total_devices, Some(4));
+        assert_eq!(degraded.active_devices, Some(3));
+        assert_eq!(degraded.slot_map.as_deref(), Some("UUU_"));
+        assert_eq!(degraded.members.len(), 4);
+        let sync = degraded.sync.as_ref().expect("resync");
+        assert_eq!(sync.operation, "resync");
+        assert_eq!(sync.percent, Some(42.5));
+        assert_eq!(sync.speed_kib, Some(150000));
+        assert_eq!(sync.finish_minutes, Some(12.3));
+        assert_eq!(parse_md_speed("1.5M/sec"), Some(1536));
+        assert_eq!(parse_md_speed("150000K/sec"), Some(150000));
+    }
+
+    #[test]
+    fn mdstat_malformed_lines_are_ignored_without_panicking() {
+        let arrays = parse_mdstat("garbage\nmd\nmd0 : active\n      123 blocks\n");
+        assert_eq!(arrays.len(), 1);
+        assert_eq!(arrays[0].name, "md0");
+        assert_eq!(arrays[0].level, "unknown");
+        assert!(arrays[0].members.is_empty());
+        assert_eq!(arrays[0].size_bytes, Some(123 * 1024));
+    }
+
+    #[test]
+    fn mdadm_scan_parser_reads_uuid_and_metadata() {
+        let arrays = parse_mdadm_scan(
+            "ARRAY /dev/md0 metadata=1.2 name=host:0 UUID=1234:5678:9abc:def0\n\
+             ARRAY /dev/md1 metadata=1.2 name=host:1 UUID=aaaa:bbbb:cccc:dddd\n\
+             bogus\n",
+        );
+        assert_eq!(arrays.len(), 2);
+        assert_eq!(arrays[0].device, "/dev/md0");
+        assert_eq!(arrays[0].uuid.as_deref(), Some("1234:5678:9abc:def0"));
+        assert_eq!(arrays[0].metadata.as_deref(), Some("1.2"));
+    }
+
+    #[test]
+    fn block_device_validation_rejects_traversal_and_missing_devices() {
+        let root = fixture_root("validate-device");
+        add_block(&root, "nvme0n1", "Fixture", "SERIAL", 100, 0);
+        let sys_block = root.join("sys/block");
+        let dev = root.join("dev");
+
+        assert_eq!(
+            validate_block_device("/dev/nvme0n1", &sys_block, &dev).expect("valid"),
+            "nvme0n1"
+        );
+        for device in [
+            "/dev/../etc/passwd",
+            "/dev/nvme0n1/../../etc/passwd",
+            "/etc/passwd",
+            "/dev/",
+            "/dev/does-not-exist",
+            "/dev/.hidden",
+            "/dev/a b",
+            "nvme0n1",
+            "/dev/md/0",
+        ] {
+            let error = validate_block_device(device, &sys_block, &dev)
+                .expect_err("invalid device must be rejected");
+            assert_eq!(error.code, "storage.invalid-device", "{device}");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{device}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn storage_health_is_bounded_and_reports_md_arrays() {
+        let root = fixture_root("health-bound");
+        for index in 0..MAX_BLOCK_DEVICES + 8 {
+            add_block(
+                &root,
+                &format!("disk{index:02}"),
+                "Fixture",
+                "SERIAL",
+                100,
+                0,
+            );
+        }
+        smartctl_fixture(&root);
+        write(&root.join("proc/mdstat"), mdstat_fixture());
+        let state = HostSurfacesState::with_test_paths(&root);
+
+        let report = state
+            .storage_health(false, false)
+            .await
+            .expect("health report");
+        assert!(report.ok);
+        assert_eq!(report.matched, MAX_BLOCK_DEVICES + 8);
+        assert_eq!(report.count, MAX_BLOCK_DEVICES);
+        assert_eq!(report.limit, MAX_BLOCK_DEVICES);
+        assert!(report.truncated);
+        assert!(!report.serials_included);
+        assert!(!report.attributes_included);
+        assert!(report.devices.iter().all(|device| device.serial.is_none()));
+        assert!(report
+            .devices
+            .iter()
+            .all(|device| device.smart.attributes.is_none()));
+        assert!(report.smart.available);
+        assert!(report.md.available);
+        assert_eq!(report.md.count, 2);
+        assert!(!report.unavailable.contains(&"md"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn storage_health_normalizes_devices_and_redacts_serials_by_default() {
+        let root = fixture_root("health-per-device");
+        add_block(&root, "nvme0n1", "Fixture NVMe", "SERIAL-NVME-123", 1000, 0);
+        add_block(&root, "sda", "Fixture SATA", "SERIAL-SATA-999", 2000, 1);
+        add_block(&root, "bad0", "Fixture Bad", "SERIAL-BAD", 3000, 0);
+        smartctl_fixture(&root);
+        let state = HostSurfacesState::with_test_paths(&root);
+
+        let report = state
+            .storage_health(false, false)
+            .await
+            .expect("health report");
+        assert_eq!(report.count, 3);
+        assert!(!report.truncated);
+        assert!(!report.serials_included);
+        assert!(report.devices.iter().all(|device| device.serial.is_none()));
+        assert!(!report.md.available);
+        assert_eq!(report.md.code, Some("storage.md-unavailable"));
+        assert!(report.unavailable.contains(&"md"));
+
+        let nvme = report
+            .devices
+            .iter()
+            .find(|device| device.name == "nvme0n1")
+            .expect("nvme");
+        assert_eq!(nvme.device, "/dev/nvme0n1");
+        assert_eq!(nvme.model.as_deref(), Some("Fixture NVMe"));
+        assert_eq!(nvme.size_bytes, Some(1000 * 512));
+        assert_eq!(nvme.rotational, Some(false));
+        assert!(nvme.smart.available);
+        assert_eq!(nvme.smart.temperature_c, Some(41));
+        assert_eq!(nvme.smart.percentage_used, Some(7));
+
+        let sata = report
+            .devices
+            .iter()
+            .find(|device| device.name == "sda")
+            .expect("sata");
+        assert_eq!(sata.rotational, Some(true));
+        assert_eq!(sata.smart.passed, Some(false));
+        assert_eq!(sata.smart.reallocated_sectors, Some(8));
+        assert_eq!(sata.smart.pending_sectors, Some(2));
+        assert_eq!(sata.smart.uncorrectable_sectors, Some(3));
+        assert_eq!(sata.smart.attributes, None);
+
+        let bad = report
+            .devices
+            .iter()
+            .find(|device| device.name == "bad0")
+            .expect("bad");
+        assert!(!bad.smart.available);
+        assert_eq!(bad.smart.code, Some("storage.smart-unavailable"));
+
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(!json.contains("SERIAL-NVME-123"));
+        assert!(!json.contains("SERIAL-SATA-999"));
+
+        let with_serials = state
+            .storage_health(true, true)
+            .await
+            .expect("health with serials");
+        assert!(with_serials.serials_included);
+        assert!(with_serials.attributes_included);
+        let nvme = with_serials
+            .devices
+            .iter()
+            .find(|device| device.name == "nvme0n1")
+            .expect("nvme");
+        assert_eq!(nvme.serial.as_deref(), Some("SERIAL-NVME-123"));
+        let sata = with_serials
+            .devices
+            .iter()
+            .find(|device| device.name == "sda")
+            .expect("sata");
+        assert_eq!(sata.serial.as_deref(), Some("SERIAL-SATA-999"));
+        assert_eq!(sata.smart.attributes.as_ref().map(Vec::len), Some(3));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn storage_health_names_unavailable_smart_and_md_sections() {
+        let root = fixture_root("health-unavailable");
+        add_block(&root, "nvme0n1", "Fixture", "SERIAL", 100, 0);
+        write_executable(
+            &root.join("bin/smartctl"),
+            r#"#!/bin/sh
+cat <<'JSON'
+{"smartctl":{"messages":[{"string":"Smartctl open device failed","severity":"error"}],"exit_status":2}}
+JSON
+"#,
+        );
+        let state = HostSurfacesState::with_test_paths(&root);
+
+        let report = state
+            .storage_health(false, false)
+            .await
+            .expect("health report");
+        assert!(!report.smart.available);
+        assert_eq!(report.smart.code, Some("storage.smart-unavailable"));
+        assert!(report
+            .smart
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("no usable SMART"));
+        assert!(!report.md.available);
+        assert_eq!(report.md.code, Some("storage.md-unavailable"));
+        assert!(report.unavailable.contains(&"smart"));
+        assert!(report.unavailable.contains(&"md"));
+        assert_eq!(report.count, 1);
+        assert!(!report.devices[0].smart.available);
+        assert_eq!(
+            report.devices[0].smart.code,
+            Some("storage.smart-unavailable")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn smart_endpoint_normalizes_and_validates_devices() {
+        let root = fixture_root("smart-endpoint");
+        add_block(&root, "nvme0n1", "Fixture NVMe", "SERIAL-NVME-123", 1000, 0);
+        add_block(&root, "sda", "Fixture SATA", "SERIAL-SATA-999", 2000, 1);
+        add_block(&root, "bad0", "Fixture Bad", "SERIAL-BAD", 3000, 0);
+        smartctl_fixture(&root);
+        let state = HostSurfacesState::with_test_paths(&root);
+
+        let report = state
+            .smart("/dev/nvme0n1", false, false)
+            .await
+            .expect("smart report");
+        assert_eq!(report.device, "/dev/nvme0n1");
+        assert_eq!(report.model.as_deref(), Some("Fixture NVMe"));
+        assert_eq!(report.serial, None);
+        assert_eq!(report.size_bytes, Some(1000 * 512));
+        assert_eq!(report.rotational, Some(false));
+        assert_eq!(report.protocol.as_deref(), Some("NVMe"));
+        assert_eq!(report.smart.temperature_c, Some(41));
+        assert_eq!(report.smart.percentage_used, Some(7));
+
+        let with_serial = state
+            .smart("/dev/nvme0n1", true, false)
+            .await
+            .expect("smart report with serial");
+        assert_eq!(with_serial.serial.as_deref(), Some("SERIAL-NVME-123"));
+
+        let sata = state
+            .smart("/dev/sda", false, true)
+            .await
+            .expect("sata smart report");
+        assert_eq!(sata.smart.reallocated_sectors, Some(8));
+        assert_eq!(sata.smart.attributes.as_ref().map(Vec::len), Some(3));
+
+        let error = state
+            .smart("/dev/../etc/passwd", false, false)
+            .await
+            .expect_err("traversal must be rejected");
+        assert_eq!(error.code, "storage.invalid-device");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+        let error = state
+            .smart("/dev/does-not-exist", false, false)
+            .await
+            .expect_err("missing device must be rejected");
+        assert_eq!(error.code, "storage.invalid-device");
+
+        let error = state
+            .smart("/dev/bad0", false, false)
+            .await
+            .expect_err("malformed smartctl output must be typed");
+        assert_eq!(error.code, "storage.smart-unavailable");
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn storage_health_routes_are_bounded_and_preserve_typed_errors() {
+        let root = fixture_root("health-routes");
+        add_block(&root, "nvme0n1", "Fixture NVMe", "SERIAL-NVME-123", 1000, 0);
+        smartctl_fixture(&root);
+        let app = router(HostSurfacesState::with_test_paths(&root));
+
+        let (status, health) = get_json(&app, STORAGE_HEALTH_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(health["ok"], true);
+        assert_eq!(health["count"], 1);
+        assert_eq!(health["serials_included"], false);
+        assert!(health["devices"][0].get("serial").is_none());
+        assert_eq!(health["devices"][0]["smart"]["percentage_used"], 7);
+
+        let (status, health) = get_json(&app, "/storage/health?serials=true").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(health["serials_included"], true);
+        assert_eq!(health["devices"][0]["serial"], "SERIAL-NVME-123");
+
+        let (status, health) = get_json(&app, STORAGE_HEALTH_API_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(health["count"], 1);
+
+        let (status, smart) = get_json(&app, "/storage/smart?device=/dev/nvme0n1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(smart["device"], "/dev/nvme0n1");
+        assert_eq!(smart["smart"]["temperature_c"], 41);
+        assert!(smart.get("serial").is_none());
+
+        let (status, smart) =
+            get_json(&app, "/storage/smart?device=/dev/nvme0n1&serials=true").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(smart["serial"], "SERIAL-NVME-123");
+
+        let (status, error) = get_json(&app, STORAGE_SMART_PATH).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["code"], "storage.invalid-device");
+
+        let (status, error) = get_json(&app, "/storage/smart?device=/dev/../etc/passwd").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["code"], "storage.invalid-device");
+
+        let (status, _) = get_json(&app, STORAGE_SMART_API_PATH).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let missing = fixture_root("health-routes-no-smartctl");
+        add_block(&missing, "nvme0n1", "Fixture", "SERIAL", 100, 0);
+        let missing_app = router(HostSurfacesState::with_test_paths(&missing));
+        let (status, error) = get_json(&missing_app, "/storage/smart?device=/dev/nvme0n1").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error["code"], "storage.smart-unavailable");
+
+        let (status, error) = get_json(&missing_app, STORAGE_HEALTH_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(error["md"]["code"], "storage.md-unavailable");
+        assert_eq!(error["smart"]["code"], "storage.smart-unavailable");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(missing);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_host_storage_health_and_smart_are_bounded_and_read_only() {
+        let state = HostSurfacesState::host_with_identity("live-node", "hardware");
+        let health = state
+            .storage_health(false, false)
+            .await
+            .expect("live storage health");
+        assert!(health.count <= MAX_BLOCK_DEVICES);
+        assert!(health.matched >= health.count);
+        assert!(!health.serials_included);
+        assert!(!health.attributes_included);
+        assert!(health.devices.iter().all(|device| device.serial.is_none()));
+        assert!(health
+            .devices
+            .iter()
+            .all(|device| device.smart.attributes.is_none()));
+        assert!(health.md.count <= MAX_MD_ARRAYS);
+        if !health.md.available {
+            assert_eq!(health.md.code, Some("storage.md-unavailable"));
+        }
+        for device in &health.devices {
+            assert_eq!(device.device, format!("/dev/{}", device.name));
+            if let Some(size) = device.size_bytes {
+                assert!(size > 0);
+            }
+        }
+        if let Some(nvme) = health
+            .devices
+            .iter()
+            .find(|device| device.name.starts_with("nvme"))
+        {
+            assert_eq!(nvme.rotational, Some(false));
+        }
+
+        if std::path::Path::new("/sys/block/nvme0n1").exists() {
+            match state.smart("/dev/nvme0n1", false, false).await {
+                Ok(report) => {
+                    assert_eq!(report.device, "/dev/nvme0n1");
+                    assert_eq!(report.serial, None);
+                    assert!(report.smart.available);
+                    assert!(
+                        report.smart.temperature_c.is_some()
+                            || report.smart.percentage_used.is_some()
+                    );
+                }
+                Err(error) => {
+                    assert_eq!(error.code, "storage.smart-unavailable");
+                    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+                }
+            }
+        }
     }
 
     #[test]
