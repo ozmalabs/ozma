@@ -406,6 +406,12 @@ impl DataplaneError {
     pub fn not_running(reason: impl Into<String>) -> Self {
         Self::new("mesh.dataplane-not-running", reason)
     }
+
+    /// The host `ip`/iproute2 version cannot create a persistent TUN link with
+    /// either supported syntax.
+    pub fn tun_unsupported(reason: impl Into<String>) -> Self {
+        Self::new("mesh.tun-unsupported", reason)
+    }
 }
 
 impl fmt::Display for DataplaneError {
@@ -764,11 +770,7 @@ impl MeshDataplane {
     fn apply(&self, applied: &mut Vec<Applied>) -> Result<(), DataplaneError> {
         let interface = &self.config.interface;
 
-        self.run(&CommandSpec::new(
-            "ip",
-            ["tuntap", "add", "dev", interface, "mode", "tun", "persist"],
-        ))?;
-        applied.push(Applied::Link(interface.clone()));
+        self.create_tun(applied)?;
 
         self.run(&CommandSpec::new(
             "ip",
@@ -885,21 +887,76 @@ impl MeshDataplane {
         Ok(())
     }
 
-    fn run(&self, command: &CommandSpec) -> Result<(), DataplaneError> {
-        let output = self.runner.run(command).map_err(|error| {
+    /// Create the persistent TUN link.
+    ///
+    /// iproute2 5.x/6.x accepts `ip tuntap add ... persist`. iproute2 7.3
+    /// removed that keyword and makes `mode tun` persistent by default, so the
+    /// same interface is created without the token. Try the explicit form first
+    /// (correct on older releases), then fall back only when the tool rejects
+    /// the token. A failure of both forms is a typed, actionable error rather
+    /// than an opaque command failure.
+    fn create_tun(&self, applied: &mut Vec<Applied>) -> Result<(), DataplaneError> {
+        let interface = &self.config.interface;
+        let explicit = CommandSpec::new(
+            "ip",
+            [
+                "tuntap".to_owned(),
+                "add".to_owned(),
+                "dev".to_owned(),
+                interface.clone(),
+                "mode".to_owned(),
+                "tun".to_owned(),
+                "persist".to_owned(),
+            ],
+        );
+        let output = self.invoke(&explicit)?;
+        if output.success() {
+            applied.push(Applied::Link(interface.clone()));
+            return Ok(());
+        }
+        if !persist_keyword_rejected(&output) {
+            return Err(command_failure(&explicit, &output));
+        }
+
+        debug!(
+            interface = %interface,
+            "iproute2 rejected the explicit `persist` token; retrying with implicit persistence"
+        );
+        let implicit = CommandSpec::new(
+            "ip",
+            [
+                "tuntap".to_owned(),
+                "add".to_owned(),
+                "dev".to_owned(),
+                interface.clone(),
+                "mode".to_owned(),
+                "tun".to_owned(),
+            ],
+        );
+        let fallback = self.invoke(&implicit)?;
+        if fallback.success() {
+            applied.push(Applied::Link(interface.clone()));
+            return Ok(());
+        }
+
+        Err(DataplaneError::tun_unsupported(format!(
+            "this host's iproute2 rejects `ip tuntap add ... persist` and `ip tuntap add ... mode tun` \
+             also failed ({}); create a persistent TUN named {interface:?} before starting or upgrade \
+             iproute2",
+            short_reason(command_detail(&fallback))
+        )))
+    }
+
+    fn invoke(&self, command: &CommandSpec) -> Result<CommandOutput, DataplaneError> {
+        self.runner.run(command).map_err(|error| {
             DataplaneError::command_failed(format!("could not execute `{command}`: {error}"))
-        })?;
+        })
+    }
+
+    fn run(&self, command: &CommandSpec) -> Result<(), DataplaneError> {
+        let output = self.invoke(command)?;
         if !output.success() {
-            let detail = if output.stderr.trim().is_empty() {
-                output.stdout.trim()
-            } else {
-                output.stderr.trim()
-            };
-            return Err(DataplaneError::command_failed(format!(
-                "`{command}` exited with status {}: {}",
-                output.status,
-                short_reason(detail)
-            )));
+            return Err(command_failure(command, &output));
         }
         Ok(())
     }
@@ -1007,6 +1064,41 @@ fn short_reason(reason: &str) -> String {
     format!("{shortened}…")
 }
 
+fn command_detail(output: &CommandOutput) -> &str {
+    if output.stderr.trim().is_empty() {
+        output.stdout.trim()
+    } else {
+        output.stderr.trim()
+    }
+}
+
+fn command_failure(command: &CommandSpec, output: &CommandOutput) -> DataplaneError {
+    DataplaneError::command_failed(format!(
+        "`{command}` exited with status {}: {}",
+        output.status,
+        short_reason(command_detail(output))
+    ))
+}
+
+/// Whether iproute2 rejected the `persist` keyword itself (rather than failing
+/// for an unrelated reason such as permissions or an existing link).
+fn persist_keyword_rejected(output: &CommandOutput) -> bool {
+    let text = format!("{} {}", output.stdout, output.stderr).to_ascii_lowercase();
+    let mentions_persist = text.contains("persist");
+    let is_parse_error = [
+        "garbage",
+        "invalid",
+        "unknown",
+        "unrecognized",
+        "unexpected",
+        "duplicate",
+        "not supported",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    mentions_persist && is_parse_error
+}
+
 fn is_already_absent(reason: &str) -> bool {
     [
         "Cannot find device",
@@ -1030,6 +1122,7 @@ mod tests {
     struct FakeRunner {
         calls: Mutex<Vec<CommandSpec>>,
         fail: Mutex<Option<CommandSpec>>,
+        reject_persist: Mutex<bool>,
         probe: Mutex<Option<Weak<MeshDataplane>>>,
         observed: Mutex<Option<DataplaneState>>,
     }
@@ -1044,6 +1137,22 @@ mod tests {
 
         fn fail_on(&self, command: CommandSpec) {
             *self.fail.lock().unwrap_or_else(|error| error.into_inner()) = Some(command);
+        }
+
+        /// Simulate iproute2 7.3, which rejects the `persist` token while
+        /// creating a persistent TUN with the implicit form.
+        fn reject_persist_keyword(&self) {
+            *self
+                .reject_persist
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = true;
+        }
+
+        fn persist_rejected(&self) -> bool {
+            *self
+                .reject_persist
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
         }
 
         fn probe(&self, dataplane: &Arc<MeshDataplane>) {
@@ -1079,6 +1188,18 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .push(command.clone());
+            let persist = CommandSpec::new(
+                "ip",
+                ["tuntap", "add", "dev", "ozma0", "mode", "tun", "persist"],
+            );
+            if self.persist_rejected() && *command == persist {
+                return Ok(CommandOutput {
+                    status: 255,
+                    stdout: String::new(),
+                    stderr: "Error: either \"name\" is duplicate, or \"persist\" is garbage."
+                        .to_owned(),
+                });
+            }
             if self
                 .fail
                 .lock()
@@ -1269,6 +1390,45 @@ mod tests {
         // Starting twice must not reprogram the kernel.
         dataplane.start().unwrap();
         assert_eq!(runner.calls().len(), expected.len());
+    }
+
+    #[test]
+    fn persist_keyword_rejected_falls_back_to_implicit_persistence() {
+        let (dataplane, runner, _sysfs) = dataplane(base_config(), FakeSysfs::rooted());
+        runner.reject_persist_keyword();
+
+        let status = dataplane.start().unwrap();
+        let calls = runner.calls();
+        assert_eq!(
+            &calls[..2],
+            &[
+                cmd(
+                    "ip",
+                    &["tuntap", "add", "dev", "ozma0", "mode", "tun", "persist"]
+                ),
+                cmd("ip", &["tuntap", "add", "dev", "ozma0", "mode", "tun"]),
+            ],
+            "the rejected explicit persist form must be followed by the implicit form"
+        );
+        assert_eq!(status.state, DataplaneState::Running);
+        assert!(status.up);
+    }
+
+    #[test]
+    fn both_tun_create_variants_rejected_is_typed_and_actionable() {
+        let (dataplane, runner, _sysfs) = dataplane(base_config(), FakeSysfs::rooted());
+        runner.reject_persist_keyword();
+        runner.fail_on(cmd("ip", &["tuntap", "add", "dev", "ozma0", "mode", "tun"]));
+
+        let error = dataplane.start().unwrap_err();
+        assert_eq!(error.code, "mesh.tun-unsupported");
+        assert!(
+            error.reason.contains("iproute2") && error.reason.contains("persistent TUN"),
+            "error must tell the operator what is unsupported and what to do: {error:?}"
+        );
+        assert_eq!(dataplane.status().state, DataplaneState::Failed);
+        // The link was never created, so no rollback command may run.
+        assert_eq!(runner.calls().len(), 2, "only the two creation attempts");
     }
 
     #[test]

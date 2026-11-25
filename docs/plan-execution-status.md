@@ -144,6 +144,10 @@ also never touch a real UDC, ConfigFS mount, or block device.
 | RPA real subset | Partial | Real type/key/screenshot/OCR (tesseract, typed unavailable) with capability advertisement; script/click/wait/BIOS remain typed 501. 550 node tests + 65 controller proxy tests. See [`phase4-rpa-report.md`](phase4-rpa-report.md). |
 | Desktop compatibility | Partial | Desktop-profile geometry (xrandr get/set + verified rollback), clipboard (xclip/xsel, bounds), wallpaper (local image tools). PATH-based availability, typed non-desktop/503, no success without real tool exit. Live Xvfb geometry set. See [`phase4-desktop-compat-report.md`](phase4-desktop-compat-report.md). |
 | Media live validation | Done (live at `e40e62c`) | `/video` real changing JPEG parts, clamps/typed errors/cap/cleanup; VNC password auth, real client frames/input, TigerVNC RFB 3.8 + VncAuth + ZRLE, registration advertise/retract; demo + clean-host 22/22. See [`phase4-live-cutover-report.md`](phase4-live-cutover-report.md). |
+| Privileged install gate | Done (installed, reversible) | Real root install + idempotent re-run: account, 4+4 units, 6 udev rules, AppArmor drop-in, tmpfiles/modules-load, `/etc/ozma`, state/runtime dirs; `qemu.conf` untouched; nothing enabled/started. verify-units 8/8, systemd-analyze 4/4, udevadm 6/6, transient service-account run; verifier 82/0/1. See [`phase4-privileged-install-report.md`](phase4-privileged-install-report.md). |
+| USB real hardware | Partial | dummy_hcd: ConfigFS mass storage + node gadget host SCSI write/read-back, FunctionFS daemon 109 CBW/CSW file round-trip, USB/IP vhci attach + read-back. UAC2 blocked by dummy_hcd lacking ISO endpoints. See [`phase4-usb-hardware-report.md`](phase4-usb-hardware-report.md). |
+| Mesh live dataplane | Partial (live green) | Two-namespace handshake + ping/UDP through TUN/pump; fixed iproute2 persist fallback, non-overlay drop classification, cooperative shutdown, and timer-driven peer expiry. Same underlay/overlay address still needs a policy route. See [`phase4-mesh-live-report.md`](phase4-mesh-live-report.md). |
+| DRM leasing | Partial | `drm`-crate connector+CRTC leases, vkms auto-select, fd inheritance, revoke/re-acquire; live vkms connector 43/CRTC 41. Lease-only, no compositor/scanout. See [`phase4-drm-lease-report.md`](phase4-drm-lease-report.md). |
 | Delete Python node trees | Blocked; criteria published | One-release overlap still required. Do not delete until every checkbox in [`phase4-cutover-audit.md`](phase4-cutover-audit.md) §9 is green on a frozen commit and the rollback tag exists. |
 | Live default-Rust cutover (validation) | Done (two regressions fixed) | Default `demo/run_demo.sh` passed discovery, health/detail, dashboard, HLS + proxy, snapshots, QMP input, paste, 24/24 switching, and graceful shutdown with no orphans. `--webrtc-fit-capture` and `demo test` cleanup were fixed afterward; a live WebRTC two-peer re-run is still pending. Clean-host `--host` 20/20 on detached `1cd866d`. See [`phase4-live-cutover-report.md`](phase4-live-cutover-report.md). |
 | UAC2 bridge → audio/node | Partial | ALSA/PipeWire adapters + dedicated pump; `/usb` reports `configured/running/stopped` with counters and typed errors, and `running` requires PCM. Real UDC/host-enumeration unproven. See [`phase4-uac2-node-report.md`](phase4-uac2-node-report.md). |
@@ -249,7 +253,7 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # 2661 passed, 49 ignored (current)
+cargo test --workspace                                   # 2696 passed, 50 ignored (current)
 cargo test -p ozma-node --test parity                    # Python/controller parity baseline (16)
 cargo test -p ozma-node --lib                            # node API, compat, session unit tests (136, 2 ignored)
 cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)

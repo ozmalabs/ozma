@@ -252,6 +252,11 @@ pub enum MultiseatError {
     /// Generic per-seat display server failure (spawn, stop, or probe).
     #[error("seat display error: {0}")]
     SeatDisplay(String),
+
+    /// A DRM lease could not be enumerated, created, validated, or revoked.
+    /// The lease-only layer never claims scanout or compositor isolation.
+    #[error("DRM lease error: {0}")]
+    DrmLease(String),
 }
 
 impl MultiseatError {
@@ -305,6 +310,7 @@ impl MultiseatError {
             Self::SeatDisplayStartupTimeout { .. } => "seat_display_startup_timeout",
             Self::SeatDisplayCrashed { .. } => "seat_display_crashed",
             Self::SeatDisplay(_) => "seat_display",
+            Self::DrmLease(_) => "drm_lease",
         }
     }
 }

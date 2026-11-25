@@ -183,6 +183,7 @@ fn options(dry_run: bool, apply_ownership: bool, apply_routing: bool) -> Supervi
         input_isolation: false,
         input_targeting: Default::default(),
         seat_display: Default::default(),
+        drm_leases: Default::default(),
     }
 }
 

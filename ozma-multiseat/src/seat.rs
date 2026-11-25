@@ -8,6 +8,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::display::DisplayOutput;
+use crate::drm_lease::DrmLeaseStatus;
 use crate::error::MultiseatError;
 use crate::input::InputGroup;
 use crate::ownership::DisplayOwnership;
@@ -363,6 +364,7 @@ impl SeatPlan {
             next_restart_in_ms: None,
             resources: SeatResourceStatus::default(),
             display: SeatDisplayStatus::shared(),
+            drm_lease: DrmLeaseStatus::default(),
             message,
         }
     }
@@ -412,6 +414,8 @@ pub enum ResourceKind {
     InputTargeting,
     /// Per-seat PipeWire/PulseAudio null sink.
     Audio,
+    /// Per-seat DRM lease (connector/CRTC object handoff only).
+    DrmLease,
 }
 
 impl ResourceKind {
@@ -423,6 +427,7 @@ impl ResourceKind {
             Self::InputIsolation => "input_isolation",
             Self::InputTargeting => "input_targeting",
             Self::Audio => "audio",
+            Self::DrmLease => "drm_lease",
         }
     }
 }
@@ -483,6 +488,9 @@ pub struct SeatResourceStatus {
     /// and that restriction has not been released.
     #[serde(default)]
     pub input_targeting_applied: bool,
+    /// A DRM lease was acquired for this seat and has not been released.
+    #[serde(default)]
+    pub drm_lease_applied: bool,
     /// Ownership was released after being applied (or a previous release was
     /// retried successfully).
     #[serde(default)]
@@ -499,6 +507,9 @@ pub struct SeatResourceStatus {
     /// Private-display input targeting was released after being applied.
     #[serde(default)]
     pub input_targeting_released: bool,
+    /// A DRM lease was released after being applied.
+    #[serde(default)]
+    pub drm_lease_released: bool,
     /// Devices the helper confirmed as exclusively grabbed for this seat.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub grabbed_device_count: usize,
@@ -525,11 +536,13 @@ impl SeatResourceStatus {
             && !self.audio_applied
             && !self.input_isolation_applied
             && !self.input_targeting_applied
+            && !self.drm_lease_applied
             && !self.ownership_released
             && !self.routing_released
             && !self.audio_released
             && !self.input_isolation_released
             && !self.input_targeting_released
+            && !self.drm_lease_released
             && self.grabbed_device_count == 0
             && self.uinput_devices.is_empty()
             && self.targeted_devices.is_empty()
@@ -594,6 +607,9 @@ pub struct SeatRuntimeStatus {
     /// omitted entirely for the default `shared` backend.
     #[serde(default, flatten)]
     pub display: SeatDisplayStatus,
+    /// Opt-in DRM lease state. Omitted when no lease was requested.
+    #[serde(default, skip_serializing_if = "DrmLeaseStatus::is_empty")]
+    pub drm_lease: DrmLeaseStatus,
     /// Optional operator-facing message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -613,6 +629,7 @@ impl SeatRuntimeStatus {
             next_restart_in_ms: None,
             resources: SeatResourceStatus::default(),
             display: SeatDisplayStatus::shared(),
+            drm_lease: DrmLeaseStatus::default(),
             message: None,
         }
     }
@@ -658,6 +675,12 @@ impl SeatRuntimeStatus {
     /// Attach private display server state.
     pub fn with_display(mut self, display: SeatDisplayStatus) -> Self {
         self.display = display;
+        self
+    }
+
+    /// Attach DRM lease state.
+    pub fn with_drm_lease(mut self, drm_lease: DrmLeaseStatus) -> Self {
+        self.drm_lease = drm_lease;
         self
     }
 }
@@ -713,6 +736,9 @@ pub struct SeatStatus {
     /// the default `shared` backend.
     #[serde(default, flatten)]
     pub display: SeatDisplayStatus,
+    /// Opt-in DRM lease state. Omitted when no lease was requested.
+    #[serde(default, skip_serializing_if = "DrmLeaseStatus::is_empty")]
+    pub drm_lease: DrmLeaseStatus,
     /// Optional state message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,

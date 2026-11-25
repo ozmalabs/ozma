@@ -2,10 +2,14 @@
 
 Status: **harness, Rust-first systemd assets, user and system install layouts,
 the host integration surface (user/group, udev, AppArmor, libvirt snippet), and
-the demo Rust switch are implemented. Gate 4 is not yet met**: the privileged
-fresh-host install has not been run end-to-end, the controller is still Python,
-and the Python trees are intentionally still present for one release. The
-2026-11-25 refresh at `437468a` passed the host harness, workspace tests, and
+the demo Rust switch are implemented. The privileged fresh-host install gate has
+now run on this host** (2026-11-25: install exit 0, assets verified, no unit
+enabled; one verifier check failed from live-state coupling and one AppArmor
+check skipped — see [Privileged install gate](#privileged-install-gate-2026-11-25)
+and [`phase4-privileged-install-report.md`](phase4-privileged-install-report.md)).
+Gate 4 is not yet met: no node service was started, the controller is still
+Python, and the Python trees are intentionally still present for one release.
+The 2026-11-25 refresh at `437468a` passed the host harness, workspace tests, and
 controller pytest. On 2026-11-25 the container gate also passed:
 `scripts/clean-host/run.sh --container --full` at `08393e7` reported
 2469 passed / 0 failed / 42 ignored (see
@@ -423,6 +427,40 @@ their checks into SKIPs). It never needs root and removes its temp roots unless
 `--keep` is set. Full host/container evidence and the root-only follow-up steps
 are in [`phase4-system-install-report.md`](phase4-system-install-report.md).
 
+### Privileged install gate (2026-11-25)
+
+The real root install was executed on `SFFPC` (systemd 262, kernel 7.3.5) as the
+gate the audit marked unrun. It used the current tree's debug binaries (release
+artifacts were not rebuilt) and left all units disabled:
+
+```bash
+./scripts/install-system.sh --dry-run --profile all --usb-gadget   # exit 0, no writes
+./scripts/install-rust.sh --from-target target/debug --prefix "$HOME/.local"
+sudo -n scripts/install-rust.sh --from-target target/debug --system --prefix /usr/local
+sudo -n scripts/install-system.sh --profile all --usb-gadget        # exit 0
+sudo -n scripts/install-system.sh --profile all --usb-gadget        # exit 0 (idempotent)
+```
+
+| Check | Result |
+|---|---|
+| `scripts/systemd/verify-units.sh` | PASS (4 system + 4 user) |
+| `systemd-analyze verify` installed units | PASS (all four; `ozma-node@hardware.service` includes the USB drop-in) |
+| `udevadm verify` installed rules | PASS (6/6) |
+| `systemd-tmpfiles --create --dry-run` | PASS |
+| `scripts/verify-system-install.sh` | 81 passed / 1 failed / 1 skipped; the failure is the live-root `--dry-run --profile hardware` check refusing the `libcomposite` line from the live `--usb-gadget` install, not an install defect |
+| AppArmor parser | SKIP (`apparmor_parser` absent, `apparmor` inactive) |
+| Transient `systemd-run` of `/usr/local/bin/ozma-node --help` as `ozma-node` | PASS (exit 0, journal clean, no leftover unit) |
+| Enabled/active Ozma units | none |
+
+The account (`ozma-node`, groups `input kvm render video libvirt`), `/run/ozma`
+(`0755`, QMP subdir `0770 root:kvm`), the `seats.json` path, the multiseat unit,
+and the operator-commands file were all confirmed. `/etc/libvirt/qemu.conf` is
+byte-identical to its pre-install copy. udev was **not** reloaded or triggered,
+so `/dev/uinput` and the render nodes still have their pre-install ownership;
+the rules apply on the next boot/trigger. The install was left in place; exact
+rollback, the full asset inventory, and the remaining privileged gaps are in
+[`phase4-privileged-install-report.md`](phase4-privileged-install-report.md).
+
 ### Rollback
 
 ```bash
@@ -501,9 +539,10 @@ Before changing a release default to Rust:
    and the overlap release has shipped. Deletion is a separate reviewed
    change, not part of this harness.
 
-Gate 4 evidence still required: a Python-free fresh-host install, the
-controller/demo regression against the Rust nodes, and a green
-`cargo test --workspace` on the release commit.
+Gate 4 evidence still required: the controller/demo regression against the Rust
+nodes and a green `cargo test --workspace` on the release commit. The
+Python-free fresh-host install portion has now been run (see
+[Privileged install gate](#privileged-install-gate-2026-11-25)).
 
 Current state (2026-11-25): only annotated `rust-cutover-preview-*` tags exist
 (latest at `437468a`); none is the
@@ -579,7 +618,8 @@ Independent checks that do not need the moving libraries still pass:
 
 ```bash
 scripts/systemd/verify-units.sh          # PASS (4 system + 4 user, systemd 262)
-scripts/verify-system-install.sh         # PASS (82 passed, 0 failed, 1 skipped)
+scripts/verify-system-install.sh         # PASS on a clean root (82/0/1);
+                                         # 81/1/1 on the live installed host, see gate section
 scripts/clean-host/run.sh --check-deps   # PASS (host; shellcheck/apparmor SKIP)
 scripts/install-rust.sh --dry-run ...    # exit 0, no files written
 scripts/install-system.sh --dry-run ...  # exit 0, no files written

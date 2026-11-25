@@ -253,8 +253,11 @@ else
     fail "install-system.sh --dry-run"
 fi
 
-# A live-root dry run must work without root and still write nothing.
-if run_install "$TMP/install-dry-live.log" --dry-run --profile hardware; then
+# A live-root dry run must work without root and still write nothing. Use
+# --force: a host that already has a different profile installed (for example
+# --usb-gadget adds libcomposite to the modules-load snippet) otherwise refuses
+# the profile mismatch. --dry-run still writes nothing.
+if run_install "$TMP/install-dry-live.log" --dry-run --force --profile hardware; then
     pass "install-system.sh --dry-run without --root (non-root)"
 else
     fail "install-system.sh --dry-run without --root (non-root)"

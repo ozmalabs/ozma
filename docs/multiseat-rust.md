@@ -4,7 +4,7 @@ Status: **library + real subprocess supervisor + CLI + controller read-only
 grouping + persisted seats/hotplug reconciliation + opt-in
 input-routing/display-ownership/audio execution + opt-in privileged input
 isolation + private-display input targeting + opt-in per-seat X servers +
-packaged systemd unit (2026-11-25).**
+opt-in DRM lease-only handoff + packaged systemd unit (2026-11-25).**
 The crate enumerates display/input topology, plans one desktop seat per output,
 can spawn, health-check, restart, stop, and report one `ozma-node --profile
 desktop` child per seat, and models the opt-in resource layers: `xinput
@@ -48,6 +48,14 @@ Implemented:
   with a pure parser and a binary/display detection helper.
 - DRM connector detection from `/sys/class/drm` (status and advertised modes).
   This is detection only, not a KMS/scanout or mode-setting backend.
+- **DRM leasing** (`drm_lease`): typed sysfs/`/dev/dri` card enumeration, object
+  inspection, `DRM_IOCTL_MODE_CREATE_LEASE` through the maintained `drm` crate,
+  an owned lessee fd, `GET_LEASE` validation, revoke/close on drop, and typed
+  no-DRM/no-permission/unsupported/unknown-object/already-leased/
+  capability-required errors. `AutoVirtual` only selects a `vkms` card; a real
+  card/output is selected only by naming `/dev/dri/cardN`. The feature is
+  opt-in and **lease-only**: it does not create scanout or compositor
+  isolation.
 - Input device model and `InputBackend` trait.
 - Linux sysfs/evdev enumeration: capability-bit classification (keyboard,
   mouse, gamepad) and USB-hub tracing, without opening an evdev node.
@@ -243,6 +251,7 @@ Deliberately not implemented yet:
 |---|---|
 | Display | `DisplayOutput`, `DisplayBackend`, `XrandrDisplayBackend`, `parse_listactivemonitors`, `BackendDetection` |
 | DRM | `drm::detect`, `drm::detect_at`, `DrmConnector`, `DrmStatus`, `DrmDetection` |
+| DRM lease | `DrmLeaseBackend`, `RealDrmLeaseBackend`, `DrmCard`, `DrmCardSelector`, `DrmCrtcSelector`, `DrmLeaseRequest`, `DrmLeaseHandle`, `DrmLeaseObjects`, `DrmLeaseStatus`, `DrmLeaseNote`, `DrmLeaseError`, `enumerate_drm_cards`, `apply_lease_environment`, `clear_lease_environment` |
 | Input | `InputDevice`, `InputDeviceKind`, `InputGroup`, `InputBackend`, `SysfsInputBackend`, `group_inputs`, `classify_capabilities`, `usb_hub_path_from_sysfs` |
 | Host | `HostTopology` |
 | Planning | `PlannerOptions`, `CapturePreference`, `MultiseatPlanner`, `PersistedPlan`, `allocate_ports` |
@@ -570,6 +579,88 @@ Lifecycle and honesty rules:
   `unsupported`). All display fields are omitted for the default `shared`
   backend, so existing status JSON is unchanged.
 
+## DRM leases (`--seat-drm-lease`)
+
+This is an opt-in **lease-only** handoff, not a new display backend that draws
+on the leased output. A seat can receive an owned lessee fd for a named
+connector and CRTC; nothing in this crate programs scanout, starts a
+compositor, or claims that the host GPU/desktop is isolated. The default
+display backend remains `shared`.
+
+Module: `ozma-multiseat/src/drm_lease.rs`.
+
+| Type | Purpose |
+|---|---|
+| `DrmCard` / `DrmLeaseConnector` | Sysfs card name/path/driver/connectors and, after `inspect`, CRTC and connector object ids. |
+| `DrmCardSelector` | `auto`/`vkms` (virtual only) or an explicit `/dev/dri/cardN`. |
+| `DrmCrtcSelector` | `auto` or an explicit object id. |
+| `DrmLeaseRequest` | `[SEAT=]CARD:CONNECTOR[@CRTC]`, parsed by `FromStr`. |
+| `DrmLeaseBackend` | `enumerate`, `inspect`, `acquire`, `list_lease_ids`; production implementation is `RealDrmLeaseBackend`. |
+| `DrmLeaseHandle` | Owned `fd`, lessee/object ids, `validate` (`GET_LEASE`), `list_lease_ids`, `revoke`, `is_active`, `set_inheritable`. |
+| `DrmLeaseStatus` | Flattened seat status: card/connector, lessee id, connector/CRTC/plane ids, exported fd, applied/released flags, typed notes and error. |
+
+### Safety and object validation
+
+- `AutoVirtual` only selects a card whose sysfs driver is `vkms` (including the
+  newer `faux_driver` binding used by vkms). Real GPUs are never selected
+  implicitly; the operator must name `/dev/dri/cardN` (or `cardN`).
+- The connector is resolved from the card's current resource handles and its
+  `Info` name, never from a hard-coded id. An explicit CRTC id is checked
+  against `resource_handles().crtcs()`. Unknown objects are
+  `DrmLeaseError::UnknownObject`.
+- A same-process duplicate is rejected by an object registry before any ioctl;
+  the kernel remains authoritative for cross-process conflicts and returns a
+  typed `AlreadyLeased`/`LeaseFailed` error. No fake lease is ever returned.
+- Setting DRM master (`SET_MASTER`) is attempted automatically only for a
+  virtual `vkms` card. A real card usually has a compositor as master; ozma
+  does not steal it. Without master/CAP_SYS_ADMIN the result is
+  `CapabilityRequired`, not a lease.
+- The lessee fd is owned by the handle. `revoke()` issues
+  `DRM_IOCTL_MODE_REVOKE_LEASE` and closes it; dropping the handle closes the
+  fd, which also releases the kernel lease. `GET_LEASE` validates the object
+  set, and `list_lease_ids` uses the lessor's master fd.
+
+### Typed errors
+
+| Error | `code()` |
+|---|---|
+| `NoDrm` | `no_drm` |
+| `NoPermission` (open denied) | `no_permission` |
+| `Unsupported` (driver/kernel/ioctl) | `unsupported_lease` |
+| `ExplicitCardRequired` (auto chose a non-virtual card) | `explicit_card_required` |
+| `UnknownObject` / `UnknownConnector` | `unknown_object` |
+| `AlreadyLeased` | `already_leased` |
+| `CapabilityRequired` (master/CAP_SYS_ADMIN) | `capability_required` |
+| `UnknownCard`, `InvalidRequest`, `Io`, `LeaseFailed`, `Released` | matching snake-case names |
+
+### Supervisor lifecycle
+
+`SupervisorOptions::drm_leases` maps seat id to `DrmLeaseRequest`. The CLI's
+repeatable `--seat-drm-lease` populates it. `ProcessSeatSupervisor::new`
+installs the production backend when at least one request exists; tests/the CLI
+using `with_parts` call `with_drm_lease_backend(...)` explicitly. Without a
+backend, a requested lease fails with a typed `Unsupported` error before the
+node spawns.
+
+- **Start order:** private display (if any) → DRM lease acquire → ownership/
+  routing/helper/audio resources → node child. A lease failure releases the
+  display and earlier seat resources and never spawns the node.
+- **Child export:** the supervisor clears `FD_CLOEXEC` only around the spawn,
+  then restores it. The child receives `OZMA_DRM_LEASE=1`, `OZMA_DRM_FD`,
+  `OZMA_DRM_LEASE_ID`, `OZMA_DRM_CARD`, `OZMA_DRM_CONNECTOR`,
+  `OZMA_DRM_CONNECTOR_ID`, and `OZMA_DRM_CRTC_ID`. No unknown argv is appended.
+- **Restart:** an active lease is reused and its environment re-applied; a
+  released lease is re-acquired before the restart spawn.
+- **Stop/remove/rollback/Drop:** the node is stopped first, then the lease is
+  revoked, then display-dependent resources/display are released. A revoke
+  failure keeps the handle and `drm_lease_applied` for a later retry.
+- **Dry run:** reports `would acquire a DRM lease ... (lease-only; no scanout or
+  compositor isolation)` and acquires nothing.
+- **Status:** `drm_lease` (omitted when no lease was requested) carries the
+  object ids, lessee id, fd, `applied`/`released`, a typed error, and the
+  `lease_only_no_scanout` note. `resources.drm_lease_applied` /
+  `drm_lease_released` mirror the lifecycle.
+
 ## Supervision
 
 `SeatSupervisor` is the synchronous lifecycle contract:
@@ -624,6 +715,13 @@ fn status(&self) -> Vec<SeatRuntimeStatus>;
   recorded as a typed `Audio` apply error and does **not** prevent the seat from
   starting; a remove failure leaves `audio_applied=true` and retains the seat for
   a later `remove` retry. Dry-run never calls the router.
+- **DRM leases (opt-in, lease-only).** With `SupervisorOptions::drm_leases`, start
+  acquires the seat's connector/CRTC lease after any private display and before
+  resource reservation, then exports the lessee fd through `OZMA_DRM_FD`. The
+  lease is revoked on stop/remove/rollback/Drop; a failure prevents the spawn
+  and releases earlier seats. Restarts reuse an active lease. This never starts
+  a compositor or programs scanout; status always carries the
+  `lease_only_no_scanout` note.
 - **Start.** Spawn `plan.command.program` with its exact args and environment.
   The child inherits the supervisor's stdout/stderr. Wait until `GET /health`
   returns HTTP 200 (default) or a bounded TCP connect succeeds. A readiness
@@ -707,12 +805,30 @@ stops any child still owned by the supervisor.
       "state": "running",
       "pid": 4242,
       "restarts": 0,
+      "drm_lease": {
+        "card": "/dev/dri/card3",
+        "connector": "Virtual-1",
+        "lessee_id": 1,
+        "connector_id": 43,
+        "crtc_id": 41,
+        "plane_ids": [],
+        "fd": 12,
+        "applied": true,
+        "released": false,
+        "notes": [
+          {
+            "kind": "lease_only_no_scanout",
+            "message": "DRM lease grants only the named connector/CRTC object IDs ..."
+          }
+        ]
+      },
       "resources": {
         "ownership_applied": true,
         "routing_applied": false,
         "input_isolation_applied": true,
         "input_targeting_applied": true,
         "audio_applied": true,
+        "drm_lease_applied": true,
         "ownership_released": false,
         "routing_released": false,
         "input_isolation_released": false,
@@ -760,7 +876,10 @@ happened. Private display failures add
 as `display_error`. Targeted private displays add
 `input_targeting_failed` / `input_targeting_unavailable` notes when targeting
 did not fully apply. All private display fields are omitted when
-`display_backend` is `shared`. `capability.node_count` always equals
+`display_backend` is `shared`. A DRM lease adds `drm_lease` (object ids, lessee
+id, fd, applied/released, typed error and the `lease_only_no_scanout` note) and
+`resources.drm_lease_applied`/`drm_lease_released`; both are omitted when no
+lease was requested. `capability.node_count` always equals
 `capability.seat_count` and the number of seat entries. There is no merged
 super-node.
 
@@ -912,6 +1031,16 @@ ozma-multiseat --display :0 --input-isolation helper \
 # alternative (`--seat-display xephyr`).
 ozma-multiseat --display :0 --seat-display xvfb --seat-display-size 1280x800
 
+# Opt in to a lease-only DRM handoff for one seat. `auto` selects only a vkms
+# card; name an explicit /dev/dri/cardN for a real output. The fd is exported in
+# OZMA_DRM_FD; this does not create scanout or compositor isolation.
+ozma-multiseat --display :0 \
+  --seat-drm-lease auto:Virtual-1
+
+# Repeat once per seat, or use an explicit seat prefix/name.
+ozma-multiseat --display :0 \
+  --seat-drm-lease host-seat-0=/dev/dri/card3:Virtual-1
+
 # Persist stable seat ids/ports/sinks across replans, reconcile sysfs hotplug,
 # and create/remove per-seat null sinks through PipeWire's pactl API.
 ozma-multiseat --display :0 \
@@ -949,6 +1078,7 @@ Configuration:
 | `--input-targeting off\|warn\|strict` | Restrict a private display to the seat's helper uinput devices. `warn` is the default; `strict` prevents the spawn on failure; `off` skips `xinput`. |
 | `--seat-display shared\|xvfb\|xephyr` | Per-seat display backend. `shared` is the default; `xvfb`/`xephyr` start and stop a private X server per seat. |
 | `--seat-display-size WxH` | Private X screen geometry (default `1280x800`). |
+| `--seat-drm-lease [SEAT=]CARD:CONNECTOR[@CRTC]` | Opt-in lease-only handoff. Repeat once per seat, or prefix every value with a seat id/index. `auto`/`vkms` selects only a virtual vkms card; real outputs must be named explicitly. |
 | `--seats-file PATH` | Load/reuse and atomically update persisted seat identities. Never written by `--print-plan`/`--dry-run`. |
 | `--hotplug` | Poll read-only sysfs DRM/input snapshots, debounce, and start/stop/restart seats. |
 | `--audio-router [pipewire\|pulseaudio]` | Ensure/remove `ozma-seat-N` null sinks around the child lifecycle (default kind `pipewire`). |
@@ -1004,6 +1134,17 @@ reused after stop or rollback. Output lists `display(<backend> <display>
 pid=... ready=...)`; JSON carries the same fields. On shutdown all child
 processes are stopped before their servers, and the sockets/processes are gone
 when `stop_all` returns.
+
+`--seat-drm-lease [SEAT=]CARD:CONNECTOR[@CRTC]` adds a lease-only handoff before
+the node spawn. Without a seat prefix the flag must be repeated exactly once per
+planned seat (in plan order); with prefixes, every value must be explicit.
+`auto`/`vkms` selects only a virtual vkms card, while a real card must be named
+as `/dev/dri/cardN`/`cardN`. The node receives the inherited fd and object ids
+in `OZMA_DRM_*`; output lists `drm_lease(...)` and JSON carries `drm_lease` plus
+`resources.drm_lease_*`. The CLI fails the start (and rolls back earlier seats)
+when the lease cannot be created; it never substitutes a fake lease. This does
+not add per-seat scanout or compositor isolation, and `--print-plan` never
+acquires a lease.
 
 `--seats-file` loads a versioned JSON store (a missing file is empty). The CLI
 reuses persisted ids/ports/hubs/sinks for discovered displays, assigns unused
@@ -1188,6 +1329,12 @@ The default suite covers:
   after stop, exact `ozma-seat-N`/`ozma-seat-N.monitor` names, per-seat sinks,
   typed non-fatal ensure failure, best-effort remove failure with seat
   retention/retry, and no audio call in dry-run.
+- DRM leases (`tests/drm_lease.rs`): fake card enumeration/inspection, request
+  parsing, object-id validation, create/validate/revoke/drop, already-leased,
+  unknown connector/CRTC, no-DRM/no-permission/unsupported/capability-required
+  typed failures, auto-virtual refusal of real cards, supervisor start/stop
+  fd export and revoke, later-seat rollback, missing-backend failure, dry-run
+  no-acquire, and status JSON (`drm_lease` plus `resources.drm_lease_*`).
 
 Controller-side grouping is covered by Python tests with fake nodes:
 
@@ -1218,6 +1365,22 @@ OZMA_MULTISEAT_REAL=1 cargo test -p ozma-multiseat --test real_backends \
 
 They enumerate the real `xrandr` output, read-only sysfs input, and DRM
 connectors. They start no node and inject no input.
+
+The live vkms lease check is explicit and `#[ignore]`d:
+
+```bash
+sudo modprobe vkms
+OZMA_DRM_LIVE=1 cargo test -p ozma-multiseat --test live_drm_lease \
+  -- --ignored --nocapture
+```
+
+It finds the card by the vkms sysfs/faux-bus identity, leases a connector and
+CRTC, verifies `GET_LEASE`, spawns a child to prove fd inheritance, checks the
+duplicate typed error, revokes, and re-acquires to prove the objects were
+released. It never leases a real GPU. On hosts where systemd-logind already
+holds DRM master on the vkms card, the test reports `capability_required` unless
+run with master access; see `docs/phase4-drm-lease-report.md` for the dedicated
+configfs run.
 
 The routing smoke is also opt-in and can map a pointer only on a throwaway
 display (for example Xvfb `:99`):

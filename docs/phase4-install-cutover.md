@@ -405,3 +405,29 @@ Not run (explicitly out of scope / environment):
 7. **Legacy installer path** — `--legacy-python` downloads the deprecated
    `ozma-agent` AppImage. It is opt-in only and should be removed with the
    Python trees after the overlap release.
+
+## 7. Privileged install gate (2026-11-25)
+
+§5 records the original uncommitted install/runtime cutover change, which
+deliberately used no sudo and ran no real install. The separate privileged gate
+has since been run on the same host at `5ae55e7` + uncommitted work:
+
+```bash
+./scripts/install-system.sh --dry-run --profile all --usb-gadget
+./scripts/install-rust.sh --from-target target/debug --prefix "$HOME/.local"
+sudo -n scripts/install-rust.sh --from-target target/debug --system --prefix /usr/local
+sudo -n scripts/install-system.sh --profile all --usb-gadget
+```
+
+Both privileged commands exited 0, the second `install-system.sh` run was
+idempotent, and no unit was enabled or started. `scripts/systemd/verify-units.sh`
+(8/8), `systemd-analyze verify` on the installed units, `udevadm verify` (6/6),
+and the tmpfiles dry run passed. `scripts/verify-system-install.sh` reported
+`81 passed, 1 failed, 1 skipped`: the failure is its live-root
+`--dry-run --profile hardware` check refusing the `libcomposite` line installed
+by `--usb-gadget` (the same dry run with `--profile all --usb-gadget` exits 0),
+not an install defect. AppArmor was skipped because the parser/service are
+absent. The install was left in place; full evidence, the debug-binary and
+env-ownership deviations, rollback, and remaining privileged gaps are in
+[`phase4-privileged-install-report.md`](phase4-privileged-install-report.md)
+and [`clean-host.md`](clean-host.md#privileged-install-gate-2026-11-25).

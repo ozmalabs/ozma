@@ -211,6 +211,7 @@ fn options(backend: SeatDisplayBackend, mode: InputTargetingMode) -> SupervisorO
         input_isolation: true,
         input_targeting: mode,
         seat_display: seat_display_options(backend),
+        drm_leases: Default::default(),
     }
 }
 

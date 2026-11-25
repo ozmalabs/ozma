@@ -6,7 +6,9 @@
 //! This crate ports the platform-neutral planning layer:
 //!
 //! * [`display`] enumerates outputs through Xrandr and exposes a side-effect
-//!   free DRM connector detector in [`drm`].
+//!   free DRM connector detector in [`drm`]. [`drm_lease`] is the opt-in
+//!   lease-only handoff: it validates connector/CRTC object ids and returns an
+//!   owned lessee fd, but creates no scanout or compositor isolation.
 //! * [`input`] reads evdev capability bits and groups devices by USB hub.
 //! * [`planner`] assigns one seat per display, allocates sequential UDP/HTTP
 //!   ports, attaches input groups, and emits the per-seat
@@ -50,13 +52,13 @@
 //!   [`ozma_audio::AudioRouter`]; it is only invoked when a router is installed.
 //!
 //! The library performs no input injection, opens no evdev node, creates no
-//! virtual display, and allocates no PipeWire sink by default. Routing,
-//! ownership, isolation, and audio commands are only executed through
-//! explicitly injected runners/controllers/helpers; the default evdev grab
-//! backend returns a typed unsupported error. The library contains no `unsafe`
-//! code (the Unix SIGTERM helper is the safe `nix` API); only the
-//! `ozma-seat-input` binary's `ioctl` module uses `unsafe`, to set a grabbed fd
-//! non-blocking.
+//! virtual display, creates no DRM lease, and allocates no PipeWire sink by
+//! default. Routing, ownership, isolation, audio, display-server, and DRM
+//! lease commands are only executed through explicitly injected
+//! runners/controllers/helpers/backends; the default evdev grab backend returns
+//! a typed unsupported error. The library contains no `unsafe` code (the Unix
+//! SIGTERM helper is the safe `nix` API); only the `ozma-seat-input` binary's
+//! `ioctl` module uses `unsafe`, to set a grabbed fd non-blocking.
 //!
 //! Test fakes in [`fake`] never touch the host. Production code must not select
 //! them from detection.
@@ -66,6 +68,7 @@
 pub mod audio;
 pub mod display;
 pub mod drm;
+pub mod drm_lease;
 pub mod error;
 pub mod fake;
 pub mod host;
@@ -93,12 +96,24 @@ pub use drm::{
     detect as detect_drm, detect_at as detect_drm_at, DrmConnector, DrmDetection, DrmStatus,
     DEFAULT_DRM_ROOT,
 };
+#[cfg(target_os = "linux")]
+pub use drm_lease::RealDrmLeaseBackend;
+pub use drm_lease::{
+    apply_lease_environment, clear_lease_environment, enumerate as enumerate_drm_cards,
+    enumerate_at as enumerate_drm_cards_at, DrmCard, DrmCardSelector, DrmCrtcSelector,
+    DrmLeaseBackend, DrmLeaseConnector, DrmLeaseError, DrmLeaseErrorStatus, DrmLeaseHandle,
+    DrmLeaseNote, DrmLeaseNoteKind, DrmLeaseObjects, DrmLeaseRequest, DrmLeaseStatus,
+    DrmObjectKind, DEFAULT_DRM_DEV_ROOT, DRM_LEASE_CARD_ENV, DRM_LEASE_CONNECTOR_ENV,
+    DRM_LEASE_CONNECTOR_ID_ENV, DRM_LEASE_CRTC_ID_ENV, DRM_LEASE_ENV, DRM_LEASE_FD_ENV,
+    DRM_LEASE_ID_ENV, VIRTUAL_DRM_DRIVER,
+};
 pub use error::MultiseatError;
 pub use fake::{
-    FakeCommandRunner, FakeDeviceNameResolver, FakeDisplayBackend, FakeEvdevGrabBackend,
-    FakeGrabAction, FakeGrabEvent, FakeHelperBackend, FakeHotplugMonitor, FakeInputBackend,
-    FakeNodeLauncher, FakeReadinessProbe, FakeSeatAudioRouter, FakeSeatDisplayLauncher,
-    FakeSeatInputHelper, FakeSeatInputTargeter, FakeSeatSupervisor,
+    FakeCommandRunner, FakeDeviceNameResolver, FakeDisplayBackend, FakeDrmLeaseBackend,
+    FakeDrmLeaseCard, FakeDrmLeaseFailure, FakeEvdevGrabBackend, FakeGrabAction, FakeGrabEvent,
+    FakeHelperBackend, FakeHotplugMonitor, FakeInputBackend, FakeLeaseRecord, FakeNodeLauncher,
+    FakeReadinessProbe, FakeSeatAudioRouter, FakeSeatDisplayLauncher, FakeSeatInputHelper,
+    FakeSeatInputTargeter, FakeSeatSupervisor,
 };
 pub use host::HostTopology;
 pub use hotplug::{

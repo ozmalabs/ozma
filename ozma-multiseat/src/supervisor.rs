@@ -23,6 +23,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::audio::{SeatAudioRouter, SeatAudioSpec};
+use crate::drm_lease::{
+    apply_lease_environment, clear_lease_environment, DrmCardSelector, DrmLeaseBackend,
+    DrmLeaseError, DrmLeaseHandle, DrmLeaseNote, DrmLeaseNoteKind, DrmLeaseRequest, DrmLeaseStatus,
+};
 use crate::error::MultiseatError;
 use crate::input::InputGroup;
 use crate::input_isolation::{helper_devices, SeatInputHelper};
@@ -378,6 +382,10 @@ pub struct SupervisorOptions {
     /// nothing; `Xvfb`/`Xephyr` start a private display before the node and stop
     /// it after the node.
     pub seat_display: SeatDisplayOptions,
+    /// Opt-in DRM leases keyed by seat id. Empty by default. A lease hands the
+    /// named connector/CRTC object IDs to the seat's inherited fd; it does not
+    /// create scanout or compositor isolation.
+    pub drm_leases: BTreeMap<String, DrmLeaseRequest>,
 }
 
 impl Default for SupervisorOptions {
@@ -395,6 +403,7 @@ impl Default for SupervisorOptions {
             input_isolation: false,
             input_targeting: InputTargetingMode::Warn,
             seat_display: SeatDisplayOptions::default(),
+            drm_leases: BTreeMap::new(),
         }
     }
 }
@@ -422,6 +431,10 @@ struct ManagedSeat {
     display: Option<Box<dyn SeatDisplayHandle>>,
     /// Status for the private X server (or the shared no-op).
     display_status: SeatDisplayStatus,
+    /// Owned DRM lease for this seat, when opt-in leasing is configured.
+    lease: Option<Box<dyn DrmLeaseHandle>>,
+    /// DRM lease status, omitted when no lease was requested.
+    drm_lease_status: DrmLeaseStatus,
     /// Shared display used as the Xephyr parent window.
     parent_display: Option<String>,
     state: SeatState,
@@ -449,6 +462,8 @@ impl ManagedSeat {
             resources: SeatResourceStatus::default(),
             display: None,
             display_status: SeatDisplayStatus::shared(),
+            lease: None,
+            drm_lease_status: DrmLeaseStatus::default(),
             parent_display: plan_parent_display(plan),
             state: SeatState::Planned,
             child: None,
@@ -472,7 +487,8 @@ impl ManagedSeat {
             .with_process(self.pid, self.launch.udp_port, self.launch.http_port)
             .with_restarts(self.restarts())
             .with_resources(self.resources.clone())
-            .with_display(self.display_status.clone());
+            .with_display(self.display_status.clone())
+            .with_drm_lease(self.drm_lease_status.clone());
         status.last_error = self.last_error.clone();
         if let Some(next) = self.next_restart {
             status.next_restart_in_ms = Some(
@@ -501,6 +517,7 @@ pub struct ProcessSeatSupervisor {
     input_targeter: Option<Box<dyn SeatInputTargeter>>,
     audio: Option<Box<dyn SeatAudioRouter>>,
     display_launcher: Option<Box<dyn SeatDisplayLauncher>>,
+    drm_lease_backend: Option<Box<dyn DrmLeaseBackend>>,
     seats: BTreeMap<String, ManagedSeat>,
 }
 
@@ -513,12 +530,19 @@ impl ProcessSeatSupervisor {
     /// launcher with [`Self::with_display_launcher`].
     pub fn new(options: SupervisorOptions) -> Self {
         let display_launcher = display_launcher_for(&options);
-        Self::with_parts(
+        let wants_lease = !options.drm_leases.is_empty();
+        let mut supervisor = Self::with_parts(
             options,
             Arc::new(ProcessLauncher),
             Arc::new(HttpHealthProbe::default()),
         )
-        .with_optional_display_launcher(display_launcher)
+        .with_optional_display_launcher(display_launcher);
+        #[cfg(target_os = "linux")]
+        if wants_lease {
+            supervisor.drm_lease_backend =
+                Some(Box::new(crate::drm_lease::RealDrmLeaseBackend::new()));
+        }
+        supervisor
     }
 
     /// Supervisor with injected launcher and readiness probe.
@@ -538,6 +562,7 @@ impl ProcessSeatSupervisor {
             input_targeter: None,
             audio: None,
             display_launcher: None,
+            drm_lease_backend: None,
             seats: BTreeMap::new(),
         }
     }
@@ -629,6 +654,18 @@ impl ProcessSeatSupervisor {
     /// seat lifecycle. Without a router no audio command is ever run.
     pub fn with_audio_router(mut self, router: Box<dyn SeatAudioRouter>) -> Self {
         self.audio = Some(router);
+        self
+    }
+
+    /// Install the DRM lease backend used by
+    /// [`SupervisorOptions::drm_leases`].
+    ///
+    /// [`Self::new`] installs [`crate::drm_lease::RealDrmLeaseBackend`] when at
+    /// least one lease request is configured. `with_parts` (tests and the CLI)
+    /// must call this explicitly; without a backend, a requested lease fails
+    /// with a typed `Unsupported` error before a child is spawned.
+    pub fn with_drm_lease_backend(mut self, backend: Box<dyn DrmLeaseBackend>) -> Self {
+        self.drm_lease_backend = Some(backend);
         self
     }
 
@@ -757,6 +794,146 @@ impl ProcessSeatSupervisor {
         seat.display = Some(handle);
         seat.display_status = status;
         Ok(())
+    }
+
+    /// Acquire the seat's opt-in DRM lease and export its fd to the launch
+    /// environment.
+    ///
+    /// A lease is independent of the X display and is deliberately lease-only:
+    /// the status note says that no scanout or compositor isolation is created.
+    /// An existing lease is reused across restarts and its environment is
+    /// re-applied to the current launch spec.
+    fn ensure_seat_lease(&mut self, seat_id: &str) -> Result<(), MultiseatError> {
+        let Some(request) = self.options.drm_leases.get(seat_id).cloned() else {
+            return Ok(());
+        };
+
+        if self
+            .seats
+            .get(seat_id)
+            .is_some_and(|seat| seat.lease.is_some())
+        {
+            let seat = self.seats.get_mut(seat_id).expect("tracked seat");
+            apply_lease_environment(&seat.drm_lease_status, &mut seat.launch.env);
+            return Ok(());
+        }
+
+        let Some(backend) = self.drm_lease_backend.as_ref() else {
+            let error = MultiseatError::Unsupported(format!(
+                "seat {seat_id} requested a DRM lease but no DRM lease backend is configured"
+            ));
+            if let Some(seat) = self.seats.get_mut(seat_id) {
+                seat.drm_lease_status = DrmLeaseStatus::requested(&request);
+                seat.drm_lease_status.applied = false;
+                seat.drm_lease_status.error = Some(crate::drm_lease::DrmLeaseErrorStatus {
+                    kind: "unsupported_lease".to_owned(),
+                    message: error.to_string(),
+                });
+                seat.resources.push_error(
+                    ResourceKind::DrmLease,
+                    ResourceAction::Apply,
+                    error.to_string(),
+                );
+            }
+            return Err(error);
+        };
+
+        let handle = match backend.acquire(&request) {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(seat) = self.seats.get_mut(seat_id) {
+                    let mut status = DrmLeaseStatus::requested(&request);
+                    status.mark_error(&error);
+                    seat.drm_lease_status = status;
+                    seat.resources.push_error(
+                        ResourceKind::DrmLease,
+                        ResourceAction::Apply,
+                        error.to_string(),
+                    );
+                }
+                return Err(MultiseatError::DrmLease(error.to_string()));
+            }
+        };
+
+        let mut status = DrmLeaseStatus::from_handle(handle.as_ref());
+        if let DrmCardSelector::Explicit(path) = &request.card {
+            if let Ok(cards) = backend.enumerate() {
+                if let Some(card) = cards.iter().find(|card| &card.path == path) {
+                    if !card.is_virtual() {
+                        status.push_note(DrmLeaseNote::new(
+                            DrmLeaseNoteKind::RealGpuNamed,
+                            format!(
+                                "operator explicitly named real card {} ({}); only the requested \
+                                 connector/CRTC objects are leased",
+                                card.path.display(),
+                                card.driver
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let seat = self.seats.get_mut(seat_id).expect("tracked seat");
+        apply_lease_environment(&status, &mut seat.launch.env);
+        seat.lease = Some(handle);
+        seat.drm_lease_status = status;
+        seat.resources.drm_lease_applied = true;
+        seat.resources.drm_lease_released = false;
+        Ok(())
+    }
+
+    /// Revoke and close the seat's DRM lease. The node child must already be
+    /// gone (or must not have been spawned) before this is called.
+    fn release_seat_lease(&mut self, seat_id: &str) -> Result<(), MultiseatError> {
+        let Some(mut handle) = self
+            .seats
+            .get_mut(seat_id)
+            .and_then(|seat| seat.lease.take())
+        else {
+            if self
+                .seats
+                .get(seat_id)
+                .is_some_and(|seat| seat.resources.drm_lease_applied)
+            {
+                return Err(MultiseatError::Unsupported(format!(
+                    "seat {seat_id} has an applied DRM lease but no lease handle is available"
+                )));
+            }
+            return Ok(());
+        };
+
+        match handle.revoke() {
+            Ok(()) => {
+                if let Some(seat) = self.seats.get_mut(seat_id) {
+                    seat.drm_lease_status.mark_released();
+                    seat.resources.drm_lease_applied = false;
+                    seat.resources.drm_lease_released = true;
+                    clear_lease_environment(&mut seat.launch.env);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(seat) = self.seats.get_mut(seat_id) {
+                    // Keep the active lease and its applied flag so a later stop
+                    // or Drop can retry; the fd is still owned by this handle.
+                    seat.lease = Some(handle);
+                    seat.drm_lease_status.error =
+                        Some(crate::drm_lease::DrmLeaseErrorStatus::from_error(&error));
+                }
+                Err(MultiseatError::DrmLease(error.to_string()))
+            }
+        }
+    }
+
+    /// Set `FD_CLOEXEC` off before a spawn so the lessee fd is inherited by the
+    /// child, then restore it. The supervisor is single-threaded, so the short
+    /// window cannot leak the fd into an unrelated spawn.
+    fn set_lease_inheritable(&self, seat_id: &str, inheritable: bool) -> Result<(), DrmLeaseError> {
+        let Some(lease) = self.seats.get(seat_id).and_then(|seat| seat.lease.as_ref()) else {
+            return Ok(());
+        };
+        lease.set_inheritable(inheritable)
     }
 
     fn wait_display_ready(&self, handle: &mut dyn SeatDisplayHandle) -> Result<(), MultiseatError> {
@@ -1497,6 +1674,24 @@ impl ProcessSeatSupervisor {
             }
         }
 
+        // The DRM lease is released after the other resources (reverse of apply
+        // order). A revoke failure keeps the handle and applied flag for a later
+        // stop/Drop retry.
+        if self
+            .seats
+            .get(seat_id)
+            .is_some_and(|seat| seat.resources.drm_lease_applied)
+        {
+            if let Err(error) = self.release_seat_lease(seat_id) {
+                self.record_resource_error(
+                    seat_id,
+                    ResourceKind::DrmLease,
+                    ResourceAction::Release,
+                    &error.to_string(),
+                );
+            }
+        }
+
         // Do not keep a privileged helper alive with no confirmed grabs. It is
         // started again lazily on the next seat start.
         let any_isolation = self
@@ -1525,6 +1720,7 @@ impl ProcessSeatSupervisor {
                     || seat.resources.input_isolation_applied
                     || seat.resources.input_targeting_applied
                     || seat.resources.audio_applied
+                    || seat.resources.drm_lease_applied
             })
             .map(|(seat_id, _)| seat_id.clone())
             .collect();
@@ -1734,6 +1930,14 @@ impl ProcessSeatSupervisor {
                     schedule_restart(&self.options, seat, now);
                     continue;
                 }
+                if let Err(error) = self.ensure_seat_lease(&seat_id) {
+                    let text = error.to_string();
+                    let seat = self.seats.get_mut(&seat_id).expect("tracked seat");
+                    seat.last_error = Some(text);
+                    seat.message = None;
+                    schedule_restart(&self.options, seat, now);
+                    continue;
+                }
                 // A restart re-applies resources only when they were released
                 // by a previous failed attempt; an already-applied resource is
                 // left in place. A failed re-apply is reported and backed off.
@@ -1863,6 +2067,7 @@ impl ProcessSeatSupervisor {
             || status.resources.input_isolation_applied
             || status.resources.input_targeting_applied
             || status.resources.audio_applied
+            || status.resources.drm_lease_applied
             || status.display.display.is_some()
         {
             return Ok(status);
@@ -1897,7 +2102,28 @@ impl ProcessSeatSupervisor {
             }
         }
 
-        match self.launcher.spawn(&spec) {
+        // An active DRM lease is exported by fd number. Clear FD_CLOEXEC only
+        // for the spawn call so the child inherits the lessee fd, then restore
+        // it immediately. The supervisor is single-threaded.
+        let lease_fd = self
+            .seats
+            .get(seat_id)
+            .and_then(|seat| seat.lease.as_ref())
+            .and_then(|lease| lease.fd());
+        let spawn = if lease_fd.is_some() {
+            match self.set_lease_inheritable(seat_id, true) {
+                Ok(()) => {
+                    let result = self.launcher.spawn(&spec);
+                    let _ = self.set_lease_inheritable(seat_id, false);
+                    result
+                }
+                Err(error) => Err(MultiseatError::DrmLease(error.to_string())),
+            }
+        } else {
+            self.launcher.spawn(&spec)
+        };
+
+        match spawn {
             Ok(mut child) => {
                 let pid = child.pid();
                 if let Some(seat) = self.seats.get_mut(seat_id) {
@@ -2046,6 +2272,7 @@ impl ProcessSeatSupervisor {
                 && !seat.resources.routing_applied
                 && !seat.resources.input_isolation_applied
                 && !seat.resources.input_targeting_applied
+                && !seat.resources.drm_lease_applied
             {
                 seat.resources = SeatResourceStatus::default();
             }
@@ -2096,6 +2323,14 @@ impl ProcessSeatSupervisor {
                         ));
                     }
                 }
+                if let Some(request) = self.options.drm_leases.get(&seat_id) {
+                    message.push_str(&format!(
+                        "; would acquire a DRM lease for {}:{} (lease-only; no scanout or \
+                         compositor isolation)",
+                        request.card.display_name(),
+                        request.connector
+                    ));
+                }
                 seat.message = Some(message);
                 return Ok(seat.status(now));
             }
@@ -2112,6 +2347,25 @@ impl ProcessSeatSupervisor {
             seat.last_error = Some(text);
             seat.message = None;
             schedule_restart(&self.options, seat, now);
+            return Err(error);
+        }
+
+        // The opt-in DRM lease is acquired after a private display exists and
+        // before any resource or node spawn. A lease failure never leaves a
+        // display or earlier seat resource behind.
+        if let Err(error) = self.ensure_seat_lease(&seat_id) {
+            self.release_seat_resources(&seat_id);
+            let _ = self.release_seat_display(&seat_id);
+            self.rollback_applied_resources();
+            let text = error.to_string();
+            let seat = self.seats.get_mut(&seat_id).expect("tracked seat");
+            seat.child = None;
+            seat.pid = None;
+            seat.started_at = None;
+            seat.state = SeatState::Failed;
+            seat.next_restart = None;
+            seat.last_error = Some(text);
+            seat.message = None;
             return Err(error);
         }
 

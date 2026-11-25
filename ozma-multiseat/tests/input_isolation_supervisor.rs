@@ -61,6 +61,7 @@ fn options(dry_run: bool) -> SupervisorOptions {
         input_isolation: true,
         input_targeting: Default::default(),
         seat_display: Default::default(),
+        drm_leases: Default::default(),
     }
 }
 

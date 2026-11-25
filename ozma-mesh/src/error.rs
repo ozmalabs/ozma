@@ -20,6 +20,9 @@ pub enum MeshError {
     #[error("Invalid mesh IP: {0}")]
     InvalidIp(String),
 
+    #[error("No mesh peer owns the destination: {0}")]
+    NoRoute(String),
+
     #[error("mDNS error: {0}")]
     Mdns(String),
 

@@ -60,6 +60,7 @@ prometheus  = { version = "0.13", features = ["process"] }
 alsa        = "0.9"
 usb-gadget  = "0.5"
 async-trait = "0.1"
+drm         = "0.15"
 libc        = "0.2"
 prost       = "0.14"
 prost-types = "0.14"

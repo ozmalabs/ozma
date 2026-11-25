@@ -98,6 +98,7 @@ impl MeshServiceError {
                 | "mesh.dataplane-unavailable"
                 | "mesh.dataplane-invalid"
                 | "mesh.dataplane-not-configured"
+                | "mesh.tun-unsupported"
         )
     }
 }

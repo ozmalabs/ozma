@@ -1923,3 +1923,497 @@ impl SeatInputTargeter for FakeSeatInputTargeter {
         state.events.push(format!("target-clear {seat_id}"));
     }
 }
+
+/// One card configured in a [`FakeDrmLeaseBackend`].
+#[derive(Clone, Debug)]
+pub struct FakeDrmLeaseCard {
+    /// Card summary returned by enumeration and inspection.
+    pub card: crate::drm_lease::DrmCard,
+    /// Connector name to object id.
+    pub connector_ids: BTreeMap<String, u32>,
+    /// CRTC object ids.
+    pub crtc_ids: Vec<u32>,
+}
+
+/// One in-memory lease record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeLeaseRecord {
+    /// Kernel lessee id.
+    pub lessee_id: u32,
+    /// Card path.
+    pub card: std::path::PathBuf,
+    /// Connector name.
+    pub connector: String,
+    /// Connector object id.
+    pub connector_id: u32,
+    /// CRTC object id.
+    pub crtc_id: u32,
+}
+
+/// Injected one-shot lease failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeDrmLeaseFailure {
+    /// No card is available.
+    NoDrm,
+    /// Opening the card is denied.
+    NoPermission,
+    /// Leasing is unsupported.
+    Unsupported,
+    /// A named object does not exist.
+    UnknownObject,
+    /// The object is already leased.
+    AlreadyLeased,
+    /// The caller is not master / lacks CAP_SYS_ADMIN.
+    CapabilityRequired,
+}
+
+#[derive(Debug, Default)]
+struct FakeDrmLeaseState {
+    cards: Vec<FakeDrmLeaseCard>,
+    leases: BTreeMap<u32, FakeLeaseRecord>,
+    next_lessee: u32,
+    failure: Option<FakeDrmLeaseFailure>,
+    requests: Vec<crate::drm_lease::DrmLeaseRequest>,
+    revoked: Vec<u32>,
+    dropped: Vec<u32>,
+    fd_enabled: bool,
+}
+
+/// Test-only DRM lease backend.
+///
+/// It validates connector/CRTC membership, rejects a duplicate object set, and
+/// records create/revoke/drop events. It never opens `/dev/dri` or issues an
+/// ioctl.
+#[derive(Clone, Debug)]
+pub struct FakeDrmLeaseBackend {
+    state: Arc<Mutex<FakeDrmLeaseState>>,
+}
+
+impl Default for FakeDrmLeaseBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeDrmLeaseBackend {
+    /// A fake with one virtual `vkms` card (`card9`), connector `Virtual-1`
+    /// (object 101), and CRTC object 201.
+    pub fn new() -> Self {
+        let mut backend = Self {
+            state: Arc::new(Mutex::new(FakeDrmLeaseState {
+                next_lessee: 0,
+                fd_enabled: true,
+                ..FakeDrmLeaseState::default()
+            })),
+        };
+        backend.add_card(
+            "card9",
+            "/dev/dri/card9",
+            "vkms",
+            true,
+            "Virtual-1",
+            101,
+            &[201],
+        );
+        backend
+    }
+
+    /// Add or replace a card and its object ids.
+    pub fn add_card(
+        &mut self,
+        name: &str,
+        path: &str,
+        driver: &str,
+        virtual_card: bool,
+        connector: &str,
+        connector_id: u32,
+        crtc_ids: &[u32],
+    ) -> &mut Self {
+        let connectors = vec![crate::drm_lease::DrmLeaseConnector {
+            name: connector.to_owned(),
+            status: crate::drm::DrmStatus::Connected,
+            modes: vec!["1024x768".to_owned()],
+            object_id: Some(connector_id),
+            crtc_id: crtc_ids.first().copied(),
+        }];
+        let mut connector_ids = BTreeMap::new();
+        connector_ids.insert(connector.to_owned(), connector_id);
+        let mut state = self.state.lock().expect("fake drm lease lock");
+        if let Some(existing) = state.cards.iter_mut().find(|card| card.card.name == name) {
+            existing.card.driver = driver.to_owned();
+            existing.card.virtual_card = virtual_card;
+            existing.card.connectors.extend(connectors.iter().cloned());
+            existing
+                .connector_ids
+                .extend(connector_ids.iter().map(|(name, id)| (name.clone(), *id)));
+            existing.crtc_ids = crtc_ids.to_vec();
+            drop(state);
+            return self;
+        }
+        state.cards.push(FakeDrmLeaseCard {
+            card: crate::drm_lease::DrmCard {
+                name: name.to_owned(),
+                path: std::path::PathBuf::from(path),
+                sysfs_path: std::path::PathBuf::from(format!("/sys/class/drm/{name}")),
+                driver: driver.to_owned(),
+                virtual_card,
+                connectors,
+                crtcs: crtc_ids.to_vec(),
+            },
+            connector_ids,
+            crtc_ids: crtc_ids.to_vec(),
+        });
+        drop(state);
+        self
+    }
+
+    /// Disable the lessee fd on subsequently acquired leases.
+    pub fn without_fd(&mut self) -> &mut Self {
+        self.state.lock().expect("fake drm lease lock").fd_enabled = false;
+        self
+    }
+
+    /// Inject one typed failure on the next acquire.
+    pub fn fail_next(&self, failure: FakeDrmLeaseFailure) {
+        self.state.lock().expect("fake drm lease lock").failure = Some(failure);
+    }
+
+    /// Inject a no-DRM failure on the next acquire.
+    pub fn fail_next_no_drm(&self) {
+        self.fail_next(FakeDrmLeaseFailure::NoDrm);
+    }
+
+    /// Inject a no-permission failure on the next acquire.
+    pub fn fail_next_no_permission(&self) {
+        self.fail_next(FakeDrmLeaseFailure::NoPermission);
+    }
+
+    /// Inject an unsupported-lease failure on the next acquire.
+    pub fn fail_next_unsupported(&self) {
+        self.fail_next(FakeDrmLeaseFailure::Unsupported);
+    }
+
+    /// Inject an unknown-object failure on the next acquire.
+    pub fn fail_next_unknown_object(&self) {
+        self.fail_next(FakeDrmLeaseFailure::UnknownObject);
+    }
+
+    /// Inject an already-leased failure on the next acquire.
+    pub fn fail_next_already_leased(&self) {
+        self.fail_next(FakeDrmLeaseFailure::AlreadyLeased);
+    }
+
+    /// Inject a capability-required failure on the next acquire.
+    pub fn fail_next_capability_required(&self) {
+        self.fail_next(FakeDrmLeaseFailure::CapabilityRequired);
+    }
+
+    /// Acquire requests recorded so far.
+    pub fn requests(&self) -> Vec<crate::drm_lease::DrmLeaseRequest> {
+        self.state
+            .lock()
+            .expect("fake drm lease lock")
+            .requests
+            .clone()
+    }
+
+    /// Active leases.
+    pub fn active_leases(&self) -> Vec<FakeLeaseRecord> {
+        self.state
+            .lock()
+            .expect("fake drm lease lock")
+            .leases
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Number of active leases.
+    pub fn active_count(&self) -> usize {
+        self.state.lock().expect("fake drm lease lock").leases.len()
+    }
+
+    /// Lessee ids revoked explicitly, in order.
+    pub fn revoked(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .expect("fake drm lease lock")
+            .revoked
+            .clone()
+    }
+
+    /// Lessee ids released by dropping an active handle, in order.
+    pub fn dropped(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .expect("fake drm lease lock")
+            .dropped
+            .clone()
+    }
+
+    fn resolve_card(
+        state: &FakeDrmLeaseState,
+        selector: &crate::drm_lease::DrmCardSelector,
+    ) -> Result<FakeDrmLeaseCard, crate::drm_lease::DrmLeaseError> {
+        match selector {
+            crate::drm_lease::DrmCardSelector::AutoVirtual => state
+                .cards
+                .iter()
+                .find(|card| card.card.virtual_card)
+                .cloned()
+                .ok_or_else(|| crate::drm_lease::DrmLeaseError::NoDrm {
+                    reason: "fake backend has no virtual card".to_owned(),
+                }),
+            crate::drm_lease::DrmCardSelector::Explicit(path) => state
+                .cards
+                .iter()
+                .find(|card| card.card.path == *path)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::drm_lease::DrmLeaseError::UnknownCard(path.display().to_string())
+                }),
+        }
+    }
+}
+
+impl crate::drm_lease::DrmLeaseBackend for FakeDrmLeaseBackend {
+    fn enumerate(&self) -> Result<Vec<crate::drm_lease::DrmCard>, crate::drm_lease::DrmLeaseError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("fake drm lease lock")
+            .cards
+            .iter()
+            .map(|card| card.card.clone())
+            .collect())
+    }
+
+    fn inspect(
+        &self,
+        card: &crate::drm_lease::DrmCard,
+    ) -> Result<crate::drm_lease::DrmCard, crate::drm_lease::DrmLeaseError> {
+        Ok(card.clone())
+    }
+
+    fn acquire(
+        &self,
+        request: &crate::drm_lease::DrmLeaseRequest,
+    ) -> Result<Box<dyn crate::drm_lease::DrmLeaseHandle>, crate::drm_lease::DrmLeaseError> {
+        use crate::drm_lease::{DrmCardSelector, DrmCrtcSelector, DrmLeaseError, DrmObjectKind};
+        let mut state = self.state.lock().expect("fake drm lease lock");
+        state.requests.push(request.clone());
+        if let Some(failure) = state.failure.take() {
+            let card = request.card.display_name();
+            return Err(match failure {
+                FakeDrmLeaseFailure::NoDrm => DrmLeaseError::NoDrm {
+                    reason: "injected no-DRM failure".to_owned(),
+                },
+                FakeDrmLeaseFailure::NoPermission => DrmLeaseError::NoPermission {
+                    path: card,
+                    source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                },
+                FakeDrmLeaseFailure::Unsupported => DrmLeaseError::Unsupported {
+                    card,
+                    reason: "injected unsupported lease".to_owned(),
+                },
+                FakeDrmLeaseFailure::UnknownObject => DrmLeaseError::UnknownObject {
+                    card,
+                    kind: DrmObjectKind::Connector,
+                    id: 0,
+                },
+                FakeDrmLeaseFailure::AlreadyLeased => DrmLeaseError::AlreadyLeased {
+                    card,
+                    kind: DrmObjectKind::Connector,
+                    id: 0,
+                },
+                FakeDrmLeaseFailure::CapabilityRequired => DrmLeaseError::CapabilityRequired {
+                    card,
+                    reason: "injected capability failure".to_owned(),
+                },
+            });
+        }
+        let card = Self::resolve_card(&state, &request.card)?;
+        if matches!(request.card, DrmCardSelector::AutoVirtual) && !card.card.virtual_card {
+            return Err(DrmLeaseError::ExplicitCardRequired {
+                card: card.card.path.display().to_string(),
+            });
+        }
+        let connector_id = card
+            .connector_ids
+            .get(&request.connector)
+            .copied()
+            .ok_or_else(|| DrmLeaseError::UnknownConnector {
+                card: card.card.path.display().to_string(),
+                connector: request.connector.clone(),
+            })?;
+        let crtc_id = match request.crtc {
+            DrmCrtcSelector::Id(id) => {
+                if !card.crtc_ids.contains(&id) {
+                    return Err(DrmLeaseError::UnknownObject {
+                        card: card.card.path.display().to_string(),
+                        kind: DrmObjectKind::Crtc,
+                        id,
+                    });
+                }
+                id
+            }
+            DrmCrtcSelector::Auto => {
+                *card
+                    .crtc_ids
+                    .first()
+                    .ok_or_else(|| DrmLeaseError::UnknownObject {
+                        card: card.card.path.display().to_string(),
+                        kind: DrmObjectKind::Crtc,
+                        id: 0,
+                    })?
+            }
+        };
+        if state.leases.values().any(|lease| {
+            lease.card == card.card.path
+                && (lease.connector_id == connector_id || lease.crtc_id == crtc_id)
+        }) {
+            return Err(DrmLeaseError::AlreadyLeased {
+                card: card.card.path.display().to_string(),
+                kind: DrmObjectKind::Connector,
+                id: connector_id,
+            });
+        }
+        state.next_lessee = state.next_lessee.saturating_add(1);
+        let lessee_id = state.next_lessee.max(1);
+        let fd = if state.fd_enabled {
+            nix::unistd::pipe().ok().map(|(read, _write)| read)
+        } else {
+            None
+        };
+        let record = FakeLeaseRecord {
+            lessee_id,
+            card: card.card.path.clone(),
+            connector: request.connector.clone(),
+            connector_id,
+            crtc_id,
+        };
+        state.leases.insert(lessee_id, record.clone());
+        drop(state);
+        Ok(Box::new(FakeDrmLeaseHandle {
+            record,
+            plane_ids: Vec::new(),
+            fd,
+            active: true,
+            state: Arc::clone(&self.state),
+        }))
+    }
+
+    fn list_lease_ids(
+        &self,
+        card: &crate::drm_lease::DrmCardSelector,
+    ) -> Result<Vec<u32>, crate::drm_lease::DrmLeaseError> {
+        let state = self.state.lock().expect("fake drm lease lock");
+        let card = Self::resolve_card(&state, card)?;
+        Ok(state
+            .leases
+            .values()
+            .filter(|lease| lease.card == card.card.path)
+            .map(|lease| lease.lessee_id)
+            .collect())
+    }
+}
+
+struct FakeDrmLeaseHandle {
+    record: FakeLeaseRecord,
+    plane_ids: Vec<u32>,
+    fd: Option<std::os::fd::OwnedFd>,
+    active: bool,
+    state: Arc<Mutex<FakeDrmLeaseState>>,
+}
+
+impl crate::drm_lease::DrmLeaseHandle for FakeDrmLeaseHandle {
+    fn card(&self) -> &std::path::Path {
+        &self.record.card
+    }
+
+    fn connector(&self) -> &str {
+        &self.record.connector
+    }
+
+    fn lessee_id(&self) -> u32 {
+        self.record.lessee_id
+    }
+
+    fn connector_id(&self) -> u32 {
+        self.record.connector_id
+    }
+
+    fn crtc_id(&self) -> u32 {
+        self.record.crtc_id
+    }
+
+    fn plane_ids(&self) -> &[u32] {
+        &self.plane_ids
+    }
+
+    fn fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        self.fd.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
+    fn set_inheritable(&self, _inheritable: bool) -> Result<(), crate::drm_lease::DrmLeaseError> {
+        Ok(())
+    }
+
+    fn validate(
+        &self,
+    ) -> Result<crate::drm_lease::DrmLeaseObjects, crate::drm_lease::DrmLeaseError> {
+        if !self.active {
+            return Err(crate::drm_lease::DrmLeaseError::Released(
+                self.record.lessee_id,
+            ));
+        }
+        Ok(crate::drm_lease::DrmLeaseObjects {
+            connectors: vec![self.record.connector_id],
+            crtcs: vec![self.record.crtc_id],
+            planes: self.plane_ids.clone(),
+        })
+    }
+
+    fn list_lease_ids(&self) -> Result<Vec<u32>, crate::drm_lease::DrmLeaseError> {
+        if !self.active {
+            return Err(crate::drm_lease::DrmLeaseError::Released(
+                self.record.lessee_id,
+            ));
+        }
+        let state = self.state.lock().expect("fake drm lease lock");
+        Ok(state
+            .leases
+            .values()
+            .filter(|lease| lease.card == self.record.card)
+            .map(|lease| lease.lessee_id)
+            .collect())
+    }
+
+    fn revoke(&mut self) -> Result<(), crate::drm_lease::DrmLeaseError> {
+        if !self.active {
+            return Ok(());
+        }
+        let mut state = self.state.lock().expect("fake drm lease lock");
+        state.leases.remove(&self.record.lessee_id);
+        state.revoked.push(self.record.lessee_id);
+        drop(state);
+        self.active = false;
+        self.fd = None;
+        Ok(())
+    }
+
+    fn is_active(&self) -> bool {
+        self.active && self.fd.is_some()
+    }
+}
+
+impl Drop for FakeDrmLeaseHandle {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = self.state.lock().expect("fake drm lease lock");
+            state.leases.remove(&self.record.lessee_id);
+            state.dropped.push(self.record.lessee_id);
+        }
+    }
+}

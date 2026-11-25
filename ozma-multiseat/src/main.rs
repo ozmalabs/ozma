@@ -14,6 +14,7 @@
 //! enumeration failure aborts before planning. No fake display, input, or
 //! process is ever substituted. `--print-plan` and `--dry-run` never spawn.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -23,11 +24,12 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use ozma_multiseat::{
-    detect_drm, render_metrics, DrmDetection, EvdevGrabRouter, HelperClient, HelperClientConfig,
-    HostTopology, HotplugDebounce, HotplugOptions, HttpHealthProbe, InputTargetingMode,
-    MultiseatPlan, MultiseatPlanner, MultiseatStatus, OzmaAudioRouter, PlannerOptions, PortProbe,
-    ProcessCommandRunner, ProcessLauncher, ProcessSeatDisplayLauncher, ProcessSeatInputTargeter,
-    ProcessSeatSupervisor, ReadinessProbe, SeatDisplayBackend, SeatDisplayOptions, SeatDisplaySize,
+    detect_drm, render_metrics, DrmDetection, DrmLeaseRequest, DrmLeaseStatus, EvdevGrabRouter,
+    HelperClient, HelperClientConfig, HostTopology, HotplugDebounce, HotplugOptions,
+    HttpHealthProbe, InputTargetingMode, MultiseatPlan, MultiseatPlanner, MultiseatStatus,
+    OzmaAudioRouter, PlannerOptions, PortProbe, ProcessCommandRunner, ProcessLauncher,
+    ProcessSeatDisplayLauncher, ProcessSeatInputTargeter, ProcessSeatSupervisor, ReadinessProbe,
+    RealDrmLeaseBackend, SeatDisplayBackend, SeatDisplayOptions, SeatDisplaySize,
     SeatDisplayStatus, SeatProfile, SeatReconciler, SeatResourceStatus, SeatState, SeatStore,
     SeatSupervisor, SupervisorOptions, SysfsHotplugMonitor, SysfsInputBackend, XInputRouter,
     XrandrDisplayBackend, XrandrOwnershipController, DEFAULT_DEBOUNCE, DEFAULT_HEALTH_PATH,
@@ -65,7 +67,10 @@ use ozma_multiseat::{
                   read-only sysfs display/input events; and `--audio-router` ensures/removes \
                   per-seat null sinks. `--print-plan` and `--dry-run` never run routing, \
                   ownership, audio, input-isolation, or hotplug actions and never write the \
-                  seat file."
+                  seat file. `--seat-drm-lease [SEAT=]CARD:CONNECTOR[@CRTC]` is an opt-in, \
+                  lease-only handoff: it exports an inherited lessee fd to the seat child but \
+                  does not create scanout or compositor isolation; `auto` only selects a vkms \
+                  card, while real outputs must be named explicitly."
 )]
 struct Args {
     /// Node binary or path passed to every planned seat.
@@ -173,6 +178,14 @@ struct Args {
     #[arg(long)]
     hotplug: bool,
 
+    /// Opt-in DRM lease for a seat: `[SEAT=]CARD:CONNECTOR[@CRTC]`. Repeat once
+    /// per seat, or give each request an explicit seat id/index prefix. `auto`
+    /// and `vkms` only select a virtual vkms card; real outputs must be named
+    /// explicitly. The lease is exported as an inherited fd in `OZMA_DRM_FD`
+    /// and does not create scanout or compositor isolation.
+    #[arg(long, value_name = "[SEAT=]CARD:CONNECTOR", action = clap::ArgAction::Append)]
+    seat_drm_lease: Vec<String>,
+
     /// Create per-seat null sinks through ozma-audio before start and remove
     /// them after stop. Optional value: pipewire (default) or pulseaudio.
     #[arg(
@@ -250,6 +263,8 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
     plan.display_backend = topology.display_backend.clone();
     plan.input_backend = topology.input_backend.clone();
 
+    let drm_leases = parse_drm_leases(&args.seat_drm_lease, &plan)?;
+
     // Selecting `helper` changes routing intent before either the plan report
     // or the supervisor sees it. It never grabs anything by itself.
     if args.input_isolation == "helper" {
@@ -264,7 +279,7 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
     }
 
     if args.print_plan {
-        print_plan_report(&args, &display, &topology, &drm, &plan)?;
+        print_plan_report(&args, &display, &topology, &drm, &plan, &drm_leases)?;
         return Ok(());
     }
 
@@ -290,10 +305,11 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
         input_isolation: args.input_isolation == "helper",
         input_targeting: input_targeting_mode,
         seat_display: seat_display_options.clone(),
+        drm_leases: drm_leases.clone(),
     };
 
     if args.dry_run {
-        print_plan_report(&args, &display, &topology, &drm, &plan)?;
+        print_plan_report(&args, &display, &topology, &drm, &plan, &drm_leases)?;
         let mut supervisor = ProcessSeatSupervisor::new(options);
         for seat in &plan.seats {
             let status = supervisor.start(seat)?;
@@ -313,6 +329,9 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
     };
     let mut supervisor =
         ProcessSeatSupervisor::with_parts(options, Arc::new(ProcessLauncher), probe);
+    if !drm_leases.is_empty() {
+        supervisor = supervisor.with_drm_lease_backend(Box::new(RealDrmLeaseBackend::new()));
+    }
     if seat_display_options.backend.is_nested() {
         supervisor = supervisor.with_display_launcher(Box::new(ProcessSeatDisplayLauncher::new(
             seat_display_options,
@@ -376,6 +395,7 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
                     || args.apply_routing
                     || args.input_isolation == "helper"
                     || args.seat_display != "shared"
+                    || !drm_leases.is_empty()
                 {
                     // The supervisor already released every applied resource
                     // when the later seat could not be reserved. Stop any
@@ -517,6 +537,79 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
     Ok(())
 }
 
+fn parse_drm_leases(
+    values: &[String],
+    plan: &MultiseatPlan,
+) -> Result<BTreeMap<String, DrmLeaseRequest>, ozma_multiseat::MultiseatError> {
+    if values.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut parsed: Vec<(Option<String>, DrmLeaseRequest)> = Vec::with_capacity(values.len());
+    for value in values {
+        let (prefix, request) = match value.split_once('=') {
+            Some((prefix, request)) if !prefix.trim().is_empty() && !prefix.contains(':') => {
+                (Some(prefix.trim().to_owned()), request)
+            }
+            _ => (None, value.as_str()),
+        };
+        let request = request.parse::<DrmLeaseRequest>()?;
+        parsed.push((prefix, request));
+    }
+
+    let explicit = parsed.iter().filter(|(prefix, _)| prefix.is_some()).count();
+    if explicit != 0 && explicit != parsed.len() {
+        return Err(ozma_multiseat::MultiseatError::DrmLease(
+            "either give every --seat-drm-lease an explicit SEAT= prefix or none of them"
+                .to_owned(),
+        ));
+    }
+    if explicit == 0 && values.len() != plan.seats.len() {
+        return Err(ozma_multiseat::MultiseatError::DrmLease(format!(
+            "{} --seat-drm-lease value(s) for {} planned seat(s); give one lease per seat or \
+             prefix each with SEAT=",
+            values.len(),
+            plan.seats.len()
+        )));
+    }
+
+    let mut leases = BTreeMap::new();
+    for (index, (prefix, request)) in parsed.into_iter().enumerate() {
+        let seat_id = match prefix {
+            Some(prefix) => plan
+                .seats
+                .iter()
+                .find(|seat| seat.config.id == prefix)
+                .map(|seat| seat.config.id.clone())
+                .or_else(|| {
+                    prefix
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|index| plan.seats.get(index))
+                        .map(|seat| seat.config.id.clone())
+                })
+                .ok_or_else(|| {
+                    ozma_multiseat::MultiseatError::UnknownSeat(format!(
+                        "{prefix} (from --seat-drm-lease)"
+                    ))
+                })?,
+            None => plan
+                .seats
+                .get(index)
+                .map(|seat| seat.config.id.clone())
+                .ok_or_else(|| {
+                    ozma_multiseat::MultiseatError::UnknownSeat(format!("seat index {index}"))
+                })?,
+        };
+        if leases.insert(seat_id.clone(), request).is_some() {
+            return Err(ozma_multiseat::MultiseatError::DrmLease(format!(
+                "duplicate --seat-drm-lease for seat {seat_id}"
+            )));
+        }
+    }
+    Ok(leases)
+}
+
 fn validate(args: &Args) -> Result<(), ozma_multiseat::MultiseatError> {
     if args.base_port == 0 || args.base_http_port == 0 {
         return Err(ozma_multiseat::MultiseatError::Supervisor(
@@ -646,6 +739,7 @@ fn print_plan_report(
     topology: &HostTopology,
     drm: &DrmDetection,
     plan: &MultiseatPlan,
+    drm_leases: &BTreeMap<String, DrmLeaseRequest>,
 ) -> Result<(), ozma_multiseat::MultiseatError> {
     if args.json {
         let report = serde_json::json!({
@@ -658,6 +752,7 @@ fn print_plan_report(
                 "inputs": &topology.inputs,
                 "drm": drm,
             },
+            "drm_leases": drm_leases,
             "plan": plan,
             "status": MultiseatStatus::from_plan(plan),
         });
@@ -734,6 +829,17 @@ fn print_plan_report(
             );
         }
         println!("    argv: {}", seat.node_argv().join(" "));
+        if let Some(request) = drm_leases.get(&seat.config.id) {
+            println!(
+                "    drm lease: {}:{} crtc={} (lease-only: no scanout/compositor isolation)",
+                request.card.display_name(),
+                request.connector,
+                match request.crtc {
+                    ozma_multiseat::DrmCrtcSelector::Auto => "auto".to_owned(),
+                    ozma_multiseat::DrmCrtcSelector::Id(id) => id.to_string(),
+                }
+            );
+        }
         if !seat.command.env.is_empty() {
             let env = seat
                 .command
@@ -795,6 +901,9 @@ fn print_status(args: &Args, status: &ozma_multiseat::SeatRuntimeStatus) {
     if let Some(display) = display_summary(&status.display) {
         line.push_str(&display);
     }
+    if let Some(lease) = lease_summary(&status.drm_lease) {
+        line.push_str(&lease);
+    }
     if let Some(message) = &status.message {
         line.push_str(&format!(" ({message})"));
     }
@@ -834,6 +943,37 @@ fn display_summary(display: &SeatDisplayStatus) -> Option<String> {
         summary.push_str(&format!(" error[{}]={}", error.kind, error.message));
     }
     for note in &display.display_notes {
+        summary.push_str(&format!(" note[{}]={}", note.kind.as_str(), note.message));
+    }
+    summary.push(')');
+    Some(summary)
+}
+
+fn lease_summary(lease: &DrmLeaseStatus) -> Option<String> {
+    if lease.is_empty() {
+        return None;
+    }
+    let mut summary = format!(" drm_lease({}:{}", lease.card, lease.connector);
+    if let Some(id) = lease.lessee_id {
+        summary.push_str(&format!(" lessee={id}"));
+    }
+    if let Some(id) = lease.connector_id {
+        summary.push_str(&format!(" connector_id={id}"));
+    }
+    if let Some(id) = lease.crtc_id {
+        summary.push_str(&format!(" crtc_id={id}"));
+    }
+    if let Some(fd) = lease.fd {
+        summary.push_str(&format!(" fd={fd}"));
+    }
+    summary.push_str(&format!(
+        " applied={} released={}",
+        lease.applied, lease.released
+    ));
+    if let Some(error) = &lease.error {
+        summary.push_str(&format!(" error[{}]={}", error.kind, error.message));
+    }
+    for note in &lease.notes {
         summary.push_str(&format!(" note[{}]={}", note.kind.as_str(), note.message));
     }
     summary.push(')');
@@ -932,6 +1072,9 @@ fn print_status_document(args: &Args, status: &MultiseatStatus) {
         }
         if let Some(display) = display_summary(&seat.display) {
             line.push_str(&display);
+        }
+        if let Some(lease) = lease_summary(&seat.drm_lease) {
+            line.push_str(&lease);
         }
         if let Some(message) = &seat.message {
             line.push_str(&format!(" ({message})"));

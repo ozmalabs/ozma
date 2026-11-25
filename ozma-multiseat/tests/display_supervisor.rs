@@ -184,6 +184,7 @@ fn options(backend: SeatDisplayBackend) -> SupervisorOptions {
         input_isolation: false,
         input_targeting: Default::default(),
         seat_display: seat_display_options(backend),
+        drm_leases: Default::default(),
     }
 }
 

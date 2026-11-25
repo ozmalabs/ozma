@@ -47,7 +47,8 @@ Start order:
 
 | Step | Invocation |
 |---|---|
-| Create TUN | `ip tuntap add dev <if> mode tun persist` |
+| Create TUN (preferred) | `ip tuntap add dev <if> mode tun persist` |
+| Create TUN (iproute2 ≥ 7.3) | `ip tuntap add dev <if> mode tun` (implicit persistence) |
 | MTU | `ip link set dev <if> mtu <mtu>` |
 | Address | `ip addr replace <addr>/<prefix> dev <if>` |
 | Link up | `ip link set dev <if> up` |
@@ -56,6 +57,14 @@ Start order:
 | NAT table | `nft add table ip <table>` |
 | NAT chain | `nft add chain ip <table> postrouting { type nat hook postrouting priority 100 ; }` |
 | NAT rule | `nft add rule ip <table> postrouting ip saddr <network>/<prefix> oifname != "<if>" masquerade` |
+
+TUN creation is feature-detected without guessing from a version string. The
+dataplane first tries the explicit `persist` token (correct on older iproute2).
+If the tool rejects only that keyword, it retries the implicit form, which
+iproute2 7.3 makes persistent by default. If both forms fail, the dataplane
+returns the typed `mesh.tun-unsupported` error with the operator action instead
+of an opaque command failure. This keeps the interface alive between the
+dataplane's creation step and the pump's attach, with no create/attach race.
 
 With `--mesh-nat-out eth0` the rule uses `oifname "eth0"` instead of the
 non-mesh-egress form.
@@ -110,6 +119,20 @@ decapsulated IPv4 packets on a bounded `tokio::mpsc` channel taken once by
 pump is IPv4-only). IPv4 packets decapsulated before a subscriber takes the
 channel are counted by the manager as dropped rather than claimed as delivered.
 
+Before a TUN packet reaches the tunnel, the pump classifies it:
+
+| Packet | Result |
+|---|---|
+| Well-formed IPv4 unicast | queued for `send_packet` |
+| Not IPv4 (for example an IPv6 router solicitation) | dropped, `dropped_non_ipv4` |
+| IPv4 multicast (`224.0.0.0/4`, for example IGMPv3 to `224.0.0.22`) | dropped, `dropped_multicast` |
+| IPv4 limited broadcast (`255.255.255.255`) | dropped, `dropped_broadcast` |
+| Valid IPv4 with no owning peer route (`mesh.pump-no-route`) | dropped, `dropped_no_route` |
+
+These are local drops, never worker failures: the pump and dataplane stay
+running. Genuine TUN/tunnel transport errors still stop both directions and
+surface a typed `mesh.pump-*` failure.
+
 Bounds and counters:
 
 * each direction has a bounded queue (`PumpConfig::queue_capacity`, default
@@ -121,7 +144,9 @@ Bounds and counters:
   counts IPv4 packets dropped before a pump subscribes;
 * `PumpStats` reports TUN read packets/bytes, tunnel send packets/bytes,
   tunnel receive packets/bytes, TUN write packets/bytes, both queue drop
-  counters, and per-direction error counters.
+  counters, four outbound classification drop counters (`dropped_non_ipv4`,
+  `dropped_multicast`, `dropped_broadcast`, `dropped_no_route`), and
+  per-direction error counters.
 
 A worker error stops both directions, records a typed `mesh.pump-*` error, and
 leaves the pump in `failed`. The node service monitors that failure and tears
@@ -169,6 +194,10 @@ dataplane is configured:
     "tunnel_to_tun_bytes": 0,
     "dropped_tun_to_tunnel": 0,
     "dropped_tunnel_to_tun": 0,
+    "dropped_non_ipv4": 0,
+    "dropped_multicast": 0,
+    "dropped_broadcast": 0,
+    "dropped_no_route": 0,
     "tun_read_errors": 0,
     "tun_write_errors": 0,
     "tunnel_send_errors": 0,
@@ -198,6 +227,7 @@ Typed pump errors:
 | `mesh.pump-unavailable` | The pump was requested but the running tunnel exposes no packet API, or the dataplane/tunnel is not running. |
 | `mesh.pump-invalid` | Queue/buffer bounds are outside the supported range. |
 | `mesh.pump-packet-too-large` | A tunnel packet exceeded the fixed bounded buffer. |
+| `mesh.pump-no-route` | A valid IPv4 packet has no owning peer. Treated as a counted drop, not a fatal pump failure. |
 
 Typed `DataplaneError.code` values:
 
@@ -209,6 +239,7 @@ Typed `DataplaneError.code` values:
 | `mesh.dataplane-not-configured` | A dataplane operation had no configuration. |
 | `mesh.dataplane-not-running` | Runtime route update attempted while not running. |
 | `mesh.dataplane-command-failed` | `ip`/`nft` exited non-zero; rollback was attempted. |
+| `mesh.tun-unsupported` | The host's iproute2 rejects both TUN creation forms; create a persistent TUN manually or upgrade iproute2. |
 
 Preflight is also performed by `MeshServiceConfig::preflight_with`, so a node
 started without root/TUN/`ip` (or with NAT but without `nft`) becomes a typed
@@ -242,6 +273,24 @@ Lifecycle:
   A running dataplane, programmed route, or running pump never promotes a
   peer.
 
+### Liveness and shutdown ordering
+
+`MeshManager` drives `Tunn::update_timers()` on its receive loop every second
+(`DEFAULT_TIMER_POLL_INTERVAL`). This sends keepalives, retries handshakes, and
+lets boringtun clear a session at its reject time. A status snapshot reports
+`established:true` only while the real handshake age is at most
+`DEFAULT_HANDSHAKE_TIMEOUT` (180 s, WireGuard `REJECT_AFTER_TIME`);
+`last_handshake_age_secs` is boringtun's handshake age, so a configured but
+never-handshaken peer is `None` and a stopped peer becomes `false`/`None` in
+bounded time.
+
+`shutdown::stop_task` now waits up to `TASK_STOP_TIMEOUT` for a task to observe
+the already-cancelled root token and run its async cleanup before aborting.
+This lets the `mesh-service` task call `MeshService::stop()`, which stops the
+pump, deletes the TUN and peer routes, restores forwarding only if this process
+changed it, and stops the WireGuard manager. Abort remains a bounded fallback
+for a task that never yields.
+
 The Python soft node is unchanged; this is node-only.
 
 ## Tests
@@ -249,17 +298,25 @@ The Python soft node is unchanged; this is node-only.
 Default tests never require root, a real TUN device, or `nft`. They use
 recording fake runner/sysfs seams and in-memory TUN/tunnel channels.
 
-Latest verification (private snapshot of the tree, to avoid concurrent edits):
+Latest verification (clean HEAD worktree with only the mesh/shutdown changes
+applied, to avoid concurrent edits elsewhere):
 
-* `cargo test -p ozma-mesh -p ozma-node --lib` — **543 passed, 5 ignored**
-  (`ozma-mesh`: 22 passed, 2 ignored; `ozma-node`: 521 passed, 3 ignored).
+* `cargo test -p ozma-mesh -p ozma-node --lib` — **577 passed, 6 ignored**
+  (`ozma-mesh`: 32 passed, 2 ignored; `ozma-node`: 545 passed, 4 ignored).
 * `cargo check -p ozma-mesh -p ozma-node --all-targets` — passes.
 * `rustfmt --edition 2021 --check` on every touched Rust file — passes.
+* Live two-node netns run — see `docs/phase4-mesh-live-report.md`.
 
 `ozma-mesh` packet-pump tests cover:
 
 * TUN→tunnel and tunnel→TUN round trips through bounded in-memory channels;
-* short TUN reads treated as one packet and partial TUN writes retried;
+* IPv6 router solicitation, IGMPv3 multicast (`224.0.0.22`), limited
+  broadcast, and no-route IPv4 each incrementing its own drop counter while
+  the pump stays `running`;
+* a genuine tunnel send failure still producing a typed fatal
+  `mesh.pump-tunnel-send` and stopping the pump;
+* short non-IPv4 TUN reads dropped rather than forwarded;
+* partial TUN writes retried;
 * queue overflow in both directions incrementing the correct drop counter;
 * per-direction packet/byte/error snapshots;
 * idempotent shutdown, no traffic after stop, and `wait_failed` returning
@@ -270,9 +327,19 @@ Latest verification (private snapshot of the tree, to avoid concurrent edits):
 * one `#[ignore]` live attach test additionally gated by `OZMA_MESH_LIVE=1`,
   requiring root and `/dev/net/tun`.
 
+`ozma-mesh` manager timer tests use a fake/clocked tunnel to prove that every
+poll calls `update_timers`, timer-emitted packets are sent to the peer, the
+reported handshake age comes from the tunnel (not construction), a stale
+handshake beyond 180 s is not `established`, and timer expiry clears
+`established` while keeping the configured peer for a future handshake.
+
 `ozma-mesh` dataplane tests cover:
 
 * exact argv/order for create, MTU, address, up, forwarding, and peer routes;
+* the explicit `persist` argv and the iproute2 7.3 implicit-persistence
+  fallback;
+* both TUN creation forms rejected producing `mesh.tun-unsupported` with no
+  rollback commands;
 * NAT opt-in, exact nft argv, and optional egress interface;
 * reverse rollback on route failure and on NAT-rule failure;
 * forwarding restore and disabled-forwarding behavior;
@@ -304,6 +371,11 @@ Latest verification (private snapshot of the tree, to avoid concurrent edits):
 * asynchronous pump failure surfacing as `failed` and tearing down the
   manager/dataplane.
 
+`ozma-node` shutdown tests additionally prove that `stop_task` lets a
+cancelled mesh-service task run `MeshService`/`MeshDataplane` teardown (peer
+route delete and TUN link delete) before any abort, while still bounding a task
+that ignores cancellation.
+
 Live test invocation (manual, root):
 
 ```bash
@@ -321,12 +393,16 @@ sudo OZMA_MESH_LIVE=1 cargo test -p ozma-mesh --lib \
 
 ## Remaining kernel/dataplane gaps
 
-* **Real-network coverage is still partial.** Packet round trips are tested
-  through in-memory seams; the optional `#[ignore]` live dataplane test only
-  checks the link, not a multi-node encrypted packet flow. No default test
-  touches a real TUN, WireGuard handshake, or network namespace.
-* **IPv4 only, single queue.** The pump reads/writes one packet buffer and
-  ignores IPv6. It does not use TUN multi-queue, GSO/GRO, or vnet headers.
+* **Real-network coverage is still manual.** Default tests use in-memory seams;
+  the two-node encrypted packet flow, teardown, and peer expiry are exercised
+  by the privileged netns run in `docs/phase4-mesh-live-report.md`, not by a
+  default CI test.
+* **Underlay endpoint vs overlay identity is unresolved.** A peer's WireGuard
+  endpoint is still its mesh IP, which the dataplane routes into the mesh TUN.
+  The live run needs policy routing so encrypted UDP does not recurse.
+* **IPv4 only, single queue.** The pump reads/writes one packet buffer; IPv6
+  and non-unicast TUN traffic is dropped and counted. It does not use TUN
+  multi-queue, GSO/GRO, or vnet headers.
 * **No per-peer queues or fairness.** All peers share one tunnel outbound path;
   a slow peer can consume the shared send budget. There is no per-peer egress
   queue, rate limit, or backpressure signal.
