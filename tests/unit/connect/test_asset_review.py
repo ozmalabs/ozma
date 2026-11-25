@@ -560,7 +560,7 @@ def test_gallery_is_self_contained_escaped_and_excludes_non_public(engine) -> No
         f'<meta http-equiv="Content-Security-Policy" content="{CSP}">'
         in response.text
     )
-    assert "default-src 'none'; style-src 'unsafe-inline'" in response.text
+    assert "default-src 'self'; script-src 'self'" in response.text
     assert "<script>" not in response.text
     assert "&lt;script&gt;" in response.text
     assert 'href="https://evil.invalid"' not in response.text

@@ -56,6 +56,70 @@ Widgets should consume tokens and expose only intentional overrides. A pack
 that hard-codes a complete visual style is harder to make coherent and harder
 to translate to constrained targets.
 
+## Charts and history
+
+The browser adapter renders multi-series charts with the dependency-free
+`web/display/widgets/chart.js` module. A `chart` node uses the chart renderer
+when it declares series data in one of these forms:
+
+- `metrics`: an array of field keys/ids, with optional `series` entries that
+  add labels and colours;
+- `series`: an array of metric keys/ids or objects with `metric` (or `field`)
+  plus optional `label`, `color`, `unit`, `style`, and `area`;
+- `history.series`: the same series descriptors nested under history;
+- a history window such as `history: {"window": 90}` or
+  `history: {"points": 120}`.
+
+Simple single-series `sparkline` and `history` widgets keep the sparkline
+renderer. If `chart.js` is unavailable, a chart falls back to the sparkline or
+a readable card. History rings are bounded; the client records every bound
+field and updates the existing SVG in place when a field changes.
+
+```json
+{
+  "type": "chart",
+  "label": "Network",
+  "metrics": ["@active.RX", "@active.TX"],
+  "series": [
+    { "label": "RX", "color": "#42d392", "style": "area" },
+    { "label": "TX", "color": "#5b6fff", "style": "line" }
+  ],
+  "min": 0,
+  "max": 1000,
+  "unit": "Mb/s",
+  "warn": 800,
+  "crit": 950,
+  "baseline": "zero",
+  "showLegend": true,
+  "showGrid": true,
+  "ticks": 5,
+  "xTicks": 5,
+  "history": { "points": 120 }
+}
+```
+
+Chart options:
+
+| Option | Meaning |
+|---|---|
+| `width`, `height` | ViewBox size in user units. Values are clamped to a safe bound. |
+| `min`, `max`, `auto` | Explicit or automatic y-range; out-of-range samples clamp visually. |
+| `warn`, `crit`, `thresholds`, `bands` | Warning/critical lines and optional severity bands. Bands may be `{from,to,severity,color,opacity}` objects. |
+| `style` | `line`, `step`, `area`, or `area-step`; per-series `style` overrides it. |
+| `area`, `fill`, `areaOpacity` | Area fill for the whole chart or a series. |
+| `baseline` | `zero`, `min`, `max`, or a numeric baseline. |
+| `timeWindow` / `windowMs` | Rolling x-axis window in milliseconds when samples carry timestamps. |
+| `history.points` / `history.window` | Bounded sample capacity for the per-series ring. |
+| `ticks` / `xTicks` | Bounded y/x tick counts. |
+| `showAxes`, `showGrid`, `showLegend`, `showLast`, `showValue` | Axis, grid, legend, marker, and value-label toggles. |
+| `tooltip` | Set `false` to disable the pointer tooltip. |
+| `colors` / `palette` | Explicit colours or a series palette; invalid colours fall back safely. |
+
+Charts follow the same accessibility contract as the gauge family: `role="img"`
+with a title and description, text equivalents for series values and
+thresholds, validated colours, and a reduced-motion variant. Hover tooltips are
+optional and never required to read the chart.
+
 ## Vibe, shape, and coherence
 
 Design language is captured, not inferred away.

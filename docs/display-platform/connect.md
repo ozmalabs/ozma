@@ -104,7 +104,7 @@ authenticated with `X-Ozma-Review-Token` and should additionally be restricted
 at the proxy to trusted operator networks. Controllers must use the public
 HTTPS URL, for example `https://connect.example.test/assets/index/stable`.
 
-## Review workflow and gallery
+## Review workflow and marketplace
 
 Review is optional and backward compatible:
 
@@ -142,13 +142,49 @@ status, reviewer, note, and timestamp. An optional
 Unknown packs or versions return `404`; private or yanked review targets return
 `409`; malformed bodies and a missing rejection note return `400`.
 
-`GET /assets/gallery` is a public, read-only HTML page listing approved public
-packs with name, author, version, tags, licence, and links to
-`/assets/entry/{id}`. It accepts optional `q`, `type`, and `tag` query filters.
-The page is self-contained: no scripts, external styles, images, or network
-requests. It sends a strict `default-src 'none'; style-src 'unsafe-inline'`
-CSP as both a meta tag and a response header, and HTML-escapes every
-manifest-derived value. It never lists private, pending, or rejected packs.
+`GET /assets/marketplace` (and the backward-compatible `GET /assets/gallery`
+alias) is a public, read-only HTML marketplace for approved public packs. The
+server renders an escaped shell with search, type/licence/tag filters, sorting,
+and pagination; the page's same-origin JavaScript then uses `/assets/search`
+for results and `/assets/entry/{id}` plus `/assets/versions/{id}` for pack
+details and version history. The detail view shows licence, provenance, vibe,
+shape, coherence, assets, and an optional preview when the image URL is
+relative, same-origin, or a safe `data:image/...` value. Private, pending, and
+rejected packs never appear because all data comes from the public search path.
+
+The shell loads only two local static files:
+
+```text
+/assets/static/marketplace.js
+/assets/static/marketplace.css
+```
+
+They are served with JavaScript and CSS MIME types,
+`X-Content-Type-Options: nosniff`, and `Cache-Control: public, max-age=3600`.
+The route accepts only these exact names, so unknown paths and traversal
+attempts return `404`. The page uses no CDN, remote fonts, third-party images,
+or network requests beyond same-origin `/assets` JSON. Its CSP is sent as both
+a meta tag and a response header:
+
+```text
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+img-src 'self' data:; connect-src 'self'; object-src 'none';
+base-uri 'none'; form-action 'none'
+```
+
+The optional review panel is on the same page and hidden until an operator
+opens it and enters the token. The token is held in memory and, when the
+browser permits it, `sessionStorage` for that tab; it is never placed in the
+URL, page HTML, or logs. Review requests send it only as
+`X-Ozma-Review-Token`. Approve/reject actions accept an optional note, require
+a note for rejection, and refresh the pending queue after a decision. If the
+review API returns `503 review_unavailable`, the panel is disabled with a
+clear message while the public marketplace remains available.
+
+`GET /assets/gallery` also accepts optional `q`, `type`, `tag`, `licence`,
+`sort`, `limit`, and `offset` query parameters and renders the same shell as
+`/assets/marketplace`. Query values are HTML-escaped and bounded before use.
+It never lists private, pending, or rejected packs.
 
 ## Backup and restore
 

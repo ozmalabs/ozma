@@ -177,11 +177,15 @@ idempotent and does not create a duplicate audit event. If
 approved automatically, preserving existing behaviour. Private submissions and
 first-party public submissions are approved automatically.
 
-`GET /assets/gallery` renders an approved-only public HTML gallery with name,
-author, version, tags, licence, and entry links. It accepts `q`, `type`, and
-`tag` filters, uses no scripts or third-party assets, applies a strict CSP, and
-escapes every manifest-derived value. Pending, rejected, and private packs never
-appear there.
+`GET /assets/marketplace` (and the compatible `/assets/gallery` alias) renders
+the approved-only public marketplace UI: search, type/licence/tag filters,
+pagination, pack detail, versions, and provenance/vibe/shape metadata. It uses
+same-origin static JS/CSS only, applies a strict CSP, escapes every
+manifest-derived value, and validates preview URLs/colours before use. Pending,
+rejected, and private packs never appear there. The same page exposes a
+token-gated review panel; the token stays in memory/session storage and is never
+embedded in the HTML or URL. `/assets/gallery` and the JSON search API remain
+available for simple integrations.
 
 Run the gate with:
 

@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+import ctypes.util
+import importlib
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+import brotli_fallback
 import font_export as fe
 import font_translation as ft
 
@@ -53,6 +57,30 @@ def _copy_with_fs_type(tmp_path: Path, fs_type: int, source: Path | None = None)
     font.save(target)
     font.close()
     return target
+
+
+@pytest.fixture
+def woff2_state():
+    """Restore Brotli module entries and fontTools' WOFF2 flag after a test."""
+
+    from fontTools.ttLib import woff2
+
+    saved = {
+        name: sys.modules.get(name) for name in ("brotli", "brotlicffi")
+    }
+    for name, module in saved.items():
+        if module is None or getattr(module, "_ozma_ctypes_fallback", False):
+            sys.modules.pop(name, None)
+    importlib.reload(woff2)
+    try:
+        yield woff2
+    finally:
+        for name in ("brotli", "brotlicffi"):
+            sys.modules.pop(name, None)
+        for name, module in saved.items():
+            if module is not None:
+                sys.modules[name] = module
+        importlib.reload(woff2)
 
 
 _LVGL_HEADER = """\
@@ -186,26 +214,53 @@ def test_subset_font_refuses_fs_type_without_subsetting(tmp_path):
             fe.subset_font(metadata, ["A"], tmp_path / f"no-{fs_type:04x}.ttf")
 
 
-def test_subset_font_woff2_output_or_explicit_dependency_error(tmp_path):
-    try:
-        from fontTools.ttLib import woff2
-    except ImportError:  # pragma: no cover - very old fontTools
-        pytest.skip("this fontTools build has no WOFF2 module")
+def test_subset_font_woff2_uses_system_lib_fallback(
+    tmp_path, monkeypatch, woff2_state
+):
+    monkeypatch.setattr(brotli_fallback, "_python_brotli", lambda: None)
+    if brotli_fallback._load_ctypes_libraries() is None:
+        pytest.skip("system libbrotlienc/libbrotlidec are not installed")
+    sys.modules.pop("brotli", None)
+    woff2_state.haveBrotli = False
 
     metadata = ft.FontMetadata.from_path(_sans())
     output = tmp_path / "subset.woff2"
-    if not woff2.haveBrotli:
-        # The optional brotli package is not installed in this environment.
-        # WOFF2 must fail closed with an actionable error rather than writing a
-        # corrupt .woff2 file.
-        with pytest.raises(fe.FontExportError, match="brotli"):
-            fe.subset_font(metadata, ["A", "B"], output, flavour="woff2")
-        assert not output.exists()
-        return
-
     fe.subset_font(metadata, ["A", "B"], output, flavour="woff2")
+
     assert output.read_bytes().startswith(b"wOF2")
     assert output.stat().st_size > 0
+    assert woff2_state.haveBrotli is True
+    assert getattr(sys.modules["brotli"], "_ozma_ctypes_fallback", False) is True
+
+    TTFont = _font_tools().TTFont
+    font = TTFont(output)
+    try:
+        assert "cmap" in font
+        assert {0x41, 0x42}.issubset(font.getBestCmap())
+        assert font["OS/2"].fsType == metadata.fs_type
+        licence_names = [
+            record.toUnicode()
+            for record in font["name"].names
+            if record.nameID == 13
+        ]
+        assert any(value.strip() for value in licence_names)
+    finally:
+        font.close()
+
+
+def test_subset_font_woff2_fails_closed_when_brotli_hidden(
+    tmp_path, monkeypatch, woff2_state
+):
+    monkeypatch.setattr(brotli_fallback, "_python_brotli", lambda: None)
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+    sys.modules.pop("brotli", None)
+    woff2_state.haveBrotli = False
+
+    metadata = ft.FontMetadata.from_path(_sans())
+    output = tmp_path / "subset.woff2"
+    with pytest.raises(fe.FontExportError, match="brotli"):
+        fe.subset_font(metadata, ["A", "B"], output, flavour="woff2")
+    assert not output.exists()
 
 
 # ---------------------------------------------------------------------------

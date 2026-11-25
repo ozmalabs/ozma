@@ -9,8 +9,12 @@ Font translation is behind `OZMA_DISPLAY_FONTS_TRANSLATION_ENABLED` (default
 metadata extraction, PANOSE and metric analysis, `fsType` licence checks,
 deterministic shape/intent matching, and export planning.
 `controller/font_export.py` performs TTF/OTF subsetting, BDF and LVGL C export,
-and PIL previews. WOFF2 writing needs the optional `brotli` package and fails
-closed when it is absent.
+and PIL previews. WOFF2 writing uses the optional Python `brotli` package when
+present. If it is absent, `controller/brotli_fallback.py` loads the system
+`libbrotlienc`/`libbrotlidec` through `ctypes` and registers a module-like shim
+for `fontTools`; no network access or compiler is involved. If neither provider
+exists, WOFF2 export fails closed with an actionable error and TTF/OTF export
+continues to work unchanged.
 
 ## Font intent
 

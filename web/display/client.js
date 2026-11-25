@@ -57,6 +57,7 @@ const WIDGET_TYPES = new Set([
 const DEFAULT_THEME = 'core-dark';
 const GAUGE_MODULE_URL = './widgets/gauge.js';
 const SPARKLINE_MODULE_URL = './widgets/sparkline.js';
+const CHART_MODULE_URL = './widgets/chart.js';
 const VU_MODULE_URL = './widgets/vu.js';
 const THEME_MODULE_URL = './theme.js';
 const SANDBOX_MODULE_URL = './sandbox.js';
@@ -107,6 +108,7 @@ const state = {
   actionsByKey: new Map(),
   gaugeModule: null,
   sparklineModule: null,
+  chartModule: null,
   vuModule: null,
   themeModule: null,
   sandboxModule: null,
@@ -122,6 +124,7 @@ const state = {
 let actionSequence = 0n;
 let gaugeSequence = 0;
 let sparklineSequence = 0;
+let chartSequence = 0;
 let vuSequence = 0;
 
 /* ------------------------------------------------------------------------- */
@@ -308,6 +311,223 @@ export function sparklineModeForType(type, node = null) {
     return 'sparkline';
   }
   return null;
+}
+
+const MAX_CHART_SERIES = 16;
+
+function nodeHasExplicitMultiSeries(node) {
+  if (!node || typeof node !== 'object') return false;
+  if (Array.isArray(node.series) && node.series.length > 1) return true;
+  if (Array.isArray(node.metrics) && node.metrics.length > 1) return true;
+  const history = node.history;
+  if (history && typeof history === 'object' && Array.isArray(history.series) && history.series.length > 1) {
+    return true;
+  }
+  return false;
+}
+
+function nodeHasChartSeriesConfig(node) {
+  if (!node || typeof node !== 'object') return false;
+  if (Array.isArray(node.series) && node.series.length) return true;
+  if (Array.isArray(node.metrics) && node.metrics.length) return true;
+  const history = node.history;
+  if (history && typeof history === 'object') {
+    if (Array.isArray(history.series) && history.series.length) return true;
+    if (
+      history.window !== undefined
+      || history.points !== undefined
+      || history.capacity !== undefined
+      || history.limit !== undefined
+    ) return true;
+  }
+  if (node.historyPoints !== undefined || node.history_points !== undefined) return true;
+  return false;
+}
+
+/**
+ * Serialise multi-series chart configuration from a definition node.
+ * Snake_case and camelCase fields are accepted; unspecified values stay
+ * undefined so the chart module can apply its defaults.
+ */
+export function chartConfigForNode(node = {}, field = null, label = '') {
+  const source = node && typeof node === 'object' ? node : {};
+  const history = source.history && typeof source.history === 'object' ? source.history : {};
+  const style = firstNodeValue(
+    source.style,
+    source.chartStyle,
+    source.chart_style,
+    source.mark,
+    source.chartMark,
+    source.chart_mark,
+  );
+
+  return {
+    width: firstNodeValue(source.width, source.chartWidth, source.chart_width),
+    height: firstNodeValue(source.height, source.chartHeight, source.chart_height),
+    min: firstNodeValue(source.min, source.yMin, source.y_min),
+    max: firstNodeValue(source.max, source.yMax, source.y_max),
+    warn: firstNodeValue(source.warn, source.warn_at, source.warnAt),
+    crit: firstNodeValue(source.crit, source.critical, source.crit_at, source.critAt),
+    unit: firstNodeValue(source.unit, field?.unit),
+    decimals: source.decimals,
+    label: label || source.label || source.title || source.name || '',
+    xLabel: firstNodeValue(source.xLabel, source.x_label, source.timeLabel, source.time_label),
+    yLabel: firstNodeValue(source.yLabel, source.y_label, source.valueLabel, source.value_label),
+    style,
+    area: firstNodeValue(source.area, source.areaFill, source.area_fill),
+    fill: source.fill,
+    baseline: firstNodeValue(source.baseline, source.zeroLine, source.zero_line),
+    showLegend: firstNodeValue(source.showLegend, source.show_legend, source.legend),
+    showGrid: firstNodeValue(source.showGrid, source.show_grid, source.grid),
+    showAxes: firstNodeValue(source.showAxes, source.show_axes, source.axis),
+    showLast: firstNodeValue(
+      source.showLast,
+      source.show_last,
+      source.lastValue,
+      source.last_value,
+    ),
+    showValue: firstNodeValue(source.showValue, source.show_value),
+    ticks: firstNodeValue(source.ticks, source.tickCount, source.tick_count),
+    xTicks: firstNodeValue(source.xTicks, source.x_ticks, source.timeTicks, source.time_ticks),
+    timeWindow: firstNodeValue(
+      source.timeWindow,
+      source.time_window,
+      source.windowMs,
+      source.window_ms,
+      history.windowMs,
+      history.window_ms,
+    ),
+    capacity: historyCapacityForNode(source),
+    thresholds: source.thresholds,
+    bands: source.bands,
+    tooltip: source.tooltip,
+    animate: source.animate,
+    colors: source.colors,
+    palette: source.palette,
+  };
+}
+
+function chartDescriptor(item, index, meta, fallbackLabel = '') {
+  if (typeof item === 'string' || typeof item === 'number') {
+    const descriptor = { metric: item, label: String(item) };
+    if (meta && typeof meta === 'object') {
+      descriptor.label = firstNodeValue(meta.label, meta.name, meta.title, descriptor.label);
+      descriptor.color = firstNodeValue(meta.color, meta.colour);
+      descriptor.unit = meta.unit;
+      descriptor.style = firstNodeValue(meta.style, meta.mark);
+      descriptor.area = firstNodeValue(meta.area, meta.fill);
+      descriptor.decimals = meta.decimals;
+    } else if (typeof meta === 'string') {
+      descriptor.label = meta;
+    }
+    return Object.fromEntries(
+      Object.entries(descriptor).filter(([, value]) => value !== undefined),
+    );
+  }
+
+  if (!item || typeof item !== 'object') return null;
+  const descriptor = {
+    metric: firstNodeValue(
+      item.metric,
+      item.field,
+      item.field_id,
+      item.fieldId,
+      item.key,
+      item.data_key,
+      item.dataKey,
+    ),
+    fieldId: firstNodeValue(item.field_id, item.fieldId),
+    label: firstNodeValue(
+      item.label,
+      item.name,
+      item.title,
+      meta && typeof meta === 'object' ? firstNodeValue(meta.label, meta.name, meta.title) : meta,
+      fallbackLabel,
+    ),
+    color: firstNodeValue(item.color, item.colour, meta && typeof meta === 'object' ? meta.color : undefined),
+    unit: firstNodeValue(item.unit, meta && typeof meta === 'object' ? meta.unit : undefined),
+    style: firstNodeValue(item.style, item.mark),
+    area: firstNodeValue(item.area, item.fill),
+    decimals: item.decimals,
+    values: item.values ?? item.samples ?? item.history ?? item.data ?? item.points,
+    times: item.times,
+  };
+  if (descriptor.fieldId === undefined && typeof descriptor.metric === 'number') {
+    descriptor.fieldId = descriptor.metric;
+  }
+  return Object.fromEntries(
+    Object.entries(descriptor).filter(([, value]) => value !== undefined),
+  );
+}
+
+/**
+ * Extract the configured series descriptors from a chart node.  Supports a
+ * `metrics` array with optional `series` labels/colours, a `series` array of
+ * metric names or objects, `history.series`, and a single field binding.
+ */
+export function chartSeriesForNode(node = {}, field = null, label = '') {
+  const source = node && typeof node === 'object' ? node : {};
+  const history = source.history && typeof source.history === 'object' ? source.history : {};
+  const result = [];
+
+  if (Array.isArray(source.metrics) && source.metrics.length) {
+    const meta = Array.isArray(source.series) ? source.series : [];
+    source.metrics.slice(0, MAX_CHART_SERIES).forEach((metric, index) => {
+      const descriptor = chartDescriptor(metric, index, meta[index], label);
+      if (descriptor) result.push(descriptor);
+    });
+  } else if (Array.isArray(source.series) && source.series.length) {
+    source.series.slice(0, MAX_CHART_SERIES).forEach((item, index) => {
+      const descriptor = chartDescriptor(item, index, null, label);
+      if (descriptor) result.push(descriptor);
+    });
+  } else if (Array.isArray(history.series) && history.series.length) {
+    history.series.slice(0, MAX_CHART_SERIES).forEach((item, index) => {
+      const descriptor = chartDescriptor(item, index, null, label);
+      if (descriptor) result.push(descriptor);
+    });
+  }
+
+  if (!result.length && field) {
+    result.push({
+      metric: field.key,
+      fieldId: field.id,
+      label: label || field.key || 'Series 1',
+      unit: field.unit,
+    });
+  } else if (!result.length && source.metric !== undefined) {
+    const descriptor = chartDescriptor(
+      { metric: source.metric, label: label || source.label || source.title || source.name },
+      0,
+      null,
+      label,
+    );
+    if (descriptor) result.push(descriptor);
+  } else if (!result.length && Array.isArray(source.history)) {
+    result.push({
+      label: label || source.label || source.title || source.name || 'Series 1',
+      values: source.history,
+    });
+  }
+
+  return result.slice(0, MAX_CHART_SERIES);
+}
+
+/**
+ * Map a widget to the multi-series chart renderer.  `chart` nodes need an
+ * explicit series/metric/history configuration; plain `sparkline` and
+ * single-series `history` widgets keep the sparkline renderer.
+ */
+export function chartRenderKind(node, { hasChartModule } = {}) {
+  const source = typeof node === 'string' ? { type: node } : (node || {});
+  const type = String(source.type || '').toLowerCase();
+  if (type !== 'chart' && type !== 'sparkline' && type !== 'history') return null;
+  const available = typeof hasChartModule === 'boolean' ? hasChartModule : true;
+  const chartable = type === 'chart'
+    ? nodeHasChartSeriesConfig(source)
+    : nodeHasExplicitMultiSeries(source);
+  if (!available || !chartable) return null;
+  return 'chart';
 }
 
 const VU_TYPES = new Set(['vu_meter', 'vue_meter']);
@@ -801,11 +1021,19 @@ export function sandboxMountPayload(node, field = null, value = undefined) {
  */
 export function widgetRenderKind(
   node,
-  { hasGaugeModule = false, hasSparklineModule = false, hasVuModule = false } = {},
+  {
+    hasGaugeModule = false,
+    hasSparklineModule = false,
+    hasVuModule = false,
+    hasChartModule = false,
+  } = {},
 ) {
   const type = typeof node === 'string' ? node : node?.type;
   if (shouldSandboxWidget(typeof node === 'string' ? null : node)) return 'sandbox';
   if (hasVuModule && vuRenderKind(node, { hasVuModule: true })) return 'vu';
+  if (hasChartModule && chartRenderKind(node, { hasChartModule: true }) === 'chart') {
+    return 'chart';
+  }
   if (hasSparklineModule && sparklineModeForType(type, typeof node === 'string' ? null : node)) {
     return 'sparkline';
   }
@@ -1241,15 +1469,24 @@ function renderWidget(node) {
   const hasVuModule = Boolean(
     state.vuModule && typeof state.vuModule.renderVu === 'function',
   );
+  const hasChartModule = Boolean(
+    state.chartModule && typeof state.chartModule.renderChart === 'function',
+  );
   const renderKind = widgetRenderKind(node, {
     hasGaugeModule: Boolean(state.gaugeModule),
     hasSparklineModule: Boolean(state.sparklineModule),
     hasVuModule,
+    hasChartModule,
   });
   const vuMode = renderKind === 'vu'
     ? vuRenderKind(node, { hasVuModule })
     : null;
-  const sparklineMode = renderKind === 'sparkline' ? sparklineModeForType(type, node) : null;
+  const chartMode = renderKind === 'chart'
+    ? chartRenderKind(node, { hasChartModule })
+    : null;
+  const sparklineMode = state.sparklineModule
+    ? sparklineModeForType(type, node)
+    : null;
   const gaugeMode = renderKind === 'gauge' ? gaugeModeForType(type) : null;
 
   const card = document.createElement('article');
@@ -1276,6 +1513,21 @@ function renderWidget(node) {
       return card;
     } catch {
       // Fall through to the gauge bar or legacy card/meter renderer.
+    }
+  }
+
+  if (chartMode) {
+    const host = document.createElement('div');
+    host.className = 'chart-host';
+    host.dataset.chart = chartMode;
+    try {
+      mountChart(host, node, field, headingText);
+      card.classList.add('widget-meter', 'widget-chart-svg');
+      card.append(host);
+      if (action) attachAction(card, action, node);
+      return card;
+    } catch {
+      // Fall through to the sparkline or legacy card/meter renderer.
     }
   }
 
@@ -1920,6 +2172,91 @@ function mountSparkline(host, node, field, mode, label) {
   return svg;
 }
 
+function chartFieldForDescriptor(descriptor) {
+  if (!descriptor) return null;
+  const rawId = descriptor.fieldId;
+  if (rawId !== undefined && rawId !== null && rawId !== '') {
+    const numeric = Number(rawId);
+    if (Number.isFinite(numeric) && state.fieldById.has(numeric)) {
+      return state.fieldById.get(numeric);
+    }
+    if (Number.isFinite(numeric)) return { id: numeric, key: String(numeric) };
+    const byKey = state.fieldByKey.get(String(rawId));
+    if (byKey) return byKey;
+  }
+  if (descriptor.metric !== undefined && descriptor.metric !== null && descriptor.metric !== '') {
+    return resolveField({
+      field: descriptor.metric,
+      metric: descriptor.metric,
+      field_id: typeof descriptor.metric === 'number' ? descriptor.metric : undefined,
+    });
+  }
+  return null;
+}
+
+function mountChart(host, node, field, label) {
+  const chart = state.chartModule;
+  if (!chart || typeof chart.renderChart !== 'function') {
+    throw new Error('chart module unavailable');
+  }
+
+  const config = chartConfigForNode(node, field, label);
+  const tokens = state.themeTokens || {};
+  const capacity = historyCapacityForNode(node);
+  const descriptors = chartSeriesForNode(node, field, label);
+  const series = descriptors.map((descriptor, index) => {
+    const resolved = chartFieldForDescriptor(descriptor);
+    const fieldId = resolved?.id ?? descriptor.fieldId;
+    const key = String(
+      firstNodeValue(
+        resolved?.key,
+        descriptor.metric,
+        descriptor.label,
+        `series-${index + 1}`,
+      ),
+    );
+    let values = descriptor.values;
+    let times = descriptor.times;
+    if (fieldId !== undefined && fieldId !== null) {
+      values = ensureHistoryRing(fieldId, capacity).samples;
+    }
+    return {
+      ...descriptor,
+      id: firstNodeValue(descriptor.id, key),
+      label: firstNodeValue(descriptor.label, resolved?.key, key),
+      unit: firstNodeValue(descriptor.unit, resolved?.unit),
+      fieldId,
+      values: Array.isArray(values) ? values : [],
+      times: Array.isArray(times) ? times : undefined,
+    };
+  });
+
+  chartSequence += 1;
+  const options = { id: node.id || node.key || `chart-${chartSequence}` };
+  const svg = chart.renderChart(host, config, series, tokens, options);
+
+  const fieldIds = [...new Set(
+    series
+      .map((item) => item.fieldId)
+      .filter((id) => id !== undefined && id !== null),
+  )];
+  if (!fieldIds.length) return svg;
+
+  const apply = () => {
+    const current = series.map((item) => {
+      if (item.fieldId === undefined || item.fieldId === null) return item;
+      return { ...item, values: historyForField(item.fieldId) };
+    });
+    if (typeof chart.updateChart === 'function') {
+      chart.updateChart(host, current, config, tokens, options);
+    } else {
+      chart.renderChart(host, config, current, tokens, options);
+    }
+  };
+  for (const fieldId of fieldIds) state.bindings.push({ fieldId, apply });
+  return svg;
+}
+
 function widgetHeading(node, type, field) {
   if (node.label !== undefined && node.label !== null && node.label !== '') {
     return String(node.label);
@@ -2264,15 +2601,17 @@ async function applySelectedTheme(themeModule) {
 }
 
 async function bootstrapOptionalModules() {
-  const [themeModule, gaugeModule, sparklineModule, sandboxModule, vuModule] = await Promise.all([
+  const [themeModule, gaugeModule, sparklineModule, chartModule, sandboxModule, vuModule] = await Promise.all([
     loadThemeModule(),
     importOptional(GAUGE_MODULE_URL),
     importOptional(SPARKLINE_MODULE_URL),
+    importOptional(CHART_MODULE_URL),
     importOptional(SANDBOX_MODULE_URL),
     importOptional(VU_MODULE_URL),
   ]);
   if (gaugeModule) state.gaugeModule = gaugeModule;
   if (sparklineModule) state.sparklineModule = sparklineModule;
+  if (chartModule) state.chartModule = chartModule;
   if (sandboxModule) state.sandboxModule = sandboxModule;
   if (vuModule) state.vuModule = vuModule;
   if (themeModule) {

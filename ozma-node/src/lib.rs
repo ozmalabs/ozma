@@ -4,6 +4,10 @@
 
 pub mod agent_metrics;
 pub mod aida64;
+// Portable protocol plus an optional Windows-only shared-memory/Registry
+// backend. The backend is `#[cfg(windows)]` inside the module; the rest is
+// compiled and tested on every platform.
+pub mod aida64_windows;
 pub mod api;
 pub mod audio_runtime;
 pub mod backend;

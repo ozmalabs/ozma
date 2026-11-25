@@ -190,9 +190,13 @@ def subset_font(
 
         if "head" in font:
             font["head"].modified = 0
-        font.flavor = "woff2" if flavour == "woff2" else None
         if flavour == "woff2":
+            # Make the optional system-libbrotli fallback available before
+            # fontTools' save path selects its WOFF2 writer.
             _require_woff2_support()
+            font.flavor = "woff2"
+        else:
+            font.flavor = None
 
         output = Path(out_path)
         suffix = output.suffix.lower()
@@ -239,11 +243,52 @@ def _require_woff2_support() -> None:
         from fontTools.ttLib import woff2
     except ImportError as exc:  # pragma: no cover - old fontTools
         raise FontExportError("this fontTools build has no WOFF2 support") from exc
-    if not woff2.haveBrotli:
-        raise FontExportError(
-            "WOFF2 output requires the 'brotli' Python package; "
-            "install it or export TTF/OTF instead"
-        )
+    if woff2.haveBrotli:
+        return
+
+    # No Python brotli/brotlicffi package. Try the ctypes shim backed by the
+    # system libbrotlienc/libbrotlidec before failing closed.
+    try:
+        import brotli_fallback
+    except ImportError:  # pragma: no cover - minimal controller image
+        brotli_fallback = None
+    if brotli_fallback is not None and brotli_fallback.install():
+        try:
+            from fontTools.ttLib import woff2 as refreshed
+        except ImportError:  # pragma: no cover - old fontTools
+            refreshed = None
+        if refreshed is not None and refreshed.haveBrotli:
+            return
+
+    raise FontExportError(
+        "WOFF2 output requires Brotli: install the Python 'brotli' package "
+        "or provide the system libbrotlienc/libbrotlidec libraries; "
+        "export TTF/OTF instead if neither is available"
+    )
+
+
+def _enable_woff2_fallback_on_import() -> None:
+    """Best-effort enablement so fontTools' ``haveBrotli`` is accurate.
+
+    WOFF2 support remains optional: failures are ignored and plain TTF/OTF use
+    is unaffected. A later WOFF2 save retries installation through
+    :func:`_require_woff2_support`.
+    """
+
+    try:
+        from fontTools.ttLib import woff2
+    except ImportError:  # pragma: no cover - fontTools missing
+        return
+    if woff2.haveBrotli:
+        return
+    try:
+        import brotli_fallback
+    except ImportError:  # pragma: no cover - minimal controller image
+        return
+    brotli_fallback.install()
+
+
+_enable_woff2_fallback_on_import()
 
 
 # ---------------------------------------------------------------------------

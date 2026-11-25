@@ -109,6 +109,7 @@ jobs:
             tests/unit/controller/test_display_import_api.py \
             tests/unit/controller/test_font_translation.py \
             tests/unit/controller/test_font_export.py \
+            tests/unit/controller/test_brotli_fallback.py \
             tests/unit/controller/test_font_golden.py \
             tests/unit/controller/test_shape_extract.py \
             tests/unit/controller/test_lvgl_export.py \
@@ -120,7 +121,8 @@ jobs:
             tests/unit/connect/test_assets.py \
             tests/unit/connect/test_asset_sync.py \
             tests/unit/connect/test_asset_bootstrap.py \
-            tests/unit/connect/test_asset_review.py -q
+            tests/unit/connect/test_asset_review.py \
+            tests/unit/connect/test_asset_gallery.py -q
       - name: Lint display Python
         run: |
           ruff check connect/assets controller/display_config.py \

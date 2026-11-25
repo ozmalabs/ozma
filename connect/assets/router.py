@@ -14,9 +14,115 @@ from typing import Any, Mapping
 from fastapi import APIRouter, Body, Header, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 
-from connect.assets.gallery import CSP, render_gallery
+from connect.assets.gallery import (
+    CSP,
+    STATIC_CACHE_CONTROL,
+    STATIC_FILES,
+    render_marketplace,
+    static_file,
+)
 from connect.assets.index import AssetService, index_bytes
 from connect.assets.models import AssetError
+
+_MAX_QUERY = 200
+_MAX_FILTER = 128
+_MAX_SORT_RESULTS = 5_000
+_SORTS = frozenset({"name", "name_desc", "author", "published", "id"})
+
+
+def _bounded(value: str | None, limit: int) -> str | None:
+    if value is None:
+        return None
+    return str(value)[:limit]
+
+
+def _sorted_search(
+    current: AssetService,
+    q: str | None,
+    *,
+    type: str | None,
+    tag: str | None,
+    licence: str | None,
+    permission: str | None,
+    include_yanked: bool,
+    limit: int,
+    offset: int,
+    sort: str | None,
+) -> dict[str, Any]:
+    result = current.search(
+        q,
+        type=type,
+        tag=tag,
+        licence=licence,
+        permission=permission,
+        include_yanked=include_yanked,
+        limit=limit,
+        offset=offset,
+    )
+    if not sort or sort == "name":
+        return result
+
+    entries: list[dict[str, Any]] = []
+    position = 0
+    while position < _MAX_SORT_RESULTS:
+        page = current.search(
+            q,
+            type=type,
+            tag=tag,
+            licence=licence,
+            permission=permission,
+            include_yanked=include_yanked,
+            limit=200,
+            offset=position,
+        )
+        chunk = list(page.get("entries") or [])
+        entries.extend(chunk)
+        position += len(chunk)
+        total = int(page.get("total") or 0)
+        if not chunk or position >= total:
+            break
+
+    if sort == "name_desc":
+        entries.sort(
+            key=lambda item: (
+                str(item.get("name", "")).lower(),
+                str(item.get("id", "")),
+            ),
+            reverse=True,
+        )
+    elif sort == "author":
+        entries.sort(key=lambda item: (
+            str(item.get("author", "")).lower(),
+            str(item.get("name", "")).lower(),
+            str(item.get("id", "")),
+        ))
+    elif sort == "published":
+        entries.sort(
+            key=lambda item: (
+                str(item.get("published_at", "")),
+                str(item.get("name", "")).lower(),
+                str(item.get("id", "")),
+            ),
+            reverse=True,
+        )
+    else:
+        entries.sort(key=lambda item: str(item.get("id", "")))
+
+    page_entries = []
+    try:
+        page_limit = int(limit)
+    except (TypeError, ValueError):
+        page_limit = 0
+    page_limit = max(0, min(page_limit, 200))
+    if page_limit:
+        page_entries = entries[offset:offset + page_limit]
+    merged = dict(result)
+    merged.update({
+        "entries": page_entries,
+        "count": len(page_entries),
+        "sort": sort,
+    })
+    return merged
 
 
 def _http_error(exc: AssetError) -> HTTPException:
@@ -163,21 +269,27 @@ def build_router(
         tag: str | None = None,
         licence: str | None = None,
         permission: str | None = None,
+        sort: str | None = None,
         include_yanked: bool = False,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
         current = _service_for(service, request)
+        chosen_sort = _bounded(sort, 32)
+        if chosen_sort not in _SORTS:
+            chosen_sort = "name"
         try:
-            return current.search(
-                q,
-                type=type,
-                tag=tag,
-                licence=licence,
-                permission=permission,
+            return _sorted_search(
+                current,
+                _bounded(q, _MAX_QUERY),
+                type=_bounded(type, _MAX_FILTER),
+                tag=_bounded(tag, _MAX_FILTER),
+                licence=_bounded(licence, _MAX_FILTER),
+                permission=_bounded(permission, _MAX_FILTER),
                 include_yanked=include_yanked,
                 limit=limit,
                 offset=offset,
+                sort=chosen_sort,
             )
         except AssetError as exc:
             raise _http_error(exc) from exc
@@ -236,16 +348,29 @@ def build_router(
         except AssetError as exc:
             raise _http_error(exc) from exc
 
-    @router.get("/gallery", response_class=HTMLResponse)
-    def get_gallery(
+    def _marketplace_response(
         request: Request,
-        q: str | None = None,
-        type: str | None = None,
-        tag: str | None = None,
+        *,
+        q: str | None,
+        type: str | None,
+        tag: str | None,
+        licence: str | None,
+        sort: str | None,
+        limit: int,
+        offset: int,
     ) -> HTMLResponse:
         current = _service_for(service, request)
         try:
-            page = render_gallery(current, q=q, type=type, tag=tag)
+            page = render_marketplace(
+                current,
+                q=_bounded(q, _MAX_QUERY),
+                type=_bounded(type, _MAX_FILTER),
+                tag=_bounded(tag, _MAX_FILTER),
+                licence=_bounded(licence, _MAX_FILTER),
+                sort=_bounded(sort, _MAX_FILTER),
+                limit=limit,
+                offset=offset,
+            )
         except AssetError as exc:
             raise _http_error(exc) from exc
         return HTMLResponse(
@@ -255,6 +380,71 @@ def build_router(
                 "X-Content-Type-Options": "nosniff",
                 "Referrer-Policy": "no-referrer",
                 "Cache-Control": "public, max-age=60",
+            },
+        )
+
+    @router.get("/gallery", response_class=HTMLResponse)
+    def get_gallery(
+        request: Request,
+        q: str | None = None,
+        type: str | None = None,
+        tag: str | None = None,
+        licence: str | None = None,
+        sort: str | None = None,
+        limit: int = 24,
+        offset: int = 0,
+    ) -> HTMLResponse:
+        # Kept as an alias of the marketplace for existing bookmarks and links.
+        return _marketplace_response(
+            request,
+            q=q,
+            type=type,
+            tag=tag,
+            licence=licence,
+            sort=sort,
+            limit=limit,
+            offset=offset,
+        )
+
+    @router.get("/marketplace", response_class=HTMLResponse)
+    def get_marketplace(
+        request: Request,
+        q: str | None = None,
+        type: str | None = None,
+        tag: str | None = None,
+        licence: str | None = None,
+        sort: str | None = None,
+        limit: int = 24,
+        offset: int = 0,
+    ) -> HTMLResponse:
+        return _marketplace_response(
+            request,
+            q=q,
+            type=type,
+            tag=tag,
+            licence=licence,
+            sort=sort,
+            limit=limit,
+            offset=offset,
+        )
+
+    @router.get("/static/{filename:path}")
+    def get_static(filename: str) -> Response:
+        body = static_file(filename)
+        if body is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "not_found",
+                    "message": "unknown static asset",
+                },
+            )
+        return Response(
+            content=body,
+            media_type=STATIC_FILES[filename],
+            headers={
+                "Cache-Control": STATIC_CACHE_CONTROL,
+                "X-Content-Type-Options": "nosniff",
             },
         )
 

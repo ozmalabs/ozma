@@ -98,6 +98,21 @@ sysinfo          = "0.29"
 # SSE stream construction for the AIDA64 RemoteSensor endpoint.
 futures-util     = "0.3"
 
+# Optional AIDA64 shared-memory/Registry bridge. The Win32 calls are only
+# compiled on Windows; Linux/macOS builds use the portable protocol layer.
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = [
+    "basetsd",
+    "errhandlingapi",
+    "handleapi",
+    "memoryapi",
+    "minwindef",
+    "minwinbase",
+    "reason",
+    "winnt",
+    "winreg",
+] }
+
 [package.metadata.deb]
 # Explicit runtime dependencies avoid dpkg-shlibdeps, which cannot resolve
 # aarch64 libraries when packaging a cross-compiled binary on an amd64 host.

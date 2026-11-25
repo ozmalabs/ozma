@@ -122,6 +122,13 @@ http://localhost:8080/?autoconnect=0
   attack/release smoothing, dB-per-second falloff, peak hold/decay, clip latch,
   RMS window, and mono/stereo channels. Add `input: "linear"` for 0..1 sources;
   the default input is dBFS (`min`/`max` default to -60/0 dB).
+- `chart` uses the dependency-free multi-series renderer in `widgets/chart.js`
+  when the node has `series`, `metrics`, `history.series`, or a history window.
+  It draws axes, grid, threshold/severity bands, multiple coloured series,
+  area/line/step styles, gaps, last-value markers, and a legend from bounded
+  per-series history rings. Simple `sparkline`/`history` widgets keep the
+  sparkline renderer; if `chart.js` is unavailable the adapter falls back to
+  the sparkline or a readable card.
 - Field bindings by numeric `field`/`field_id` or metric key
   (`metric`, `binding`, `data_key`, `metric_key`).
 - `{variable}` interpolation in labels/text using current field values.
@@ -141,8 +148,9 @@ http://localhost:8080/?autoconnect=0
   renderer.
 - Compressed definitions (`definition_zstd` only). The controller normally
   includes `definition_json`.
-- Full sparkline history, image packs, fonts, themes, and vendor widget-pack
-  JavaScript. These are rendered as generic cards or skipped.
+- External chart libraries such as uPlot; the built-in `chart` module covers
+  multi-series and rolling history. Image packs, fonts, themes, and vendor
+  widget-pack JavaScript are rendered as generic cards or skipped.
 - Scene snapshots, scene commits, definition refs/patches, and legacy JSON
   layout/data frames. Reconnect with `"protocol": "protobuf"` to receive the
   binary Display channel.

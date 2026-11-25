@@ -11,6 +11,9 @@ import assert from 'node:assert/strict';
 
 import {
   allowlistedSandboxSvg,
+  chartConfigForNode,
+  chartRenderKind,
+  chartSeriesForNode,
   gaugeModeForType,
   historyCapacityForNode,
   sandboxCapabilitiesForNode,
@@ -351,6 +354,180 @@ test('historyCapacityForNode uses points/window and stays bounded', () => {
   assert.equal(historyCapacityForNode({ history: { points: -5 } }, 40), 40);
   assert.equal(historyCapacityForNode({ history: { points: 99_999 } }), 4096);
   assert.equal(historyCapacityForNode({ history: { points: '15' } }), 15);
+});
+
+/* ------------------------------------------------------------------------- */
+/* Multi-series chart selection and configuration                             */
+/* ------------------------------------------------------------------------- */
+
+test('chart widgets use the chart module when a history or series config exists', () => {
+  for (const node of [
+    { type: 'chart', history: { window: 60 } },
+    { type: 'chart', history: { points: 60 } },
+    { type: 'chart', series: ['cpu', 'mem'] },
+    { type: 'chart', metrics: ['cpu', 'mem'] },
+    { type: 'chart', history: { series: ['cpu'] } },
+  ]) {
+    assert.equal(chartRenderKind(node, { hasChartModule: true }), 'chart', JSON.stringify(node));
+  }
+
+  assert.equal(chartRenderKind({ type: 'chart' }, { hasChartModule: true }), null);
+  assert.equal(chartRenderKind({ type: 'chart', history: {} }, { hasChartModule: true }), null);
+  assert.equal(chartRenderKind({ type: 'chart', history: { points: 20 } }, { hasChartModule: false }), null);
+  assert.equal(chartRenderKind({ type: 'text' }, { hasChartModule: true }), null);
+  assert.equal(chartRenderKind(undefined, { hasChartModule: true }), null);
+});
+
+test('simple single-series widgets stay on the sparkline renderer', () => {
+  assert.equal(
+    chartRenderKind({ type: 'sparkline', history: { points: 20 } }, { hasChartModule: true }),
+    null,
+  );
+  assert.equal(
+    chartRenderKind({ type: 'history', history: { points: 20 } }, { hasChartModule: true }),
+    null,
+  );
+  assert.equal(
+    chartRenderKind(
+      { type: 'sparkline', series: [{ metric: 'cpu' }, { metric: 'mem' }] },
+      { hasChartModule: true },
+    ),
+    'chart',
+  );
+});
+
+test('chart renderer wins over sparkline only when its module is available', () => {
+  const options = { hasChartModule: true, hasSparklineModule: true };
+  assert.equal(
+    widgetRenderKind({ type: 'chart', history: { points: 20 } }, options),
+    'chart',
+  );
+  assert.equal(
+    widgetRenderKind({ type: 'sparkline', history: { points: 20 } }, options),
+    'sparkline',
+  );
+  assert.equal(
+    widgetRenderKind({ type: 'chart', history: { points: 20 } }, { hasSparklineModule: true }),
+    'sparkline',
+  );
+  assert.equal(
+    widgetRenderKind({ type: 'chart', history: { points: 20 } }, { hasChartModule: true }),
+    'chart',
+  );
+  assert.equal(widgetRenderKind({ type: 'chart' }, options), 'fallback');
+  assert.equal(
+    widgetRenderKind({ type: 'gauge' }, { ...options, hasGaugeModule: true }),
+    'gauge',
+  );
+  assert.equal(
+    widgetRenderKind({ type: 'vu_meter' }, { ...options, hasVuModule: true }),
+    'vu',
+  );
+});
+
+test('chartConfigForNode serialises ranges, thresholds, style, and history capacity', () => {
+  const config = chartConfigForNode(
+    {
+      type: 'chart',
+      width: 300,
+      height: 150,
+      min: 0,
+      max: 100,
+      warn: 70,
+      crit: 90,
+      unit: '%',
+      decimals: 1,
+      style: 'step',
+      area: true,
+      baseline: 'zero',
+      showLegend: false,
+      showGrid: true,
+      ticks: 6,
+      xTicks: 4,
+      timeWindow: 60_000,
+      history: { points: 200 },
+      thresholds: [50],
+      animate: true,
+    },
+    { unit: 'C' },
+    'CPU',
+  );
+
+  assert.equal(config.width, 300);
+  assert.equal(config.height, 150);
+  assert.equal(config.min, 0);
+  assert.equal(config.max, 100);
+  assert.equal(config.warn, 70);
+  assert.equal(config.crit, 90);
+  assert.equal(config.unit, '%');
+  assert.equal(config.decimals, 1);
+  assert.equal(config.label, 'CPU');
+  assert.equal(config.style, 'step');
+  assert.equal(config.area, true);
+  assert.equal(config.baseline, 'zero');
+  assert.equal(config.showLegend, false);
+  assert.equal(config.showGrid, true);
+  assert.equal(config.ticks, 6);
+  assert.equal(config.xTicks, 4);
+  assert.equal(config.timeWindow, 60_000);
+  assert.equal(config.capacity, 200);
+  assert.deepEqual(config.thresholds, [50]);
+  assert.equal(config.animate, true);
+});
+
+test('chartSeriesForNode maps metrics with optional labels and colours', () => {
+  const metrics = chartSeriesForNode({
+    type: 'chart',
+    metrics: ['cpu', 'mem'],
+    series: [
+      { label: 'CPU', color: '#111111' },
+      { label: 'Memory', color: '#222222' },
+    ],
+  });
+  assert.deepEqual(
+    metrics.map((item) => [item.metric, item.label, item.color]),
+    [
+      ['cpu', 'CPU', '#111111'],
+      ['mem', 'Memory', '#222222'],
+    ],
+  );
+
+  const explicit = chartSeriesForNode({
+    type: 'chart',
+    series: [
+      { metric: 'cpu', label: 'CPU', color: '#123456', style: 'area' },
+      { field: 'mem', label: 'Memory', unit: 'MB' },
+    ],
+  });
+  assert.deepEqual(
+    explicit.map((item) => [item.metric, item.label, item.unit]),
+    [['cpu', 'CPU', undefined], ['mem', 'Memory', 'MB']],
+  );
+
+  const fromHistory = chartSeriesForNode({
+    type: 'chart',
+    history: { series: ['rpm', { metric: 'load', label: 'Load' }] },
+  });
+  assert.deepEqual(fromHistory.map((item) => item.metric), ['rpm', 'load']);
+});
+
+test('chartSeriesForNode falls back to a single field or metric', () => {
+  const fromField = chartSeriesForNode({ type: 'chart' }, { id: 3, key: 'load', unit: '%' }, 'Load');
+  assert.deepEqual(fromField, [
+    { metric: 'load', fieldId: 3, label: 'Load', unit: '%' },
+  ]);
+
+  const fromMetric = chartSeriesForNode({ type: 'chart', metric: 'cpu', label: 'CPU' }, null, '');
+  assert.deepEqual(fromMetric, [{ metric: 'cpu', label: 'CPU' }]);
+
+  const fromHistory = chartSeriesForNode({ type: 'chart', history: [1, 2, 3] }, null, 'Static');
+  assert.deepEqual(fromHistory, [{ label: 'Static', values: [1, 2, 3] }]);
+
+  const bounded = chartSeriesForNode({
+    type: 'chart',
+    metrics: Array.from({ length: 40 }, (_, index) => `m${index}`),
+  });
+  assert.equal(bounded.length, 16);
 });
 
 /* ------------------------------------------------------------------------- */
