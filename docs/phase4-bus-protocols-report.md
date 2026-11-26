@@ -1,13 +1,18 @@
-# Phase 4 — opt-in 1-Wire, I²C, and SPI bus report
+# Phase 4 — opt-in 1-Wire, I²C, SPI, GPIO, and SocketCAN bus report
 
-Status: **implemented, opt-in, and bounded**. The bus module is
-`ozma-node/src/buses/` (`mod.rs`, `onewire.rs`, `i2c.rs`, `spi.rs`). It adds
-explicit allowlists, typed errors, and read/write/transfer surfaces for the
-three protocols without auto-detecting any device.
+Status: **implemented, wired, opt-in, and bounded**. The bus module is
+`ozma-node/src/buses/` (`mod.rs`, `onewire.rs`, `i2c.rs`, `spi.rs`, `gpio.rs`,
+`can.rs`). It adds explicit allowlists, typed errors, and read/write/transfer/
+capture surfaces for the five protocols without auto-detecting any device.
 
-The CLI/mount wiring is intentionally **pending** because `main.rs` and
-`controller_compat.rs` are owned by another in-flight change. Everything needed
-for that wiring is exported from the module; the exact mount line is below.
+The CLI, `ConnectionState`, router mount, and `buses` capability advertisement
+are wired:
+
+- `main.rs` builds `BusConfig::from_cli_full(...)` and `BusState::new(...)`;
+- `controller_compat::ConnectionState::with_buses` carries the state;
+- `controller_compat::compat_router` merges `crate::buses::router(...)` behind
+  the node bearer guard;
+- the `buses` capability is true when any of the five protocols is configured.
 
 ## Configuration model
 
@@ -16,61 +21,44 @@ for that wiring is exported from the module; the exact mount line is below.
 injects deterministic test/fake backends. `BusState::default()` is valid and
 enables nothing.
 
-| Planned CLI flag | Config field | Default | Validation |
+| CLI flag | Config field | Default | Validation |
 |---|---|---|---|
 | `--onewire` | `onewire` | unset | Enables the read-only 1-Wire sysfs surface |
 | `--onewire-root PATH` | `onewire.root` | `/sys/bus/w1/devices` | Absolute, no `.`/`..` |
 | `--i2c-allow BUS:ADDR,...` | `i2c.allow` | empty | Exact pairs only; bus 0–65535; address `0x08..=0x77` |
 | `--spi-allow /dev/spidevX.Y` | `spi.devices` | empty | Absolute `/dev/spidevX.Y` only |
+| `--gpio-allow CHIP:LINE[:input\|output]` | `gpio.allow` | empty | Exact chip/line; default input; output only when spelled |
+| `--can-allow IFACE[:send]` | `can.allow` | empty | Exact interface; `:send` opts that interface into TX |
+| `--can-send-allow IFACE` | `can.allow[*].send` | empty | Names must already be in `--can-allow` |
+| `--can-max-frames N` | `max_can_frames` | 128 | 1–1024 per interface |
 | `--bus-max-transfer-bytes N` | `max_transfer_bytes` | 4096 | 1–65,536 |
 | `--bus-max-block-bytes N` | `max_block_bytes` | 32 | 1–32 (SMBus block limit) |
-| `--bus-max-devices N` | `max_devices` | 64 | 1–256 |
+| `--bus-max-devices N` | `max_devices` | 64 | 1–256 (also caps GPIO lines/CAN interfaces) |
 
-`BusConfig::from_cli(onewire, i2c_allow, spi_allow)` and
-`BusConfig::from_cli_with_limits(...)` are the intended adapters. `onewire`
-follows clap bool semantics: `None` disables the surface, `Some("")` or
-`Some("true")` selects the default sysfs root, and any other string is an
-explicit root (for containers/tests). Each I²C/SPI allowlist string may contain
-comma- or whitespace-separated entries. I²C addresses accept decimal or `0x`
-hex; the examples use `0x50`.
+`BusConfig::from_cli_full(onewire, i2c, spi, gpio, can, can_send, ...)` is the
+node startup adapter. `BusConfig::from_cli`/`from_cli_with_limits` remain for
+callers that only use the original three protocols. `onewire` follows clap bool
+semantics: `None` disables the surface, `Some("")` or `Some("true")` selects the
+default sysfs root, and any other string is an explicit root (for
+containers/tests). Each allowlist string may contain comma- or whitespace-
+separated entries. I²C addresses accept decimal or `0x` hex; GPIO line offsets
+accept decimal or `0x` hex.
 
-`--onewire-root` is a convenience for containers/tests; if the final CLI only
-exposes a boolean `--onewire`, pass `args.onewire.then_some("")`.
+GPIO `CHIP` accepts `gpiochipN`, `/dev/gpiochipN`, or a bare numeric `N` and is
+normalized to `/dev/gpiochipN`. A line defaults to `input`; a duplicate line
+with two different directions is rejected. CAN `IFACE` is 1–15 ASCII
+letters/digits/`_-.`; `:send` is the only accepted suffix. `--can-send-allow`
+can narrow but never widen `--can-allow`.
 
-### Exact mount line
-
-Once `controller_compat::ConnectionState` carries a `buses: BusState` field,
-add this line in `controller_compat::compat_router`, directly after
-`.merge(crate::serial::router(state.serial.clone()))`:
-
-```rust
-.merge(crate::buses::router(state.buses.clone()))
-```
-
-If the field is `Option<BusState>`, use:
-
-```rust
-.merge(crate::buses::router(state.buses.clone().unwrap_or_default()))
-```
-
-The router deliberately contains **no authentication logic**. It must remain
+The router deliberately contains **no authentication logic**. It remains
 inside the existing node bearer guard. With an unconfigured `BusState`, every
 route returns a typed `bus.not-configured` 503; `GET /buses/status` remains a
 200 summary with all `configured` flags false.
 
-Minimal `main` wiring once the CLI exists:
+Mount line (already present in `controller_compat::compat_router`):
 
 ```rust
-let bus_config = buses::BusConfig::from_cli_with_limits(
-    args.onewire.then_some(""),
-    &args.i2c_allow,
-    &args.spi_allow,
-    args.bus_max_transfer_bytes,
-    args.bus_max_block_bytes,
-    args.bus_max_devices,
-)?;
-let buses = buses::BusState::new(bus_config)?;
-// pass `buses` into ConnectionState
+.merge(crate::buses::router(state.buses.clone()))
 ```
 
 ## Routes
@@ -89,11 +77,19 @@ All routes are node routes and are meant to sit behind the bearer guard.
 | `/buses/spi` | GET | Allowlisted `/dev/spidevX.Y` nodes and existence. No open. |
 | `/buses/spi/{device}/transfer` | POST | Full-duplex hex TX/RX; mode 0–3; 8/16 bits; bounded speed and length. |
 | `/buses/spi/dev/{device}/transfer` | POST | Alias for callers that spell the device as `dev/spidevX.Y`. |
+| `/buses/gpio` | GET | Allowlisted exact chip/line pairs, configured direction, `/dev/gpiochipN` existence. No chip open. |
+| `/buses/gpio/{chip}/{line}` | GET | Kernel direction/name/consumer/flags, active-low, open-drain/source, value for an idle input. |
+| `/buses/gpio/{chip}/{line}/set` | POST | Drive 0/1; optional bounded pulse (1–5000 ms) that restores the sampled value. Output allowlist required. |
+| `/buses/can` | GET | Allowlisted interfaces, `/sys/class/net` existence, send opt-in, capture buffer bound. No socket. |
+| `/buses/can/{iface}/status` | GET | `ip -details -statistics -json`: operstate, MTU, kind, bitrate, controller state, error counters, link stats. |
+| `/buses/can/{iface}/frames?limit=N` | GET | Bounded recent capture (default buffer 128, absolute 1024); starts one receive socket lazily. |
+| `/buses/can/{iface}/send` | POST | Classic/FD data, standard/extended ID, explicit RTR; requires `:send` or `--can-send-allow`. |
 
 Axum 0.7 uses `:param` internally; the docs above use the controller-facing
 `{param}` notation. SPI `{device}` accepts `spidev0.0`, `0.0`, `/dev/spidev0.0`,
 or `dev/spidev0.0`, always normalized to the exact allowlisted
-`/dev/spidevX.Y`.
+`/dev/spidevX.Y`. GPIO `{chip}` accepts `gpiochipN`, `/dev/gpiochipN`, or `N`;
+`{line}` is a decimal/`0x` offset. CAN `{iface}` is the exact interface name.
 
 ### I²C request bodies
 
@@ -137,6 +133,52 @@ must be 1 kHz–50 MHz. `bits` defaults to 8 and must be 8 or 16; 16-bit transfe
 require an even number of TX bytes. The response returns the exact `rx` hex and
 byte count. RX length must equal TX length.
 
+### GPIO request body
+
+```json
+{"value":1}
+{"value":1,"pulse":{"duration_ms":25}}
+```
+
+`value` must be 0 or 1. `pulse.duration_ms` must be 1–5000 ms. The line must be
+allowlisted as `:output`; input lines are read-only and return `bus.not-allowed`
+before the backend is called. A pulse samples the current value, drives the
+requested value for the bounded duration, and restores the sampled value. The
+response reports `value`, `pulsed`, `duration_ms`, `previous_value`, and
+`restored_value`. Writing the same line concurrently returns `bus.busy` rather
+than racing.
+
+`GET /buses/gpio/{chip}/{line}` never re-requests an output line as an input;
+its `value` is omitted for output or kernel-owned lines. `active_low`,
+`open_drain`, and `open_source` come from the kernel line info. The GPIO v1
+character-device ABI does not expose bias, so `bias` is omitted rather than
+invented.
+
+### CAN request body
+
+```json
+{"id":291,"data":"de ad be ef"}
+{"id":291,"extended":false,"fd":true,"brs":true,"data":"00112233"}
+{"id":291,"rtr":true,"dlc":4}
+```
+
+- `id` must be ≤ `0x7ff` standard or ≤ `0x1fff_ffff` extended (`extended:true`).
+- Classic data is at most 8 bytes; `fd:true` allows up to 64. Hex accepts
+  spaces/`:`/`-`/`_` and an optional `0x`.
+- `rtr:true` sends an explicit remote frame; `data` must be empty and `dlc`
+  (0–8) is the requested length. RTR and FD are mutually exclusive.
+- `brs:true` requires `fd:true`. `dlc` is rejected without `rtr:true`.
+- Send requires `--can-allow IFACE:send` or `--can-send-allow IFACE`; a listed
+  read-only interface returns `bus.not-allowed` without opening a send socket.
+- One send socket per interface is in flight at a time; a concurrent send gets
+  `bus.busy`. No bus-off or controller restart operation exists.
+
+`GET /buses/can/{iface}/frames` starts one bounded receive socket for that exact
+interface on first use. The buffer keeps the most recent `--can-max-frames`
+(default 128, absolute 1024); `?limit=N` slices the latest N and reports
+`matched`, `truncated`, `dropped`, and `total`. `last_error` is non-null when a
+capture socket later failed.
+
 ### 1-Wire detail parsing
 
 `w1_slave` is read with a hard 4 KiB cap (also capped by `max_transfer_bytes`).
@@ -150,8 +192,27 @@ temperature/CRC, not an invented reading.
 ## Safety model
 
 - **No default bus or device.** I²C requires an exact `BUS:ADDR` pair; SPI
-  requires an exact `/dev/spidevX.Y`; 1-Wire requires the `--onewire` opt-in.
-  There is no implicit bus 0, no glob, and no fallback device.
+  requires an exact `/dev/spidevX.Y`; GPIO requires an exact `CHIP:LINE`; CAN
+  requires an exact interface name; 1-Wire requires the `--onewire` opt-in.
+  There is no implicit bus 0, chip 0, interface, glob, or fallback device.
+- **GPIO is line-scoped.** No chip-wide request, export, scan, or line
+  enumeration exists. A chip/line is checked against the allowlist before
+  `/dev/gpiochipN` is opened. The line offset is then checked against the
+  kernel's line count. Input is the default; only an explicit `:output` can be
+  driven. A line the node has driven is kept requested for the life of the
+  process, so `set` is a latched output and a later pulse restores the value
+  that was actually driven. `set`/`pulse` are serialized per line and a GET
+  never turns an output line into an input.
+- **CAN is read-only unless opted in.** `--can-allow IFACE` permits only status
+  and capture. Transmission needs `:send` or `--can-send-allow IFACE`, and the
+  separate send list cannot name an interface absent from `--can-allow`. The
+  node never runs `ip link set`, never restarts a controller, and never
+  enumerates interfaces. Status shells out to `ip -details -statistics -json`
+  with a 2 s deadline and bounded output.
+- **Bounded CAN capture.** One receive socket per allowlisted interface,
+  started lazily; the buffer is capped at `--can-max-frames` (128 default,
+  1024 absolute). Outbound sockets are capped at one in flight per interface.
+  `?limit=N` is capped at the absolute frame bound and cannot over-read.
 - **Allowlist before any I/O.** I²C read/write checks the pair before opening
   `/dev/i2c-N`; detect checks the bus before spawning `i2cdetect`; SPI checks the
   normalized path before `Spidev::open`; 1-Wire validates the id before joining
@@ -188,7 +249,9 @@ Bodies use `{ok:false,supported,configured,available:false,code,error,remediatio
 |---|---|---|
 | `bus.not-configured` | 503 | No allowlist/flag enables this protocol |
 | `bus.unavailable` | 503 | Configured bus/device/sysfs entry is absent, unreadable, or no longer present |
-| `bus.not-allowed` | 403 | Exact bus/address or SPI path is not allowlisted |
+| `bus.not-allowed` | 403 | Exact bus/address/path/GPIO line/CAN interface is not allowlisted or not send-enabled |
+| `bus.permission-denied` | 403 | Kernel denied the GPIO chip/device (group/ACL) |
+| `bus.busy` | 409 | GPIO line write/pulse or CAN send already in flight; kernel `EBUSY` |
 | `bus.invalid-request` | 400 | Malformed id/path/JSON/operation or a bound violation |
 | `bus.io-failed` | 502 | Kernel/backend I/O failed after the request was accepted |
 | `bus.unsupported` | 501 | Non-Linux backend or missing `i2cdetect` |
@@ -199,18 +262,23 @@ otherwise valid target is `bus.not-allowed` and never reaches the backend.
 
 ## Dependencies
 
-`ozma-node/Cargo.toml` adds two safe wrappers under
+`ozma-node/Cargo.toml` adds four safe wrappers under
 `[target.'cfg(target_os = "linux")'.dependencies]`:
 
 - `i2cdev = "0.6.2"` for Linux `i2c-dev`/SMBus ioctls.
 - `spidev = "0.7.1"` for Linux spidev ioctls.
+- `gpio-cdev = "0.6.0"` for the GPIO v1 character-device ABI.
+- `socketcan = { version = "4.0.0", default-features = false }` for raw
+  SocketCAN sockets (netlink/dump features are not used).
 
-Non-Linux builds use cfg-gated real backends that return `bus.unsupported`; the
-portable model, router, validation, and tests still compile.
+No `unsafe` is written in this module. Non-Linux builds use cfg-gated real
+backends that return `bus.unsupported`; the portable model, router, validation,
+and fake-backend tests still compile.
 
 ## Tests
 
-`cargo test -p ozma-node --lib buses` — 31 passed, 1 ignored (live i2c-stub).
+`cargo test -p ozma-node --lib buses` — 49 passed, 3 ignored (live i2c-stub,
+gpio-sim, and vcan).
 
 Coverage:
 
@@ -229,9 +297,20 @@ Coverage:
   (`spidev0.0`, `0.0`, `/dev/...`, `dev/...`); listing without opening; transfer
   mode/speed/bits/length bounds; exact RX response; unlisted-device rejection
   before backend; backend unavailable/timeout mapping; unconfigured behavior.
-- **Router/config:** default/unconfigured state, CLI parsing, transfer/block/
-  device bounds, route presence, 404/405 shapes, typed `bus.not-configured` for
-  every implemented route.
+- **GPIO:** exact `CHIP:LINE[:input|output]` parsing/normalization, default
+  input, conflicting duplicate rejection, route chip/line normalization,
+  listing without opening chips, kernel facts, input-only GET values, output
+  GET never re-requesting input, output-required set/pulse, 0/1 and 1–5000 ms
+  bounds, pulse restore shape, unlisted/invalid rejection before backend,
+  busy/permission mapping, unconfigured behavior.
+- **CAN:** exact interface parsing and `:send` opt-in, separate send allowlist
+  narrowing, route list without sockets, status shape, send payload/ID/FD/RTR/
+  BRS/DLC bounds, FD/extended normalization, `?limit` and buffer bounds, frames
+  metadata, read-only send rejection, busy/permission mapping, `ip` JSON
+  parsing without inventing absent fields, unconfigured behavior.
+- **Router/config:** default/unconfigured state, full CLI parsing including
+  GPIO/CAN, transfer/block/device/frame bounds, route presence, 404/405 shapes,
+  typed `bus.not-configured` for every implemented route.
 
 ### Live i2c-stub evidence
 
@@ -279,17 +358,121 @@ $ ls /dev/i2c-22
 ls: cannot access '/dev/i2c-22': No such file or directory
 ```
 
+### Live gpio-sim evidence
+
+A virtual `gpio-sim` bank was created explicitly; no physical GPIO line was
+touched:
+
+```text
+$ sudo modprobe gpio-sim
+$ sudo mkdir /sys/kernel/config/gpio-sim/ozma-test
+$ sudo mkdir /sys/kernel/config/gpio-sim/ozma-test/gpio-bank0
+$ echo 4 | sudo tee /sys/kernel/config/gpio-sim/ozma-test/gpio-bank0/num_lines
+$ sudo mkdir /sys/kernel/config/gpio-sim/ozma-test/gpio-bank0/line0
+$ echo ozma-sim-line0 | sudo tee /sys/kernel/config/gpio-sim/ozma-test/gpio-bank0/line0/name
+$ echo 1 | sudo tee /sys/kernel/config/gpio-sim/ozma-test/live
+$ ls -l /dev/gpiochip2
+crw------- 1 root root 254, 2 ... /dev/gpiochip2
+```
+
+The ignored real-backend test (`live_gpio_sim_set_pulse_read`) was run against
+`gpiochip2` line 0:
+
+```text
+$ sudo env OZMA_LIVE_GPIO_CHIP=gpiochip2 OZMA_LIVE_GPIO_LINE=0 \
+    ./target/debug/deps/ozma_node-<hash> \
+    --exact buses::gpio::tests::live_gpio_sim_set_pulse_read \
+    --ignored --nocapture
+running 1 test
+test buses::gpio::tests::live_gpio_sim_set_pulse_read ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored
+```
+
+It read the kernel line detail, drove the line to 1, ran a 20 ms pulse that
+reported the sampled previous value and restored it, read the restored value
+back through the input side of the same virtual line, and listed the configured
+pair.
+
+Cleanup:
+
+```text
+$ echo 0 | sudo tee /sys/kernel/config/gpio-sim/ozma-test/live
+$ sudo rmdir /sys/kernel/config/gpio-sim/ozma-test/gpio-bank0/line0
+$ sudo rmdir /sys/kernel/config/gpio-sim/ozma-test/gpio-bank0
+$ sudo rmdir /sys/kernel/config/gpio-sim/ozma-test
+$ sudo modprobe -r gpio_sim
+$ ls /dev/gpiochip2
+ls: cannot access '/dev/gpiochip2': No such file or directory
+```
+
+### Live vcan evidence
+
+A virtual `vcan0` interface was created explicitly; no CAN hardware was touched:
+
+```text
+$ sudo modprobe vcan
+$ sudo ip link add dev vcan0 type vcan
+$ sudo ip link set up vcan0
+$ ip -details -statistics -json link show dev vcan0
+[{"ifname":"vcan0",...,"operstate":"UNKNOWN","linkinfo":{"info_kind":"vcan"},...}]
+```
+
+The ignored real-backend test (`live_vcan_send_capture_status`) was run against
+that interface:
+
+```text
+$ sudo env OZMA_LIVE_CAN_IFACE=vcan0 \
+    ./target/debug/deps/ozma_node-<hash> \
+    --exact buses::can::tests::live_vcan_send_capture_status \
+    --ignored --nocapture
+running 1 test
+test buses::can::tests::live_vcan_send_capture_status ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored
+```
+
+It read `status` via `ip` (available, `kind: vcan`, operstate accepted as
+`UNKNOWN` because vcan reports that even when its link flags are UP), started
+the bounded capture, sent a classic frame (`0x123`, `deadbeef`) and an extended
+frame (`0x1abcdef`, `010203`), then captured both exact frames from the receive
+socket before the deadline.
+
+Cleanup:
+
+```text
+$ sudo ip link del dev vcan0
+$ sudo modprobe -r vcan
+$ ip link show vcan0
+Device "vcan0" does not exist.
+```
+
 No `spidev` or 1-Wire hardware exists on this host (`/dev/spidev*` and
 `/sys/bus/w1/devices/` are absent), so live 1-Wire/SPI evidence is the typed
 `bus.unavailable` path exercised by the fixture/fake tests. No virtual spidev or
-w1 module was loaded.
+w1 module was loaded. Real GPIO lines (`gpiochip0/1`) and physical CAN
+interfaces were never opened or modified.
 
 ## Remaining gaps
 
-- **CLI and mount wiring are pending** in `main.rs` and
-  `controller_compat.rs` (owned by another change). The exact mount line is
-  above; until it lands, the routes are not reachable from the node process.
 - Controller proxies are not added. The routes are node-only.
+- GPIO uses the v1 character-device ABI (`gpio-cdev 0.6`). It reports
+  active-low/open-drain/open-source but not bias, and it cannot observe an
+  output line's value without briefly re-requesting it as an input, so GET
+  deliberately omits output values. There is no edge-event/stream surface and
+  no bias configuration.
+- GPIO pulses are implemented in-process with `sleep`; the kernel does not arm
+  a one-shot edge. Driven output handles are held for the process lifetime and
+  there is no explicit release route; process exit releases them. A crash or
+  kill during a pulse closes the handle, which releases the line but does not
+  run the in-process restore.
+- CAN capture uses a userspace timestamp at read time, not kernel/hardware
+  RX timestamps. There is no filtering, error-frame subscription, BCM, ISO-TP,
+  or J1939 surface.
+- CAN FD transmission is implemented but the live virtual evidence covers
+  classic and extended classic frames; FD requires an FD-capable vcan MTU and
+  is covered by backend-shape/fake tests on this host.
+- CAN status depends on `iproute2` (`ip -details -statistics -json`); the crate
+  is built without socketcan's netlink feature, so there is no in-process
+  bitrate/state query.
 - I²C supports only 7-bit user addresses, SMBus byte/word/block transactions,
   and no PEC, 10-bit addressing, SMBus process calls, or raw `I2C_RDWR`
   combined transfers.
@@ -302,5 +485,6 @@ w1 module was loaded.
   search, or event/stream surface.
 - No bus device hotplug/event stream; availability is reported by stat per
   request.
-- The live test is ignored by default and requires the operator to create a
-  stub bus; it does not auto-load kernel modules.
+- Live tests are ignored by default and require the operator to create the
+  stub bus / gpio-sim chip / vcan interface; they do not auto-load modules or
+  alter hardware.

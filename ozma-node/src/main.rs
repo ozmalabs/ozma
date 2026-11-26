@@ -1240,6 +1240,48 @@ pub struct Args {
     )]
     pub spi_allow: Vec<String>,
 
+    /// Exact GPIO `CHIP:LINE[:input|output]` allowlist (repeatable or
+    /// comma-separated). The default direction is input; `set`/`pulse`
+    /// require an explicit `output` entry. Nothing is probed without an entry.
+    #[arg(
+        long,
+        env = "OZMA_GPIO_ALLOW",
+        value_name = "CHIP:LINE[:input|output]",
+        value_delimiter = ','
+    )]
+    pub gpio_allow: Vec<String>,
+
+    /// Exact CAN interface allowlist (repeatable or comma-separated).
+    ///
+    /// Capture/status are read-only by default. Add `:send` to one exact
+    /// interface (or use --can-send-allow) to opt it into transmission.
+    #[arg(
+        long,
+        env = "OZMA_CAN_ALLOW",
+        value_name = "IFACE[:send]",
+        value_delimiter = ','
+    )]
+    pub can_allow: Vec<String>,
+
+    /// Exact CAN interfaces allowed to transmit (repeatable or
+    /// comma-separated). Every name must also appear in --can-allow.
+    #[arg(
+        long,
+        env = "OZMA_CAN_SEND_ALLOW",
+        value_name = "IFACE",
+        value_delimiter = ','
+    )]
+    pub can_send_allow: Vec<String>,
+
+    /// Maximum recent CAN frames buffered per allowlisted interface.
+    #[arg(
+        long,
+        env = "OZMA_CAN_MAX_FRAMES",
+        value_name = "COUNT",
+        default_value_t = ozma_node::buses::DEFAULT_MAX_CAN_FRAMES
+    )]
+    pub can_max_frames: usize,
+
     /// Maximum bytes in one SPI bus transfer.
     #[arg(
         long,
@@ -3453,13 +3495,17 @@ async fn run() -> std::process::ExitCode {
     set_capability(&mut args, &mut config, "serial", serial_available);
     // Opt-in low-speed buses. Nothing is probed or opened without an explicit
     // allowlist; the default state keeps every route at typed 503.
-    let bus_config = match ozma_node::buses::BusConfig::from_cli_with_limits(
+    let bus_config = match ozma_node::buses::BusConfig::from_cli_full(
         args.onewire.as_deref(),
         &args.i2c_allow,
         &args.spi_allow,
+        &args.gpio_allow,
+        &args.can_allow,
+        &args.can_send_allow,
         args.bus_max_transfer_bytes,
         args.bus_max_block_bytes,
         args.bus_max_devices,
+        args.can_max_frames,
     ) {
         Ok(config) => config,
         Err(error) => {
@@ -3487,7 +3533,9 @@ async fn run() -> std::process::ExitCode {
     let bus_status = bus_state.status();
     let buses_configured = bus_status.onewire.configured
         || bus_status.i2c.configured
-        || bus_status.spi.configured;
+        || bus_status.spi.configured
+        || bus_status.gpio.configured
+        || bus_status.can.configured;
     set_capability(&mut args, &mut config, "buses", buses_configured);
     // Opt-in application control. Nothing is signalled unless this flag is
     // present; without it the routes stay mounted and return a typed 503.

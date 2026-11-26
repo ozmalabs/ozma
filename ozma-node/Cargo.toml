@@ -108,6 +108,13 @@ serialport       = { version = "4.7", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 i2cdev = "0.6.2"
 spidev = "0.7.1"
+# Safe GPIO character-device wrapper (no unsafe in this crate). Lines are only
+# opened after an exact --gpio-allow CHIP:LINE check.
+gpio-cdev = "0.6.0"
+# Safe SocketCAN sockets. Default features (netlink/dump) are unnecessary: the
+# node only opens an explicit allowlisted interface and shells out to `ip
+# -details -json` for status.
+socketcan = { version = "4.0.0", default-features = false }
 
 # Optional AIDA64 shared-memory/Registry bridge. The Win32 calls are only
 # compiled on Windows; Linux/macOS builds use the portable protocol layer.

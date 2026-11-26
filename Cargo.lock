@@ -1367,6 +1367,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-can"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9d2e857f87ac832df68fa498d18ddc679175cf3d2e4aa893988e5601baf9438"
+dependencies = [
+ "nb",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1830,6 +1839,17 @@ name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
+name = "gpio-cdev"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09831ec59b80be69e75d29cf36e16afbbe5fd1af9c1bf4689ad91c77db5aa6a6"
+dependencies = [
+ "bitflags 2.11.0",
+ "libc",
+ "nix 0.27.1",
+]
 
 [[package]]
 name = "hashbrown"
@@ -2562,9 +2582,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.185"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libloading"
@@ -2910,6 +2930,12 @@ checksum = "706bf8a5e8c8ddb99128c3291d31bd21f4bcde17f0f4c20ec678d85c74faa149"
 dependencies = [
  "log",
 ]
+
+[[package]]
+name = "nb"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d5439c4ad607c3c23abf66de8c8bf57ba8adcd1f129e699851a6e43935d339d"
 
 [[package]]
 name = "ndk"
@@ -3819,6 +3845,7 @@ dependencies = [
  "clap",
  "flate2",
  "futures-util",
+ "gpio-cdev",
  "hostname 0.4.2",
  "http-body-util",
  "i2cdev",
@@ -3857,6 +3884,7 @@ dependencies = [
  "serde_json",
  "serialport",
  "sha2 0.10.9",
+ "socketcan",
  "spidev",
  "sysinfo 0.29.11",
  "tempfile",
@@ -5321,6 +5349,24 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "socketcan"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "472e000403167b1e2f65cfcf8ff235fe94b911f9bd9bdbc1f48047b8a1cf49aa"
+dependencies = [
+ "bitflags 2.11.0",
+ "embedded-can",
+ "hex",
+ "libc",
+ "log",
+ "nb",
+ "nix 0.31.2",
+ "smallvec",
+ "socket2 0.6.3",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

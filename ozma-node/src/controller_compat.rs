@@ -3960,8 +3960,9 @@ pub struct ConnectionState {
     /// `serial.not-configured` and every other `/serial/*` path stays a typed
     /// 501. No device is opened unless the service is configured.
     pub serial: Option<crate::serial::SerialService>,
-    /// Opt-in 1-Wire/I²C/SPI bus surface. The default enables nothing and
-    /// every `/buses/*` route answers a typed 503 `bus.not-configured`.
+    /// Opt-in 1-Wire/I²C/SPI/GPIO/SocketCAN bus surface. The default enables
+    /// nothing and every `/buses/*` route answers a typed 503
+    /// `bus.not-configured`.
     pub buses: crate::buses::BusState,
 }
 
@@ -4289,8 +4290,9 @@ impl ConnectionState {
         self
     }
 
-    /// Attach the opt-in bounded 1-Wire/I²C/SPI surface (`--onewire`,
-    /// `--i2c-allow`, `--spi-allow`). Defaults to a not-configured state.
+    /// Attach the opt-in bounded bus surface (`--onewire`, `--i2c-allow`,
+    /// `--spi-allow`, `--gpio-allow`, `--can-allow`). Defaults to a
+    /// not-configured state.
     pub fn with_buses(mut self, buses: crate::buses::BusState) -> Self {
         self.buses = buses;
         self
