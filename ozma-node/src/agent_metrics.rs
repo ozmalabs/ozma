@@ -98,7 +98,7 @@ impl AgentMetricsSampler {
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn collect_sysinfo(&self, node_id: &str) -> Value {
-        use sysinfo::{Disks, Networks, System};
+        use sysinfo30::{Disks, Networks, System};
 
         let mut sys = System::new_all();
         sys.refresh_cpu();

@@ -133,7 +133,7 @@ winapi = { version = "0.3", features = [
 ] }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
-sysinfo            = "0.30"
+sysinfo30           = { package = "sysinfo", version = "0.30" }
 
 [package.metadata.deb]
 # Explicit runtime dependencies avoid dpkg-shlibdeps, which cannot resolve
