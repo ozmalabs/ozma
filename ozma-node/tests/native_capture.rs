@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
 use ozma_api::{ClientCaptureSink, NodeBackend};
@@ -342,6 +343,8 @@ async fn native_client_camera_and_microphone_reach_the_node() {
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/sessions/{}/capture", session.id))
+                .header("host", "127.0.0.1:3000")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -362,6 +365,8 @@ async fn native_client_camera_and_microphone_reach_the_node() {
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/sessions/{}/capture/frame.ppm", session.id))
+                .header("host", "127.0.0.1:3000")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -1,20 +1,19 @@
-# Ozma RPA script: Bootstrap Windows agent — fully air-gapped
+# Ozma RPA script: Bootstrap Windows Rust node (ozma-node --profile desktop)
 #
-# NO NETWORK in the VM. Everything comes from the USB drive (E:\).
-# The soft node delivers the drive via USB mass storage.
+# Everything comes from the USB drive (E:\) delivered by the soft node / QEMU.
 #
 # Prerequisites:
-#   - bash dev/windows-vm/prepare-media.sh  (downloads everything to host)
-#   - bash dev/windows-vm/provision.sh create  (starts VM, no network)
+#   - bash dev/windows-vm/prepare-media.sh  (stages Rust workspace + vendored crates)
+#   - bash dev/windows-vm/provision.sh create  (starts Windows VM)
 #   - Windows booted and at desktop (autounattend.xml handles this)
 #
 # What's on the USB drive (E:\):
-#   python/         Python 3.12 installer
-#   wheels/         All pip wheels (offline)
-#   ozma/           Agent source + offline install script
+#   rust/           rustup-init.exe
+#   ozma/src/       Rust workspace (ozma-node + workspace crates + vendor/)
+#   ozma/           install-offline.ps1, install-offline.bat, controller.txt
 #   viostor/        Virtio drivers (used during Windows install)
 
-log === Ozma Windows Agent Bootstrap (Air-Gapped) ===
+log === Ozma Windows Rust Node Self-Bootstrap ===
 
 # Wait for Windows desktop
 log Waiting for Windows desktop...
@@ -36,35 +35,23 @@ sleep 3
 wait_for_text PS C:\
 sleep 1
 
-# Run the offline install script from the USB drive
-log Running offline installer from USB drive...
+# Run the offline Rust bootstrap script from the USB drive
+log Running Rust self-bootstrap script from USB drive...
 type Set-ExecutionPolicy Bypass -Scope Process -Force\n
 sleep 2
-type E:\ozma\install-offline.ps1\n
+type for ($d in 'D','E','F','G') { if (Test-Path "${d}:\ozma\install-offline.ps1") { & "${d}:\ozma\install-offline.ps1"; break } }\n
 
-# This takes a while — Python install + pip from wheels + pyinstaller build
-# Wait for each major step
+# Wait for Rust toolchain check/install + cargo test + cargo build --release
+log Waiting for Rust toolchain & cargo test/build...
+sleep 120
 
-# Python install (~30s)
-log Waiting for Python install...
-sleep 60
-
-# Pip wheels install (~30s)
-log Waiting for pip packages...
-sleep 60
-
-# PyInstaller build (~2-3 min)
-log Waiting for PyInstaller build (this is the slow part)...
-sleep 180
-
-# Wait for completion
+# Wait for completion marker
 wait_for_text === Complete ===
 sleep 5
 
-# Verify the exe was copied to the USB drive
-type dir E:\ozma\ozma-agent.exe\n
+# Verify the built .exe was staged back to the USB drive
+type dir E:\ozma\ozma-node.exe\n
 sleep 3
 
-log === Air-gapped bootstrap complete ===
-log No network was used. Everything came from the USB drive.
-log Built .exe is on the USB drive at E:\ozma\ozma-agent.exe
+log === Windows Rust node self-bootstrap complete ===
+log Built .exe is at C:\Program Files\Ozma\Node\ozma-node.exe and E:\ozma\ozma-node.exe

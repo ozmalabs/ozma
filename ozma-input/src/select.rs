@@ -45,6 +45,8 @@ use crate::sink::{RecordingSink, SharedSink};
 pub enum SinkKind {
     /// Linux evdev/uinput virtual keyboard and pointer.
     Uinput,
+    /// Windows desktop `SendInput` keyboard and pointer.
+    SendInput,
     /// QEMU QMP `input-send-event` injection.
     Qmp,
     /// ConfigFS USB HID gadget (`/dev/hidg0`, `/dev/hidg1`).
@@ -55,8 +57,9 @@ pub enum SinkKind {
 
 impl SinkKind {
     /// Every sink kind known to this crate.
-    pub const ALL: [SinkKind; 4] = [
+    pub const ALL: [SinkKind; 5] = [
         SinkKind::Uinput,
+        SinkKind::SendInput,
         SinkKind::Qmp,
         SinkKind::HidGadget,
         SinkKind::Recording,
@@ -66,6 +69,7 @@ impl SinkKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             SinkKind::Uinput => "uinput",
+            SinkKind::SendInput => "send-input",
             SinkKind::Qmp => "qmp",
             SinkKind::HidGadget => "hid-gadget",
             SinkKind::Recording => "recording",
@@ -101,6 +105,7 @@ impl FromStr for SinkKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "uinput" => Ok(SinkKind::Uinput),
+            "send-input" | "send_input" | "sendinput" => Ok(SinkKind::SendInput),
             "qmp" => Ok(SinkKind::Qmp),
             // Accept the snake-case spelling used by some config files.
             "hid-gadget" | "hid_gadget" | "gadget" => Ok(SinkKind::HidGadget),

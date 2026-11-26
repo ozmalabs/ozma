@@ -44,6 +44,7 @@ pub mod shutdown;
 pub mod software;
 pub mod thermal;
 pub mod transport;
+#[cfg(target_os = "linux")]
 pub mod usb_audio;
 pub mod usb_uac2;
 pub mod video;

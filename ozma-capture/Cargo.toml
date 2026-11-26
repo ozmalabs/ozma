@@ -19,13 +19,20 @@ async-trait = "0.1"
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["fs", "sync", "time", "rt", "process", "io-util", "net"] }
 tracing = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 v4l = "0.14"
 nix = { version = "0.30", features = ["fs", "socket", "uio", "user"] }
 memmap2 = "0.8"
-
-[target.'cfg(target_os = "linux")'.dependencies]
 ozma-pipewire = { path = "../ozma-pipewire" }
 zbus = { version = "4.4", optional = true, default-features = false, features = ["tokio"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 ozma-protocol = { path = "../ozma-protocol" }

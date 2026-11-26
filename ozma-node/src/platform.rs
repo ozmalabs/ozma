@@ -10,10 +10,11 @@ use ozma_protocol::{
 };
 
 use ozma_capture::{
-    CaptureRegistry, DBusDisplayConfig, FakeCaptureProvider, LookingGlassProviderConfig,
-    QmpDisplayConfig, VncDisplayConfig, DBUS_DEFAULT_ID, QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS,
-    VNC_DEFAULT_ID,
+    CaptureRegistry, FakeCaptureProvider, LookingGlassProviderConfig, QmpDisplayConfig,
+    VncDisplayConfig, QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS, VNC_DEFAULT_ID,
 };
+#[cfg(target_os = "linux")]
+use ozma_capture::{DBusDisplayConfig, DBUS_DEFAULT_ID};
 use ozma_input::SinkKind;
 use ozma_media::FrameFormat;
 use ozma_qmp::SharedQmpClient;
@@ -295,6 +296,7 @@ fn vm_capture_registry(config: &NodeConfig, shared: Option<&SharedQmpClient>) ->
             }
             None => CaptureRegistry::new(),
         },
+        #[cfg(target_os = "linux")]
         Some("dbus") => match &config.qmp_socket {
             Some(socket) => {
                 let display = DBusDisplayConfig::new(socket.clone())
@@ -535,13 +537,15 @@ pub fn input_capability_for(sink: Option<SinkKind>) -> InputCapability {
             release_all: true,
             ..InputCapability::default()
         },
-        Some(SinkKind::Qmp) | Some(SinkKind::HidGadget) => InputCapability {
-            keyboard: true,
-            mouse_absolute: true,
-            mouse_relative: true,
-            release_all: true,
-            ..InputCapability::default()
-        },
+        Some(SinkKind::SendInput) | Some(SinkKind::Qmp) | Some(SinkKind::HidGadget) => {
+            InputCapability {
+                keyboard: true,
+                mouse_absolute: true,
+                mouse_relative: true,
+                release_all: true,
+                ..InputCapability::default()
+            }
+        }
         // A recording sink validates events but injects nothing.
         Some(SinkKind::Recording) | None => InputCapability::default(),
     }

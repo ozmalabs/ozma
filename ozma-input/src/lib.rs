@@ -139,6 +139,7 @@ mod select;
 mod sink;
 mod state;
 mod uinput;
+mod windows_sink;
 
 pub use error::codes;
 pub use fake::FakeInputSink;
@@ -158,3 +159,4 @@ pub use state::{HeldInput, MAX_KEYS};
 pub use uinput::{
     UinputOptions, UinputSink, DEFAULT_UINPUT_KEYBOARD_NAME, DEFAULT_UINPUT_POINTER_NAME,
 };
+pub use windows_sink::WindowsSendInputSink;

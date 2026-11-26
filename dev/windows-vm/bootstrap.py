@@ -86,6 +86,11 @@ async def main(controller_url: str, vm_name: str = "win10") -> None:
     qmp = QMPClient(qmp_socket)
     await qmp.start()
 
+    for _ in range(20):
+        if qmp.connected:
+            break
+        await asyncio.sleep(0.5)
+
     if not qmp.connected:
         log.error("Cannot connect to QMP at %s", qmp_socket)
         return
@@ -149,20 +154,21 @@ async def main(controller_url: str, vm_name: str = "win10") -> None:
                 data = json.loads(r.read())
                 for n in data.get("nodes", []):
                     hw = n.get("hw", "").lower()
-                    if "desktop" in hw or "windows" in hw:
+                    caps = [c.lower() for c in (n.get("capabilities") or [])]
+                    nid = n.get("id", "").lower()
+                    if "agent" in caps or "desktop" in hw or "windows" in hw or vm_name.lower() in nid:
                         log.info("=== AGENT CONNECTED ===")
-                        log.info("Node: %s (hw: %s)", n["id"], n["hw"])
+                        log.info("Node: %s (hw: %s, caps: %s)", n["id"], n["hw"], caps)
                         log.info("")
                         log.info("The full loop works:")
                         log.info("  ozma controller")
-                        log.info("  → soft node (QMP)")
-                        log.info("  → Windows VM")
-                        log.info("  → RPA typed commands")
-                        log.info("  → Python installed")
-                        log.info("  → ozma-agent built + installed")
-                        log.info("  → agent registered back with controller")
+                        log.info("  -> soft node (QMP)")
+                        log.info("  -> Windows VM")
+                        log.info("  -> RPA typed commands")
+                        log.info("  -> Rust ozma-agent tested + built + installed")
+                        log.info("  -> agent registered back with controller")
                         log.info("")
-                        log.info("Built .exe should be at C:\\ozma-agent.exe in the VM")
+                        log.info("Built .exe should be at C:\\Program Files\\Ozma\\Agent\\ozma-agent.exe")
                         return
         except Exception:
             pass

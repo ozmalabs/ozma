@@ -27,9 +27,6 @@ tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
 thiserror          = { workspace = true }
-usb-gadget         = { workspace = true }
-alsa               = { workspace = true }
-libc               = { workspace = true }
 
 # Ozma plan crates
 ozma-protocol = { path = "../ozma-protocol" }
@@ -116,6 +113,9 @@ gpio-cdev = "0.6.0"
 # node only opens an explicit allowlisted interface and shells out to `ip
 # -details -json` for status.
 socketcan = { version = "4.0.0", default-features = false }
+usb-gadget         = { workspace = true }
+alsa               = { workspace = true }
+libc               = { workspace = true }
 
 # Optional AIDA64 shared-memory/Registry bridge. The Win32 calls are only
 # compiled on Windows; Linux/macOS builds use the portable protocol layer.
@@ -131,6 +131,9 @@ winapi = { version = "0.3", features = [
     "winnt",
     "winreg",
 ] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+sysinfo            = "0.30"
 
 [package.metadata.deb]
 # Explicit runtime dependencies avoid dpkg-shlibdeps, which cannot resolve

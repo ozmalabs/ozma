@@ -88,7 +88,118 @@ impl MetricsPaths {
 impl AgentMetricsSampler {
     /// Sample the host and build the controller-facing metrics document.
     pub fn collect(&self, node_id: &str) -> Value {
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            return self.collect_sysinfo(node_id);
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         self.collect_with(&MetricsPaths::host(), node_id)
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn collect_sysinfo(&self, node_id: &str) -> Value {
+        use sysinfo::{Disks, Networks, System};
+
+        let mut sys = System::new_all();
+        sys.refresh_cpu();
+        sys.refresh_memory();
+
+        let mut metrics = Map::new();
+        let mut unavailable: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+
+        let cpu = f64::from(sys.global_cpu_info().cpu_usage());
+        if cpu.is_finite() && cpu >= 0.0 {
+            metrics.insert("cpu_usage".to_owned(), number(round2(cpu.min(100.0))));
+        } else {
+            unavailable.push("cpu_usage".to_owned());
+        }
+
+        let ram_total = sys.total_memory();
+        let ram_used = sys.used_memory();
+        if ram_total > 0 {
+            metrics.insert("ram_total".to_owned(), Value::from(ram_total));
+            metrics.insert("ram_used".to_owned(), Value::from(ram_used));
+        } else {
+            unavailable.push("ram_used".to_owned());
+            unavailable.push("ram_total".to_owned());
+        }
+
+        let disks = Disks::new_with_refreshed_list();
+        let root_mount = if cfg!(target_os = "windows") {
+            Path::new("C:\\")
+        } else {
+            Path::new("/")
+        };
+        let (disk_total, disk_used) = disks
+            .iter()
+            .find(|d| d.mount_point() == root_mount)
+            .or_else(|| disks.iter().next())
+            .map(|d| (d.total_space(), d.total_space().saturating_sub(d.available_space())))
+            .unwrap_or((0, 0));
+        if disk_total > 0 {
+            metrics.insert("disk_total".to_owned(), Value::from(disk_total));
+            metrics.insert("disk_used".to_owned(), Value::from(disk_used));
+        } else {
+            unavailable.push("disk_used".to_owned());
+            unavailable.push("disk_total".to_owned());
+        }
+
+        let networks = Networks::new_with_refreshed_list();
+        let mut rx_total: u64 = 0;
+        let mut tx_total: u64 = 0;
+        for (_name, data) in &networks {
+            rx_total = rx_total.saturating_add(data.total_received());
+            tx_total = tx_total.saturating_add(data.total_transmitted());
+        }
+        let current = NetTotals {
+            rx_bytes: rx_total,
+            tx_bytes: tx_total,
+        };
+        let now = Instant::now();
+        let rates = {
+            let mut previous = lock(&self.previous);
+            let rates = previous
+                .net
+                .and_then(|sample| net_rates(sample, current, now));
+            previous.net = Some(NetSample {
+                totals: current,
+                at: now,
+            });
+            rates
+        };
+        match rates {
+            Some((rx, tx)) => {
+                metrics.insert("net_rx_rate".to_owned(), number(round2(rx)));
+                metrics.insert("net_tx_rate".to_owned(), number(round2(tx)));
+            }
+            None => {
+                unavailable.push("net_rx_rate".to_owned());
+                unavailable.push("net_tx_rate".to_owned());
+                notes.push("network rates need two samples at least 50 ms apart".to_owned());
+            }
+        }
+
+        metrics.insert("uptime".to_owned(), Value::from(System::uptime()));
+
+        for missing in ["cpu_temp", "gpu_usage", "gpu_temp", "fan_rpm", "power_draw"] {
+            unavailable.push(missing.to_owned());
+        }
+
+        let available = !metrics.is_empty();
+        let mut document = Map::new();
+        document.insert("ok".to_owned(), Value::Bool(true));
+        document.insert("available".to_owned(), Value::Bool(available));
+        document.insert("source".to_owned(), Value::String("ozma-node".to_owned()));
+        document.insert("scope".to_owned(), Value::String("host".to_owned()));
+        document.insert("node_id".to_owned(), Value::String(node_id.to_owned()));
+        document.insert(
+            "unavailable".to_owned(),
+            Value::Array(unavailable.into_iter().map(Value::String).collect()),
+        );
+        document.insert("notes".to_owned(), Value::String(notes.join("; ")));
+        document.extend(metrics);
+        Value::Object(document)
     }
 
     fn collect_with(&self, paths: &MetricsPaths, node_id: &str) -> Value {

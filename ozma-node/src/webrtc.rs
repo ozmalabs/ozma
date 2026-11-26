@@ -70,7 +70,9 @@ use async_trait::async_trait;
 use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError, PixelFormat};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
@@ -769,11 +771,13 @@ pub trait Signaler: Send {
     async fn read_line(&mut self) -> Result<Option<String>, WebRtcError>;
 }
 
+#[cfg(unix)]
 struct SystemSignaler {
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl Signaler for SystemSignaler {
     async fn write_line(&mut self, line: &str) -> Result<(), WebRtcError> {
@@ -829,6 +833,7 @@ pub trait HelperSpawner: Send + Sync {
 struct SystemHelperSpawner;
 
 impl HelperSpawner for SystemHelperSpawner {
+    #[cfg(unix)]
     fn spawn(&self, config: &WebRtcConfig) -> Result<SpawnedHelper, WebRtcError> {
         // A stale socket would make `connect` fail before the new worker has
         // bound it, and a stale frame would be shown to the controller.
@@ -871,8 +876,17 @@ impl HelperSpawner for SystemHelperSpawner {
             }),
         })
     }
+
+    #[cfg(not(unix))]
+    fn spawn(&self, config: &WebRtcConfig) -> Result<SpawnedHelper, WebRtcError> {
+        Err(WebRtcError::Spawn {
+            program: config.helper_program.clone(),
+            message: "WebRTC Unix socket helper signaling is only supported on Unix".to_owned(),
+        })
+    }
 }
 
+#[cfg(unix)]
 fn connect_with_timeout(
     child: &mut Child,
     config: &WebRtcConfig,
@@ -2193,7 +2207,7 @@ fn duration_millis(duration: Duration) -> u64 {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::collections::VecDeque;

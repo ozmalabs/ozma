@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{header, Request, StatusCode};
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -282,6 +283,8 @@ async fn camera_channel_decodes_a_real_h264_access_unit_and_serves_http() {
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/sessions/{}/capture", session.id))
+                .header("host", "127.0.0.1:3000")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -303,6 +306,8 @@ async fn camera_channel_decodes_a_real_h264_access_unit_and_serves_http() {
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/sessions/{}/capture/frame.ppm", session.id))
+                .header("host", "127.0.0.1:3000")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
                 .body(Body::empty())
                 .unwrap(),
         )

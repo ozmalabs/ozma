@@ -3538,6 +3538,7 @@ dependencies = [
  "tokio",
  "tracing",
  "v4l",
+ "windows 0.58.0",
  "zbus",
 ]
 
@@ -3774,6 +3775,7 @@ dependencies = [
 name = "ozma-input"
 version = "0.1.0"
 dependencies = [
+ "enigo",
  "evdev",
  "ozma-proto",
  "ozma-protocol",
@@ -3897,6 +3899,7 @@ dependencies = [
  "socketcan",
  "spidev",
  "sysinfo 0.29.11",
+ "sysinfo 0.30.13",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ozma_input::{
     FakeInputSink, HidGadgetSink, InputSink, QmpSink, QmpSinkHandle, RecordingSink, SharedSink,
-    SinkKind, UinputSink,
+    SinkKind, UinputSink, WindowsSendInputSink,
 };
 use ozma_qmp::{QmpConfig, SharedQmpClient};
 use tracing::{debug, info, warn};
@@ -93,6 +93,9 @@ impl InputSinkFactory for SystemInputFactory {
             SinkKind::Uinput => UinputSink::open()
                 .map(BuiltInput::recorded)
                 .map_err(|error| format!("uinput unavailable: {error}")),
+            SinkKind::SendInput => WindowsSendInputSink::open()
+                .map(BuiltInput::recorded)
+                .map_err(|error| format!("send-input unavailable: {error}")),
             SinkKind::Qmp => {
                 if let Some(config) = &self.dedicated_input {
                     let (sink, handle) = QmpSink::spawn_dedicated_input(config.clone())

@@ -1,0 +1,68 @@
+name: Rust Windows CI
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "ozma-agent/**"
+      - "ozma-node/**"
+      - "ozma-capture/**"
+      - "ozma-audio/**"
+      - "ozma-proto/**"
+      - "ozma-mesh/**"
+      - "ozma-crypto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust-windows.yml"
+  pull_request:
+    paths:
+      - "ozma-agent/**"
+      - "ozma-node/**"
+      - "ozma-capture/**"
+      - "ozma-audio/**"
+      - "ozma-proto/**"
+      - "ozma-mesh/**"
+      - "ozma-crypto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust-windows.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-rust-agent:
+    name: ozma-agent (Windows x86_64-pc-windows-msvc)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check ozma-agent
+        run: cargo check -p ozma-agent --all-targets
+
+      - name: Check ozma-node (Windows cross-platform gate)
+        run: cargo check -p ozma-node --target x86_64-pc-windows-msvc
+
+      - name: Test ozma-agent
+        run: cargo test -p ozma-agent
+
+      - name: Build Windows release zip (and MSI if WiX present)
+        shell: pwsh
+        run: .\ozma-agent\installer\build-windows.ps1
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ozma-agent-windows-x86_64
+          path: |
+            dist/ozma-agent-*-windows-x86_64.zip
+            target/wix/ozma-agent-*.msi
+          retention-days: 7

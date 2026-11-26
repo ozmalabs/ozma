@@ -11,6 +11,23 @@ use ozma_protocol::{codes, ApiError, CaptureCapability, CaptureKind};
 
 use ozma_media::CaptureSource;
 
+/// Advance a monotonically increasing frame sequence number.
+pub fn next_sequence(previous: Option<u64>) -> u64 {
+    previous.map_or(0, |sequence| sequence.saturating_add(1))
+}
+
+/// Keep a PTS sequence strictly increasing.
+///
+/// Drivers occasionally stamp two buffers with the same time or their clock
+/// restarts. PTS is part of the capture contract, so nudge a non-increasing
+/// candidate forward by one microsecond instead of passing it through.
+pub fn monotonic_pts(candidate: u64, previous: Option<u64>) -> u64 {
+    match previous {
+        Some(previous) => candidate.max(previous.saturating_add(1)),
+        None => candidate,
+    }
+}
+
 /// A backend that can enumerate and open capture sources.
 ///
 /// Implementations are synchronous because discovery is filesystem/kernel
@@ -74,9 +91,25 @@ impl CaptureRegistry {
         Self::default()
     }
 
-    /// A registry with the host's V4L2 discovery provider.
+    /// A registry with the host's native discovery provider (V4L2 on Linux,
+    /// desktop GDI capture on Windows, empty otherwise).
     pub fn system() -> Self {
-        Self::new().with(crate::v4l2::V4l2Provider::new())
+        #[cfg(target_os = "linux")]
+        {
+            Self::new().with(crate::v4l2::V4l2Provider::new())
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self::new().with(crate::windows_display::WindowsDisplayProvider::new())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Self::new().with(crate::macos_display::MacOsDisplayProvider::new())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        {
+            Self::new()
+        }
     }
 
     /// A registry with the host's V4L2 provider and, on Linux, the PipeWire
@@ -188,6 +221,7 @@ impl CaptureRegistry {
     /// Like [`CaptureRegistry::with_qmp_display`], this is opt-in: the QMP
     /// socket and `-display dbus,p2p=yes` belong to VM profile configuration,
     /// not a hardware node. Enumeration only checks the socket path.
+    #[cfg(target_os = "linux")]
     pub fn with_dbus_display(mut self, config: crate::dbus_display::DBusDisplayConfig) -> Self {
         self.register(crate::dbus_display::DBusDisplayProvider::new(config));
         self
@@ -199,6 +233,7 @@ impl CaptureRegistry {
     /// [`ozma_qmp::SharedQmpClient`], register the D-Bus provider with this
     /// method so its `getfd`/`add_client` handoff never opens a second control
     /// connection.
+    #[cfg(target_os = "linux")]
     pub fn with_dbus_display_shared(
         mut self,
         config: crate::dbus_display::DBusDisplayConfig,
@@ -212,6 +247,7 @@ impl CaptureRegistry {
     ///
     /// Like the QMP provider, this is opt-in: a hardware node has no IVSHMEM
     /// region. Discovery still only reads the shared-memory header.
+    #[cfg(target_os = "linux")]
     pub fn with_looking_glass(
         mut self,
         config: crate::lookingglass::LookingGlassProviderConfig,
@@ -231,6 +267,7 @@ impl CaptureRegistry {
     ///
     /// This is deliberately not part of [`CaptureRegistry::system`] or
     /// [`CaptureRegistry::system_with_pipewire`].
+    #[cfg(target_os = "linux")]
     pub fn with_virtual_capture(
         mut self,
         config: crate::r#virtual::VirtualCaptureProviderConfig,

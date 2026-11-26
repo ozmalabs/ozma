@@ -54,8 +54,7 @@ use ozma_protocol::{codes, ApiError, CaptureCapability, CaptureKind};
 use ozma_qmp::{QmpClient, QmpConfig, QmpError, SharedQmpClient};
 use tracing::warn;
 
-use crate::provider::CaptureProvider;
-use crate::v4l2::{monotonic_pts, next_sequence};
+use crate::provider::{monotonic_pts, next_sequence, CaptureProvider};
 
 /// Default source id (`qmp0`).
 pub const QMP_DEFAULT_ID: &str = "qmp0";
