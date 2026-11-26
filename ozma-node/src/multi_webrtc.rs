@@ -45,7 +45,9 @@ use crate::display_control::{
     open_selected_source, ConsoleSelectionObserver, ConsoleSourceFactory,
 };
 use crate::display_outputs::{DisplayOutput, DisplayOutputSelection};
-use crate::webrtc::{WebRtcAnswer, WebRtcConfig, WebRtcError, WebRtcHelper, WebRtcStatus};
+use crate::webrtc::{
+    WebRtcAnswer, WebRtcBackend, WebRtcConfig, WebRtcError, WebRtcHelper, WebRtcStatus,
+};
 
 /// Default maximum number of simultaneous per-console WebRTC helpers.
 pub const DEFAULT_MAX_CONSOLE_WEBRTC: usize = 2;
@@ -99,6 +101,10 @@ impl MultiConsoleWebrtcConfig {
 pub trait ConsoleWebRtcSession: Send + Sync {
     /// Live helper status.
     fn status(&self) -> WebRtcStatus;
+    /// Selected helper implementation for this console.
+    fn backend(&self) -> WebRtcBackend {
+        self.status().backend()
+    }
     /// True while the helper socket is connected and the feeder runs.
     fn is_running(&self) -> bool;
     /// Helper process id, when one was spawned.
@@ -127,6 +133,10 @@ pub trait ConsoleWebRtcSession: Send + Sync {
 pub trait ConsoleWebRtcFactory: Send + Sync {
     /// Configured capture transport.
     fn provider(&self) -> Option<VmConsoleBackend>;
+    /// Configured helper implementation for started consoles.
+    fn backend(&self) -> WebRtcBackend {
+        WebRtcBackend::External
+    }
     /// Configured audio monitor, when the base helper uses one.
     fn audio_source(&self) -> Option<String> {
         None
@@ -285,15 +295,28 @@ impl ConsoleWebRtcFactory for ControllerWebRtcFactory {
         self.console_factory.provider()
     }
 
+    fn backend(&self) -> WebRtcBackend {
+        self.base.backend
+    }
+
     fn audio_source(&self) -> Option<String> {
+        if self.base.backend.is_video_only() {
+            return None;
+        }
         self.base.audio_source.clone()
     }
 
     fn audio_configured(&self) -> bool {
+        if self.base.backend.is_video_only() {
+            return false;
+        }
         self.audio_source_template.is_some() || self.base.audio_source.is_some()
     }
 
     fn audio_source_for(&self, console: u32) -> Option<String> {
+        if self.base.backend.is_video_only() {
+            return None;
+        }
         match &self.audio_source_template {
             Some(template) => expand_audio_source(template, console).ok(),
             None => self.base.audio_source.clone(),
@@ -348,6 +371,8 @@ pub struct ConsoleWebRtcStatus {
     pub console: u32,
     /// True when this console is the active WebRTC console.
     pub active: bool,
+    /// Helper implementation (`native` or `external`).
+    pub backend: &'static str,
     /// `running`, `starting`, `failed`, `not-started`, or `unsupported`.
     pub status: String,
     /// Why the helper is not running, when it is configured and failing.
@@ -386,6 +411,8 @@ pub struct MultiConsoleWebrtcStatus {
     /// Capture transport, when one is configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Helper implementation used by new/active per-console helpers.
+    pub backend: &'static str,
     /// Maximum simultaneous helpers.
     pub max_helpers: usize,
     /// Idle timeout applied to non-active helpers (zero = disabled).
@@ -462,6 +489,9 @@ impl MultiConsoleWebrtc {
     /// A per-console template counts as configuration intent even when no
     /// shared base source was supplied; per-console truth is in [`Self::status`].
     pub fn audio_configured(&self) -> bool {
+        if self.inner.factory.backend().is_video_only() {
+            return false;
+        }
         self.inner.config.audio_source_template.is_some() || self.inner.factory.audio_configured()
     }
 
@@ -960,19 +990,26 @@ impl MultiConsoleWebrtc {
         }
         let provider = self.inner.factory.provider();
         if !matches!(provider, Some(VmConsoleBackend::Dbus)) {
-            return WebRtcStatus::failed(unsupported_message(provider));
+            return WebRtcStatus::failed_with_backend(
+                unsupported_message(provider),
+                self.inner.factory.backend(),
+            );
         }
         let active = state.selection.active_console;
         match state.entries.get(&active) {
             Some(entry) => match entry.session.as_ref() {
                 Some(session) => session.status(),
-                None => WebRtcStatus::failed(entry.error.clone().unwrap_or_else(|| {
-                    format!("per-console WebRTC for Console_{active} is not running")
-                })),
+                None => WebRtcStatus::failed_with_backend(
+                    entry.error.clone().unwrap_or_else(|| {
+                        format!("per-console WebRTC for Console_{active} is not running")
+                    }),
+                    self.inner.factory.backend(),
+                ),
             },
-            None => WebRtcStatus::failed(format!(
-                "per-console WebRTC for the active Console_{active} is not running"
-            )),
+            None => WebRtcStatus::failed_with_backend(
+                format!("per-console WebRTC for the active Console_{active} is not running"),
+                self.inner.factory.backend(),
+            ),
         }
     }
 
@@ -1045,9 +1082,14 @@ impl MultiConsoleWebrtc {
             let audio_source = capturable
                 .then(|| self.inner.factory.audio_source_for(output.index))
                 .flatten();
+            let backend = entry
+                .and_then(|entry| entry.session.as_ref())
+                .map(|session| session.backend())
+                .unwrap_or_else(|| self.inner.factory.backend());
             consoles.push(ConsoleWebRtcStatus {
                 console: output.index,
                 active: output.index == active,
+                backend: backend.as_str(),
                 status,
                 error,
                 pid,
@@ -1063,6 +1105,7 @@ impl MultiConsoleWebrtc {
         MultiConsoleWebrtcStatus {
             enabled: true,
             provider: provider.map(|provider| provider.as_str().to_owned()),
+            backend: self.inner.factory.backend().as_str(),
             max_helpers: self.inner.config.max_helpers,
             idle_timeout_seconds: self.inner.config.idle_timeout.as_secs(),
             active_console: active,
@@ -1751,6 +1794,7 @@ mod tests {
         WebRtcConfig {
             helper_program: PathBuf::from("/bin/true"),
             helper_script: None,
+            backend: WebRtcBackend::External,
             socket_path: PathBuf::from("/tmp/base.sock"),
             shm_path: PathBuf::from("/tmp/base.bgra"),
             width: 640,
@@ -1772,6 +1816,26 @@ mod tests {
     fn controller_factory(base: WebRtcConfig, template: Option<&str>) -> ControllerWebRtcFactory {
         ControllerWebRtcFactory::new(Arc::new(DummyConsoleFactory), base)
             .with_audio_source_template(template.map(str::to_owned))
+    }
+
+    #[test]
+    fn native_per_console_config_never_claims_audio() {
+        let mut base = base_webrtc_config();
+        base.backend = WebRtcBackend::Native;
+        base.audio_source = Some("ozma-vm1.monitor".to_owned());
+        let factory = controller_factory(base, Some("ozma-vm{console}.monitor"));
+
+        assert_eq!(factory.backend(), WebRtcBackend::Native);
+        assert!(!factory.audio_configured());
+        assert_eq!(factory.audio_source(), None);
+        assert_eq!(factory.audio_source_for(1), None);
+
+        let config = factory.config_for(1, None).expect("console 1 config");
+        assert_eq!(config.backend, WebRtcBackend::Native);
+        assert!(
+            config.audio_source.is_some(),
+            "argv compatibility keeps the source even though native audio is inactive"
+        );
     }
 
     #[test]

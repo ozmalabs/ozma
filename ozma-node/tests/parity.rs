@@ -1211,6 +1211,7 @@ async fn webrtc_offer_proxies_to_a_fake_unix_socket_helper() {
     let config = WebRtcConfig {
         helper_program: std::path::PathBuf::from("/fake/helper"),
         helper_script: None,
+        backend: ozma_node::webrtc::WebRtcBackend::External,
         socket_path: directory.join("helper.sock"),
         shm_path: directory.join("frame.bgra"),
         width: 2,
@@ -1312,6 +1313,7 @@ async fn webrtc_bitrate_is_not_reported_as_success_without_an_ack() {
     let config = WebRtcConfig {
         helper_program: std::path::PathBuf::from("/fake/helper"),
         helper_script: None,
+        backend: ozma_node::webrtc::WebRtcBackend::External,
         socket_path: directory.join("helper.sock"),
         shm_path: directory.join("frame.bgra"),
         width: 2,

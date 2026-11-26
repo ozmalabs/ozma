@@ -42,9 +42,12 @@ scripts/install-rust.sh --build --prefix "$HOME/.local"
 This installs `ozma-node`/`ozma-virtual-node` (and `ozma-multiseat` plus
 `ozma-meeting-detect` when their binaries are built) under `~/.local/bin`, lays
 out user units under `~/.local/lib/systemd/user`, and writes env examples under
-`~/.local/etc/ozma`. Use `--no-multiseat`/`--no-meeting-detect` to skip the
-optional binaries and the multiseat unit. It never removes Python and never
-starts a unit. Then:
+`~/.local/etc/ozma`. It also builds the native Rust WebRTC helper from its own
+manifest/lockfile and installs `ozma-webrtc-native` next to `ozma-node`
+(video-only; select it with `OZMA_WEBRTC_NATIVE=true`). Use
+`--no-multiseat`/`--no-meeting-detect`/`--no-webrtc-native` to skip the
+optional binaries and units. It never removes Python and never starts a unit.
+Then:
 
 ```bash
 systemctl --user daemon-reload

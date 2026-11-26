@@ -62,8 +62,9 @@ use ozma_node::{
     software::report::{InventoryReporter, DEFAULT_REPORT_INTERVAL},
     usb_audio, usb_uac2,
     webrtc::{
-        probe_settled_geometry, FitProbe, WebRtcAudioBackend, WebRtcConfig, WebRtcControl,
-        WebRtcGeometryStatus, WebRtcHelper, MAX_FIT_PROBE, MAX_FIT_SETTLE_MS,
+        probe_settled_geometry, select_helper, FitProbe, HelperSelection, WebRtcAudioBackend,
+        WebRtcBackend, WebRtcConfig, WebRtcControl, WebRtcGeometryStatus, WebRtcHelper,
+        MAX_FIT_PROBE, MAX_FIT_SETTLE_MS,
     },
 };
 
@@ -110,8 +111,9 @@ pub struct Args {
     /// --x11-display`) and the XDG Portal ScreenCast handshake
     /// (`--capture-provider portal`); a denied portal or missing X display is a
     /// warned no-capture state, never a fake source. Local HLS is opt-in via
-    /// `--hls`; WebRTC runs only through an external helper when
-    /// `--webrtc-helper` is set. The per-VM supervisor remains a later phase.
+    /// `--hls`; WebRTC runs only through a configured helper (external
+    /// `--webrtc-helper` or the opt-in native `--webrtc-native`). The per-VM
+    /// supervisor remains a later phase.
     #[arg(long, env = "OZMA_PROFILE", value_enum, default_value_t = NodeProfile::Hardware)]
     pub profile: NodeProfile,
 
@@ -1489,7 +1491,7 @@ pub struct Args {
     /// one; an offer without a selector targets the active console, preserving
     /// the historical behavior. Single-head providers (QMP/VNC/Looking Glass)
     /// keep the active helper and report a typed `unsupported` limitation.
-    /// Requires `--webrtc-helper`.
+    /// Requires `--webrtc-helper` or `--webrtc-native`.
     #[arg(
         long,
         env = "OZMA_MULTI_CONSOLE_WEBRTC",
@@ -1567,10 +1569,21 @@ pub struct Args {
 
     /// External WebRTC helper executable (for example `/usr/bin/python3`).
     ///
-    /// WebRTC stays disabled (`not-configured`) unless this is set. The helper
-    /// is the existing GStreamer/Python worker; native WebRTC is future work.
+    /// WebRTC stays disabled (`not-configured`) unless this or
+    /// `--webrtc-native` is set. `--webrtc-helper ozma-webrtc-native` selects
+    /// the native Rust helper explicitly.
     #[arg(long, env = "OZMA_WEBRTC_HELPER", value_name = "PATH")]
     pub webrtc_helper: Option<std::path::PathBuf>,
+
+    /// Use the native Rust `ozma-webrtc-native` helper (video-only).
+    ///
+    /// Without `--webrtc-helper`, the binary is looked up next to `ozma-node`
+    /// and then on `PATH`; it is never substituted for a configured Python
+    /// helper. Any `--webrtc-helper-script` is ignored for this backend.
+    /// Native audio is not implemented, so `/api/v1/connection` reports
+    /// `webrtc_audio_configured=false` even if an audio source is supplied.
+    #[arg(long, env = "OZMA_WEBRTC_NATIVE")]
+    pub webrtc_native: bool,
 
     /// Optional first argument passed to `--webrtc-helper` (for example the
     /// Python worker script; when absent the program is spawned directly).
@@ -2737,10 +2750,10 @@ async fn run() -> std::process::ExitCode {
         platform::apply_hls_encode_capability(&mut capabilities, hls_config);
     }
 
-    // External WebRTC helper (GStreamer/Python first; native WebRTC is future
-    // work). WebRTC is disabled unless `--webrtc-helper` is configured. A
-    // configured helper that cannot start is reported as `failed`, never
-    // `running`, and never crashes the node.
+    // WebRTC helper (external GStreamer/Python or the native Rust binary).
+    // WebRTC is disabled unless `--webrtc-helper` or `--webrtc-native` is
+    // configured. A configured helper that cannot start is reported as
+    // `failed`, never `running`, and never crashes the node.
     // Per-console WebRTC only owns the helper set when the configured capture
     // provider really exposes independent console indexes (D-Bus). A
     // single-head provider keeps the historical active helper and the manager
@@ -2753,176 +2766,233 @@ async fn run() -> std::process::ExitCode {
     let multi_console_webrtc_owns = args.multi_console_webrtc
         && webrtc_capture_provider == Some(ozma_display::vm::VmConsoleBackend::Dbus);
     let mut webrtc_switch_config: Option<WebRtcConfig> = None;
-    let webrtc_control: Option<WebRtcControl> = match args.webrtc_helper.clone() {
-        None => None,
-        Some(program) => {
-            let audio_source = args.webrtc_audio_source.clone();
-            let webrtc_config = WebRtcConfig {
-                helper_program: program,
-                helper_script: args.webrtc_helper_script.clone(),
-                socket_path: args
-                    .webrtc_socket
-                    .clone()
-                    .unwrap_or_else(|| default_webrtc_socket(&config.name)),
-                shm_path: args.webrtc_shm.clone().unwrap_or_else(default_webrtc_shm),
-                width: args.webrtc_width,
-                height: args.webrtc_height,
-                scale_to_fit: args.webrtc_fit_capture,
-                fps: args.webrtc_fps,
-                bitrate_kbps: args.webrtc_bitrate_kbps,
-                audio_source: audio_source.clone(),
-                audio_backend: args.webrtc_audio_backend,
-                stun_server: args.webrtc_stun.clone(),
-                turn_server: args.webrtc_turn.clone(),
-                turn_user: args.webrtc_turn_user.clone(),
-                turn_password: args.webrtc_turn_password.clone(),
-                startup_timeout: std::time::Duration::from_secs(5),
-                offer_timeout: std::time::Duration::from_secs(10),
-            };
-            webrtc_switch_config = Some(webrtc_config.clone());
-            if let Err(error) = webrtc_config.validate() {
-                warn!(error = %error, "WebRTC unavailable: invalid helper configuration");
-                Some(WebRtcControl::failed_with_audio(
-                    format!("WebRTC unavailable: {error}"),
-                    audio_source,
-                ))
-            } else if !config.has_capability("video") {
+    let mut webrtc_selection_error: Option<(String, WebRtcBackend)> = None;
+    let webrtc_selection: Option<HelperSelection> = if args.webrtc_native
+        || args.webrtc_helper.is_some()
+    {
+        match select_helper(
+            args.webrtc_native,
+            args.webrtc_helper.as_deref(),
+            args.webrtc_helper_script.as_deref(),
+        ) {
+            Ok(selection) => {
+                if selection.script_ignored {
+                    warn!(
+                        "--webrtc-helper-script is ignored for the native WebRTC helper; \
+                             the binary takes its flags directly"
+                    );
+                }
+                Some(selection)
+            }
+            Err(error) => {
                 warn!(
-                    "--webrtc-helper was configured but the video capability is disabled; \
-                     WebRTC is unavailable"
+                    error = %error,
+                    native = args.webrtc_native,
+                    "WebRTC unavailable: the configured helper could not be resolved"
                 );
-                Some(WebRtcControl::failed_with_audio(
-                    "WebRTC unavailable: the video capability is disabled".to_owned(),
-                    audio_source,
-                ))
-            } else if multi_console_webrtc_owns {
-                // The per-console manager starts one helper per advertised
-                // console (including the active console), so starting the
-                // historical single helper would duplicate that capture
-                // source and encoder. It is constructed after the display
-                // selector below.
-                info!(
-                    socket = %webrtc_config.socket_path.display(),
-                    shm = %webrtc_config.shm_path.display(),
-                    "per-console WebRTC manager owns the helper set; the single active helper is not started"
-                );
+                let backend = if args.webrtc_native {
+                    WebRtcBackend::Native
+                } else {
+                    WebRtcBackend::External
+                };
+                webrtc_selection_error = Some((format!("WebRTC unavailable: {error}"), backend));
                 None
-            } else {
-                let requested_source = capture_source_selection(&config);
-                match open_capture_source(&capture_registry, requested_source.as_deref()) {
-                    Err(error) => {
-                        warn!(
-                            error = %error,
-                            "WebRTC unavailable: no capture source could be opened"
-                        );
-                        Some(WebRtcControl::failed_with_audio(
-                            format!("WebRTC unavailable: {error}"),
-                            audio_source,
-                        ))
-                    }
-                    Ok(mut source) => {
-                        let mut start_config = webrtc_config.clone();
-                        let mut fit_source_geometry: Option<(u32, u32)> = None;
-                        let mut fit_settled: Option<bool> = None;
-                        if args.webrtc_fit_capture {
-                            // QMP/VNC sources report 0x0 until the first
-                            // screendump, and the guest can modeset during
-                            // boot. When discovery geometry is unknown, wait
-                            // for a stable size instead of latching the first
-                            // transient frame.
-                            let declared = source.format();
-                            let resolved = if declared.width > 0 && declared.height > 0 {
-                                Some((declared.width, declared.height))
-                            } else {
-                                let settle_ms = args.webrtc_settle_ms.min(MAX_FIT_SETTLE_MS);
-                                let probe = FitProbe {
-                                    settle_window: std::time::Duration::from_millis(settle_ms),
-                                    max_wait: MAX_FIT_PROBE,
-                                };
-                                match probe_settled_geometry(source.as_mut(), probe).await {
-                                    Some(result) => {
-                                        fit_settled = Some(result.settled);
-                                        info!(
-                                            width = result.width,
-                                            height = result.height,
-                                            frames = result.frames,
-                                            settled = result.settled,
-                                            settle_ms,
-                                            "WebRTC fit probe resolved the capture geometry"
-                                        );
-                                        Some((result.width, result.height))
-                                    }
-                                    None => {
-                                        warn!(
-                                            settle_ms,
-                                            "WebRTC fit: no usable capture frame arrived; \
-                                             keeping the configured size"
-                                        );
-                                        None
-                                    }
-                                }
-                            };
-                            if let Some((width, height)) = resolved {
-                                if width != start_config.width || height != start_config.height {
-                                    info!(
-                                        configured = %format!(
-                                            "{}x{}",
-                                            start_config.width, start_config.height
-                                        ),
-                                        capture = %format!("{width}x{height}"),
-                                        settled = ?fit_settled,
-                                        "fitting WebRTC helper to the capture frame size"
-                                    );
-                                }
-                                start_config.width = width;
-                                start_config.height = height;
-                                fit_source_geometry = Some((width, height));
-                            }
+            }
+        }
+    } else {
+        None
+    };
+    let webrtc_control: Option<WebRtcControl> = if let Some((error, backend)) =
+        webrtc_selection_error
+    {
+        Some(WebRtcControl::failed_with_audio_and_backend(
+            error,
+            args.webrtc_audio_source.clone(),
+            backend,
+        ))
+    } else {
+        match webrtc_selection {
+            None => None,
+            Some(selection) => {
+                let audio_source = args.webrtc_audio_source.clone();
+                let backend = selection.backend;
+                let webrtc_config = WebRtcConfig {
+                    helper_program: selection.program,
+                    helper_script: selection.script,
+                    backend,
+                    socket_path: args
+                        .webrtc_socket
+                        .clone()
+                        .unwrap_or_else(|| default_webrtc_socket(&config.name)),
+                    shm_path: args.webrtc_shm.clone().unwrap_or_else(default_webrtc_shm),
+                    width: args.webrtc_width,
+                    height: args.webrtc_height,
+                    scale_to_fit: args.webrtc_fit_capture,
+                    fps: args.webrtc_fps,
+                    bitrate_kbps: args.webrtc_bitrate_kbps,
+                    audio_source: audio_source.clone(),
+                    audio_backend: args.webrtc_audio_backend,
+                    stun_server: args.webrtc_stun.clone(),
+                    turn_server: args.webrtc_turn.clone(),
+                    turn_user: args.webrtc_turn_user.clone(),
+                    turn_password: args.webrtc_turn_password.clone(),
+                    startup_timeout: std::time::Duration::from_secs(5),
+                    offer_timeout: std::time::Duration::from_secs(10),
+                };
+                webrtc_switch_config = Some(webrtc_config.clone());
+                if let Err(error) = webrtc_config.validate() {
+                    warn!(error = %error, "WebRTC unavailable: invalid helper configuration");
+                    Some(WebRtcControl::failed_with_audio_and_backend(
+                        format!("WebRTC unavailable: {error}"),
+                        audio_source,
+                        backend,
+                    ))
+                } else if !config.has_capability("video") {
+                    warn!(
+                        "--webrtc-helper/--webrtc-native was configured but the video \
+                         capability is disabled; WebRTC is unavailable"
+                    );
+                    Some(WebRtcControl::failed_with_audio_and_backend(
+                        "WebRTC unavailable: the video capability is disabled".to_owned(),
+                        audio_source,
+                        backend,
+                    ))
+                } else if multi_console_webrtc_owns {
+                    // The per-console manager starts one helper per advertised
+                    // console (including the active console), so starting the
+                    // historical single helper would duplicate that capture
+                    // source and encoder. It is constructed after the display
+                    // selector below.
+                    info!(
+                        socket = %webrtc_config.socket_path.display(),
+                        shm = %webrtc_config.shm_path.display(),
+                        "per-console WebRTC manager owns the helper set; the single active helper is not started"
+                    );
+                    None
+                } else {
+                    let requested_source = capture_source_selection(&config);
+                    match open_capture_source(&capture_registry, requested_source.as_deref()) {
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                "WebRTC unavailable: no capture source could be opened"
+                            );
+                            Some(WebRtcControl::failed_with_audio_and_backend(
+                                format!("WebRTC unavailable: {error}"),
+                                audio_source,
+                                backend,
+                            ))
                         }
-                        match WebRtcHelper::start(source, start_config) {
-                            Ok(helper) => {
-                                // Keep the geometry actually used, so a later
-                                // console switch restarts at the same size.
-                                let used = helper.config();
-                                webrtc_switch_config = Some(used.clone());
-                                let mut geometry = WebRtcGeometryStatus::from_config(used);
-                                geometry.fitted =
-                                    fit_source_geometry.is_some_and(|(width, height)| {
-                                        width != webrtc_config.width
-                                            || height != webrtc_config.height
-                                    });
-                                if let Some((width, height)) = fit_source_geometry {
-                                    geometry.capture_width = Some(width);
-                                    geometry.capture_height = Some(height);
+                        Ok(mut source) => {
+                            let mut start_config = webrtc_config.clone();
+                            let mut fit_source_geometry: Option<(u32, u32)> = None;
+                            let mut fit_settled: Option<bool> = None;
+                            if args.webrtc_fit_capture {
+                                // QMP/VNC sources report 0x0 until the first
+                                // screendump, and the guest can modeset during
+                                // boot. When discovery geometry is unknown, wait
+                                // for a stable size instead of latching the first
+                                // transient frame.
+                                let declared = source.format();
+                                let resolved = if declared.width > 0 && declared.height > 0 {
+                                    Some((declared.width, declared.height))
+                                } else {
+                                    let settle_ms = args.webrtc_settle_ms.min(MAX_FIT_SETTLE_MS);
+                                    let probe = FitProbe {
+                                        settle_window: std::time::Duration::from_millis(settle_ms),
+                                        max_wait: MAX_FIT_PROBE,
+                                    };
+                                    match probe_settled_geometry(source.as_mut(), probe).await {
+                                        Some(result) => {
+                                            fit_settled = Some(result.settled);
+                                            info!(
+                                                width = result.width,
+                                                height = result.height,
+                                                frames = result.frames,
+                                                settled = result.settled,
+                                                settle_ms,
+                                                "WebRTC fit probe resolved the capture geometry"
+                                            );
+                                            Some((result.width, result.height))
+                                        }
+                                        None => {
+                                            warn!(
+                                                settle_ms,
+                                                "WebRTC fit: no usable capture frame arrived; \
+                                             keeping the configured size"
+                                            );
+                                            None
+                                        }
+                                    }
+                                };
+                                if let Some((width, height)) = resolved {
+                                    if width != start_config.width || height != start_config.height
+                                    {
+                                        info!(
+                                            configured = %format!(
+                                                "{}x{}",
+                                                start_config.width, start_config.height
+                                            ),
+                                            capture = %format!("{width}x{height}"),
+                                            settled = ?fit_settled,
+                                            "fitting WebRTC helper to the capture frame size"
+                                        );
+                                    }
+                                    start_config.width = width;
+                                    start_config.height = height;
+                                    fit_source_geometry = Some((width, height));
                                 }
-                                geometry.settled = fit_settled;
-                                helper.record_geometry(geometry);
-                                info!(
-                                    pid = ?helper.status().helper_pid(),
-                                    socket = %used.socket_path.display(),
-                                    shm = %used.shm_path.display(),
-                                    width = used.width,
-                                    height = used.height,
-                                    fps = used.fps,
-                                    audio = ?used.audio_source,
-                                    audio_backend = used.audio_backend.as_arg(),
-                                    stun = ?used.stun_server,
-                                    turn = ?used.turn_server,
-                                    turn_auth = used.turn_user.is_some()
-                                        && used.turn_password.is_some(),
-                                    "WebRTC helper started"
-                                );
-                                Some(WebRtcControl::from_helper(helper))
                             }
-                            Err(error) => {
-                                warn!(
-                                    error = %error,
-                                    "WebRTC unavailable: the external helper did not start"
-                                );
-                                Some(WebRtcControl::failed_with_audio(
-                                    format!("WebRTC unavailable: {error}"),
-                                    audio_source,
-                                ))
+                            match WebRtcHelper::start(source, start_config) {
+                                Ok(helper) => {
+                                    // Keep the geometry actually used, so a later
+                                    // console switch restarts at the same size.
+                                    let used = helper.config();
+                                    webrtc_switch_config = Some(used.clone());
+                                    let mut geometry = WebRtcGeometryStatus::from_config(used);
+                                    geometry.fitted =
+                                        fit_source_geometry.is_some_and(|(width, height)| {
+                                            width != webrtc_config.width
+                                                || height != webrtc_config.height
+                                        });
+                                    if let Some((width, height)) = fit_source_geometry {
+                                        geometry.capture_width = Some(width);
+                                        geometry.capture_height = Some(height);
+                                    }
+                                    geometry.settled = fit_settled;
+                                    helper.record_geometry(geometry);
+                                    info!(
+                                        pid = ?helper.status().helper_pid(),
+                                        socket = %used.socket_path.display(),
+                                        shm = %used.shm_path.display(),
+                                        width = used.width,
+                                        height = used.height,
+                                        fps = used.fps,
+                                        backend = used.backend.as_str(),
+                                        audio = ?used
+                                            .audio_source
+                                            .as_ref()
+                                            .filter(|_| used.audio_supported()),
+                                        audio_backend = used.audio_backend.as_arg(),
+                                        stun = ?used.stun_server,
+                                        turn = ?used.turn_server,
+                                        turn_auth = used.turn_user.is_some()
+                                            && used.turn_password.is_some(),
+                                        "WebRTC helper started"
+                                    );
+                                    Some(WebRtcControl::from_helper(helper))
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        error = %error,
+                                        "WebRTC unavailable: the configured helper did not start"
+                                    );
+                                    Some(WebRtcControl::failed_with_audio_and_backend(
+                                        format!("WebRTC unavailable: {error}"),
+                                        audio_source,
+                                        backend,
+                                    ))
+                                }
                             }
                         }
                     }
@@ -3253,8 +3323,8 @@ async fn run() -> std::process::ExitCode {
         match webrtc_switch_config.clone() {
             None => {
                 warn!(
-                    "--multi-console-webrtc was requested without --webrtc-helper; no \
-                     per-console WebRTC helper can start"
+                    "--multi-console-webrtc was requested without --webrtc-helper or \
+                     --webrtc-native; no per-console WebRTC helper can start"
                 );
                 None
             }
@@ -3906,12 +3976,13 @@ async fn run() -> std::process::ExitCode {
                 "Profile 'vm' is PARTIALLY WIRED: QMP/D-Bus/VNC capture, uinput/QMP input \
                  injection, QMP/libvirt power control, and optional PipeWire/PulseAudio routing \
                  start when their flags are configured. Local HLS is opt-in via `--hls` and feeds \
-                 `/stream/*` from the first capture source. WebRTC runs only through an external \
-                 helper and only when `--webrtc-helper` is set. POST /codec validates an override \
-                 and, when HLS is running, restarts the pipeline with the mapped encoder; with HLS \
-                 off it is stored with pending_restart. Still not implemented: native WebRTC, live \
-                 D-Bus/VNC validation in CI, per-VM provisioning (ozma-softnode supervisor), and \
-                 WebRTC audio. Do not treat WebRTC as functional without a configured helper."
+                 `/stream/*` from the first capture source. WebRTC runs only through a configured \
+                 helper (`--webrtc-helper` or the opt-in native `--webrtc-native`). POST /codec \
+                 validates an override and, when HLS is running, restarts the pipeline with the \
+                 mapped encoder; with HLS off it is stored with pending_restart. Still not \
+                 implemented: live D-Bus/VNC validation in CI, per-VM provisioning \
+                 (ozma-softnode supervisor), and WebRTC audio (native is video-only). Do not treat \
+                 WebRTC as functional without a configured helper."
             );
         }
         NodeProfile::Desktop => {
@@ -5268,6 +5339,10 @@ mod tests {
             "WebRTC must not default to an implicit Python helper"
         );
         assert!(args.webrtc_helper_script.is_none());
+        assert!(
+            !args.webrtc_native,
+            "the native helper must be selected explicitly"
+        );
         assert_eq!(args.webrtc_width, 640);
         assert_eq!(args.webrtc_height, 480);
         assert_eq!(args.webrtc_fps, 30);
@@ -5284,6 +5359,23 @@ mod tests {
         assert!(args.webrtc_turn.is_none());
         assert!(args.webrtc_turn_user.is_none());
         assert!(args.webrtc_turn_password.is_none());
+    }
+
+    #[test]
+    fn webrtc_native_flag_parses_and_stays_opt_in() {
+        let defaults = Args::parse_from(["ozma-node"]);
+        assert!(!defaults.webrtc_native);
+
+        let native = Args::parse_from(["ozma-node", "--webrtc-native"]);
+        assert!(native.webrtc_native);
+        assert!(native.webrtc_helper.is_none());
+
+        let named = Args::parse_from(["ozma-node", "--webrtc-helper", "ozma-webrtc-native"]);
+        assert!(!named.webrtc_native);
+        assert_eq!(
+            named.webrtc_helper.as_deref(),
+            Some(std::path::Path::new("ozma-webrtc-native"))
+        );
     }
 
     #[test]

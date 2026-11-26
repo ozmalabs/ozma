@@ -7,6 +7,9 @@ Wants=network-online.target
 # ozma-virtual-node, which discovers VMs and spawns one ozma-node per VM.
 [Service]
 Type=simple
+# Optional WebRTC: set OZMA_WEBRTC_NATIVE=true (video-only Rust helper) or
+# OZMA_WEBRTC_HELPER/OZMA_WEBRTC_HELPER_SCRIPT (external) in vm-%i.env; the
+# node supervises the helper process itself.
 ExecStart=@BIN_DIR@/ozma-node --profile vm --name %i $OZMA_NODE_ARGS
 EnvironmentFile=-@ENV_DIR@/vm-%i.env
 

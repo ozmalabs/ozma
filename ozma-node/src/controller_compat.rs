@@ -4398,6 +4398,11 @@ pub struct ConnectionResponse {
     pub webrtc: &'static str,
     /// Why WebRTC is not `running`, when it is configured and failing.
     pub webrtc_error: Option<String>,
+    /// Which helper implementation serves `webrtc`: `native`, `external`, or
+    /// `not-configured`.
+    ///
+    /// `native` means the video-only Rust helper; audio is never claimed for it.
+    pub webrtc_backend: &'static str,
     /// Resolved helper geometry, when a helper is configured.
     ///
     /// Additive: consumers that only read `webrtc`/`webrtc_error` are
@@ -4839,6 +4844,24 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
             Some(control) => (control.audio_configured(), control.audio_source()),
         }
     };
+    let webrtc_backend = if webrtc == "not-configured" {
+        "not-configured"
+    } else if webrtc_manager_owns {
+        state
+            .multi_console_webrtc
+            .as_ref()
+            .expect("checked above")
+            .active_status()
+            .await
+            .backend()
+            .as_str()
+    } else {
+        state
+            .webrtc
+            .as_ref()
+            .map(|control| control.backend().as_str())
+            .unwrap_or("not-configured")
+    };
     let input = InputStatus {
         sink_kind: info.sink_kind.clone(),
         available: state.input_sink.is_some(),
@@ -4899,6 +4922,7 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         hls_audio_encoder,
         webrtc,
         webrtc_error,
+        webrtc_backend,
         webrtc_geometry,
         audio,
         audio_error,
@@ -12206,6 +12230,36 @@ mod tests {
         assert_eq!(body["webrtc_audio_source"], "ozma-vm1.monitor");
         // Audio configuration is not a claim that the helper produced samples.
         assert_eq!(body["webrtc"], "failed");
+        assert_eq!(body["webrtc_backend"], "external");
+    }
+
+    #[tokio::test]
+    async fn connection_reports_native_backend_without_claiming_audio() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_webrtc(Some(WebRtcControl::failed_with_audio_and_backend(
+            "native helper did not start".to_owned(),
+            Some("ozma-vm1.monitor".to_owned()),
+            crate::webrtc::WebRtcBackend::Native,
+        )));
+        let (status, body) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["webrtc"], "failed");
+        assert_eq!(body["webrtc_backend"], "native");
+        assert_eq!(body["webrtc_audio_configured"], false);
+        assert!(
+            body["webrtc_audio_source"].is_null(),
+            "native is video-only and must not report an audio monitor: {body}"
+        );
     }
 
     #[tokio::test]

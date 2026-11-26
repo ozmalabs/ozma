@@ -8,6 +8,9 @@ Wants=network-online.target
 Type=simple
 # %i is hardware, vm, or desktop. Extra flags come from OZMA_NODE_ARGS in the
 # matching environment file (systemd splits that variable at whitespace).
+# Optional WebRTC: set OZMA_WEBRTC_NATIVE=true (video-only Rust helper) or
+# OZMA_WEBRTC_HELPER/OZMA_WEBRTC_HELPER_SCRIPT (external) in that env file;
+# the node supervises the helper process itself.
 ExecStart=@BIN_DIR@/ozma-node --profile %i $OZMA_NODE_ARGS
 EnvironmentFile=-@ENV_DIR@/ozma-node-%i.env
 

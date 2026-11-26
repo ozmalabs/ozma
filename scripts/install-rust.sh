@@ -12,12 +12,18 @@
 # It still runs under system Python with GStreamer; pass its installed path to
 # `ozma-node --webrtc-helper-script` or OZMA_WEBRTC_HELPER_SCRIPT.
 #
+# The native Rust helper (ozma-webrtc-native) is built from its own manifest and
+# lockfile and installed next to ozma-node. It is video-only; select it with
+# `--webrtc-native` / OZMA_WEBRTC_NATIVE=true. Use --no-webrtc-native to skip
+# it. ozma-webrtc is deliberately not a member of the root workspace.
+#
 # Usage:
 #   scripts/install-rust.sh --build                 # ~/.local user layout
 #   scripts/install-rust.sh --from-target target/release
 #   scripts/install-rust.sh --system --prefix /usr/local   # run as root
 #   scripts/install-rust.sh --dry-run --build
-#   scripts/install-rust.sh --build --no-helper     # skip the WebRTC helper
+#   scripts/install-rust.sh --build --no-helper     # skip the Python helper
+#   scripts/install-rust.sh --build --no-webrtc-native  # skip the Rust helper
 #   scripts/install-rust.sh --build --no-multiseat --no-meeting-detect
 #
 # ozma-multiseat and ozma-meeting-detect are installed when their binaries are
@@ -48,6 +54,7 @@ DRY_RUN=0
 FORCE=0
 INSTALL_ENV=1
 INSTALL_HELPER=1
+INSTALL_WEBRTC_NATIVE=1
 INSTALL_MULTISEAT=1
 INSTALL_MEETING=1
 HELPER_DIR=""
@@ -135,6 +142,7 @@ while [ "$#" -gt 0 ]; do
         --build) DO_BUILD=1 ;;
         --no-env) INSTALL_ENV=0 ;;
         --no-helper) INSTALL_HELPER=0 ;;
+        --no-webrtc-native) INSTALL_WEBRTC_NATIVE=0 ;;
         --no-multiseat) INSTALL_MULTISEAT=0 ;;
         --no-meeting-detect) INSTALL_MEETING=0 ;;
         --helper-dir) shift; HELPER_DIR="${1:-}" ;;
@@ -210,6 +218,7 @@ say "  state:       $STATE_DIR"
 say "  runtime:     $RUNTIME_DIR"
 say "  supervisor:  $SUP_STATE_DIR $SUP_RUNTIME_DIR"
 say "  webrtc:      $([ "$INSTALL_HELPER" = "1" ] && echo "$HELPER_DIR/gst_webrtc_worker.py" || echo skipped)"
+say "  webrtc-rust: $([ "$INSTALL_WEBRTC_NATIVE" = "1" ] && echo "$BIN_DIR/ozma-webrtc-native (video-only)" || echo skipped)"
 say "  multiseat:   $([ "$INSTALL_MULTISEAT" = "1" ] && echo "$BIN_DIR/$MULTISEAT_BIN (if built) + ozma-multiseat.service" || echo skipped)"
 say "  meeting:     $([ "$INSTALL_MEETING" = "1" ] && echo "$BIN_DIR/$MEETING_BIN (if built; on demand, no unit)" || echo skipped)"
 say "  target:      $FROM_TARGET"
@@ -227,6 +236,19 @@ if [ "$DO_BUILD" = "1" ]; then
     say "Building release binaries (cargo ${BUILD_ARGS[*]})"
     run cargo "${BUILD_ARGS[@]}"
     FROM_TARGET="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/release"
+fi
+
+# The native helper lives in its own workspace/lockfile so webrtc-rs's
+# x25519-dalek requirement cannot disturb the root workspace graph.
+if [ "$INSTALL_WEBRTC_NATIVE" = "1" ]; then
+    NATIVE_TARGET="${CARGO_TARGET_DIR:-$REPO_ROOT/ozma-webrtc/target}/release"
+    if [ "$DO_BUILD" = "1" ]; then
+        command -v cargo >/dev/null 2>&1 || die "cargo is required for --build"
+        say "Building native WebRTC helper (cargo build --release --manifest-path ozma-webrtc/Cargo.toml)"
+        run cargo build --release --manifest-path "$REPO_ROOT/ozma-webrtc/Cargo.toml"
+    fi
+else
+    NATIVE_TARGET=""
 fi
 
 NODE_SRC="$FROM_TARGET/ozma-node"
@@ -290,6 +312,28 @@ if [ "$INSTALL_HELPER" = "1" ]; then
     say "Installing GStreamer WebRTC helper (Python 3 + GStreamer required at runtime)"
     install_file "$HELPER_SRC" "$HELPER_DIR/gst_webrtc_worker.py" 0644
     say "  pass it to a node with --webrtc-helper python3 --webrtc-helper-script $HELPER_DIR/gst_webrtc_worker.py"
+fi
+
+WEBRTC_NATIVE_INSTALLED=0
+if [ "$INSTALL_WEBRTC_NATIVE" = "1" ]; then
+    if [ -x "$FROM_TARGET/ozma-webrtc-native" ]; then
+        NATIVE_SRC="$FROM_TARGET/ozma-webrtc-native"
+    else
+        NATIVE_SRC="$NATIVE_TARGET/ozma-webrtc-native"
+    fi
+    say ""
+    say "Installing native Rust WebRTC helper (video-only, OpenH264; no Python/GStreamer)"
+    if [ "$DO_BUILD" = "1" ] && [ "$DRY_RUN" = "1" ]; then
+        # A dry-run build writes nothing; plan the install anyway.
+        install_file "$NATIVE_SRC" "$BIN_DIR/ozma-webrtc-native" 0755
+        WEBRTC_NATIVE_INSTALLED=1
+    elif [ -x "$NATIVE_SRC" ]; then
+        install_file "$NATIVE_SRC" "$BIN_DIR/ozma-webrtc-native" 0755
+        WEBRTC_NATIVE_INSTALLED=1
+        say "  select it with --webrtc-native (or OZMA_WEBRTC_NATIVE=true); audio is not implemented"
+    else
+        say "  skipped ozma-webrtc-native: no executable at $NATIVE_SRC (use --build, or --no-webrtc-native)"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -390,6 +434,11 @@ if [ "$MEETING_INSTALLED" = "1" ]; then
 else
     MEETING_HINT="Meeting detection is not installed in this pass."
 fi
+if [ "$WEBRTC_NATIVE_INSTALLED" = "1" ]; then
+    WEBRTC_NATIVE_HINT="or set OZMA_WEBRTC_NATIVE=true to use $BIN_DIR/ozma-webrtc-native (video-only)."
+else
+    WEBRTC_NATIVE_HINT="(the native helper was not installed in this pass)"
+fi
 if [ "$MODE" = "user" ]; then
     cat <<EOF
 Next steps (no sudo, no unit has been started):
@@ -404,7 +453,8 @@ $MULTISEAT_USER_HINT
        journalctl --user -u ozma-node@vm.service -f
 
 Optional WebRTC: set OZMA_WEBRTC_HELPER=python3 and
-OZMA_WEBRTC_HELPER_SCRIPT="$HELPER_DIR/gst_webrtc_worker.py" in the env file.
+OZMA_WEBRTC_HELPER_SCRIPT="$HELPER_DIR/gst_webrtc_worker.py" in the env file,
+$WEBRTC_NATIVE_HINT
 $MEETING_HINT
 Hardware access (video/input/uinput) still requires host udev/group setup.
 The Python softnode/node/agent trees are untouched and remain the rollback path.
@@ -420,6 +470,10 @@ Next steps (system layout; no unit has been started):
      systemctl enable --now ozma-node@hardware.service
      # or: systemctl enable --now ozma-virtual-node.service
 $MULTISEAT_SYSTEM_HINT
+
+Optional WebRTC: set OZMA_WEBRTC_HELPER=python3 and
+OZMA_WEBRTC_HELPER_SCRIPT="$HELPER_DIR/gst_webrtc_worker.py",
+$WEBRTC_NATIVE_HINT
 
 $MEETING_HINT
 The Python softnode/node/agent trees are untouched and remain the rollback path.

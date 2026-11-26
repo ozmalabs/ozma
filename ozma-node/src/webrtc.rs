@@ -45,6 +45,19 @@
 //! pipewire>`; the worker adds an Opus/`rtpopuspay` branch from that monitor
 //! only if the required GStreamer elements exist. Without it the helper argv
 //! and pipeline are unchanged, and video still runs if audio is unavailable.
+//!
+//! Two helpers implement this contract:
+//!
+//! * [`WebRtcBackend::External`] — the GStreamer/Python worker (or any other
+//!   program that speaks the protocol);
+//! * [`WebRtcBackend::Native`] — the sibling `ozma-webrtc-native` Rust binary.
+//!
+//! The native helper is **video-only**. It accepts the audio argv for
+//! compatibility but answers an offered Opus m-line `inactive`, so the node
+//! never reports native audio as configured or produced even when an audio
+//! source is supplied. Native selection is explicit (`--webrtc-native`,
+//! `OZMA_WEBRTC_NATIVE`, or `--webrtc-helper ozma-webrtc-native`); the node
+//! never silently substitutes it for a configured Python helper.
 
 use std::fmt;
 use std::io;
@@ -114,6 +127,39 @@ impl WebRtcAudioBackend {
     }
 }
 
+/// Which helper implementation serves the WebRTC stream.
+///
+/// The backend is selected explicitly by the operator; it is never inferred
+/// from a missing binary. The native helper is video-only and never claims
+/// audio capture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebRtcBackend {
+    /// The historical GStreamer/Python worker (or another explicit program).
+    #[default]
+    External,
+    /// The native Rust `ozma-webrtc-native` helper (video-only).
+    Native,
+}
+
+impl WebRtcBackend {
+    /// Status/JSON token for this backend.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::External => "external",
+            Self::Native => "native",
+        }
+    }
+
+    /// True when this helper cannot carry audio today.
+    pub fn is_video_only(self) -> bool {
+        self == Self::Native
+    }
+}
+
+/// Binary name of the native helper installed next to `ozma-node`.
+pub const NATIVE_HELPER_BIN: &str = "ozma-webrtc-native";
+
 /// Configuration for the external WebRTC helper.
 ///
 /// `helper_program` is required and has no default: WebRTC stays disabled
@@ -131,7 +177,12 @@ pub struct WebRtcConfig {
     /// Helper executable (for example `/usr/bin/python3`).
     pub helper_program: PathBuf,
     /// Optional first argument (for example `scripts/webrtc/gst_webrtc_worker.py`).
+    ///
+    /// Ignored for [`WebRtcBackend::Native`]: the native binary takes its flags
+    /// directly, with no script argument.
     pub helper_script: Option<PathBuf>,
+    /// Helper implementation selected by the operator.
+    pub backend: WebRtcBackend,
     /// Unix socket receiving newline-delimited signaling JSON.
     pub socket_path: PathBuf,
     /// Shared-memory file receiving packed BGRA frames.
@@ -184,6 +235,7 @@ impl fmt::Debug for WebRtcConfig {
             .debug_struct("WebRtcConfig")
             .field("helper_program", &self.helper_program)
             .field("helper_script", &self.helper_script)
+            .field("backend", &self.backend)
             .field("socket_path", &self.socket_path)
             .field("shm_path", &self.shm_path)
             .field("width", &self.width)
@@ -206,6 +258,19 @@ impl fmt::Debug for WebRtcConfig {
 }
 
 impl WebRtcConfig {
+    /// True when this configuration targets the native Rust helper.
+    pub fn is_native(&self) -> bool {
+        self.backend == WebRtcBackend::Native
+    }
+
+    /// Whether this helper can carry audio.
+    ///
+    /// The native helper is video-only even if audio flags were forwarded, so
+    /// configuration intent must not be reported as audio support.
+    pub fn audio_supported(&self) -> bool {
+        !self.backend.is_video_only()
+    }
+
     /// True when any ICE server was configured.
     ///
     /// This is configuration intent, not proof that a candidate was gathered.
@@ -425,6 +490,17 @@ pub enum WebRtcError {
     /// No helper was configured.
     #[error("WebRTC is not configured")]
     NotConfigured,
+    /// The explicitly selected native helper could not be located.
+    #[error(
+        "native WebRTC helper `{name}` was not found next to `{sibling}` or on PATH; \
+         install it with scripts/install-rust.sh or pass --webrtc-helper <path>"
+    )]
+    NativeHelperNotFound {
+        /// Expected binary name.
+        name: String,
+        /// Sibling directory that was searched.
+        sibling: PathBuf,
+    },
     /// A helper was configured but is not running.
     #[error("WebRTC helper is not running")]
     NotRunning,
@@ -458,6 +534,7 @@ struct WebRtcStatusInner {
     state: WebRtcState,
     error: Option<String>,
     helper_pid: Option<u32>,
+    backend: WebRtcBackend,
     audio_configured: bool,
     geometry: Option<WebRtcGeometryStatus>,
 }
@@ -527,17 +604,28 @@ impl WebRtcStatus {
 
     /// A configured helper could not be used.
     pub fn failed(message: impl Into<String>) -> Self {
-        let status = Self::starting();
+        Self::failed_with_backend(message, WebRtcBackend::External)
+    }
+
+    /// A configured helper of `backend` could not be used.
+    pub fn failed_with_backend(message: impl Into<String>, backend: WebRtcBackend) -> Self {
+        let status = Self::starting_with_backend(backend);
         status.set_failed(message);
         status
     }
 
+    #[cfg(test)]
     fn starting() -> Self {
+        Self::starting_with_backend(WebRtcBackend::External)
+    }
+
+    fn starting_with_backend(backend: WebRtcBackend) -> Self {
         Self {
             inner: Arc::new(Mutex::new(WebRtcStatusInner {
                 state: WebRtcState::Starting,
                 error: None,
                 helper_pid: None,
+                backend,
                 audio_configured: false,
                 geometry: None,
             })),
@@ -558,7 +646,8 @@ impl WebRtcStatus {
     }
 
     fn set_audio_configured(&self, configured: bool) {
-        self.lock().audio_configured = configured;
+        let mut inner = self.lock();
+        inner.audio_configured = configured && !inner.backend.is_video_only();
     }
 
     fn set_geometry(&self, geometry: WebRtcGeometryStatus) {
@@ -597,6 +686,11 @@ impl WebRtcStatus {
     /// Helper process id, when one was spawned.
     pub fn helper_pid(&self) -> Option<u32> {
         self.lock().helper_pid
+    }
+
+    /// Selected helper implementation.
+    pub fn backend(&self) -> WebRtcBackend {
+        self.lock().backend
     }
 
     /// Whether an audio source was configured and handed to the helper.
@@ -835,6 +929,8 @@ fn connect_with_timeout(
 /// Build the exact helper argument vector.
 ///
 /// The program is first, then the optional script, then the worker's flags.
+/// A native helper takes no script argument, so [`WebRtcConfig::helper_script`]
+/// is omitted for [`WebRtcBackend::Native`] even if it is set.
 /// Bitrate is intentionally not an argument: `gst_webrtc_worker.py` rejects
 /// unknown flags, so bitrate changes go through the signaling socket instead.
 /// Audio flags are appended only when [`WebRtcConfig::audio_source`] is set, so
@@ -842,8 +938,10 @@ fn connect_with_timeout(
 pub fn helper_argv(config: &WebRtcConfig) -> Vec<String> {
     let mut argv = Vec::with_capacity(15);
     argv.push(config.helper_program.display().to_string());
-    if let Some(script) = &config.helper_script {
-        argv.push(script.display().to_string());
+    if config.backend == WebRtcBackend::External {
+        if let Some(script) = &config.helper_script {
+            argv.push(script.display().to_string());
+        }
     }
     argv.push("--sock".to_owned());
     argv.push(config.socket_path.display().to_string());
@@ -874,6 +972,125 @@ pub fn helper_argv(config: &WebRtcConfig) -> Vec<String> {
         argv.push(config.turn_password.clone().unwrap_or_default());
     }
     argv
+}
+
+/// Explicit helper choice resolved from operator configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelperSelection {
+    /// Program to spawn.
+    pub program: PathBuf,
+    /// First argument, only for an external helper with a script.
+    pub script: Option<PathBuf>,
+    /// Reported helper implementation.
+    pub backend: WebRtcBackend,
+    /// True when a script was supplied but dropped because the helper is native.
+    pub script_ignored: bool,
+}
+
+/// True when `path` names the native helper binary.
+pub fn is_native_helper_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == NATIVE_HELPER_BIN)
+}
+
+/// Resolve the explicitly configured helper, including a bare native name.
+///
+/// Auto-detection happens **only** for the native helper and only after the
+/// operator selected it (`--webrtc-native`, its env variable, or
+/// `--webrtc-helper ozma-webrtc-native`). The Python worker is never inferred:
+/// no helper means `NotConfigured`.
+pub fn select_helper(
+    native: bool,
+    helper: Option<&Path>,
+    script: Option<&Path>,
+) -> Result<HelperSelection, WebRtcError> {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    select_helper_in(
+        native,
+        helper,
+        script,
+        sibling.as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+fn select_helper_in(
+    native: bool,
+    helper: Option<&Path>,
+    script: Option<&Path>,
+    sibling_dir: Option<&Path>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Result<HelperSelection, WebRtcError> {
+    if native {
+        let program = resolve_native_helper_in(helper, sibling_dir, path_var)?;
+        return Ok(HelperSelection {
+            program,
+            script: None,
+            backend: WebRtcBackend::Native,
+            script_ignored: script.is_some(),
+        });
+    }
+    let Some(helper) = helper else {
+        return Err(WebRtcError::NotConfigured);
+    };
+    if is_native_helper_name(helper) {
+        let program = resolve_native_helper_in(Some(helper), sibling_dir, path_var)?;
+        return Ok(HelperSelection {
+            program,
+            script: None,
+            backend: WebRtcBackend::Native,
+            script_ignored: script.is_some(),
+        });
+    }
+    Ok(HelperSelection {
+        program: helper.to_path_buf(),
+        script: script.map(Path::to_path_buf),
+        backend: WebRtcBackend::External,
+        script_ignored: false,
+    })
+}
+
+/// Resolve a native helper path against a sibling directory and `PATH`.
+///
+/// An explicit path with a directory component is honoured as-is. A bare name
+/// (or no name at all, which means [`NATIVE_HELPER_BIN`]) is searched next to
+/// the node binary first, then on `PATH`.
+pub fn resolve_native_helper_in(
+    explicit: Option<&Path>,
+    sibling_dir: Option<&Path>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, WebRtcError> {
+    if let Some(explicit) = explicit {
+        if explicit.is_absolute() || explicit.components().count() > 1 {
+            return Ok(explicit.to_path_buf());
+        }
+    }
+    let name = explicit
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(NATIVE_HELPER_BIN);
+    let searched_sibling = sibling_dir
+        .map(|directory| directory.join(name))
+        .unwrap_or_else(|| PathBuf::from(name));
+    if sibling_dir.is_some() && searched_sibling.is_file() {
+        return Ok(searched_sibling);
+    }
+    if let Some(path_var) = path_var {
+        for directory in std::env::split_paths(path_var) {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(WebRtcError::NativeHelperNotFound {
+        name: name.to_owned(),
+        sibling: searched_sibling,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -936,7 +1153,7 @@ impl WebRtcHelper {
             });
         }
 
-        let status = WebRtcStatus::starting();
+        let status = WebRtcStatus::starting_with_backend(config.backend);
         status.set_audio_configured(config.audio_source.is_some());
         status.set_geometry(WebRtcGeometryStatus::from_config(&config));
         let spawned = match spawner.spawn(&config) {
@@ -1230,7 +1447,21 @@ impl WebRtcControl {
     /// A configured helper that could not be started, retaining the configured
     /// audio monitor for `/api/v1/connection`.
     pub fn failed_with_audio(message: impl Into<String>, audio_source: Option<String>) -> Self {
-        Self::from_parts(WebRtcStatus::failed(message), None, audio_source)
+        Self::failed_with_audio_and_backend(message, audio_source, WebRtcBackend::External)
+    }
+
+    /// A configured helper of `backend` that could not be started, retaining
+    /// the configured audio monitor for `/api/v1/connection`.
+    pub fn failed_with_audio_and_backend(
+        message: impl Into<String>,
+        audio_source: Option<String>,
+        backend: WebRtcBackend,
+    ) -> Self {
+        Self::from_parts(
+            WebRtcStatus::failed_with_backend(message, backend),
+            None,
+            audio_source,
+        )
     }
 
     /// Status shared with `/api/v1/connection`.
@@ -1247,6 +1478,11 @@ impl WebRtcControl {
         self.lock().status.status_name()
     }
 
+    /// Selected helper implementation (`native` or `external`).
+    pub fn backend(&self) -> WebRtcBackend {
+        self.lock().status.backend()
+    }
+
     /// Why WebRTC is not running, when it is configured and failing.
     pub fn error(&self) -> Option<String> {
         self.lock().status.error()
@@ -1260,15 +1496,22 @@ impl WebRtcControl {
     /// Whether the helper was configured with an audio monitor source.
     pub fn audio_configured(&self) -> bool {
         let inner = self.lock();
-        inner.status.audio_configured() || inner.audio_source.is_some()
+        !inner.status.backend().is_video_only()
+            && (inner.status.audio_configured() || inner.audio_source.is_some())
     }
 
     /// The configured monitor source, when one was supplied.
     ///
     /// This is only the PulseAudio/PipeWire monitor name; it is not proof that
-    /// the worker opened the source or produced samples.
+    /// the worker opened the source or produced samples. The native helper is
+    /// video-only, so it reports `None` even when the argv carried an audio
+    /// source for compatibility.
     pub fn audio_source(&self) -> Option<String> {
-        self.lock().audio_source.clone()
+        let inner = self.lock();
+        if inner.status.backend().is_video_only() {
+            return None;
+        }
+        inner.audio_source.clone()
     }
 
     /// Replace the current helper after a successful restart.
@@ -1290,7 +1533,8 @@ impl WebRtcControl {
     /// typed failure so `/api/v1/connection` cannot imply a live stream.
     pub fn mark_failed(&self, message: impl Into<String>) {
         let mut inner = self.lock();
-        inner.status = WebRtcStatus::failed(message);
+        let backend = inner.status.backend();
+        inner.status = WebRtcStatus::failed_with_backend(message, backend);
         inner.helper = None;
     }
 
@@ -2195,6 +2439,7 @@ mod tests {
         WebRtcConfig {
             helper_program: PathBuf::from("/bin/true"),
             helper_script: None,
+            backend: WebRtcBackend::External,
             socket_path: directory.join("helper.sock"),
             shm_path: directory.join("frame.bgra"),
             width: 2,
@@ -2263,6 +2508,212 @@ mod tests {
         let argv = helper_argv(&config);
         assert_eq!(argv[0], "/usr/local/bin/ozma-webrtc-helper");
         assert_eq!(argv[1], "--sock");
+    }
+
+    #[test]
+    fn native_argv_omits_the_script_even_when_one_is_configured() {
+        let mut config = config("argv-native");
+        config.helper_program = PathBuf::from("/usr/local/bin/ozma-webrtc-native");
+        config.helper_script = Some(PathBuf::from("/opt/ozma/gst_webrtc_worker.py"));
+        config.backend = WebRtcBackend::Native;
+
+        let argv = helper_argv(&config);
+        assert_eq!(argv[0], "/usr/local/bin/ozma-webrtc-native");
+        assert_eq!(argv[1], "--sock");
+        assert!(
+            !argv.iter().any(|arg| arg.ends_with("gst_webrtc_worker.py")),
+            "native argv must not carry --webrtc-helper-script: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn helper_selection_keeps_the_external_script_and_defaults_to_not_configured() {
+        assert!(matches!(
+            select_helper_in(false, None, None, None, None),
+            Err(WebRtcError::NotConfigured)
+        ));
+
+        let selection = select_helper_in(
+            false,
+            Some(Path::new("/usr/bin/python3")),
+            Some(Path::new("/opt/ozma/gst_webrtc_worker.py")),
+            None,
+            None,
+        )
+        .expect("external helper selection");
+        assert_eq!(selection.backend, WebRtcBackend::External);
+        assert_eq!(selection.program, PathBuf::from("/usr/bin/python3"));
+        assert_eq!(
+            selection.script.as_deref(),
+            Some(Path::new("/opt/ozma/gst_webrtc_worker.py"))
+        );
+        assert!(!selection.script_ignored);
+    }
+
+    #[test]
+    fn native_selection_prefers_the_sibling_binary_and_drops_the_script() {
+        let sibling = temp_dir("native-sibling");
+        let binary = sibling.join(NATIVE_HELPER_BIN);
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let selection = select_helper_in(
+            true,
+            None,
+            Some(Path::new("/opt/ozma/gst_webrtc_worker.py")),
+            Some(&sibling),
+            None,
+        )
+        .expect("sibling native helper is found");
+        assert_eq!(selection.backend, WebRtcBackend::Native);
+        assert_eq!(selection.program, binary);
+        assert_eq!(selection.script, None);
+        assert!(selection.script_ignored);
+
+        // A bare `--webrtc-helper ozma-webrtc-native` selects the same backend
+        // without the native flag, because the operator named it explicitly.
+        let named = select_helper_in(
+            false,
+            Some(Path::new(NATIVE_HELPER_BIN)),
+            None,
+            Some(&sibling),
+            None,
+        )
+        .expect("named native helper is found");
+        assert_eq!(named.backend, WebRtcBackend::Native);
+        assert_eq!(named.program, binary);
+    }
+
+    #[test]
+    fn native_selection_uses_path_and_missing_is_typed() {
+        let directory = temp_dir("native-path");
+        let binary = directory.join(NATIVE_HELPER_BIN);
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        let path_var = std::ffi::OsString::from(directory.as_os_str());
+
+        let selection = select_helper_in(true, None, None, None, Some(&path_var))
+            .expect("PATH native helper is found");
+        assert_eq!(selection.program, binary);
+
+        let missing = select_helper_in(true, None, None, Some(Path::new("/nonexistent")), None);
+        assert!(
+            matches!(
+                missing,
+                Err(WebRtcError::NativeHelperNotFound { ref name, .. })
+                    if name == NATIVE_HELPER_BIN
+            ),
+            "expected a typed native-helper miss, got {missing:?}"
+        );
+
+        // An explicit absolute path is honoured without substitution.
+        let explicit = select_helper_in(
+            true,
+            Some(Path::new("/custom/bin/ozma-webrtc-native")),
+            None,
+            Some(&directory),
+            None,
+        )
+        .expect("explicit path is returned as configured");
+        assert_eq!(
+            explicit.program,
+            PathBuf::from("/custom/bin/ozma-webrtc-native")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_status_never_claims_audio() {
+        let mut config = config("native-audio");
+        config.helper_program = PathBuf::from("/fake/helper");
+        config.backend = WebRtcBackend::Native;
+        config.audio_source = Some("ozma-vm1.monitor".to_owned());
+        let spawner = Arc::new(RecordingSpawner::new(silent_signaler()));
+        let source = Box::new(PendingSource::new(FrameFormat::rgb24(2, 2)));
+        let helper =
+            WebRtcHelper::start_with_spawner(source, config, spawner).expect("fake helper starts");
+        let status = helper.status();
+        assert_eq!(status.backend(), WebRtcBackend::Native);
+        assert!(
+            !status.audio_configured(),
+            "the native helper is video-only even when argv carries an audio source"
+        );
+
+        let control = WebRtcControl::from_helper(helper);
+        assert_eq!(control.backend(), WebRtcBackend::Native);
+        assert!(!control.audio_configured());
+        assert_eq!(control.audio_source(), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_helper_lifecycle_spawns_a_real_binary_without_a_script() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = temp_dir("native-fake");
+        let binary = directory.join(NATIVE_HELPER_BIN);
+        let script = r#"#!/usr/bin/env python3
+import json, os, socket, sys
+args = sys.argv[1:]
+def value(name):
+    return args[args.index(name) + 1]
+sock = value("--sock")
+with open(sock + ".argv", "w") as handle:
+    json.dump(sys.argv, handle)
+try:
+    os.unlink(sock)
+except FileNotFoundError:
+    pass
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(sock)
+server.listen(1)
+conn, _ = server.accept()
+reader = conn.makefile("r")
+writer = conn.makefile("w")
+for line in reader:
+    message = json.loads(line)
+    if message.get("type") == "offer":
+        writer.write(json.dumps({"type": "answer", "sdp": "v=0 native fake",
+                                 "session": "native-1"}) + "\n")
+    elif message.get("type") == "bitrate":
+        writer.write(json.dumps({"ok": True, "bitrate": message.get("bitrate")}) + "\n")
+    writer.flush()
+"#;
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut config = config("native-fake-run");
+        config.helper_program = binary.clone();
+        config.helper_script = Some(PathBuf::from("/opt/ozma/gst_webrtc_worker.py"));
+        config.backend = WebRtcBackend::Native;
+        config.audio_source = Some("ozma-vm1.monitor".to_owned());
+        config.startup_timeout = Duration::from_secs(10);
+
+        let source = Box::new(PendingSource::new(FrameFormat::rgb24(2, 2)));
+        let mut helper = WebRtcHelper::start(source, config.clone()).expect("native fake starts");
+        assert_eq!(helper.status().status_name(), "running");
+        assert_eq!(helper.status().backend(), WebRtcBackend::Native);
+        assert!(helper.status().helper_pid().is_some());
+        assert!(!helper.status().audio_configured());
+
+        let answer = helper
+            .offer_answer("v=0 offer")
+            .await
+            .expect("offer answer");
+        assert_eq!(answer.sdp, "v=0 native fake");
+        assert_eq!(answer.session.as_deref(), Some("native-1"));
+        helper.set_bitrate(2_500).await.expect("bitrate ack");
+
+        let argv: Vec<String> = serde_json::from_str(
+            &std::fs::read_to_string(config.socket_path.with_extension("sock.argv"))
+                .expect("fake native helper recorded its argv"),
+        )
+        .expect("argv is JSON");
+        assert_eq!(argv[0], binary.display().to_string());
+        assert_eq!(argv[1], "--sock");
+        assert!(
+            !argv.iter().any(|arg| arg.ends_with("gst_webrtc_worker.py")),
+            "native helper must not receive a script argument: {argv:?}"
+        );
+
+        helper.stop().await.expect("native fake stops");
     }
 
     #[test]

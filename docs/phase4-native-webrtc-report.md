@@ -2,9 +2,10 @@
 
 **Scope:** replace the GStreamer/Python WebRTC helper with a standalone Rust
 binary that speaks the node's existing signaling protocol and streams a real
-OpenH264-encoded video track over `webrtc-rs`. This is a **prototype**, not the
-product default: `ozma-node` is unchanged and still spawns whatever
-`--webrtc-helper` names.
+OpenH264-encoded video track over `webrtc-rs`. This report covers the prototype.
+The opt-in node integration (`--webrtc-native`) is documented in
+`docs/phase4-native-webrtc-integration-report.md`; native remains non-default
+and video-only.
 
 **Result: PASS for the prototype.** A real GStreamer `webrtcbin` peer completed
 ICE and DTLS against the native helper and decoded **155 real H.264 frames at
@@ -276,25 +277,34 @@ needs GStreamer `gi` and a working `webrtcbin`.
 
 ## 5. Switching `ozma-node` to the native helper
 
-This is intentionally not wired into the product yet. To try it:
+The prototype originally required pointing the generic helper flag at the
+binary. This checkout now integrates it explicitly (see
+`docs/phase4-native-webrtc-integration-report.md`):
 
 ```bash
 cargo build --release --manifest-path ozma-webrtc/Cargo.toml
 ./target/release/ozma-node \
   ... \
-  --webrtc-helper "$PWD/ozma-webrtc/target/release/ozma-webrtc-native" \
+  --webrtc-native \
   --webrtc-width 1280 --webrtc-height 800 --webrtc-fps 15
 ```
 
-* Do **not** pass `--webrtc-helper-script`; the helper takes the flags directly.
-* `--webrtc-audio-source`/`--webrtc-audio-backend` are accepted but produce
-  video-only output (audio m-line answered `inactive`).
+* `--webrtc-native` / `OZMA_WEBRTC_NATIVE=true` selects the native backend.
+  Without an explicit `--webrtc-helper` it looks next to the node binary and
+  then on `PATH`; it is never substituted silently for a configured Python
+  helper.
+* `--webrtc-helper ozma-webrtc-native` also selects the native backend.
+* Do **not** pass `--webrtc-helper-script`; the node drops it for native and
+  spawns the binary with the same `--sock/--shm/--width/--height/--fps` argv.
+* `--webrtc-audio-source`/`--webrtc-audio-backend` are accepted for argv
+  compatibility but produce video-only output (audio m-line answered
+  `inactive`). `/api/v1/connection` reports `webrtc_backend: "native"` and
+  `webrtc_audio_configured: false`.
 * STUN/TURN flags are forwarded unchanged and are accepted by the native binary.
-* `--multi-console-webrtc` will also work at the process level (one helper per
-  derived socket/shm), but it has not been exercised live with two native
-  helpers.
-* Status reporting is unchanged: the node reports `running` once the socket is
-  connected. The native helper logs its own frame counters to stderr.
+* `--multi-console-webrtc` runs one native helper per derived socket/shm; the
+  per-console status now carries `backend: "native"`.
+* The node reports `running` once the socket is connected. The native helper
+  logs its own frame counters to stderr.
 
 The node's stop path drops the signaling socket and then `kill_on_drop`s the
 child; the native helper also supports SIGTERM/SIGINT and removes its socket and
@@ -326,8 +336,11 @@ pipeline tasks. The process test exercises that path directly.
 7. **Dependency isolation.** `webrtc` 0.11 is pinned in a separate lockfile
    because of the `x25519-dalek` conflict. Moving to a newer `webrtc`/`rtc`
    API may allow the crate to join the main workspace once that pin changes.
-8. **No product integration or commit.** No `ozma-node` source, parity matrix,
-   or plan status was changed, and nothing was committed.
+8. **Product integration is now opt-in.** `ozma-node` gained `--webrtc-native`
+   and `/api/v1/connection.webrtc_backend`; it remains non-default and video
+   only. Nothing was committed. See
+   `docs/phase4-native-webrtc-integration-report.md` for the integration test
+   and live evidence.
 
 ## 7. Cleanup
 

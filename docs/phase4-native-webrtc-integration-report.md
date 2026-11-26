@@ -1,0 +1,345 @@
+# Phase 4: native WebRTC helper integration report
+
+Date: 2026-11-26 (Australia/Sydney)
+Checkout: `/home/matt/ozma/ozma`
+HEAD: `5a339642a1f894143f3d9e04b74f81020e5d898e`
+Node binary: `target/debug/ozma-node` 0.1.0, built from this tree.
+Native helper: `ozma-webrtc/target/release/ozma-webrtc-native` 0.1.0.
+Peer: GStreamer `webrtcbin` 1.28.9 + `avdec_h264` via
+`scripts/gate2/webrtc-client.py`.
+
+## Verdict
+
+The native Rust helper is now an **explicit, opt-in backend** of `ozma-node`
+and the Rust installer. A node started with `--webrtc-native` spawned the
+native binary with the node's existing helper argv (no script), reported
+`webrtc_backend: "native"`, and streamed **242 decoded H.264 frames at
+640x480** to a real GStreamer peer. A second concurrent node reached
+**183 frames at 800x600**. An offered Opus m-line was answered `inactive` and
+decoded **0 audio buffers**; no audio was claimed.
+
+The external GStreamer/Python helper remains the default when the operator
+configures it. The node never substitutes the native binary for a configured
+Python helper, and no helper at all still reports `not-configured`.
+
+## 1. CLI and backend selection
+
+New flag:
+
+```text
+--webrtc-native        env OZMA_WEBRTC_NATIVE
+```
+
+Behaviour (`ozma-node/src/webrtc.rs::{select_helper,resolve_native_helper_in}`):
+
+| Configuration | Result |
+|---|---|
+| no `--webrtc-helper`, no `--webrtc-native` | `webrtc: "not-configured"`, no process |
+| `--webrtc-native`, no helper path | sibling `ozma-webrtc-native` next to the node binary, then `PATH` |
+| `--webrtc-native --webrtc-helper PATH` | `PATH` is spawned as configured; backend `native` |
+| `--webrtc-helper ozma-webrtc-native` | same native resolution, backend `native` |
+| `--webrtc-helper python3 --webrtc-helper-script worker.py` | external backend and script unchanged |
+| native selected but binary missing | typed `NativeHelperNotFound`; node stays up and reports `failed` + `native` |
+
+* Auto-detection happens **only** after explicit selection. There is no
+  implicit Python default and no silent native substitution.
+* `--webrtc-helper-script` is dropped for native with a warning. The helper is
+  spawned with the same argv the Python worker receives: `--sock`, `--shm`,
+  `--width`, `--height`, `--fps`, optional `--audio-source/--audio-backend`,
+  `--stun-server`, and `--turn-*`.
+* An explicit path containing a directory component is honoured as-is; a bare
+  name is searched next to the node and then on `PATH`.
+
+## 2. Status contract
+
+`/api/v1/connection` gained an additive field next to the existing token:
+
+```json
+{
+  "webrtc": "running",
+  "webrtc_backend": "native",
+  "webrtc_error": null,
+  "webrtc_audio_configured": false,
+  "webrtc_audio_source": null,
+  "webrtc_geometry": {"width": 640, "height": 480, "scale_to_fit": false, "fitted": false}
+}
+```
+
+* `webrtc` keeps its old `running`/`failed`/`not-configured` values.
+* `webrtc_backend` is `native`, `external`, or `not-configured`.
+* Native is video-only: `webrtc_audio_configured` is `false` and
+  `webrtc_audio_source` is `null` even when an audio source was passed on the
+  argv for compatibility. No sample, track, or negotiation is claimed.
+* Multi-console status carries `backend` per console and on the summary.
+  `--multi-console-webrtc` still derives one socket/shm per console and clones
+  the selected backend into each helper config.
+
+A failed native selection is honest rather than a false `not-configured`:
+
+```text
+webrtc = failed
+webrtc_backend = native
+webrtc_error = WebRTC unavailable: native WebRTC helper `ozma-webrtc-native`
+               was not found next to `/home/matt/ozma/ozma/target/debug/ozma-webrtc-native`
+               or on PATH; install it with scripts/install-rust.sh or pass
+               --webrtc-helper <path>
+```
+
+That exact state was observed on a node started before the sibling symlink was
+created.
+
+## 3. Packaging
+
+`scripts/install-rust.sh`:
+
+* Builds the native helper with
+  `cargo build --release --manifest-path ozma-webrtc/Cargo.toml`. The crate
+  remains outside the root workspace and keeps its own `Cargo.lock`; the root
+  workspace/lockfile is untouched.
+* Installs it as `<bin-dir>/ozma-webrtc-native` (next to `ozma-node`, which is
+  exactly where sibling detection looks).
+* Defaults to installing the helper; `--no-webrtc-native` opts out.
+  `--no-helper` still controls only the Python worker.
+* Dry-run evidence:
+
+  ```text
+  webrtc-rust: /tmp/opencode/ozma-install-check/bin/ozma-webrtc-native (video-only)
+  Building native WebRTC helper (cargo build --release --manifest-path .../ozma-webrtc/Cargo.toml)
+  DRY   install -m 0755 .../ozma-webrtc/target/release/ozma-webrtc-native .../bin/ozma-webrtc-native
+  ```
+
+  With `--no-webrtc-native`, the same run prints `webrtc-rust: skipped` and does
+  not invoke the helper build or install.
+* `scripts/systemd/env/ozma-node-vm.env.example`,
+  `scripts/systemd/env/ozma-node-desktop.env.example`, and
+  `scripts/systemd/README.md` document `OZMA_WEBRTC_NATIVE=true` and state that
+  native is video-only. Units are unchanged: the node reads the environment
+  file and spawns the helper itself.
+
+## 4. Tests
+
+Required commands:
+
+```text
+cargo test -p ozma-node --lib
+  -> 876 passed, 0 failed, 13 ignored
+
+cargo check -p ozma-node --all-targets
+  -> Finished (3 pre-existing ozma-pipewire warnings only)
+
+cargo test --manifest-path ozma-webrtc/Cargo.toml
+  -> 32 unit tests passed
+  -> tests/helper_lifecycle.rs: 1 passed
+
+rustfmt --check on every modified Rust file
+  -> clean
+```
+
+New node coverage:
+
+* `native_argv_omits_the_script_even_when_one_is_configured` — native argv
+  starts with `--sock` and never contains the worker script.
+* `helper_selection_keeps_the_external_script_and_defaults_to_not_configured` —
+  no helper stays `NotConfigured`; external keeps its script.
+* `native_selection_prefers_the_sibling_binary_and_drops_the_script` — sibling
+  resolution and `--webrtc-helper ozma-webrtc-native` both choose `Native`.
+* `native_selection_uses_path_and_missing_is_typed` — `PATH` fallback, explicit
+  absolute path passthrough, and `NativeHelperNotFound`.
+* `native_status_never_claims_audio` — native status/control are video-only even
+  with `audio_source: Some(...)`.
+* `native_helper_lifecycle_spawns_a_real_binary_without_a_script` — a real
+  executable named `ozma-webrtc-native` is spawned through the production
+  `SystemHelperSpawner`; the test asserts the recorded argv has no script,
+  `running`/`native` status, a real pid, an offer answer, a bitrate ack, and a
+  clean stop.
+* `connection_reports_native_backend_without_claiming_audio` — the connection
+  document reports `webrtc_backend: "native"`, `webrtc_audio_configured: false`,
+  and no audio source.
+* `native_per_console_config_never_claims_audio` — per-console `ControllerWebRtcFactory`
+  keeps the native backend, drops audio claims, and still retains the source on
+  the helper config for argv compatibility.
+
+## 5. Live evidence
+
+### 5.1 Node + native helper + GStreamer peer, 640x480
+
+Node (deterministic fake capture source, explicitly selected native backend):
+
+```bash
+./target/debug/ozma-node --name native-live --profile vm \
+  --capture-provider fake --fake-width 640 --fake-height 480 --fake-fps 30 \
+  --http-port 7392 --hid-udp-port 7391 --cap hid,video \
+  --webrtc-native --webrtc-width 640 --webrtc-height 480 --webrtc-fps 30 \
+  --webrtc-socket /tmp/opencode/native-live/signal.sock \
+  --webrtc-shm /tmp/opencode/native-live/frame.bgra
+```
+
+Node log (`/api/v1/connection` agreed):
+
+```text
+INFO ozma_node: WebRTC helper started pid=Some(1344126)
+  socket=/tmp/opencode/native-live/signal.sock shm=/tmp/opencode/native-live/frame.bgra
+  width=640 height=480 fps=30 backend="native" audio=None
+```
+
+Process argv (no script):
+
+```text
+/home/matt/ozma/ozma/target/debug/ozma-webrtc-native
+  --sock /tmp/opencode/native-live/signal.sock
+  --shm /tmp/opencode/native-live/frame.bgra
+  --width 640 --height 480 --fps 30
+```
+
+Peer:
+
+```bash
+python3 scripts/gate2/webrtc-client.py \
+  --node-url http://127.0.0.1:7392 --duration 8 --bitrate 2500000
+```
+
+Exact decoded result:
+
+```json
+{
+  "ok": true,
+  "connection_state": "connected",
+  "ice_connection_state": "completed",
+  "answer_candidates": 6,
+  "media": {
+    "video": {
+      "buffers": 242,
+      "bytes": 111513600,
+      "caps": "video/x-raw, format=(string)I420, width=(int)640, height=(int)480, interlace-mode=(string)progressive, pixel-aspect-ratio=(fraction)1/1, chroma-site=(string)mpeg2, colorimetry=(string)bt601, framerate=(fraction)0/1"
+    },
+    "audio": {"buffers": 0, "bytes": 0, "caps": null}
+  },
+  "bitrate": {"ok": true, "body": {"bitrate": 2500000, "ok": true}}
+}
+```
+
+The helper's answer carried a single video m-line:
+
+```text
+m=video 9 UDP/TLS/RTP/SAVPF 96
+a=mid:video0
+a=rtpmap:96 H264/90000
+a=sendonly
+```
+
+### 5.2 Offered Opus audio stays inactive
+
+Same node, peer run with `--audio`:
+
+```text
+m=video 9 UDP/TLS/RTP/SAVPF 96
+a=mid:video0
+a=sendonly
+m=audio 9 UDP/TLS/RTP/SAVPF 97
+a=mid:audio1
+a=rtpmap:97 OPUS/48000
+a=inactive
+```
+
+```json
+{
+  "ok": true,
+  "connection_state": "connected",
+  "video_buffers": 153,
+  "video_caps": "I420 640x480",
+  "audio_buffers": 0,
+  "audio_caps": null
+}
+```
+
+This proves the m-line shape is accepted by a BUNDLE peer while native audio
+remains honestly unimplemented.
+
+### 5.3 Two concurrent native helpers
+
+A second node used the bare native name and a different geometry:
+
+```bash
+./target/debug/ozma-node --name native-live-2 --profile vm \
+  --capture-provider fake --fake-width 800 --fake-height 600 --fake-fps 30 \
+  --http-port 7393 --hid-udp-port 7394 --cap hid,video \
+  --webrtc-helper ozma-webrtc-native \
+  --webrtc-width 800 --webrtc-height 600 --webrtc-fps 30 \
+  --webrtc-socket /tmp/opencode/native-live/signal2.sock \
+  --webrtc-shm /tmp/opencode/native-live/frame2.bgra
+```
+
+Both nodes reported `running`/`native`, each with its own helper pid, socket,
+and shm (`1,228,800` bytes = 640*480*4 and `1,920,000` bytes = 800*600*4).
+Two peers ran concurrently:
+
+```text
+node 7392 (640x480): ok=true, connected, ICE completed, 181 video buffers, I420 640x480
+node 7393 (800x600): ok=true, connected, ICE completed, 183 video buffers, I420 800x600
+```
+
+This is two independent node/helper processes, not the D-Bus per-console
+manager. The per-console manager requires independently capturable D-Bus
+consoles, which the fake provider does not expose; its native config/status is
+covered by unit tests and clones the same backend into every helper.
+
+### 5.4 Environment-variable selection
+
+`OZMA_WEBRTC_NATIVE=true` with no `--webrtc-native` spawned the sibling helper
+and reported `webrtc: running`, `webrtc_backend: native`,
+`webrtc_audio_configured: false`. A deliberate 320x240 capture with the default
+640x480 helper produced the existing typed dimension failure while still
+reporting `webrtc_backend: native`.
+
+## 6. Cleanup
+
+* Both nodes received SIGTERM, logged `shutdown requested` and
+  `Ozma node shutting down`, and exited.
+* Both native helpers exited with their parent. No `ozma-node` or
+  `ozma-webrtc-native` process remains.
+* Both Unix sockets and shm files were removed; no listeners remain on
+  7392/7393.
+* The temporary `target/debug/ozma-webrtc-native` sibling symlink was removed.
+* No QEMU VM was needed for these runs; the deterministic fake capture source
+  wrote real frames to the node's shm. No audio was produced or claimed.
+
+## 7. Remaining gaps
+
+1. **Native audio is not implemented.** Opus is answered `inactive`; the node
+   reports no audio configuration or samples for native. A real native audio
+   track still needs an encoder and a monitor/source path.
+2. **`--multi-console-webrtc` was not exercised live with two D-Bus consoles**
+   on this host. The manager clones the backend and derives per-console
+   socket/shm paths; only config/status unit tests and two independent helper
+   processes were validated here.
+3. **TURN is still not live-verified** for the native helper (host/STUN paths
+   were exercised in the prototype report).
+4. **No browser matrix** was rerun; the live peer is GStreamer. The inactive
+   Opus shape is designed for browsers but not browser-tested in this pass.
+5. **The checkout was not frozen.** It contains pre-existing parallel edits
+   outside this task (controller, ozma-api, other crates); only the files listed
+   below were changed here. Nothing was committed.
+6. **Static SDP H.264 profile-level-id**, single video track, and no
+   RTX/RTCP-stat assertion remain as documented in the prototype report.
+
+## 8. Files changed by this integration
+
+```text
+ozma-node/src/webrtc.rs              backend enum, selection, argv/status
+ozma-node/src/multi_webrtc.rs        per-console backend/status, no native audio
+ozma-node/src/main.rs                --webrtc-native, selection, logging
+ozma-node/src/controller_compat.rs   connection.webrtc_backend
+ozma-node/tests/parity.rs            new config field
+scripts/install-rust.sh              optional native build/install
+scripts/systemd/README.md            installer/unit docs
+scripts/systemd/ozma-node@.service   native opt-in comment
+scripts/systemd/ozma-node-vm@.service native opt-in comment
+scripts/systemd/env/*.env.example    native opt-in examples
+ozma-webrtc/README.md                explicit native selection
+docs/phase4-native-webrtc-report.md  integration pointer
+docs/phase4-native-webrtc-integration-report.md  this report
+```
+
+`docs/parity-matrix.md`, `docs/plan-execution-status.md`, `ozma-usb`,
+`ozma-mesh`, `ozma-multiseat`, `ozma-audio`, `ozma-softnode`, and the Python
+controller were not edited.

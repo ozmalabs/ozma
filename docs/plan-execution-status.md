@@ -182,6 +182,7 @@ also never touch a real UDC, ConfigFS mount, or block device.
 | VNC authentication | Resolved (software) | Opt-in RFB type 2, DES known-answer tested, constant-time compare, redacted/zeroized key, one attempt; non-loopback requires password or explicit override; max clients/idle timeout. No TLS. See [`phase4-vnc-server-report.md`](phase4-vnc-server-report.md). |
 | CI / release / container gate | Resolved (assets + gate) | Blocking Rust workspace gate, optional legacy Python jobs, Rust binary/helper release assets, controller-only image, Rust-first Makefile. `--container --full` passed at `08393e7` (2469/0/42); `--host` 22/0/0. See [`phase4-ci-release-report.md`](phase4-ci-release-report.md), [`phase4-container-gate-report.md`](phase4-container-gate-report.md). |
 | WebRTC modeset robustness | Resolved (live) | Settled-head probe (default 4000 ms, `--webrtc-settle-ms` 0–5 s, 8 s bound), last-size fallback, modeset scaling, and `webrtc_geometry`. Live at `7b9c0a1`: both nodes native 1280x800 `settled=true`, two direct peers + proxy connected/ICE completed, ~350 buffers each. Per-console audio template `{console}` wired per helper with bounded validation. See [`phase4-multiconsole-webrtc-audio-report.md`](phase4-multiconsole-webrtc-audio-report.md). |
+| Native Rust WebRTC helper | Partial (interop green) | `ozma-webrtc` speaks the helper protocol, reads BGRA shm, encodes H.264/OpenH264, uses webrtc-rs ICE/DTLS/SRTP, bounded drop-newest, clean shutdown. GStreamer peers decoded 120–242 frames at 640×480 (host/STUN, Opus inactive). `--webrtc-native`, `webrtc_backend` status, installer build/install with opt-out. No native audio/TURN live/browser matrix. See [`phase4-native-webrtc-integration-report.md`](phase4-native-webrtc-integration-report.md). |
 
 Verification added by this work:
 
@@ -264,7 +265,7 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # 3208 passed, 71 ignored (current)
+cargo test --workspace                                   # 3217 passed, 71 ignored (current)
 cargo test -p ozma-node --test parity                    # Python/controller parity baseline (16)
 cargo test -p ozma-node --lib                            # node API, compat, session unit tests (136, 2 ignored)
 cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)
