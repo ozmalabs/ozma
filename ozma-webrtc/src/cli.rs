@@ -10,29 +10,22 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
-/// Audio capture backend token accepted for compatibility with the GStreamer
-/// worker. Native audio is not implemented yet; the flag is parsed and
-/// reported rather than rejected so the node's argv keeps working.
+/// Audio capture backend token shared with the GStreamer worker.
+///
+/// `auto` tries the native PipeWire stream first and falls back to Pulse. The
+/// explicit tokens never use the other backend. Pulse capture uses `parec`
+/// (the PulseAudio/PipeWire compatibility server), always with an explicit
+/// device name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum AudioBackend {
-    /// Prefer PulseAudio, fall back to PipeWire (compatibility token).
+    /// Prefer native PipeWire capture, fall back to PulseAudio.
     #[default]
     Auto,
-    /// PulseAudio (compatibility token).
+    /// PulseAudio via `parec`.
     Pulse,
-    /// PipeWire (compatibility token).
+    /// Native PipeWire capture.
     #[value(name = "pipewire")]
     PipeWire,
-}
-
-impl AudioBackend {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Pulse => "pulse",
-            Self::PipeWire => "pipewire",
-        }
-    }
 }
 
 /// Native WebRTC helper speaking the node's Unix-socket protocol.
@@ -86,12 +79,14 @@ pub struct Args {
     #[arg(long)]
     pub turn_password: Option<String>,
 
-    /// PulseAudio/PipeWire monitor source accepted for compatibility. Native
-    /// audio is not implemented in this prototype; video is unaffected.
+    /// Opt-in audio source: a PipeWire object/monitor name, `object:<name>`,
+    /// `monitor:<sink>`, `node:<id>`, or an explicit `default`. Without this
+    /// flag the helper is video-only and an offered Opus m-line stays inactive.
     #[arg(long)]
     pub audio_source: Option<String>,
 
-    /// Audio capture backend accepted for compatibility; ignored.
+    /// Audio capture backend: `auto` (PipeWire, then Pulse), `pipewire`, or
+    /// `pulse`. Only meaningful with `--audio-source`.
     #[arg(long, value_enum, default_value_t = AudioBackend::Auto)]
     pub audio_backend: AudioBackend,
 

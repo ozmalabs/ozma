@@ -14,6 +14,7 @@
 //! OpenH264 encodes the frames as a real H.264 track. This is a prototype, not
 //! the product default; see `docs/phase4-native-webrtc-report.md`.
 
+mod audio;
 mod cli;
 mod encoder;
 mod sdp;
@@ -28,6 +29,7 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::audio::AudioConfig;
 use crate::cli::Args;
 use crate::server::{ice_servers, NativeHelper, ServerConfig, VideoConfig};
 
@@ -43,14 +45,6 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     if let Err(message) = args.validate() {
         anyhow::bail!("invalid configuration: {message}");
-    }
-
-    if args.audio_source.is_some() {
-        warn!(
-            source = args.audio_source.as_deref().unwrap_or_default(),
-            backend = args.audio_backend.as_str(),
-            "native audio is not implemented; streaming video only (the offered audio m-line is answered inactive)"
-        );
     }
 
     let servers = ice_servers(
@@ -78,12 +72,17 @@ async fn main() -> anyhow::Result<()> {
             fps: args.fps,
             bitrate_kbps: encoder::clamp_bitrate_bps(u64::from(args.bitrate) * 1_000) / 1_000,
         },
+        audio: args.audio_source.as_ref().map(|source| AudioConfig {
+            source: source.clone(),
+            backend: args.audio_backend,
+        }),
         ice_servers: servers,
         gather_timeout: std::time::Duration::from_secs(args.gather_timeout_seconds),
         max_sessions: args.max_sessions,
     };
 
     let helper = NativeHelper::new(config)
+        .await
         .map_err(|message| anyhow::anyhow!("could not start the native helper: {message}"))?;
 
     let shutdown = Arc::new(Notify::new());

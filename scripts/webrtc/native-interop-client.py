@@ -6,15 +6,17 @@ This is a real GStreamer ``webrtcbin`` receive-only peer, not a probe. It:
 
 1. writes an animated packed-BGRA test pattern to the same shared-memory file
    the node writes (atomic temp-file + rename, like the Rust node);
-2. creates a receive-only H.264 offer and gathers ICE candidates;
+2. creates a receive-only H.264 offer and, with ``--audio``, a receive-only
+   Opus m-line, then gathers ICE candidates;
 3. sends ``{"type":"offer",...}`` over the helper's Unix socket;
 4. applies the answer and its candidates, then adds one of its own candidates
    through ``add-ice-candidate`` to exercise the trickle path;
-5. counts decoded I420 buffers and records their caps;
+5. counts decoded I420 buffers and Opus packets/decoded PCM buffers;
 6. asks for a 2.5 Mbps bitrate over signaling and checks the ack.
 
-Exit 0 only when ICE/DTLS connected, at least ``--min-frames`` decoded buffers
-arrived, and the decoded width/height match ``--width``/``--height``.
+Exit 0 only when ICE/DTLS connected, at least ``--min-frames`` decoded video
+buffers arrived at the expected dimensions, and (when ``--audio`` is used with
+a non-zero ``--min-audio-frames``) the Opus branch decoded that many frames.
 
 Usage:
   python3 scripts/webrtc/native-interop-client.py \
@@ -239,7 +241,10 @@ def state_name(enum, value) -> str:
 class Client:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.media = {"video": {"buffers": 0, "bytes": 0, "caps": None}}
+        self.media = {
+            "video": {"buffers": 0, "bytes": 0, "caps": None},
+            "audio": {"packets": 0, "packet_bytes": 0, "buffers": 0, "bytes": 0, "caps": None},
+        }
         self.elements: list[Gst.Element] = []
         self.connection_state = None
         self.ice_connection_state = None
@@ -418,8 +423,60 @@ class Client:
             if element.get_parent() is self.pipeline:
                 element.sync_state_with_parent()
 
+    def attach_audio(self, pad) -> None:
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        text = caps.to_string() if caps else ""
+        if "OPUS" not in text.upper():
+            return
+        src_pad = pad
+        for factory in ("rtpopusdepay", "identity", "opusdec", "audioconvert"):
+            element = Gst.ElementFactory.make(factory, None)
+            if element is None:
+                print(f"missing GStreamer element {factory}", file=sys.stderr)
+                return
+            if factory == "identity":
+                # Count the real Opus packets handed to the decoder.
+                element.set_property("signal-handoffs", True)
+
+                def on_packet(_identity, buffer):
+                    entry = self.media["audio"]
+                    entry["packets"] += 1
+                    entry["packet_bytes"] += buffer.get_size()
+
+                element.connect("handoff", on_packet)
+            self.pipeline.add(element)
+            self.elements.append(element)
+            if src_pad.link(element.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+                print(f"could not link Opus chain at {factory}", file=sys.stderr)
+                return
+            src_pad = element.get_static_pad("src")
+
+        sink = Gst.ElementFactory.make("fakesink", "audio-sink")
+        sink.set_property("sync", False)
+        sink.set_property("signal-handoffs", True)
+        self.pipeline.add(sink)
+        self.elements.append(sink)
+        if src_pad.link(sink.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+            print("could not link the Opus chain to fakesink", file=sys.stderr)
+            return
+
+        def on_buffer(_sink, buffer, _pad):
+            entry = self.media["audio"]
+            entry["buffers"] += 1
+            entry["bytes"] += buffer.get_size()
+            if entry["caps"] is None:
+                sink_pad = _sink.get_static_pad("sink")
+                current = sink_pad.get_current_caps()
+                entry["caps"] = current.to_string() if current else None
+
+        sink.connect("handoff", on_buffer)
+        for element in self.elements:
+            if element.get_parent() is self.pipeline:
+                element.sync_state_with_parent()
+
     def on_pad_added(self, _webrtc, pad) -> None:
         self.attach_video(pad)
+        self.attach_audio(pad)
 
     # -- state -----------------------------------------------------------
 
@@ -505,11 +562,21 @@ class Client:
 
         width, height = self.decoded_dimensions()
         buffers = self.media["video"]["buffers"]
+        audio = self.media["audio"]
         dimensions_ok = width == self.args.width and height == self.args.height
+        audio_ok = (
+            not self.args.audio
+            or self.args.min_audio_frames == 0
+            or (
+                audio["packets"] > 0
+                and audio["buffers"] >= self.args.min_audio_frames
+            )
+        )
         ok = (
             self.failure is None
             and buffers >= self.args.min_frames
             and dimensions_ok
+            and audio_ok
             and (self.trickle_ack or {}).get("ok") is True
         )
         summary = {
@@ -530,6 +597,8 @@ class Client:
                 GstWebRTC.WebRTCICEGatheringState, self.ice_gathering_state
             ),
             "decoded_video": self.media["video"],
+            "decoded_audio": self.media["audio"],
+            "min_audio_frames": self.args.min_audio_frames,
             "expected_dimensions": [self.args.width, self.args.height],
             "decoded_dimensions": [width, height],
             "trickle": self.trickle_ack,
@@ -559,7 +628,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--audio",
         action="store_true",
-        help="also offer a recvonly Opus m-line (the native helper answers it inactive)",
+        help="also offer and decode a recvonly Opus m-line",
+    )
+    parser.add_argument(
+        "--min-audio-frames",
+        type=int,
+        default=0,
+        help="require at least this many decoded audio frames (with --audio)",
     )
     parser.add_argument(
         "--audio-pt",

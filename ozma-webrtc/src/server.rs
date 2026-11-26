@@ -35,8 +35,10 @@ use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
 use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
+use crate::audio::{opus_capability, AudioConfig, AudioPeerGuard, AudioStream};
 use crate::encoder::BgraEncoder;
 use crate::sdp::{
     append_ice_candidates, candidate_type_counts, offered_payload_type, remote_ice_candidates,
@@ -62,6 +64,8 @@ pub struct VideoConfig {
 pub struct ServerConfig {
     pub socket_path: PathBuf,
     pub video: VideoConfig,
+    /// Optional native Opus capture; `None` keeps the helper video-only.
+    pub audio: Option<AudioConfig>,
     pub ice_servers: Vec<RTCIceServer>,
     pub gather_timeout: Duration,
     pub max_sessions: usize,
@@ -397,12 +401,14 @@ fn run_encoder(
 struct SessionEntry {
     pc: Arc<RTCPeerConnection>,
     _peer: PeerGuard,
+    _audio_peer: Option<AudioPeerGuard>,
 }
 
 /// The signaling server and its global session table.
 pub struct NativeHelper {
     config: ServerConfig,
     video: Arc<VideoStream>,
+    audio: Option<Arc<AudioStream>>,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
 }
 
@@ -421,8 +427,6 @@ fn h264_capability() -> RTCRtpCodecCapability {
     }
 }
 
-/// Opus is registered only so an offered audio m-line can be answered
-/// `inactive` with a valid mid/rtpmap. Native audio capture is not implemented.
 /// True for an IPv6 link-local candidate (`fe80::/10`).
 ///
 /// `webrtc-rs` can emit these even when the host refuses to bind the
@@ -437,23 +441,56 @@ fn is_link_local_candidate(candidate: &str) -> bool {
         .is_some_and(|address| address.to_ascii_lowercase().starts_with("fe80:"))
 }
 
-fn opus_capability() -> RTCRtpCodecCapability {
-    RTCRtpCodecCapability {
-        mime_type: "audio/OPUS".to_owned(),
-        clock_rate: 48_000,
-        channels: 2,
-        sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
-        rtcp_feedback: vec![],
-    }
+/// The audio m-line direction for one offer.
+///
+/// `None` means the offer had no Opus m-line, so there is nothing to answer.
+/// With an Opus offer and a live capture source the helper sends audio
+/// (`sendonly`); without one it stays `inactive` exactly as the video-only
+/// helper did.
+fn audio_answer_direction(
+    audio_enabled: bool,
+    offered_opus_pt: Option<u8>,
+) -> Option<RTCRtpTransceiverDirection> {
+    offered_opus_pt.map(|_| {
+        if audio_enabled {
+            RTCRtpTransceiverDirection::Sendonly
+        } else {
+            RTCRtpTransceiverDirection::Inactive
+        }
+    })
 }
 
 impl NativeHelper {
-    /// Build the shared video pipeline.
-    pub fn new(config: ServerConfig) -> Result<Arc<Self>, String> {
+    /// Build the shared video pipeline and, when configured, the Opus stream.
+    ///
+    /// A configured audio source that cannot open does not take video down; it
+    /// is logged and the helper continues video-only with an `inactive` audio
+    /// m-line. This mirrors the external worker's documented degradation.
+    pub async fn new(config: ServerConfig) -> Result<Arc<Self>, String> {
         let video = VideoStream::start(config.video.clone())?;
+        let audio = match config.audio.clone() {
+            Some(audio_config) => match AudioStream::start(audio_config).await {
+                Ok(audio) => {
+                    info!(
+                        source = audio.description(),
+                        "native Opus audio track configured"
+                    );
+                    Some(audio)
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "could not start native audio; continuing video-only with an inactive audio m-line"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
         Ok(Arc::new(Self {
             config,
             video,
+            audio,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }))
     }
@@ -490,6 +527,7 @@ impl NativeHelper {
             width = self.config.video.width,
             height = self.config.video.height,
             fps = self.config.video.fps,
+            audio = self.audio.as_ref().map(|audio| audio.description()).unwrap_or("off"),
             "native WebRTC helper ready"
         );
 
@@ -516,6 +554,10 @@ impl NativeHelper {
         info!("shutting down native WebRTC helper");
         self.close_all_sessions().await;
         self.video.shutdown().await;
+        if let Some(audio) = &self.audio {
+            audio.shutdown().await;
+            info!(stats = %audio.stats_snapshot(), "final audio pipeline counters");
+        }
         info!(stats = %self.video.stats_snapshot(), "final pipeline counters");
         let _ = std::fs::remove_file(&self.config.socket_path);
         Ok(())
@@ -601,6 +643,7 @@ impl NativeHelper {
         // advertises, which GStreamer receivers require.
         let offered_pt = offered_payload_type(offer_sdp, "video", "H264").unwrap_or(96);
         let offered_audio_pt = offered_payload_type(offer_sdp, "audio", "OPUS");
+        let audio_direction = audio_answer_direction(self.audio.is_some(), offered_audio_pt);
         let mut media_engine = MediaEngine::default();
         media_engine
             .register_codec(
@@ -695,10 +738,28 @@ impl NativeHelper {
             .map_err(|error| format!("could not attach the video track: {error}"))?;
 
         // An offered Opus m-line gets a real transceiver so the answer carries
-        // its mid and is answered `inactive`. Without this webrtc-rs emits a
-        // bare rejected m-line with no mid, which breaks a BUNDLE answer for
-        // GStreamer peers that offered audio.
-        let audio_transceiver = match offered_audio_pt {
+        // its mid. With a live capture source it carries the shared Opus
+        // track (`sendonly`); otherwise it stays `inactive` as before.
+        // Without a transceiver webrtc-rs emits a bare rejected m-line with no
+        // mid, which breaks a BUNDLE answer for GStreamer peers offering audio.
+        let audio_transceiver = match audio_direction {
+            Some(RTCRtpTransceiverDirection::Sendonly) => {
+                let audio = self
+                    .audio
+                    .as_ref()
+                    .ok_or_else(|| "audio direction was sendonly without a source".to_owned())?;
+                Some(
+                    pc.add_transceiver_from_track(
+                        audio.track(),
+                        Some(RTCRtpTransceiverInit {
+                            direction: RTCRtpTransceiverDirection::Sendonly,
+                            send_encodings: Vec::new(),
+                        }),
+                    )
+                    .await
+                    .map_err(|error| format!("could not attach the audio track: {error}"))?,
+                )
+            }
             Some(_) => Some(
                 pc.add_transceiver_from_kind(RTPCodecType::Audio, None)
                     .await
@@ -713,10 +774,9 @@ impl NativeHelper {
         pc.set_remote_description(offer)
             .await
             .map_err(|error| format!("could not apply the offer: {error}"))?;
-        if let Some(audio) = audio_transceiver {
-            // Video-only helper: never send or receive native audio.
+        if let Some(audio) = &audio_transceiver {
             audio
-                .set_direction(RTCRtpTransceiverDirection::Inactive)
+                .set_direction(audio_direction.unwrap_or(RTCRtpTransceiverDirection::Inactive))
                 .await;
         }
 
@@ -775,6 +835,11 @@ impl NativeHelper {
         };
 
         let peer = self.video.peer_guard();
+        let audio_peer = if audio_direction == Some(RTCRtpTransceiverDirection::Sendonly) {
+            self.audio.as_ref().map(|audio| audio.peer_guard())
+        } else {
+            None
+        };
         self.sessions
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -783,6 +848,7 @@ impl NativeHelper {
                 SessionEntry {
                     pc: pc.clone(),
                     _peer: peer,
+                    _audio_peer: audio_peer,
                 },
             );
         info!(
@@ -790,6 +856,7 @@ impl NativeHelper {
             width = self.config.video.width,
             height = self.config.video.height,
             fps = self.config.video.fps,
+            audio = ?audio_direction,
             ice_candidates = candidates.len(),
             ice_types = %type_summary,
             remote_candidates,
@@ -938,5 +1005,35 @@ mod tests {
     #[test]
     fn invalid_ice_server_is_a_startup_error() {
         assert!(ice_servers(Some("turn:host:3478"), None, None, None).is_err());
+    }
+
+    #[test]
+    fn audio_answer_is_sendonly_only_with_a_source_and_offered_opus() {
+        assert_eq!(
+            audio_answer_direction(true, Some(111)),
+            Some(RTCRtpTransceiverDirection::Sendonly)
+        );
+        assert_eq!(
+            audio_answer_direction(false, Some(111)),
+            Some(RTCRtpTransceiverDirection::Inactive)
+        );
+        assert_eq!(audio_answer_direction(true, None), None);
+        assert_eq!(audio_answer_direction(false, None), None);
+    }
+
+    #[test]
+    fn offered_opus_payload_type_is_reused_for_the_track() {
+        let offer = "v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=rtpmap:96 H264/90000\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 97 111\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=rtpmap:97 telephone-event/48000\r\n";
+        assert_eq!(offered_payload_type(offer, "audio", "OPUS"), Some(111));
+        assert_eq!(offered_payload_type(offer, "video", "H264"), Some(96));
+        let capability = opus_capability();
+        assert_eq!(capability.mime_type, "audio/opus");
+        assert_eq!(capability.clock_rate, 48_000);
+        assert_eq!(capability.channels, 2);
     }
 }

@@ -30,6 +30,8 @@ uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 libc = "0.2"
 openh264 = "0.9"
+audiopus = "0.3.0-rc.0"
+ozma-pipewire = { path = "../ozma-pipewire" }
 
 [dev-dependencies]
 tempfile = "3"
