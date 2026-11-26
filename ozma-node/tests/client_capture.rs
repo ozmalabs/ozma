@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{header, Request, StatusCode};
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -231,6 +232,16 @@ fn capture_router(backend: &Arc<SessionBackend>) -> (axum::Router, Arc<dyn Clien
     )
 }
 
+fn local_session_request(uri: String) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(header::HOST, "127.0.0.1:3000")
+        .header(header::ORIGIN, "http://127.0.0.1:3000")
+        .extension(ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 12345))))
+        .body(Body::empty())
+        .unwrap()
+}
+
 #[tokio::test]
 async fn camera_channel_decodes_a_real_h264_access_unit_and_serves_http() {
     let backend = backend();
@@ -280,10 +291,7 @@ async fn camera_channel_decodes_a_real_h264_access_unit_and_serves_http() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/sessions/{}/capture", session.id))
-                .body(Body::empty())
-                .unwrap(),
+            local_session_request(format!("/api/v1/sessions/{}/capture", session.id)),
         )
         .await
         .unwrap();
@@ -300,12 +308,10 @@ async fn camera_channel_decodes_a_real_h264_access_unit_and_serves_http() {
 
     // The PPM is the proof artifact: P6 header and exact RGB byte count.
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/sessions/{}/capture/frame.ppm", session.id))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(local_session_request(format!(
+            "/api/v1/sessions/{}/capture/frame.ppm",
+            session.id
+        )))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
