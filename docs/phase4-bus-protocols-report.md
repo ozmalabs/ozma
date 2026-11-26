@@ -641,7 +641,65 @@ No `spidev` or 1-Wire hardware exists on this host (`/dev/spidev*` and
 `/sys/bus/w1/devices/` are absent), so live 1-Wire/SPI evidence is the typed
 `bus.unavailable` path exercised by the fixture/fake tests. No virtual spidev or
 w1 module was loaded. Real GPIO lines (`gpiochip0/1`), physical CAN interfaces,
-and real I²C devices/DDC buses were never opened or modified.
+and real I²C devices/DDC buses were never opened or modified on this host.
+
+## Raspberry Pi 5 hardware validation
+
+A second rig (`kodilounge`, Raspberry Pi 5 8 GB, Debian 13, kernel 6.12
+aarch64) exercised the real backends. `ozma-node` was built natively for
+aarch64 (release, stripped) from the same tree and started with explicit
+allowlists:
+
+```text
+--i2c-allow 13:0x50,13:0x3a,13:0x54,13:0x37
+--ddc-allow 13:0x37
+--gpio-allow 0:22:output,0:17:input
+--spi-allow /dev/spidev10.0
+--iio-allow iio:device0:voltage0
+--pwm-allow pwmchip0:0
+```
+
+| Surface | Result |
+|---|---|
+| `GET /buses/status` | `buses` capability advertised; I²C 1 bus/4 addresses, GPIO 1 chip/2 lines, DDC 1 address; IIO/PWM configured but unavailable |
+| I²C EDID | `POST /buses/i2c/13/0x50/read {"op":"block","register":0,"length":16}` → `00ffffffffffff004c2d9f0f000e0001`; byte read → `0x03`. Bus 13 is the HDMI-A-1 DDC link (Samsung EDID, 2019) |
+| I²C allowlist | `13:0x51` → 403 `bus.not-allowed` |
+| GPIO | `GET /buses/gpio/0/22` → `GPIO22`, output; set high/low both returned the read-back value; `0:23` → 403 `bus.not-allowed` |
+| SPI | `/dev/spidev10.0` listed available; **no transfer was performed** because that CS is the BCM2712 boot flash (`spi10 CS0` / `2712_BOOT_CS_N`) |
+| IIO / PWM | 503 `bus.unavailable` (`iio:device0` and `pwmchip0` absent) |
+| DDC/CI | bus 13/0x37 opened; VCP and capabilities → 502 `bus.io-failed` (Remote I/O error 121). `ddcutil detect` agrees the Samsung display does not support DDC/CI. No write attempted |
+| PMBus | see below |
+| Serial | not opened: `/dev/ttyAMA10` is the active kernel console (`console=ttyAMA10,115200`) |
+| 1-Wire | not enabled on this image |
+
+### PMBus false positive found and fixed
+
+On the Pi, the HDMI DDC EDID EEPROM at `13:0x50` answers PMBus register reads,
+so the first build reported `pmbus:true` with revision `0x40` and fabricated
+`VOUT`/`IOUT`/temperature values. Identification now requires a plausible PMBus
+major.minor revision (major 1–3, decimal minor) **and** at least one
+manufacturer identity string. A responsive address that fails either check
+returns `200 {"pmbus":false,"revision":...}` with no sensor fields. Re-run on
+the Pi after the fix:
+
+```text
+GET /buses/pmbus/13/0x50
+{"ok":true,"supported":true,"configured":true,"bus":13,"address":80,
+ "pmbus":false,"revision":64,"pec":false}   HTTP 200
+```
+
+New unit tests cover the EDID byte (`0x40`) and a plausible revision with no
+identity strings; the existing PMBus success-path test still reads the same
+eight registers.
+
+### Safety notes from the rig
+
+- Only allowlisted targets were opened. The SPI transfer route was deliberately
+  not called; a write to `spidev10.0` could corrupt the Pi bootloader.
+- The serial route was not opened because the only tty is the kernel console.
+- DDC writes require an explicit `:write` entry and were not enabled.
+- GPIO line 22 is a free 40-pin header line; line 17 was configured input-only.
+- The node was stopped after each run; no device state was changed.
 
 ## Remaining gaps
 
@@ -673,7 +731,10 @@ and real I²C devices/DDC buses were never opened or modified.
 - I²C detection shells out to `i2cdetect`; there is no in-process scan. PMBus
   identification is best-effort and standard-register only; it does not parse
   device-specific IOUT/temperature coefficients and does not expose PMBus
-  writes/configuration.
+  writes/configuration. A device is only reported as PMBus when the revision is
+  a plausible major.minor value and a manufacturer identity string is present;
+  a responsive non-PMBus address (for example an EDID EEPROM on a DDC bus) is
+  reported as `pmbus:false` with no sensor values.
 - IIO is read-only and channel-scoped. There is no trigger, buffer, event,
   write, calibration, or sampling-frequency write, and no channel enumeration
   outside the allowlist.
@@ -685,7 +746,9 @@ and real I²C devices/DDC buses were never opened or modified.
   fragment per request, and no multi-monitor discovery. The real backend reads
   fixed bounded reply sizes (11 bytes get-VCP, 35 bytes capabilities); a monitor
   that returns a shorter capabilities fragment may need a retry or a different
-  read strategy. There is no live DDC evidence on this host.
+  read strategy. Live DDC evidence is limited to a real Pi 5 HDMI DDC bus that
+  returns typed `bus.io-failed` (the attached Samsung display has DDC/CI
+  disabled); no successful physical VCP read or write has been performed.
 - SPI is one full-duplex `SPI_IOC_MESSAGE` per request; no multi-segment
   transfers, explicit CS changes, LSB-first flag, dual/quad modes, or partial
   reads independent of TX length.

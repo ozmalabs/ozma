@@ -7,6 +7,11 @@
 //! `MFR_MODEL`, `MFR_REVISION`) and, when present, `VOUT_MODE`, `READ_VOUT`,
 //! `READ_IOUT`, and `READ_TEMPERATURE_1`. If the revision register does not
 //! answer, the route returns typed `bus.unavailable` instead of guessing.
+//! A responsive address is only reported as PMBus when the revision is a
+//! plausible PMBus major.minor value and at least one manufacturer identity
+//! string is present; otherwise the response is `pmbus:false` with the raw
+//! revision and no invented sensor readings. This matters on shared buses such
+//! as HDMI DDC, where an EDID EEPROM answers every read.
 //!
 //! No PMBus write or configuration command is exposed. VOUT is converted only
 //! when `VOUT_MODE` reports the linear format; IOUT and temperature are returned
@@ -84,6 +89,15 @@ fn sanitize_text(bytes: &[u8]) -> Option<String> {
         .collect();
     let text = text.trim().to_owned();
     (!text.is_empty()).then_some(text)
+}
+
+/// PMBus revision is a two-nibble major.minor value (for example `0x12`).
+///
+/// A read succeeding is not enough to claim a PMBus device: an arbitrary
+/// EEPROM address (such as an EDID byte at register `0x98` on a DDC bus) also
+/// answers. Only accept the documented major range with a decimal minor nibble.
+fn plausible_revision(revision: u8) -> bool {
+    (1..=3).contains(&(revision >> 4)) && (revision & 0x0f) <= 9
 }
 
 /// Convert a PMBus linear-format word to volts. Only the linear VOUT mode
@@ -178,6 +192,29 @@ impl BusState {
             }
         };
 
+        // A responsive address with an implausible revision is not identified
+        // as PMBus. Report the raw byte instead of fabricating a device.
+        if !plausible_revision(revision) {
+            return Ok(PmbusResponse {
+                ok: true,
+                supported: true,
+                configured: true,
+                bus,
+                address,
+                pmbus: false,
+                revision,
+                mfr_id: None,
+                mfr_model: None,
+                mfr_revision: None,
+                vout_mode: None,
+                vout_raw: None,
+                vout_volts: None,
+                iout_raw: None,
+                temperature_raw: None,
+                pec,
+            });
+        }
+
         let mfr_id = self
             .pmbus_read_block(bus, address, PMBUS_MFR_ID)
             .ok()
@@ -190,6 +227,30 @@ impl BusState {
             .pmbus_read_block(bus, address, PMBUS_MFR_REVISION)
             .ok()
             .and_then(|bytes| sanitize_text(&bytes));
+
+        // PMBus devices carry at least one manufacturer identity string.
+        // Without one, a plausible revision is still not enough to claim PMBus.
+        if mfr_id.is_none() && mfr_model.is_none() {
+            return Ok(PmbusResponse {
+                ok: true,
+                supported: true,
+                configured: true,
+                bus,
+                address,
+                pmbus: false,
+                revision,
+                mfr_id,
+                mfr_model,
+                mfr_revision,
+                vout_mode: None,
+                vout_raw: None,
+                vout_volts: None,
+                iout_raw: None,
+                temperature_raw: None,
+                pec,
+            });
+        }
+
         let vout_mode = self.pmbus_read_byte(bus, address, PMBUS_VOUT_MODE).ok();
         let vout_raw = self.pmbus_read_word(bus, address, PMBUS_READ_VOUT).ok();
         let vout_volts = vout_mode
@@ -432,6 +493,41 @@ mod tests {
                 true
             )
         );
+    }
+
+    #[tokio::test]
+    async fn eeprom_revision_is_not_mistaken_for_pmbus() {
+        // The HDMI DDC EDID EEPROM answers register 0x98 with 0x40, which is
+        // not a valid PMBus major.minor revision. It must not be identified as
+        // a PMBus device or produce sensor values.
+        let fake = FakeI2c::default();
+        fake.queue(Ok(vec![0x40]));
+        let app = router(state(config(false), fake.clone()));
+
+        let (status, body) = get(&app, "/buses/pmbus/1/0x40").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["pmbus"], false);
+        assert_eq!(body["revision"], 0x40);
+        assert!(body.get("vout_volts").is_none());
+        assert!(body.get("iout_raw").is_none());
+        assert_eq!(fake.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn plausible_revision_without_identity_strings_is_not_pmbus() {
+        let fake = FakeI2c::default();
+        fake.queue(Ok(vec![0x12]));
+        fake.queue(Ok(Vec::new()));
+        fake.queue(Ok(Vec::new()));
+        fake.queue(Ok(Vec::new()));
+        let app = router(state(config(false), fake.clone()));
+
+        let (status, body) = get(&app, "/buses/pmbus/1/0x40").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["pmbus"], false);
+        assert_eq!(body["revision"], 0x12);
+        assert!(body.get("vout_mode").is_none());
+        assert_eq!(fake.calls().len(), 4);
     }
 
     #[tokio::test]
