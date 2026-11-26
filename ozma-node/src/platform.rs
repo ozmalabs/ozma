@@ -9,7 +9,6 @@ use ozma_protocol::{
     VirtualDisplayCaps,
 };
 
-#[cfg(target_os = "linux")]
 use ozma_capture::{
     CaptureRegistry, FakeCaptureProvider, QmpDisplayConfig, VncDisplayConfig, QMP_DEFAULT_ID,
     QMP_DEFAULT_MAX_FPS, VNC_DEFAULT_ID,
@@ -319,6 +318,7 @@ fn vm_capture_registry(config: &NodeConfig, shared: Option<&SharedQmpClient>) ->
         // the KVMFR header; a missing file, foreign magic, or a region without
         // a published frame yields no source (never a synthetic frame). The
         // provider is registered explicitly here, not in `system*`.
+        #[cfg(target_os = "linux")]
         Some("looking-glass") => match &config.looking_glass_shm {
             Some(shm) => CaptureRegistry::new().with_looking_glass(
                 LookingGlassProviderConfig::new(shm.clone())

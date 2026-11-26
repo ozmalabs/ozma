@@ -95,6 +95,9 @@ jpeg-encoder     = "0.6"
 sysinfo          = "0.29"
 # SSE stream construction for the AIDA64 RemoteSensor endpoint.
 futures-util     = "0.3"
+# libc supports portable Unix process and filesystem operations used by the
+# node's host metrics and process-control surfaces.
+libc             = { workspace = true }
 # Opt-in UART/USB-serial console (`--serial-device`). default-features are
 # disabled to avoid a libudev build/runtime dependency; the node opens an
 # explicit operator-supplied path and never enumerates devices.
@@ -115,7 +118,6 @@ gpio-cdev = "0.6.0"
 socketcan = { version = "4.0.0", default-features = false }
 usb-gadget         = { workspace = true }
 alsa               = { workspace = true }
-libc               = { workspace = true }
 
 # Optional AIDA64 shared-memory/Registry bridge. The Win32 calls are only
 # compiled on Windows; Linux/macOS builds use the portable protocol layer.
