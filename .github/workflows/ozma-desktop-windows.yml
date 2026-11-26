@@ -1,0 +1,48 @@
+name: Windows desktop tray
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ozma-desktop-windows.yml'
+      - 'ozma-desktop/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  push:
+    paths:
+      - '.github/workflows/ozma-desktop-windows.yml'
+      - 'ozma-desktop/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build tray shell (Windows x64)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build and stage tray shell
+        shell: pwsh
+        run: .\ozma-desktop\build-windows.ps1
+
+      - name: Verify staged files
+        shell: pwsh
+        run: |
+          if (!(Test-Path .\ozma-desktop\dist\ozma-desktop.exe)) { throw 'Tray executable was not staged.' }
+          if (!(Test-Path .\ozma-desktop\dist\ozma.ico)) { throw 'Tray icon was not staged.' }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ozma-desktop-windows-x64
+          path: |
+            ozma-desktop/dist/ozma-desktop.exe
+            ozma-desktop/dist/ozma.ico
+          if-no-files-found: error

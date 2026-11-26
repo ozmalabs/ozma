@@ -333,7 +333,7 @@ export default function Scenarios() {
       {showCreate && (
         <ScenarioModal
           onClose={() => setShowCreate(false)}
-          onSave={data => createScenario(data as ScenarioCreateRequest)}
+          onSave={async data => { await createScenario(data as ScenarioCreateRequest) }}
         />
       )}
 
@@ -342,7 +342,7 @@ export default function Scenarios() {
         <ScenarioModal
           scenario={editTarget}
           onClose={() => setEditTarget(null)}
-          onSave={data => updateScenario(editTarget.id, data as ScenarioUpdateRequest)}
+          onSave={async data => { await updateScenario(editTarget.id, data as ScenarioUpdateRequest) }}
         />
       )}
 

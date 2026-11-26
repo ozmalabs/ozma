@@ -125,6 +125,23 @@ pub trait NodeBackend: Send + Sync + 'static {
     fn list_sessions(&self) -> Vec<Session>;
     fn get_session(&self, id: &SessionId) -> Option<Session>;
     fn create_session(&self, spec: SessionSpec) -> Result<Session, ApiError>;
+
+    /// Explain the requested and effective capability aperture for a session.
+    /// Backends that do not evaluate aperture policy may leave this absent;
+    /// clients must not infer policy enforcement when no receipt is returned.
+    fn permission_aperture(
+        &self,
+        _session: &Session,
+    ) -> Result<Option<serde_json::Value>, ApiError> {
+        Ok(None)
+    }
+
+    /// Requested and effective quality limits for a session. Backends may
+    /// omit this when they cannot apply and report the quality preference.
+    fn quality_receipt(&self, _session: &Session) -> Result<Option<serde_json::Value>, ApiError> {
+        Ok(None)
+    }
+
     fn start_session(&self, id: &SessionId) -> Result<Session, ApiError>;
     fn stop_session(&self, id: &SessionId, reason: EndReason) -> Result<Session, ApiError>;
     fn approve_consent(&self, id: &SessionId, by: &str) -> Result<Session, ApiError>;

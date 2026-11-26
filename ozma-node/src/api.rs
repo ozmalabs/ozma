@@ -5,8 +5,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
-use axum::http::{header, Method, StatusCode};
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderName, Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
 use ozma_api::state::BrowserSceneSink;
@@ -323,11 +325,17 @@ pub async fn serve_with_scene_replay_and_sink(
     // `serve_with_scene_replay_and_sink`.
     let app = with_hls(app, hls_dir, multi_console_hls);
     let app = app.layer(dev_cors());
+    // Local consent metadata is same-origin only. Strip the permissive dev CORS
+    // headers even from preflight responses on these paths.
+    let app = app.layer(middleware::from_fn(strip_local_consent_cors));
     info!(port, "Node API listening");
-    let served = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
-        .await
-        .context("serving node API");
+    let served = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+    .await
+    .context("serving node API");
     for (name, task) in listeners {
         crate::shutdown::stop_task(task, name).await;
     }
@@ -349,6 +357,36 @@ fn dev_cors() -> CorsLayer {
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+}
+
+async fn strip_local_consent_cors(request: Request, next: Next) -> Response {
+    let local_path = request.uri().path() == "/api/v1/local/consent"
+        || request.uri().path().starts_with("/api/v1/local/consent/");
+    let mut response = next.run(request).await;
+    if local_path {
+        for name in [
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            header::ACCESS_CONTROL_MAX_AGE,
+        ] {
+            response.headers_mut().remove(name);
+        }
+        response
+            .headers_mut()
+            .remove(HeaderName::from_static("vary"));
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store, max-age=0"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-content-type-options"),
+            axum::http::HeaderValue::from_static("nosniff"),
+        );
+    }
+    response
 }
 
 /// Merge the unauthenticated HLS file service when HLS is configured.

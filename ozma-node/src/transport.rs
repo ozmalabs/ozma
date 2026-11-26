@@ -11,17 +11,16 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ozma_client_core::VideoAssembler;
 use ozma_display_protocol::{scene_convert, DisplayMessage};
-use ozma_encode::SelectedEncoder;
 use ozma_media::{
-    CaptureSource, FakeCapture, FakeEncoder, Frame, FrameFormat, MediaError, Pipeline,
-    PipelineConfig, RunningPipeline,
+    CaptureSource, FakeCapture, Frame, FrameFormat, MediaError, Pipeline, PipelineConfig,
+    RunningPipeline,
 };
 use ozma_protocol::scene::{DisplayCapabilities, DisplayProfile};
 use ozma_protocol::{
@@ -467,8 +466,11 @@ async fn start_media(
             )
         }
     };
+    let effective_max_fps = backend.effective_max_fps(&session.spec);
+    let (effective_max_bitrate_kbps, _) = backend.effective_max_bitrate_kbps(&session.spec);
     let input = source.format();
-    let encoder = match backend.build_encoder(input) {
+    let encoder = match backend.build_encoder(input, effective_max_fps, effective_max_bitrate_kbps)
+    {
         Ok(encoder) => {
             tracing::info!(
                 input = %input,
@@ -479,9 +481,10 @@ async fn start_media(
         }
         Err(error) => {
             tracing::warn!(error = %error, "No real H.264 encoder available; using fake encoder");
-            SelectedEncoder::Fake(FakeEncoder::h264(input, 2_000))
+            SessionBackend::fake_fallback_encoder(input, effective_max_bitrate_kbps)
         }
     };
+    let source = FrameRateLimitedCapture::new(source, effective_max_fps);
     Pipeline::start(source, encoder, PipelineConfig::default()).map_err(Into::into)
 }
 
@@ -497,6 +500,51 @@ impl SessionSource {
         match self {
             SessionSource::Real(source) => source.format(),
             SessionSource::Fake(source) => source.format(),
+        }
+    }
+}
+
+/// Enforce the admitted maximum on outgoing media even when a capture device
+/// or the fake fallback produces frames faster than the selected encoder rate.
+struct FrameRateLimitedCapture {
+    source: SessionSource,
+    max_fps: u32,
+    last_frame_at: Option<Instant>,
+}
+
+impl FrameRateLimitedCapture {
+    fn new(source: SessionSource, max_fps: u32) -> Self {
+        Self {
+            source,
+            max_fps: max_fps.max(1),
+            last_frame_at: None,
+        }
+    }
+}
+
+#[async_trait]
+impl CaptureSource for FrameRateLimitedCapture {
+    fn id(&self) -> &str {
+        self.source.id()
+    }
+
+    fn format(&self) -> FrameFormat {
+        self.source.format()
+    }
+
+    async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+        let minimum_interval = Duration::from_secs_f64(1.0 / f64::from(self.max_fps));
+        loop {
+            let frame = self.source.next_frame().await?;
+            let now = Instant::now();
+            if self
+                .last_frame_at
+                .is_some_and(|last| now.duration_since(last) < minimum_interval)
+            {
+                continue;
+            }
+            self.last_frame_at = Some(now);
+            return Ok(frame);
         }
     }
 }
@@ -1036,6 +1084,7 @@ mod latency_tests {
             input: Default::default(),
             privacy: Default::default(),
             transport: Default::default(),
+            quality: None,
             ttl_seconds: 60,
         };
         let now = now_micros() / 1_000_000;

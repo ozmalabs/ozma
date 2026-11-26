@@ -925,6 +925,7 @@ mod tests {
             },
             privacy: PrivacyPolicy::default(),
             transport: TransportPreference::default(),
+            quality: None,
             ttl_seconds: 60,
         }
     }

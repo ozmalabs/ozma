@@ -39,18 +39,16 @@ function useAudioData() {
 
   const refresh = useCallback(async () => {
     try {
-      const [nodesRes, routesRes, vbanRes, allNodesRes] = await Promise.all([
+      const [nodesRes, routesRes, allNodesRes] = await Promise.all([
         fetch(`${API}/audio/nodes`),
         fetch(`${API}/audio/routes`),
-        fetch(`${API}/audio/vban`),
         fetch(`${API}/nodes`),
       ])
-      if (!nodesRes.ok || !routesRes.ok || !vbanRes.ok || !allNodesRes.ok) {
+      if (!nodesRes.ok || !routesRes.ok || !allNodesRes.ok) {
         throw new Error('Failed to fetch audio data')
       }
       const nodesData = await nodesRes.json()
       const routesData = await routesRes.json()
-      const vbanData = await vbanRes.json()
       const allNodesData = await allNodesRes.json()
 
       setPwNodes(nodesData.nodes ?? {})

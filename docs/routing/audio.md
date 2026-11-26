@@ -8,27 +8,180 @@ this document are to be interpreted as described in [RFC 2119](https://www.ietf.
 ## Abstract
 
 This document specifies the audio routing model for the Ozma routing graph.
-The routing graph handles audio as pipelines between source and sink ports.
-For basic KVM audio (stereo from target machine to desk speakers), the
-pipeline model is sufficient. Professional audio requires additional
-primitives: mix buses, monitor controllers, channel mapping, insert chains,
-metering, and precision processing. This specification defines these
-primitives as virtual devices in the routing graph, covering channel mapping,
-mix buses, monitor controllers, cue sends, insert chains, latency
-compensation, metering, gain staging, dither, professional audio transports,
-active redundancy, sample-accurate synchronisation, and spatial audio with
-speaker arrangement and room acoustics.
+Users configure durable logical endpoints and desired connections; the graph
+resolves them onto the audio objects, links, formats, and processing available
+at runtime. The abstraction must survive the absence of a live application or
+device object, and must not force users to connect channels one by one.
+Professional audio also requires mix buses, monitor controllers, channel
+mapping, insert chains, metering, and precision processing. This specification
+defines these as graph features, covering channel mapping, mix buses, monitor
+controllers, cue sends, insert chains, latency compensation, metering, gain
+staging, dither, professional audio transports, active redundancy,
+sample-accurate synchronisation, and spatial audio.
 
 ## Specification
 
-### 1. Virtual Audio Devices
+### 1. Persistent Logical Endpoints (Plumbs)
 
-Audio routing primitives are modelled as **virtual devices** in the routing
-graph. They do not correspond to physical hardware, but they have ports,
-participate in pipelines, consume resources, and contribute latency. On
-machines running PipeWire, each virtual device MUST map to a PipeWire node.
+A **Plumb** is a persistent logical audio endpoint: a named source, sink, or
+bidirectional endpoint that can be connected to other Plumbs. A Plumb is not
+the PipeWire node, application stream, or network socket currently backing it.
+It is the stable identity and user configuration for that endpoint. Runtime
+objects MAY appear and disappear while the Plumb, its metadata, and its route
+and processing configuration remain available.
 
-### 2. Channel Mapping
+```yaml
+Plumb:
+  id: string                    # stable, persistent identity
+  name: string                  # user-facing name
+  kind: application | device | network | virtual | service
+  direction: source | sink | bidirectional
+  group_id: string?             # PlumbGroup that can route this endpoint
+  audio_profile: AudioProfile?  # preferred/known layout and format capabilities
+  supported_connections: string[]? # available local or network adapters
+  metadata: PropertyBag         # app/device identity, tags, user annotations
+  runtime: PlumbRuntimeState    # observed separately from durable configuration
+
+PlumbRuntimeState:
+  status: absent | discovered | active | idle | unavailable
+  backing_objects: RuntimeObjectRef[]? # transient PipeWire/app/device objects
+  active_format: AudioFormat?   # actual negotiated format, may change at runtime
+  last_activity: timestamp?
+  meters: MeterReading[]?       # live readings, not persistent configuration
+```
+
+Plumbs and their configuration MUST persist independently of live backing
+objects. Application Plumbs MAY be created automatically when an application
+audio stream is first observed. The Plumb identity SHOULD be based on stable
+application identity (for example, executable, app ID, or user-assigned rule),
+not the transient PipeWire stream ID. A configured Plumb MUST remain
+configurable while its backing stream is absent. Inactivity MAY hide it from a
+default list, but MUST NOT discard its saved connections, filters, or metadata.
+A user MAY explicitly remove an inactive Plumb. System sounds and other
+unwanted automatic discoveries MAY be hidden by user or administrator policy.
+
+A Plumb connection (a **jam**) expresses a durable logical relationship
+between endpoints. It is resolved to one or more runtime graph links when the
+endpoints are available. A bidirectional Plumb MAY act as source or sink; when
+both ends are bidirectional, the configured connection direction or explicit
+source/sink role MUST determine signal flow rather than an implicit guess.
+
+```yaml
+PlumbConnection:
+  id: string
+  source: PlumbRef
+  sink: PlumbRef
+  enabled: bool
+  policy: ConnectionPolicy?    # auto, manual, activity-triggered, preference
+  channel_policy: ChannelPolicy?
+```
+
+The connection is device-level by default, not a set of manually wired channel
+pairs. Channel count and layout are negotiated from the active source and
+destination formats. A source that becomes active with stereo content on a
+multichannel-capable device MUST report its active format; routing policy may
+pass stereo through, upmix it, or select a compatible channel-mapping filter.
+The saved Plumb connection remains the same when that runtime format changes.
+
+Plumbs connect at the endpoint/device level by default. Implementations MUST
+negotiate channel layout and mapping for the whole connection; users SHOULD
+not need to create a separate connection for each channel. Per-channel routes
+MAY be exposed when the hardware or a specific intent requires them.
+
+#### Plumb groups and locality
+
+A `PlumbGroup` identifies endpoints that can route to each other through a
+particular local graph or adapter. It can represent one PipeWire graph, an
+application audio graph, a hardware mixer, or a network-connected group.
+Groups MAY have separate source and sink preference orders. These orders are
+hints for route selection, not fixed signal paths. A route that crosses groups
+requires an advertised bridge or transport feature; locality is one cost and
+policy input, not an assumption that all endpoints share one machine.
+
+```yaml
+PlumbGroup:
+  id: string
+  name: string
+  adapter: string              # namespaced backend/bridge feature
+  members: PlumbRef[]
+  source_order: PlumbRef[]?     # preferred sources in this context
+  sink_order: PlumbRef[]?       # preferred destinations in this context
+```
+
+#### Plumb processing chains
+
+Processing is attached to logical endpoints and connections so configuration
+survives runtime object churn. A Plumb MAY have ordered input and output filter
+chains that apply to all of its connections. Each Plumb connection MAY also
+have a pair-specific chain. A resolved path applies the stages in this order:
+
+1. Source Plumb output chain.
+2. Source-to-sink pair chain.
+3. Destination Plumb input chain.
+
+The filter identity, order, bypass state, and settings MUST be persisted
+independently of the currently instantiated audio processor. Runtime filter
+instances are graph participants with declared format support, latency, and
+resource costs. In a source-to-sink route, the source's outbound chain runs
+first, then the pair-specific chain, then the destination's inbound chain.
+Inbound/outbound are relative to signal direction, including for bidirectional
+Plumbs. Automatic filters MAY be proposed by a policy or device profile; they
+MUST remain distinguishable from user-configured filters and MUST NOT silently
+overwrite saved user settings.
+
+Plumb meters are observation taps, not in-line filters. Plumbs SHOULD expose
+runtime activity and meters when the backing runtime supports them. Activity,
+latency, CPU use, and custom metrics describe current realization; they are
+not substitutes for the persistent Plumb configuration.
+
+A **PlumbRunner** is the runtime service that reconciles persistent Plumb,
+connection, and processing configuration with currently available audio
+backends. It creates or updates runtime links when backing objects appear,
+reports unavailable or degraded realizations, and releases runtime objects
+when they disappear. It MUST NOT delete durable Plumb configuration just
+because its current realization is gone. Multiple runners MAY participate for
+different graph groups or remote backends.
+
+```yaml
+PlumbFilterChain:
+  scope: plumb_inbound | plumb_outbound | source_sink_pair
+  source: PlumbRef?
+  sink: PlumbRef?
+  filters: FilterInstance[]    # ordered, persistent configuration
+
+FilterInstance:
+  id: string
+  type: string                 # namespaced filter feature
+  settings: PropertyBag
+  bypass: bool
+  origin: user | policy | device_default
+
+PlumbMeter:
+  id: string
+  type: string                 # namespaced meter feature
+  settings: PropertyBag
+  readings: MeterReading[]     # runtime state
+```
+
+#### Network and media Plumbs
+
+Network audio endpoints and controllable media sources/sinks are Plumbs too.
+They advertise their connection features and formats; the graph MAY establish
+or release a network connection as part of resolving a Plumb connection or an
+audio intent. Casting sinks MAY use an activity-triggered policy, but the
+policy and selected route remain inspectable and overridable.
+
+### 2. Runtime Audio Graph Adapters
+
+Virtual audio processors, buses, and adapters are modelled as graph
+participants. They have ports, participate in pipelines, consume resources,
+and contribute latency. On machines running PipeWire, an adapter MAY realize
+these with PipeWire/WirePlumber nodes and links. Persistent Plumb identity and
+configuration MUST remain in the Ozma model rather than being equated with a
+transient PipeWire object. Other backends (including Windows audio graphs and
+remote transports) use equivalent adapters.
+
+### 3. Channel Mapping
 
 Channel mapping MUST use ITU-R BS.2051 labels. `AudioFormat` specifies
 channel count but not channel assignment. Pro audio requires knowing which
@@ -76,7 +229,7 @@ plugin MUST perform channel remixing -- upmix, downmix, or remap. The
 format negotiation system handles this: if the source produces 7.1 and the
 sink accepts stereo, a downmix converter MUST be inserted.
 
-### 3. Mix Bus
+### 4. Mix Bus
 
 A mix bus is a virtual device that sums multiple audio inputs with per-input
 gain, pan, and mute. It is the fundamental building block for monitor
@@ -124,7 +277,7 @@ controls or a `pw-filter-chain` summing node.
 When one or more inputs have `solo: true`, all non-soloed inputs MUST be
 muted (solo-in-place behaviour).
 
-### 4. Monitor Controller
+### 5. Monitor Controller
 
 A monitor controller is a compound virtual device that provides source
 selection, speaker set switching, and monitoring utilities. It replaces
@@ -196,7 +349,7 @@ audio, with additional processing (dim, mono, talkback). On PipeWire, it
 MUST map to a combination of `pw-link` operations (source selection), volume
 controls (dim/level), and a filter-chain node (mono sum, crossover).
 
-### 5. Cue Sends / Aux Sends
+### 6. Cue Sends / Aux Sends
 
 Cue sends allow per-source, per-destination level control -- "send 50% of
 source A to headphone mix B". These are modelled as mix buses with a
@@ -220,7 +373,7 @@ CueSend:
 Pre-fader sends MUST tap the signal before the main mix bus gain stage.
 This MUST map to PipeWire as a separate mix bus node with per-input volumes.
 
-### 6. Insert Chain
+### 7. Insert Chain
 
 An insert chain is an ordered sequence of audio processors applied to a
 signal path. The order matters -- EQ before compressor produces different
@@ -249,7 +402,7 @@ When `bypass` is `true` on an `InsertSlot`, the signal MUST pass through
 unprocessed. When `bypass` is `true` on the `InsertChain`, the entire chain
 MUST be bypassed.
 
-### 7. Automatic Latency Compensation
+### 8. Automatic Latency Compensation
 
 When multiple audio paths have different processing chain lengths, their
 latencies diverge. A source going through 3 processors arrives later than
@@ -277,7 +430,7 @@ paths to match. On PipeWire, delay insertion SHOULD use `pw-loopback
 In `manual` mode, the operator MAY specify per-path delays explicitly.
 In `disabled` mode, no latency compensation SHALL be applied.
 
-### 8. Metering
+### 9. Metering
 
 Metering is observation of audio levels at any point in the graph.
 Implementations MUST support at least `peak` and `lufs_momentary` metering
@@ -316,7 +469,7 @@ Metering data MUST be available via WebSocket events (`audio.meters`) and
 REST API. On PipeWire, metering SHOULD read from `pw-dump` volume/peak data
 or from a dedicated analysis filter-chain.
 
-### 9. Gain Staging and Headroom
+### 10. Gain Staging and Headroom
 
 Every audio hop in a pipeline has a gain contribution. The total gain
 through the pipeline determines whether the signal clips or is too quiet.
@@ -336,7 +489,7 @@ warn when headroom is insufficient. The `clip_risk` flag MUST be set to
 `true` when headroom falls below 3 dB. This MUST feed into the monitoring
 system as `audio.gain_stage.clip_risk` events.
 
-### 10. Dither
+### 11. Dither
 
 When audio passes through a bit-depth conversion (e.g., 32-bit float
 processing to 24-bit output), truncation introduces quantisation distortion.
@@ -360,7 +513,7 @@ increases.
 Dither is modelled as a property of format conversion, not a separate
 device. The converter plugin handles this.
 
-### 11. Professional Audio Transports
+### 12. Professional Audio Transports
 
 Additional transport types for pro audio installations:
 
@@ -382,7 +535,7 @@ Implementations SHOULD support AES67 and Dante as network transport plugins.
 Implementations MAY support MADI, ADAT, AES3, and S/PDIF where the
 corresponding hardware interfaces are present.
 
-### 12. Active Redundancy
+### 13. Active Redundancy
 
 Professional installations require redundant audio paths -- two independent
 network paths carrying the same audio, with automatic failover.
@@ -410,7 +563,7 @@ Dante natively supports primary/secondary redundancy. AES67 achieves it
 via IGMP multicast on two independent network paths. The routing graph
 MUST model both pipelines and their independent link health.
 
-### 13. Sample-Accurate Synchronisation
+### 14. Sample-Accurate Synchronisation
 
 When multiple audio sources must be time-aligned (multi-machine recording,
 distributed DAW), they need a shared sample clock.
@@ -438,7 +591,7 @@ corresponding hardware is present.
 On PipeWire, the clock master MUST map to a PipeWire driver node -- the
 device whose hardware clock drives the graph scheduling.
 
-### 14. Spatial Audio
+### 15. Spatial Audio
 
 The routing graph knows the physical position and orientation of every
 speaker (`PhysicalLocation` -- `pos` + `rot`), the speaker's directional

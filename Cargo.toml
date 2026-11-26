@@ -4,6 +4,7 @@ members = [
     "ozma-node",
     "ozma-softnode",
     "ozma-agent",
+    "ozma-desktop",
     "ozma-drivers",
     "ozma-proto",
     "ozma-protocol",

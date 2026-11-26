@@ -198,8 +198,28 @@ pub struct SessionSpec {
     pub privacy: PrivacyPolicy,
     #[serde(default)]
     pub transport: TransportPreference,
+    /// Optional image-quality ceiling requested for the outgoing video.
+    /// Missing quality keeps the historical 30 FPS session default.
+    #[serde(default)]
+    pub quality: Option<QualityPreference>,
     #[serde(default = "default_ttl")]
     pub ttl_seconds: u64,
+}
+
+/// User-requested quality preferences that can be bounded by node capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QualityPreference {
+    /// Maximum outgoing video frame rate. Currently supported choices are
+    /// 15, 24, and 30 FPS.
+    pub max_fps: u32,
+    /// Maximum encoded video bitrate in kilobits per second. Missing values
+    /// from older clients retain the historical 2000 kbps default.
+    #[serde(default = "default_video_max_bitrate_kbps")]
+    pub max_bitrate_kbps: u32,
+}
+
+fn default_video_max_bitrate_kbps() -> u32 {
+    2_000
 }
 
 fn default_ttl() -> u64 {
@@ -431,6 +451,7 @@ mod tests {
             },
             privacy: PrivacyPolicy::default(),
             transport: TransportPreference::Auto,
+            quality: None,
             ttl_seconds: 60,
         };
         let required = spec.required_permissions();

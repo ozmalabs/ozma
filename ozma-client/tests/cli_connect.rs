@@ -59,6 +59,7 @@ fn session_in(state: SessionState) -> Session {
         input: Default::default(),
         privacy: Default::default(),
         transport: Default::default(),
+        quality: None,
         ttl_seconds: 300,
     };
     let permissions = PermissionSet::from_iter([Permission::View, Permission::Control]);

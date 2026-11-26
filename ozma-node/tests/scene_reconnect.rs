@@ -57,6 +57,7 @@ fn spec() -> SessionSpec {
         input: Default::default(),
         privacy: Default::default(),
         transport: Default::default(),
+        quality: None,
         ttl_seconds: 60,
     }
 }

@@ -327,6 +327,7 @@ fn session_json(id: &str, state: SessionState) -> Value {
         input: Default::default(),
         privacy: Default::default(),
         transport: Default::default(),
+        quality: None,
         ttl_seconds: 60,
     };
     let permissions = PermissionSet::from_iter([Permission::View, Permission::Control]);
@@ -398,6 +399,7 @@ async fn node_session_create_approve_start_and_get_use_the_real_api() {
             ..Default::default()
         },
         transport: TransportPreference::Quic,
+        quality: None,
         ttl_seconds: 300,
     };
 

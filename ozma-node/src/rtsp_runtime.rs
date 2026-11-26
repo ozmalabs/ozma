@@ -97,7 +97,7 @@ pub async fn run(port: u16, backend: Arc<SessionBackend>) -> Result<()> {
         }
     };
     let input = source.format();
-    let encoder = match backend.build_encoder(input) {
+    let encoder = match backend.build_encoder(input, 30, 2_000) {
         Ok(encoder) => encoder,
         Err(error) => {
             warn!(error = %error, "No encoder for RTSP; using fake source");

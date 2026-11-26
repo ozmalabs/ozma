@@ -8,6 +8,8 @@ interface NavItem {
 
 const NAV_ITEMS: NavItem[] = [
   { to: '/',          label: 'Dashboard' },
+  { to: '/setup',     label: 'Set up Ozma' },
+  { to: '/help',      label: 'Help' },
   { to: '/nodes',     label: 'Nodes' },
   { to: '/scenarios', label: 'Scenarios' },
   { to: '/streaming', label: 'Streaming' },

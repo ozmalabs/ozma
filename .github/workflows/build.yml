@@ -157,6 +157,41 @@ jobs:
             ozma-rust-node-linux-${{ matrix.arch }}.tar.gz.sha256
           if-no-files-found: error
 
+  # ── Windows notification-area shell ───────────────────────────────────
+  windows-desktop:
+    name: Windows desktop tray shell (x64)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build and stage the tray shell
+        shell: pwsh
+        run: .\ozma-desktop\build-windows.ps1
+
+      - name: Package executable, icon, setup guide, and license files
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP 'ozma-desktop-windows-x64'
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+          Copy-Item .\ozma-desktop\dist\ozma-desktop.exe $package
+          Copy-Item .\ozma-desktop\dist\ozma.ico $package
+          Copy-Item .\ozma-desktop\README.md $package\README.md
+          Copy-Item .\docs\gui-configuration-alpha.md $package\SETUP.md
+          Copy-Item .\COPYING $package\COPYING
+          Copy-Item .\LICENSE.txt $package\LICENSE.txt
+          Compress-Archive -Path "$package\*" -DestinationPath .\ozma-desktop-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ozma-desktop-windows-x64
+          path: ozma-desktop-windows-x64.zip
+          if-no-files-found: error
+
   # ── WebRTC helper asset (Python + GStreamer; same for every arch) ───────
   # The archive extracts to share/ozma/webrtc/gst_webrtc_worker.py, which is
   # exactly the path scripts/install-rust.sh installs into <prefix>/share.
@@ -316,7 +351,7 @@ jobs:
 
   # ── GitHub Release (default Rust-first asset set) ───────────────────────
   release:
-    needs: [wheel-controller, container, rust-binaries, webrtc-helper, deb, sign-ota]
+    needs: [wheel-controller, container, rust-binaries, windows-desktop, webrtc-helper, deb, sign-ota]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -330,6 +365,7 @@ jobs:
           files: |
             artifacts/ozma-rust-node-linux-*/*.tar.gz
             artifacts/ozma-rust-node-linux-*/*.sha256
+            artifacts/ozma-desktop-windows-x64/*.zip
             artifacts/ozma-webrtc-helper/*.tar.gz
             artifacts/ozma-webrtc-helper/*.sha256
             artifacts/wheel-controller/*.whl

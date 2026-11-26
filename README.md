@@ -200,6 +200,7 @@ bash demo/start_vms.sh stop   # stop soft nodes
 | [Security](docs/security.md) | Device identity, WireGuard mesh, enrollment, OTA signing, device assurance, mobile auth, DNS integrity |
 | [VPN](docs/vpn.md) | Tiered VPN — what each mode provides and does not provide |
 | [Getting Started](docs/getting-started.md) | Dev harness setup guide |
+| [Connect asset service](docs/display-platform/connect.md) | Shared display asset database deployment: environment, storage, signing keys, TLS, backup |
 
 ---
 

@@ -1,7 +1,8 @@
-import React, { lazy, Suspense } from 'react'
+import { lazy, Suspense } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AuthProvider, RequireAuth } from './auth/AuthContext'
 import LoginPage from './auth/LoginPage'
+import AppLayout from './layouts/AppLayout'
 
 // Lazy-loaded route pages
 const Dashboard  = lazy(() => import('./pages/Dashboard'))
@@ -14,6 +15,8 @@ const Controls   = lazy(() => import('./pages/Controls'))
 const RGB        = lazy(() => import('./pages/RGB'))
 const Settings   = lazy(() => import('./pages/Settings'))
 const Streams    = lazy(() => import('./pages/StreamsPage'))
+const Setup      = lazy(() => import('./pages/SetupPage'))
+const Help       = lazy(() => import('./pages/HelpPage'))
 
 function PageFallback() {
   return (
@@ -32,27 +35,22 @@ export default function App() {
             {/* Public route */}
             <Route path="/login" element={<LoginPage />} />
 
-            {/* All other routes require authentication */}
-            <Route
-              path="/*"
-              element={
-                <RequireAuth>
-                  <Routes>
-                    <Route path="/"          element={<Dashboard />} />
-                    <Route path="/nodes"     element={<Nodes />} />
-                    <Route path="/nodes/:id" element={<NodeDetail />} />
-                    <Route path="/scenarios" element={<Scenarios />} />
-                    <Route path="/audio"     element={<Audio />} />
-                    <Route path="/streaming" element={<Streaming />} />
-                    <Route path="/controls"  element={<Controls />} />
-                    <Route path="/rgb"       element={<RGB />} />
-                    <Route path="/streams"   element={<Streams />} />
-                    <Route path="/settings"  element={<Settings />} />
-                    <Route path="*"          element={<Navigate to="/" replace />} />
-                  </Routes>
-                </RequireAuth>
-              }
-            />
+            {/* All product routes share the application shell and require auth. */}
+            <Route element={<RequireAuth><AppLayout /></RequireAuth>}>
+              <Route index element={<Dashboard />} />
+              <Route path="nodes" element={<Nodes />} />
+              <Route path="nodes/:id" element={<NodeDetail />} />
+              <Route path="scenarios" element={<Scenarios />} />
+              <Route path="audio" element={<Audio />} />
+              <Route path="streaming" element={<Streaming />} />
+              <Route path="controls" element={<Controls />} />
+              <Route path="rgb" element={<RGB />} />
+              <Route path="streams" element={<Streams />} />
+              <Route path="setup" element={<Setup />} />
+              <Route path="help" element={<Help />} />
+              <Route path="settings" element={<Settings />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Route>
           </Routes>
         </Suspense>
       </AuthProvider>

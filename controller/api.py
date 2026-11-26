@@ -131,9 +131,62 @@ from backup_status import BackupNudgeService
 log = logging.getLogger("ozma.api")
 
 
+class SetupProfilePermissions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    view: Literal[True] = True
+    control: bool
+    audio: bool
+    microphone: bool
+    clipboard: bool
+
+    @model_validator(mode="after")
+    def microphone_requires_audio(self) -> "SetupProfilePermissions":
+        if self.microphone and not self.audio:
+            raise ValueError("microphone access requires audio access")
+        return self
+
+
+class SetupProfileSessionOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ttl_seconds: int = Field(ge=1, le=86400)
+    consent: Literal["always"] = "always"
+    indicate: Literal[True] = True
+
+
+class SetupProfileQuality(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_fps: Literal[15, 24, 30] = 30
+    max_bitrate_kbps: Literal[1000, 2000, 4000] = 2000
+
+
+class SetupProfilePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    intent: Literal["control", "observe", "desktop"]
+    goal_id: Literal["control", "observe", "desktop", "custom"] | None = None
+    source_endpoint_id: str = Field(default="controller", min_length=1, max_length=255)
+    target_node_id: str = Field(min_length=1, max_length=255)
+    permissions: SetupProfilePermissions
+    session_options: SetupProfileSessionOptions
+    quality: SetupProfileQuality = Field(default_factory=SetupProfileQuality)
+    ui_aperture_level: Literal["simple", "guided", "fine", "expert"]
+
+
+class UpdateScenarioSetupProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    setup_profile: SetupProfilePayload
+
+
 class CreateScenarioRequest(BaseModel):
     name: str
     node_id: str | None = None
+    setup_profile: SetupProfilePayload | None = None
 
 
 class BindNodeRequest(BaseModel):
@@ -1715,6 +1768,229 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             )
         return payload
 
+    # --- Native session proxy -------------------------------------------------
+
+    _SESSION_SPEC_FIELDS = {
+        "tracks", "audio", "input", "privacy", "transport", "ttl_seconds", "quality",
+    }
+    _SESSION_TRACK_FIELDS = {
+        "track_id", "kind", "source_id", "display", "format", "mode", "hdr",
+    }
+    _SESSION_AUDIO_FIELDS = {"enabled", "mic", "format"}
+    _SESSION_QUALITY_FIELDS = {"max_fps", "max_bitrate_kbps"}
+    _SESSION_INPUT_FIELDS = {
+        "keyboard", "pointer", "gamepad", "touch", "pen", "clipboard", "owner_only",
+    }
+    _SESSION_PRIVACY_FIELDS = {
+        "local_display", "consent", "indicate", "disconnect_on_local_unlock",
+    }
+
+    def _session_identity(ctx: AuthContext) -> tuple[str, str]:
+        """Return node-session principal/client id from controller auth state."""
+        subject = ctx.user_id or f"{ctx.auth_method}:{ctx.source_ip}"
+        return subject, f"controller:{subject}"
+
+    def _session_node(request: Request, node_id: str, scope: str) -> tuple[NodeInfo, AuthContext]:
+        ctx = _require_scope(request, scope)
+        node = state.nodes.get(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+        if not node.api_port:
+            raise HTTPException(status_code=503, detail="Node has no HTTP API")
+        if node.owner_id:
+            if ctx.user_id:
+                allowed = check_node_permission(node, ctx.user_id, "use", state)
+            else:
+                # Legacy/admin contexts have no stable user id. They may use an
+                # owned node only with explicit controller-wide admin scope.
+                allowed = has_scope(ctx, SCOPE_ADMIN)
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Use permission required for this node")
+        return node, ctx
+
+    async def _node_session_transport_available(node_id: str) -> bool:
+        status, transport = await _proxy_node_response(node_id, "/api/v1/transport")
+        if status in (401, 403):
+            raise HTTPException(status_code=502, detail=_node_auth_error(status))
+        return (
+            status < 400
+            and isinstance(transport, dict)
+            and isinstance(transport.get("endpoint"), str)
+            and bool(transport["endpoint"].strip())
+        )
+
+    def _validate_session_spec(body: dict[str, Any]) -> dict[str, Any]:
+        """Whitelist the SessionSpec surface; identities and grants are server-owned."""
+        forbidden_identity = {"client_id", "principal", "permissions", "grants"}
+        if forbidden_identity.intersection(body):
+            raise HTTPException(
+                status_code=400,
+                detail="Session identity and permissions are derived by the controller and node",
+            )
+        unknown = set(body) - _SESSION_SPEC_FIELDS
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported session fields: {', '.join(sorted(unknown))}",
+            )
+
+        def require_object(name: str, allowed: set[str]) -> dict[str, Any] | None:
+            value = body.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, dict):
+                raise HTTPException(status_code=400, detail=f"{name} must be an object")
+            extra = set(value) - allowed
+            if extra:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported {name} fields: {', '.join(sorted(extra))}",
+                )
+            return value
+
+        result = dict(body)
+        tracks = body.get("tracks")
+        if tracks is not None:
+            if not isinstance(tracks, list):
+                raise HTTPException(status_code=400, detail="tracks must be an array")
+            checked_tracks = []
+            for index, track in enumerate(tracks):
+                if not isinstance(track, dict):
+                    raise HTTPException(status_code=400, detail=f"tracks[{index}] must be an object")
+                extra = set(track) - _SESSION_TRACK_FIELDS
+                if extra:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported tracks[{index}] fields: {', '.join(sorted(extra))}",
+                    )
+                checked_tracks.append(track)
+            result["tracks"] = checked_tracks
+        require_object("audio", _SESSION_AUDIO_FIELDS)
+        quality = require_object("quality", _SESSION_QUALITY_FIELDS)
+        if quality is not None:
+            if "max_fps" in quality and (
+                type(quality["max_fps"]) is not int
+                or quality["max_fps"] not in {15, 24, 30}
+            ):
+                raise HTTPException(status_code=400, detail="quality.max_fps must be 15, 24, or 30")
+            if "max_bitrate_kbps" in quality and (
+                type(quality["max_bitrate_kbps"]) is not int
+                or quality["max_bitrate_kbps"] not in {1000, 2000, 4000}
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="quality.max_bitrate_kbps must be 1000, 2000, or 4000",
+                )
+        require_object("input", _SESSION_INPUT_FIELDS)
+        require_object("privacy", _SESSION_PRIVACY_FIELDS)
+        if "transport" in body and body["transport"] not in {
+            "auto", "quic", "udp", "tcp_interleaved", "relay",
+        }:
+            raise HTTPException(status_code=400, detail="Unsupported session transport")
+        if "ttl_seconds" in body and (
+            type(body["ttl_seconds"]) is not int or not 1 <= body["ttl_seconds"] <= 86400
+        ):
+            raise HTTPException(status_code=400, detail="ttl_seconds must be an integer from 1 to 86400")
+        return result
+
+    def _session_response(status: int, payload: Any) -> Any:
+        if status in (401, 403):
+            raise HTTPException(status_code=502, detail=_node_auth_error(status))
+        if status >= 400:
+            return JSONResponse(status_code=status, content=payload)
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="Node returned an invalid session response")
+        return JSONResponse(status_code=status, content=payload)
+
+    def _assert_session_owner(payload: Any, ctx: AuthContext) -> None:
+        session = payload.get("session") if isinstance(payload, dict) else None
+        principal = session.get("principal") if isinstance(session, dict) else None
+        expected, _ = _session_identity(ctx)
+        if principal != expected and not has_scope(ctx, SCOPE_ADMIN):
+            raise HTTPException(status_code=403, detail="This session belongs to another controller identity")
+
+    def _safe_native_session_id(session_id: str) -> str:
+        if (
+            not session_id or len(session_id) > 128
+            or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for char in session_id)
+        ):
+            raise HTTPException(status_code=400, detail="Invalid session id")
+        return session_id
+
+    @app.post("/api/v1/nodes/{node_id}/sessions")
+    async def create_node_session(
+        request: Request, node_id: str, body: dict[str, Any]
+    ) -> Any:
+        """Create a native node session from an authenticated, node-bound spec."""
+        node, ctx = _session_node(request, node_id, SCOPE_WRITE)
+        spec = _validate_session_spec(body)
+        if not await _node_session_transport_available(node_id):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "This computer is not ready to accept a remote session. "
+                    "Its native session connection needs to be enabled first."
+                ),
+            )
+        principal, client_id = _session_identity(ctx)
+        spec["principal"] = principal
+        spec["client_id"] = client_id
+        status, payload = await _proxy_node_response(node_id, "/api/v1/sessions", "POST", spec)
+        return _session_response(status, payload)
+
+    @app.get("/api/v1/nodes/{node_id}/sessions/{session_id}")
+    async def get_node_session(request: Request, node_id: str, session_id: str) -> Any:
+        """Inspect a native session and its aperture receipt."""
+        node, ctx = _session_node(request, node_id, SCOPE_READ)
+        del node  # Lookup and API-port validation are performed by the proxy.
+        session_id = _safe_native_session_id(session_id)
+        status, payload = await _proxy_node_response(
+            node_id, f"/api/v1/sessions/{session_id}", "GET"
+        )
+        if status < 400:
+            _assert_session_owner(payload, ctx)
+        return _session_response(status, payload)
+
+    async def _change_node_session(
+        request: Request, node_id: str, session_id: str, action: str, body: dict[str, Any]
+    ) -> Any:
+        _node, ctx = _session_node(request, node_id, SCOPE_WRITE)
+        session_id = _safe_native_session_id(session_id)
+        status, current = await _proxy_node_response(
+            node_id, f"/api/v1/sessions/{session_id}", "GET"
+        )
+        if status >= 400:
+            return _session_response(status, current)
+        _assert_session_owner(current, ctx)
+        status, payload = await _proxy_node_response(
+            node_id, f"/api/v1/sessions/{session_id}/{action}", "POST", body
+        )
+        return _session_response(status, payload)
+
+    @app.post("/api/v1/nodes/{node_id}/sessions/{session_id}/start")
+    async def start_node_session(request: Request, node_id: str, session_id: str) -> Any:
+        return await _change_node_session(request, node_id, session_id, "start", {})
+
+    @app.get("/api/v1/nodes/{node_id}/session-availability")
+    async def node_session_availability(request: Request, node_id: str) -> dict[str, Any]:
+        """Check that the target exposes a native session transport before asking for consent."""
+        _session_node(request, node_id, SCOPE_READ)
+        if not await _node_session_transport_available(node_id):
+            return {
+                "available": False,
+                "message": (
+                    "This computer is not ready to accept a remote session. "
+                    "Its native session connection needs to be enabled first."
+                ),
+            }
+        return {"available": True}
+
+    @app.post("/api/v1/nodes/{node_id}/sessions/{session_id}/stop")
+    async def stop_node_session(request: Request, node_id: str, session_id: str) -> Any:
+        return await _change_node_session(
+            request, node_id, session_id, "stop", {"reason": "admin_terminated"}
+        )
+
     def _is_typed_unsupported(payload: Any) -> bool:
         """Whether a node body is a typed ``supported:false`` surface result."""
         return (
@@ -2684,29 +2960,58 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Scenario endpoints ---
 
     @app.get("/api/v1/scenarios")
-    async def list_scenarios() -> dict[str, Any]:
+    async def list_scenarios(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
         return {
             "scenarios": scenarios.list(),
             "active_id": scenarios.active_id,
         }
 
     @app.get("/api/v1/scenarios/{scenario_id}")
-    async def get_scenario(scenario_id: str) -> dict[str, Any]:
+    async def get_scenario(request: Request, scenario_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
         s = scenarios.get(scenario_id)
         if s is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
         return s.to_dict()
 
     @app.post("/api/v1/scenarios")
-    async def create_scenario(req: CreateScenarioRequest, scenario_id: str) -> dict[str, Any]:
+    async def create_scenario(
+        request: Request, req: CreateScenarioRequest, scenario_id: str
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
         try:
-            s = await scenarios.create(scenario_id, req.name, req.node_id)
+            setup_profile = req.setup_profile.model_dump(mode="json") if req.setup_profile else None
+            if setup_profile:
+                profile_node_id = setup_profile["target_node_id"]
+                if req.node_id != profile_node_id:
+                    raise HTTPException(status_code=400, detail="Scenario node_id must match setup_profile.target_node_id")
+                _session_node(request, profile_node_id, SCOPE_WRITE)
+            s = await scenarios.create(scenario_id, req.name, req.node_id, setup_profile)
+        except HTTPException:
+            raise
         except ValueError as e:
             raise HTTPException(status_code=409, detail=str(e))
         return s.to_dict()
 
+    @app.patch("/api/v1/scenarios/{scenario_id}/setup-profile")
+    async def update_scenario_setup_profile(
+        request: Request, scenario_id: str, req: UpdateScenarioSetupProfileRequest
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        node_id = req.setup_profile.target_node_id
+        _session_node(request, node_id, SCOPE_WRITE)
+        try:
+            s = await scenarios.update_setup_profile(
+                scenario_id, req.name, node_id, req.setup_profile.model_dump(mode="json")
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        return s.to_dict()
+
     @app.post("/api/v1/scenarios/{scenario_id}/activate")
-    async def activate_scenario(scenario_id: str) -> dict[str, Any]:
+    async def activate_scenario(request: Request, scenario_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
         try:
             s = await scenarios.activate(scenario_id)
         except KeyError:

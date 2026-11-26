@@ -6,7 +6,7 @@
  *   so the user is never silently stuck with stale credentials.
  */
 
-import { GraphQLClient, ClientError } from 'graphql-request';
+import { GraphQLClient, ClientError, type RequestDocument, type Variables } from 'graphql-request';
 import { getToken, clearToken } from '../auth/tokenStorage';
 
 // The controller serves the GraphQL endpoint at /graphql.
@@ -47,8 +47,8 @@ export const gqlClient = new GraphQLClient(GRAPHQL_ENDPOINT, {
  * as plain network errors (e.g. from the REST fallback paths).
  */
 export async function gqlRequest<T>(
-  document: Parameters<typeof gqlClient.request>[0],
-  variables?: Parameters<typeof gqlClient.request>[1],
+  document: RequestDocument,
+  variables?: Variables,
 ): Promise<T> {
   try {
     return await gqlClient.request<T>(document, variables);

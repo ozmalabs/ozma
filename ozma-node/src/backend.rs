@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ozma_aperture::{evaluate_with_policy_version, Aperture, Dimension, Frame, Provenance, Value};
 use ozma_api::state::{CaptureReport, ClientCaptureSink};
 use ozma_api::NodeBackend;
 use ozma_auth::{ConsentPolicy, TokenClaims, TokenIssuer, TokenVerifier};
@@ -14,16 +15,20 @@ use ozma_encode::{EncoderRegistry, SelectedEncoder};
 use ozma_input::{FakeInputSink, InputSink, SharedSink};
 use ozma_protocol::scene::SceneCommit;
 use ozma_protocol::{
-    transport::TransportInfo, ApiError, CheckStatus, DiagnosticCheck, DiagnosticReport, DisplayId,
-    DisplayMode, DisplayTopology, DpmsState, EndReason, NodeCapabilities, PermissionSet,
-    RuntimeMetrics, Session, SessionEvent, SessionId, SessionOffer, SessionSpec, SessionState,
-    TransportMode, VirtualDisplaySpec,
+    transport::TransportInfo, ApiError, CheckStatus, ConsentRequirement, DiagnosticCheck,
+    DiagnosticReport, DisplayId, DisplayMode, DisplayTopology, DpmsState, EncoderBackend,
+    EndReason, NodeCapabilities, Permission, PermissionSet, RuntimeMetrics, Session, SessionEvent,
+    SessionId, SessionOffer, SessionSpec, SessionState, TransportMode, VirtualDisplaySpec,
 };
 use ozma_session::SessionManager;
 use ozma_transport::offer::{SessionOfferBuilder, TransportDescriptorBuilder};
 use ozma_transport::ChannelMap;
 use rand::RngCore;
 use tokio::sync::broadcast;
+
+const DEFAULT_VIDEO_MAX_FPS: u32 = 30;
+const DEFAULT_VIDEO_MAX_BITRATE_KBPS: u32 = 2_000;
+const PRODUCT_MAX_VIDEO_BITRATE_KBPS: u32 = 4_000;
 
 use crate::client_capture::ClientCaptureHub;
 
@@ -201,16 +206,97 @@ impl SessionBackend {
     pub fn build_encoder(
         &self,
         input: ozma_media::FrameFormat,
+        max_fps: u32,
+        max_bitrate_kbps: u32,
     ) -> Result<SelectedEncoder, ApiError> {
         let request = ozma_protocol::MediaFormat::new(
             ozma_protocol::Codec::H264,
             input.width.max(2),
             input.height.max(2),
-            30,
-            2_000,
+            max_fps,
+            max_bitrate_kbps,
         );
         let selection = self.encoders.select_buildable(&request)?;
         selection.build_encoder(input)
+    }
+
+    pub(crate) fn fake_fallback_encoder(
+        input: ozma_media::FrameFormat,
+        max_bitrate_kbps: u32,
+    ) -> SelectedEncoder {
+        SelectedEncoder::Fake(ozma_media::FakeEncoder::h264(input, max_bitrate_kbps))
+    }
+
+    fn requested_max_fps(spec: &SessionSpec) -> u32 {
+        spec.quality
+            .map_or(DEFAULT_VIDEO_MAX_FPS, |quality| quality.max_fps)
+    }
+
+    fn requested_max_bitrate_kbps(spec: &SessionSpec) -> u32 {
+        spec.quality
+            .map_or(DEFAULT_VIDEO_MAX_BITRATE_KBPS, |quality| {
+                quality.max_bitrate_kbps
+            })
+    }
+
+    fn encoder_max_fps(&self) -> u32 {
+        self.encoders
+            .capabilities()
+            .iter()
+            .filter(|encoder| {
+                encoder.codec == ozma_protocol::Codec::H264
+                    && matches!(
+                        encoder.backend,
+                        EncoderBackend::Software | EncoderBackend::Vaapi | EncoderBackend::Fake
+                    )
+            })
+            .map(|encoder| encoder.max_fps)
+            .filter(|fps| *fps > 0)
+            .max()
+            .unwrap_or(30)
+            .min(30)
+    }
+
+    /// Resolve the requested limit against the node's currently usable H.264
+    /// encoder capabilities. This same value is passed to encoder selection
+    /// and the capture-frame limiter.
+    pub fn effective_max_fps(&self, spec: &SessionSpec) -> u32 {
+        Self::requested_max_fps(spec).min(self.encoder_max_fps())
+    }
+
+    fn max_bitrate_cap(&self) -> (u32, &'static str) {
+        let budget = self.capabilities.budget.max_bitrate_kbps;
+        if budget > 0 && budget < PRODUCT_MAX_VIDEO_BITRATE_KBPS {
+            (budget, "node-resource-budget")
+        } else {
+            (PRODUCT_MAX_VIDEO_BITRATE_KBPS, "product-policy")
+        }
+    }
+
+    pub(crate) fn effective_max_bitrate_kbps(&self, spec: &SessionSpec) -> (u32, &'static str) {
+        let (cap, source) = self.max_bitrate_cap();
+        let requested = Self::requested_max_bitrate_kbps(spec);
+        if requested > cap {
+            (cap, source)
+        } else {
+            (requested, "")
+        }
+    }
+
+    fn validate_quality(spec: &SessionSpec) -> Result<(), ApiError> {
+        if let Some(quality) = spec.quality {
+            if !matches!(quality.max_fps, 15 | 24 | 30) {
+                return Err(ApiError::invalid(
+                    "The requested maximum frame rate must be 15, 24, or 30 FPS.",
+                ));
+            }
+            if !matches!(quality.max_bitrate_kbps, 1_000 | 2_000 | 4_000) {
+                return Err(ApiError::invalid(
+                    "The requested maximum video bitrate must be 1000, 2000, or 4000 kbps.",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn manager(&self) -> &SessionManager {
@@ -421,12 +507,127 @@ impl NodeBackend for SessionBackend {
         self.manager.get(id).ok()
     }
 
-    fn create_session(&self, spec: SessionSpec) -> Result<Session, ApiError> {
-        // The HTTP layer will narrow this to a controller-issued grant in the
-        // authentication pass. The local API currently runs on a trusted
-        // transport (loopback or the authenticated node API).
-        let granted = PermissionSet::all();
+    fn create_session(&self, mut spec: SessionSpec) -> Result<Session, ApiError> {
+        Self::validate_quality(&spec)?;
+        // Start with only the permissions implied by the user's session
+        // choices. A later controller grant or local policy may narrow this
+        // set further; it must never silently widen it to every permission.
+        let granted = spec.required_permissions();
+        // A controller cannot opt out of local approval for remote input by
+        // setting privacy.consent = "never". Enforce this at the target node,
+        // where the requested capabilities are known and before the session
+        // is created. The consent decision itself still needs a target-local
+        // authorization surface; the remote approval route is not that.
+        if granted.contains(Permission::Control) {
+            spec.privacy.consent = ConsentRequirement::Always;
+        }
         self.manager.create(spec, granted, now())
+    }
+
+    fn permission_aperture(
+        &self,
+        session: &Session,
+    ) -> Result<Option<serde_json::Value>, ApiError> {
+        let names = |permissions: &PermissionSet| {
+            permissions
+                .clone()
+                .into_iter()
+                .map(|permission| permission.to_string())
+                .collect::<Vec<_>>()
+        };
+        let physiology = Aperture::new().with(
+            Dimension::Permissions,
+            Value::set(ozma_protocol::Permission::ALL.map(|permission| permission.to_string())),
+        );
+        let grant = Frame::new(
+            "session-grant",
+            Provenance::Forced,
+            Aperture::new().with(
+                Dimension::Permissions,
+                Value::set(names(&session.permissions)),
+            ),
+        );
+        let request = Aperture::new().with(
+            Dimension::Permissions,
+            Value::set(names(&session.spec.required_permissions())),
+        );
+        let evaluation =
+            evaluate_with_policy_version(&physiology, &[grant], &request, "session-permissions-v1")
+                .map_err(|error| {
+                    ApiError::new(
+                        "aperture.invalid",
+                        "Unable to evaluate the session permission policy",
+                    )
+                    .with_details(serde_json::json!({ "reason": error.to_string() }))
+                })?;
+        let receipt = match evaluation {
+            ozma_aperture::Evaluation::Admitted(admission) => admission.receipt,
+            ozma_aperture::Evaluation::Residual(residual) => residual.receipt,
+        };
+        let value = serde_json::to_value(receipt).map_err(|error| {
+            ApiError::internal(format!("Unable to serialize permission receipt: {error}"))
+        })?;
+        Ok(Some(value))
+    }
+
+    fn quality_receipt(&self, session: &Session) -> Result<Option<serde_json::Value>, ApiError> {
+        let requested = Self::requested_max_fps(&session.spec);
+        let requested_bitrate = Self::requested_max_bitrate_kbps(&session.spec);
+        let capability_max = self.encoder_max_fps();
+        let (bitrate_cap, _) = self.max_bitrate_cap();
+        let physiology = Aperture::new()
+            .with(Dimension::Fps, Value::number(u64::from(capability_max)))
+            .with(
+                Dimension::BitrateKbps,
+                Value::number(u64::from(bitrate_cap)),
+            );
+        let request = Aperture::new()
+            .with(Dimension::Fps, Value::number(u64::from(requested)))
+            .with(
+                Dimension::BitrateKbps,
+                Value::number(u64::from(requested_bitrate)),
+            );
+        let evaluation =
+            evaluate_with_policy_version(&physiology, &[], &request, "session-video-quality-v1")
+                .map_err(|error| {
+                    ApiError::new(
+                        "aperture.invalid",
+                        "Unable to evaluate the session video quality policy",
+                    )
+                    .with_details(serde_json::json!({ "reason": error.to_string() }))
+                })?;
+        let effective = self.effective_max_fps(&session.spec);
+        let mut limiting = Vec::new();
+        if effective < requested {
+            limiting.push(serde_json::json!({
+                "source": "encoder-capability",
+                "max_fps": effective,
+            }));
+        }
+        let (effective_bitrate, bitrate_limit_source) =
+            self.effective_max_bitrate_kbps(&session.spec);
+        if effective_bitrate < requested_bitrate {
+            limiting.push(serde_json::json!({
+                "source": bitrate_limit_source,
+                "max_bitrate_kbps": effective_bitrate,
+            }));
+        }
+        let policy_receipt = match evaluation {
+            ozma_aperture::Evaluation::Admitted(admission) => admission.receipt,
+            ozma_aperture::Evaluation::Residual(residual) => residual.receipt,
+        };
+        Ok(Some(serde_json::json!({
+            "requested": {
+                "max_fps": requested,
+                "max_bitrate_kbps": requested_bitrate,
+            },
+            "effective": {
+                "max_fps": effective,
+                "max_bitrate_kbps": effective_bitrate,
+            },
+            "limiting": limiting,
+            "policy_receipt": policy_receipt,
+        })))
     }
 
     fn start_session(&self, id: &SessionId) -> Result<Session, ApiError> {
@@ -595,6 +796,7 @@ mod tests {
                 ..Default::default()
             },
             transport: Default::default(),
+            quality: None,
             ttl_seconds: 60,
         }
     }
@@ -602,13 +804,217 @@ mod tests {
     #[test]
     fn create_start_stop_roundtrip() {
         let backend = backend();
-        let session = backend.create_session(spec()).unwrap();
+        let mut request = spec();
+        request.input = InputSpec::default();
+        let session = backend.create_session(request).unwrap();
         let session = backend.start_session(&session.id).unwrap();
         assert_eq!(session.state, SessionState::Streaming);
         let stopped = backend
             .stop_session(&session.id, EndReason::AdminTerminated)
             .unwrap();
         assert_eq!(stopped.state, SessionState::Ended);
+    }
+
+    #[test]
+    fn remote_control_forces_consent_even_when_spec_says_never() {
+        let backend = backend();
+        backend.configure_transport("quic://127.0.0.1:7443", "test-fingerprint");
+        let request = spec();
+        assert_eq!(request.privacy.consent, ConsentRequirement::Never);
+        let session = backend.create_session(request).unwrap();
+        assert_eq!(session.spec.privacy.consent, ConsentRequirement::Always);
+        assert_eq!(session.state, SessionState::PendingConsent);
+        let receipt = backend
+            .permission_aperture(&session)
+            .unwrap()
+            .expect("session receipt");
+        assert_eq!(
+            receipt["requested"]["permissions"],
+            serde_json::json!(["control", "view"])
+        );
+        assert_eq!(
+            receipt["effective"]["permissions"],
+            serde_json::json!(["control", "view"])
+        );
+        let offer = backend.session_offer(&session).unwrap();
+        let claims = backend.verify_token(&offer.token).unwrap();
+        assert!(claims.permissions.contains(Permission::Control));
+    }
+
+    #[test]
+    fn view_only_request_grants_and_tokens_view_only_access() {
+        let backend = backend();
+        backend.configure_transport("quic://127.0.0.1:7443", "test-fingerprint");
+        let mut request = spec();
+        request.input = InputSpec::default();
+        request.audio = Default::default();
+        request.tracks = vec![ozma_protocol::TrackSpec {
+            track_id: "screen0".into(),
+            kind: ozma_protocol::TrackKind::Capture,
+            source_id: None,
+            display: None,
+            format: None,
+            mode: None,
+            hdr: false,
+        }];
+
+        let expected: PermissionSet = [Permission::View].into_iter().collect();
+        let session = backend.create_session(request).unwrap();
+        assert_eq!(session.permissions, expected);
+        let receipt = backend
+            .permission_aperture(&session)
+            .unwrap()
+            .expect("session receipt");
+        assert_eq!(
+            receipt["requested"]["permissions"],
+            serde_json::json!(["view"])
+        );
+        assert_eq!(
+            receipt["effective"]["permissions"],
+            serde_json::json!(["view"])
+        );
+
+        let offer = backend.session_offer(&session).unwrap();
+        let claims = backend.verify_token(&offer.token).unwrap();
+        assert_eq!(claims.permissions, expected);
+        assert!(!claims.permissions.contains(Permission::Control));
+    }
+
+    #[test]
+    fn quality_preference_is_capped_and_reported_separately_from_permissions() {
+        let backend = backend();
+        let mut request = spec();
+        request.quality = Some(ozma_protocol::QualityPreference {
+            max_fps: 15,
+            max_bitrate_kbps: 1_000,
+        });
+
+        let session = backend.create_session(request).unwrap();
+        let quality = backend
+            .quality_receipt(&session)
+            .unwrap()
+            .expect("quality receipt");
+
+        assert_eq!(backend.effective_max_fps(&session.spec), 15);
+        assert_eq!(quality["requested"]["max_fps"], 15);
+        assert_eq!(quality["effective"]["max_fps"], 15);
+        assert!(quality["limiting"].as_array().unwrap().is_empty());
+        assert!(backend.permission_aperture(&session).unwrap().is_some());
+    }
+
+    #[test]
+    fn quality_receipt_explains_an_encoder_frame_rate_limit() {
+        let backend = backend().with_encoder_registry(EncoderRegistry::from_capabilities([
+            ozma_protocol::EncodeCapability {
+                codec: ozma_protocol::Codec::H264,
+                backend: EncoderBackend::Software,
+                hardware: false,
+                max_width: 1920,
+                max_height: 1080,
+                max_fps: 24,
+                hdr: false,
+                profiles: vec!["baseline".to_owned()],
+            },
+        ]));
+        let mut request = spec();
+        request.quality = Some(ozma_protocol::QualityPreference {
+            max_fps: 30,
+            max_bitrate_kbps: 2_000,
+        });
+
+        let session = backend.create_session(request).unwrap();
+        let quality = backend
+            .quality_receipt(&session)
+            .unwrap()
+            .expect("quality receipt");
+
+        assert_eq!(quality["requested"]["max_fps"], 30);
+        assert_eq!(quality["effective"]["max_fps"], 24);
+        assert_eq!(quality["limiting"][0]["source"], "encoder-capability");
+        assert_eq!(quality["limiting"][0]["max_fps"], 24);
+        assert_eq!(backend.effective_max_fps(&session.spec), 24);
+    }
+
+    #[test]
+    fn bitrate_limit_is_applied_to_encoder_and_reported_in_quality_receipt() {
+        let mut capabilities = NodeCapabilities::fake("node");
+        capabilities.budget.max_bitrate_kbps = 1_000;
+        let backend = SessionBackend::new(
+            capabilities,
+            ConsentPolicy::for_machine(MachineClass::Server),
+        );
+        let mut request = spec();
+        request.quality = Some(ozma_protocol::QualityPreference {
+            max_fps: 30,
+            max_bitrate_kbps: 4_000,
+        });
+        let session = backend.create_session(request).unwrap();
+        let quality = backend
+            .quality_receipt(&session)
+            .unwrap()
+            .expect("quality receipt");
+        let (effective_bitrate, _) = backend.effective_max_bitrate_kbps(&session.spec);
+        let encoder = backend
+            .build_encoder(
+                ozma_media::FrameFormat::rgb24(320, 240),
+                30,
+                effective_bitrate,
+            )
+            .unwrap();
+        let applied = ozma_media::Encoder::output_format(&encoder);
+
+        assert_eq!(effective_bitrate, 1_000);
+        assert_eq!(applied.bitrate_kbps, 1_000);
+        assert_eq!(quality["requested"]["max_bitrate_kbps"], 4_000);
+        assert_eq!(quality["effective"]["max_bitrate_kbps"], 1_000);
+        assert_eq!(quality["limiting"][0]["source"], "node-resource-budget");
+        assert_eq!(quality["limiting"][0]["max_bitrate_kbps"], 1_000);
+
+        let fallback = SessionBackend::fake_fallback_encoder(
+            ozma_media::FrameFormat::rgb24(320, 240),
+            effective_bitrate,
+        );
+        assert_eq!(
+            ozma_media::Encoder::output_format(&fallback).bitrate_kbps,
+            1_000
+        );
+    }
+
+    #[test]
+    fn bitrate_above_product_limit_is_rejected() {
+        let backend = backend();
+        let mut request = spec();
+        request.quality = Some(ozma_protocol::QualityPreference {
+            max_fps: 30,
+            max_bitrate_kbps: 8_000,
+        });
+
+        let error = backend.create_session(request).unwrap_err();
+
+        assert_eq!(error.code, ozma_protocol::error::codes::INVALID_REQUEST);
+        assert!(backend.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn older_quality_preferences_default_to_2000_kbps() {
+        let preference: ozma_protocol::QualityPreference =
+            serde_json::from_str(r#"{"max_fps":24}"#).unwrap();
+        assert_eq!(preference.max_bitrate_kbps, 2_000);
+    }
+
+    #[test]
+    fn invalid_quality_preference_is_rejected_before_session_creation() {
+        let backend = backend();
+        let mut request = spec();
+        request.quality = Some(ozma_protocol::QualityPreference {
+            max_fps: 0,
+            max_bitrate_kbps: 2_000,
+        });
+
+        let error = backend.create_session(request).unwrap_err();
+
+        assert_eq!(error.code, ozma_protocol::error::codes::INVALID_REQUEST);
+        assert!(backend.list_sessions().is_empty());
     }
 
     #[test]

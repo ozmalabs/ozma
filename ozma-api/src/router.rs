@@ -5,9 +5,10 @@
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, Request, State};
+use axum::extract::{ConnectInfo, Path as AxumPath, Request, State};
 use axum::http::{header, HeaderMap};
 use axum::middleware::{self, Next};
+use axum::response::Html;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -121,6 +122,13 @@ pub fn router_with_sinks_and_extra(
         .route("/api/v1/sessions/:id/stop", post(stop_session))
         .route("/api/v1/sessions/:id/approve", post(approve_session))
         .route("/api/v1/sessions/:id/deny", post(deny_session))
+        .route("/api/v1/local/consent", get(local_consent_page))
+        .route("/api/v1/local/consent/pending", get(local_pending_consent))
+        .route(
+            "/api/v1/local/consent/:id/approve",
+            post(local_approve_session),
+        )
+        .route("/api/v1/local/consent/:id/deny", post(local_deny_session))
         .route("/api/v1/sessions/:id/resume", post(resume_session))
         .route("/api/v1/sessions/:id/events", get(session_events))
         .route("/api/v1/displays", get(list_displays).post(create_display))
@@ -143,7 +151,7 @@ pub fn router_with_sinks_and_extra(
             std::sync::Arc::new(token),
             require_bearer,
         )),
-        _ => router,
+        _ => router.layer(middleware::from_fn(require_local_session_client)),
     }
 }
 
@@ -164,6 +172,19 @@ async fn require_bearer(
     next: Next,
 ) -> Result<Response, ApiFailure> {
     let path = request.uri().path();
+    let local_consent_route = path == "/api/v1/local/consent"
+        || path == "/api/v1/local/consent/pending"
+        || path
+            .strip_prefix("/api/v1/local/consent/")
+            .is_some_and(|tail| {
+                let mut parts = tail.split('/');
+                let id = parts.next().unwrap_or_default();
+                let action = parts.next().unwrap_or_default();
+                !id.is_empty() && parts.next().is_none() && matches!(action, "approve" | "deny")
+            });
+    if local_consent_route {
+        return Ok(next.run(request).await);
+    }
     if path == "/health"
         || path == "/api/v1/health"
         || path == "/api/v1/capabilities"
@@ -184,6 +205,20 @@ async fn require_bearer(
             "Pass Authorization: Bearer <token> from the controller or local configuration.",
         ),
     ))
+}
+
+/// The API listener is commonly bound on all interfaces. If no bearer token
+/// is configured, keep native session operations local instead of exposing
+/// spoofable SessionSpec principals and unauthenticated session controls.
+async fn require_local_session_client(
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiFailure> {
+    let path = request.uri().path();
+    if path == "/api/v1/sessions" || path.starts_with("/api/v1/sessions/") {
+        ensure_local_request(&request)?;
+    }
+    Ok(next.run(request).await)
 }
 
 fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
@@ -384,13 +419,27 @@ async fn list_sessions(State(backend): State<Backend>) -> Json<SessionsResponse>
 #[derive(Serialize)]
 struct SessionResponse {
     session: Session,
+    /// Additive policy receipt for clients that need to explain requested vs.
+    /// effective session permissions. Absent only for non-policy backends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aperture: Option<serde_json::Value>,
+    /// Additive receipt describing the requested and applied quality ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     offer: Option<SessionOffer>,
 }
 
-fn session_response(backend: &Backend, session: Session) -> SessionResponse {
+fn session_response(backend: &Backend, session: Session) -> Result<SessionResponse, ApiFailure> {
     let offer = backend.session_offer(&session).ok();
-    SessionResponse { session, offer }
+    let aperture = backend.permission_aperture(&session)?;
+    let quality = backend.quality_receipt(&session)?;
+    Ok(SessionResponse {
+        session,
+        aperture,
+        quality,
+        offer,
+    })
 }
 
 async fn create_session(
@@ -398,7 +447,7 @@ async fn create_session(
     Json(spec): Json<SessionSpec>,
 ) -> Result<(axum::http::StatusCode, Json<SessionResponse>), ApiFailure> {
     let session = backend.create_session(spec)?;
-    let response = session_response(&backend, session);
+    let response = session_response(&backend, session)?;
     Ok((axum::http::StatusCode::CREATED, Json(response)))
 }
 
@@ -413,7 +462,7 @@ async fn get_session(
     let session = backend.get_session(&session_id(id)).ok_or_else(|| {
         ApiError::new(ozma_protocol::error::codes::NOT_FOUND, "Session not found")
     })?;
-    Ok(Json(session_response(&backend, session)))
+    Ok(Json(session_response(&backend, session)?))
 }
 
 async fn start_session(
@@ -421,7 +470,7 @@ async fn start_session(
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<SessionResponse> {
     let session = backend.start_session(&session_id(id))?;
-    Ok(Json(session_response(&backend, session)))
+    Ok(Json(session_response(&backend, session)?))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -439,7 +488,7 @@ async fn stop_session(
         &session_id(id),
         request.reason.unwrap_or(EndReason::AdminTerminated),
     )?;
-    Ok(Json(session_response(&backend, session)))
+    Ok(Json(session_response(&backend, session)?))
 }
 
 async fn delete_session(
@@ -447,33 +496,295 @@ async fn delete_session(
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<SessionResponse> {
     let session = backend.stop_session(&session_id(id), EndReason::AdminTerminated)?;
-    Ok(Json(session_response(&backend, session)))
-}
-
-#[derive(Debug, Deserialize)]
-struct DecisionRequest {
-    #[serde(default)]
-    by: Option<String>,
+    Ok(Json(session_response(&backend, session)?))
 }
 
 async fn approve_session(
     State(backend): State<Backend>,
     AxumPath(id): AxumPath<String>,
-    Json(request): Json<DecisionRequest>,
+    request: Request,
 ) -> ApiResult<SessionResponse> {
-    let by = request.by.unwrap_or_else(|| "local".to_owned());
-    let session = backend.approve_consent(&session_id(id), &by)?;
-    Ok(Json(session_response(&backend, session)))
+    ensure_local_request(&request)?;
+    let session = backend.approve_consent(&session_id(id), &local_actor())?;
+    Ok(Json(session_response(&backend, session)?))
 }
 
 async fn deny_session(
     State(backend): State<Backend>,
     AxumPath(id): AxumPath<String>,
-    Json(request): Json<DecisionRequest>,
+    request: Request,
 ) -> ApiResult<SessionResponse> {
-    let by = request.by.unwrap_or_else(|| "local".to_owned());
-    let session = backend.deny_consent(&session_id(id), &by)?;
-    Ok(Json(session_response(&backend, session)))
+    ensure_local_request(&request)?;
+    let session = backend.deny_consent(&session_id(id), &local_actor())?;
+    Ok(Json(session_response(&backend, session)?))
+}
+
+fn ensure_local_request(request: &Request) -> Result<(), ApiFailure> {
+    let peer_is_loopback = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .is_some_and(|ConnectInfo(peer)| peer.ip().is_loopback());
+    let host_authority = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<axum::http::uri::Authority>().ok());
+    let host_is_loopback = host_authority.as_ref().is_some_and(|authority| {
+        let host = authority.host().trim_end_matches('.').to_ascii_lowercase();
+        if host == "localhost" {
+            return true;
+        }
+        let unbracketed = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(&host);
+        unbracketed
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+    });
+    // A remote web page can make the browser connect to loopback and send a
+    // loopback Host itself. Reject cross-origin reads as well as writes; writes
+    // additionally require Origin to be present as a CSRF boundary.
+    let origin_required = matches!(
+        *request.method(),
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+            | axum::http::Method::DELETE
+    );
+    let origin_header = request.headers().get(header::ORIGIN);
+    let origin_is_same = match origin_header {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<axum::http::Uri>().ok())
+            .filter(|origin| origin.scheme_str() == Some("http"))
+            .and_then(|origin| origin.authority().cloned())
+            .zip(host_authority.clone())
+            .is_some_and(|(origin, host)| origin == host),
+        None => !origin_required,
+    };
+    if peer_is_loopback && host_is_loopback && origin_is_same {
+        Ok(())
+    } else {
+        Err(ApiFailure(
+            ApiError::new(
+                ozma_protocol::error::codes::FORBIDDEN,
+                "Session and consent routes require a loopback connection and same-origin browser access",
+            )
+            .with_remediation(
+                "Open consent review on the target computer. For remote controller session requests, configure the same OZMA_API_TOKEN on the node and a per-node or OZMA_NODE_API_TOKEN on the controller.",
+            ),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn local_actor() -> String {
+    // The effective uid is supplied by the operating system, unlike a caller
+    // controlled `by` field or environment variable.
+    format!("local-uid:{}", nix::unistd::geteuid().as_raw())
+}
+
+#[cfg(not(unix))]
+fn local_actor() -> String {
+    #[cfg(windows)]
+    {
+        use winapi::um::winbase::GetUserNameW;
+        let mut buffer = [0u16; 256];
+        let mut size = buffer.len() as u32;
+        // SAFETY: buffer is writable, sized to `size`, and remains alive for
+        // the duration of the OS call.
+        if unsafe { GetUserNameW(buffer.as_mut_ptr(), &mut size) } != 0 {
+            let length = size.saturating_sub(1) as usize;
+            let name = String::from_utf16_lossy(&buffer[..length]);
+            if !name.is_empty() {
+                return format!("local-user:{name}");
+            }
+        }
+    }
+    "local-user:os-identity-unavailable".to_owned()
+}
+
+const LOCAL_CONSENT_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ozma access requests</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+    body { margin: 0; background: #111827; color: #f3f4f6; }
+    main { max-width: 46rem; margin: 3rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.8rem; margin-bottom: .3rem; }
+    p, .muted { color: #cbd5e1; }
+    #requests { display: grid; gap: 1rem; margin-top: 1.5rem; }
+    section { border: 1px solid #475569; border-radius: .8rem; padding: 1rem; background: #1f2937; }
+    section h2 { margin: 0 0 .5rem; font-size: 1.15rem; }
+    ul { padding-left: 1.4rem; }
+    .actions { display: flex; gap: .75rem; margin-top: 1rem; }
+    button { border: 0; border-radius: .5rem; padding: .65rem 1rem; font: inherit; font-weight: 650; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .allow { background: #6ee7b7; color: #052e2b; }
+    .deny { background: #fecaca; color: #450a0a; }
+    #notice { min-height: 1.5rem; color: #a7f3d0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Remote access requests</h1>
+    <p>Review what the other Ozma computer wants to do. Approval applies only to this request and its stated duration.</p>
+    <p id="notice" role="status" aria-live="polite"></p>
+    <div id="requests" aria-live="polite">Loading requests…</div>
+  </main>
+  <script>
+    const labels = {
+      view: 'See this computer’s screen',
+      control: 'Use this computer’s keyboard and mouse',
+      audio: 'Hear sound from this computer',
+      mic: 'Send microphone audio to the other computer',
+      clipboard_read: 'Read clipboard contents',
+      clipboard_write: 'Change clipboard contents',
+      display_attach: 'Create a remote display',
+      file_transfer: 'Transfer files',
+      usb: 'Use connected USB devices',
+      power: 'Use power actions',
+      commands: 'Run approved commands',
+      admin: 'Manage this session',
+    };
+    const root = document.querySelector('#requests');
+    const notice = document.querySelector('#notice');
+    async function refresh() {
+      try {
+        const response = await fetch('/api/v1/local/consent/pending');
+        if (!response.ok) throw new Error('Could not load requests from this computer.');
+        const data = await response.json();
+        root.replaceChildren();
+        for (const request of data.sessions) {
+          const card = document.createElement('section');
+          const title = document.createElement('h2');
+          title.textContent = 'Access to this computer';
+          const requester = document.createElement('p');
+          requester.textContent = `Ozma account: ${request.principal}`;
+          const intro = document.createElement('p');
+          intro.textContent = 'They are asking to:';
+          const permissions = document.createElement('ul');
+          for (const permission of request.permissions) {
+            const item = document.createElement('li');
+            item.textContent = labels[permission] || 'Use an additional Ozma capability';
+            permissions.append(item);
+          }
+          const expiry = document.createElement('p');
+          expiry.className = 'muted';
+          expiry.textContent = `This request expires ${new Date(request.expires_at * 1000).toLocaleString()}.`;
+          const actions = document.createElement('div');
+          actions.className = 'actions';
+          for (const action of ['approve', 'deny']) {
+            const button = document.createElement('button');
+            button.className = action === 'approve' ? 'allow' : 'deny';
+            button.textContent = action === 'approve' ? 'Allow this request' : 'Deny';
+            button.onclick = async () => {
+              button.disabled = true;
+              try {
+                const result = await fetch(`/api/v1/local/consent/${encodeURIComponent(request.id)}/${action}`, { method: 'POST' });
+                if (!result.ok) throw new Error('The decision could not be recorded. Refresh and try again.');
+                notice.textContent = action === 'approve'
+                  ? 'Request approved. Return to Ozma setup to start the session.'
+                  : 'Request denied.';
+                await refresh();
+              } catch (error) {
+                notice.textContent = error instanceof Error ? error.message : 'The decision could not be recorded.';
+                button.disabled = false;
+              }
+            };
+            actions.append(button);
+          }
+          card.append(title, requester, intro, permissions, expiry, actions);
+          root.append(card);
+        }
+        if (!data.sessions.length) root.textContent = 'No access requests are waiting.';
+      } catch (error) {
+        root.textContent = error instanceof Error ? error.message : 'Could not load requests.';
+      }
+    }
+    void refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>"##;
+
+async fn local_consent_page(request: Request) -> Result<Response, ApiFailure> {
+    ensure_local_request(&request)?;
+    let mut response = Html(LOCAL_CONSENT_HTML).into_response();
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-frame-options"),
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("content-security-policy"),
+        axum::http::HeaderValue::from_static(
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+        ),
+    );
+    Ok(response)
+}
+
+#[derive(Serialize)]
+struct PendingConsentList {
+    sessions: Vec<PendingConsentMetadata>,
+}
+
+#[derive(Serialize)]
+struct PendingConsentMetadata {
+    id: SessionId,
+    principal: String,
+    permissions: Vec<String>,
+    expires_at: u64,
+}
+
+async fn local_pending_consent(
+    State(backend): State<Backend>,
+    request: Request,
+) -> Result<Json<PendingConsentList>, ApiFailure> {
+    ensure_local_request(&request)?;
+    let sessions = backend
+        .list_sessions()
+        .into_iter()
+        .filter(|session| session.state == ozma_protocol::SessionState::PendingConsent)
+        .filter_map(|session| {
+            session.consent.map(|consent| PendingConsentMetadata {
+                id: session.id,
+                principal: consent.principal,
+                permissions: consent
+                    .requested
+                    .into_iter()
+                    .map(|permission| permission.to_string())
+                    .collect(),
+                expires_at: consent.expires_at,
+            })
+        })
+        .collect();
+    Ok(Json(PendingConsentList { sessions }))
+}
+
+async fn local_approve_session(
+    State(backend): State<Backend>,
+    AxumPath(id): AxumPath<String>,
+    request: Request,
+) -> ApiResult<SessionResponse> {
+    ensure_local_request(&request)?;
+    let session = backend.approve_consent(&session_id(id), &local_actor())?;
+    Ok(Json(session_response(&backend, session)?))
+}
+
+async fn local_deny_session(
+    State(backend): State<Backend>,
+    AxumPath(id): AxumPath<String>,
+    request: Request,
+) -> ApiResult<SessionResponse> {
+    ensure_local_request(&request)?;
+    let session = backend.deny_consent(&session_id(id), &local_actor())?;
+    Ok(Json(session_response(&backend, session)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -487,7 +798,7 @@ async fn resume_session(
     Json(request): Json<ResumeRequest>,
 ) -> ApiResult<SessionResponse> {
     let session = backend.resume_session(&session_id(id), &request.client_id)?;
-    Ok(Json(session_response(&backend, session)))
+    Ok(Json(session_response(&backend, session)?))
 }
 
 async fn session_events(
@@ -819,13 +1130,50 @@ async fn send_scene_json(socket: &mut WebSocket, value: serde_json::Value) -> bo
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use ozma_protocol::{ClientId, InputSpec, PointerMode, SessionSpec, TrackKind, TrackSpec};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tower::ServiceExt;
 
     fn backend() -> Backend {
         Arc::new(crate::state::MemoryBackend::fake())
+    }
+
+    fn request_with_peer(
+        method: &str,
+        uri: impl Into<String>,
+        peer: IpAddr,
+        origin: Option<&str>,
+        body: Body,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri.into())
+            .header("host", "127.0.0.1:3000")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        builder
+            .extension(ConnectInfo(SocketAddr::new(peer, 12345)))
+            .body(body)
+            .unwrap()
+    }
+
+    fn view_spec() -> SessionSpec {
+        SessionSpec {
+            client_id: ClientId::new("client-view"),
+            principal: "alice".into(),
+            tracks: Vec::new(),
+            audio: Default::default(),
+            input: InputSpec::default(),
+            privacy: Default::default(),
+            transport: Default::default(),
+            quality: None,
+            ttl_seconds: 60,
+        }
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -929,18 +1277,18 @@ mod tests {
             },
             privacy: Default::default(),
             transport: Default::default(),
+            quality: None,
             ttl_seconds: 60,
         };
         let response = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/sessions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&spec).unwrap()))
-                    .unwrap(),
-            )
+            .oneshot(request_with_peer(
+                "POST",
+                "/api/v1/sessions",
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                Some("http://127.0.0.1:3000"),
+                Body::from(serde_json::to_vec(&spec).unwrap()),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
@@ -949,18 +1297,122 @@ mod tests {
 
         let response = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/v1/sessions/{id}/start"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(request_with_peer(
+                "POST",
+                format!("/api/v1/sessions/{id}/start"),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                Some("http://127.0.0.1:3000"),
+                Body::empty(),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         assert_eq!(json["session"]["state"], "streaming");
+    }
+
+    #[tokio::test]
+    async fn no_token_session_routes_reject_non_loopback_peers_even_with_loopback_host() {
+        let app = router(backend());
+        let remote = "192.0.2.44".parse().unwrap();
+        let listed = app
+            .clone()
+            .oneshot(request_with_peer(
+                "GET",
+                "/api/v1/sessions",
+                remote,
+                Some("http://127.0.0.1:3000"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::FORBIDDEN);
+
+        let created = app
+            .oneshot(request_with_peer(
+                "POST",
+                "/api/v1/sessions",
+                remote,
+                Some("http://127.0.0.1:3000"),
+                Body::from(serde_json::to_vec(&view_spec()).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn no_token_session_routes_allow_same_origin_loopback_requests() {
+        let app = router(backend());
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let listed = app
+            .clone()
+            .oneshot(request_with_peer(
+                "GET",
+                "/api/v1/sessions",
+                peer,
+                Some("http://127.0.0.1:3000"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+
+        let created = app
+            .oneshot(request_with_peer(
+                "POST",
+                "/api/v1/sessions",
+                peer,
+                Some("http://127.0.0.1:3000"),
+                Body::from(serde_json::to_vec(&view_spec()).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn no_token_session_mutations_require_a_matching_origin() {
+        let app = router(backend());
+        for origin in [None, Some("http://localhost:3000")] {
+            let response = app
+                .clone()
+                .oneshot(request_with_peer(
+                    "POST",
+                    "/api/v1/sessions",
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    origin,
+                    Body::from(serde_json::to_vec(&view_spec()).unwrap()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        let cross_origin_read = app
+            .clone()
+            .oneshot(request_with_peer(
+                "GET",
+                "/api/v1/sessions",
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                Some("http://localhost:3000"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_origin_read.status(), StatusCode::FORBIDDEN);
+
+        let pending = app
+            .oneshot(request_with_peer(
+                "GET",
+                "/api/v1/local/consent/pending",
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                Some("http://localhost:3000"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pending.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1030,6 +1482,7 @@ mod tests {
             input: Default::default(),
             privacy: Default::default(),
             transport: Default::default(),
+            quality: None,
             ttl_seconds: 60,
         }
     }
@@ -1070,12 +1523,13 @@ mod tests {
 
         let response = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/v1/sessions/{}/capture", session.id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(request_with_peer(
+                "GET",
+                format!("/api/v1/sessions/{}/capture", session.id),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                Some("http://127.0.0.1:3000"),
+                Body::empty(),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1092,12 +1546,13 @@ mod tests {
         assert_eq!(json["audio"]["samples"], 48_000);
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/v1/sessions/{}/capture/frame.ppm", session.id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(request_with_peer(
+                "GET",
+                format!("/api/v1/sessions/{}/capture/frame.ppm", session.id),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                Some("http://127.0.0.1:3000"),
+                Body::empty(),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1144,12 +1599,13 @@ mod tests {
     async fn unknown_session_is_a_structured_404() {
         let app = router(backend());
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/sessions/nope")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(request_with_peer(
+                "GET",
+                "/api/v1/sessions/nope",
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                Some("http://127.0.0.1:3000"),
+                Body::empty(),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);

@@ -77,6 +77,7 @@ class Scenario:
     capture_sources: list[str] | None = None  # Multi-monitor: ["hdmi-0", "hdmi-1"]
     wallpaper: dict | None = None        # Desktop wallpaper: {"mode": "gradient", "color": "#..."}
                                           # Modes: image, color, gradient, url, restore
+    setup_profile: dict | None = None    # Versioned user-intent setup saved from the GUI
 
     @classmethod
     def from_dict(cls, d: dict) -> "Scenario":
@@ -91,6 +92,7 @@ class Scenario:
             capture_source=d.get("capture_source"),
             capture_sources=d.get("capture_sources"),
             wallpaper=d.get("wallpaper"),
+            setup_profile=d.get("setup_profile"),
         )
 
     def to_dict(self) -> dict:
@@ -111,6 +113,8 @@ class Scenario:
             d["capture_sources"] = self.capture_sources
         if self.wallpaper:
             d["wallpaper"] = self.wallpaper
+        if self.setup_profile is not None:
+            d["setup_profile"] = self.setup_profile
         return d
 
 
@@ -185,13 +189,33 @@ class ScenarioManager:
         await self._state.events.put({"type": "scenario.updated", "scenario": s.to_dict()})
         return s
 
-    async def create(self, scenario_id: str, name: str, node_id: str | None = None) -> Scenario:
+    async def create(
+        self,
+        scenario_id: str,
+        name: str,
+        node_id: str | None = None,
+        setup_profile: dict | None = None,
+    ) -> Scenario:
         if scenario_id in self._scenarios:
             raise ValueError(f"Scenario already exists: {scenario_id}")
-        s = Scenario(id=scenario_id, name=name, node_id=node_id)
+        s = Scenario(id=scenario_id, name=name, node_id=node_id, setup_profile=setup_profile)
         self._scenarios[scenario_id] = s
         self._save()
         await self._state.events.put({"type": "scenario.created", "scenario": s.to_dict()})
+        return s
+
+    async def update_setup_profile(
+        self, scenario_id: str, name: str, node_id: str, setup_profile: dict
+    ) -> Scenario:
+        """Replace a scenario's validated GUI setup profile and persist it."""
+        s = self._scenarios.get(scenario_id)
+        if s is None:
+            raise KeyError(f"Unknown scenario: {scenario_id}")
+        s.name = name
+        s.node_id = node_id
+        s.setup_profile = setup_profile
+        self._save()
+        await self._state.events.put({"type": "scenario.updated", "scenario": s.to_dict()})
         return s
 
     async def delete(self, scenario_id: str) -> None:

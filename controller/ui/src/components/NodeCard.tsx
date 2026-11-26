@@ -1,14 +1,6 @@
 import StatusDot from './StatusDot';
 import Card from './Card';
-
-export interface NodeInfo {
-  id: string;
-  name?: string;
-  hostname: string;
-  host: string;
-  machine_class: string;
-  online: boolean;
-}
+import type { NodeInfo } from '../types/node';
 
 interface NodeCardProps {
   node: NodeInfo;
@@ -16,13 +8,14 @@ interface NodeCardProps {
 }
 
 export default function NodeCard({ node, className = '' }: NodeCardProps) {
+  const status = node.status === 'online' ? 'online' : node.status === 'offline' ? 'offline' : 'warning';
   return (
     <Card className={className}>
       <div className="flex items-center justify-between mb-2">
         <span className="text-zinc-100 font-semibold truncate">
           {node.name ?? node.hostname}
         </span>
-        <StatusDot status={node.online ? 'online' : 'offline'} />
+        <StatusDot status={status} />
       </div>
       <div className="text-xs text-zinc-400 space-y-1">
         <div>

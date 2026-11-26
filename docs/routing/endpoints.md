@@ -10,23 +10,71 @@ interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
 
 ## Abstract
 
-This document specifies how endpoint devices -- screens, RGB lighting, and
-control surfaces -- participate in the Ozma routing graph. Endpoint devices have
-ports, capabilities, resource requirements, and connection constraints identical
-to any other device. The router MUST account for them when assembling pipelines
-and managing device pressure.
+This document specifies how endpoint devices -- displays, RGB lighting, and
+control surfaces -- participate in the Ozma routing graph. Endpoint devices
+have ports, capabilities, resource requirements, and connection constraints
+like any other device. The router MUST account for them when resolving intents,
+selecting display methods, assembling pipelines, and managing device pressure.
 
 ## Specification
 
-### Screens
+### Displays
 
-A screen is any visual output device that is not a full-size monitor or
-projector. Screens are data sinks -- they consume rendered frames or widget
-definitions.
+A display is a visual endpoint, from a full-size monitor or projector to a
+small embedded panel. A display is not necessarily a pixel sink. It MAY consume
+pixel frames, renderable UI descriptions, structured data, or semantic entities
+and render them using its own display method. Routing structured content to a
+capable display MUST NOT require Ozma to first reconstruct that content as a
+picture.
 
-Every screen endpoint MUST declare its rendering tier. The rendering tier
-determines where rendering happens and what format the screen's sink port
-accepts.
+The user or application supplies desired content or an intent. The graph
+matches that content to display capabilities and an available display method.
+The method may run on the display, on a nearby node, or as a remote graph
+service. The selected method is part of the resolution, not a fixed assumption
+in the user request. A method MAY apply a style or theme, map entity attributes
+to widgets, and choose layout based on the display's size, color, touch, and
+character-set capabilities. Where possible, semantic calculations SHOULD be
+provided as data attributes rather than embedded in presentation code.
+
+Every display endpoint MUST advertise the representations and display methods
+it accepts. A method declaration identifies accepted content types or schemas,
+its rendering location, output formats, interaction support, and configuration
+needs. The `DisplayMethod` contract is defined in the [format system](formats.md).
+Methods and content schemas use open, namespaced identifiers so plugins and
+devices can add them without extending a closed display-type enum.
+
+For a display that renders locally, the route carries structured content to
+the display method and the display emits pixels locally. For a display that
+cannot render the content, the graph MAY select a compatible renderer service
+and route its output to the display. Pixel reconstruction is therefore one
+available method, not the universal display contract.
+
+#### Display representation tiers
+
+The rendering tier indicates the boundary at which content becomes pixels.
+Displays MAY support multiple tiers and methods; the endpoint advertises all
+supported tiers, while each `ScreenFormat` describes one representation.
+
+| Tier | Representation delivered | Rendering location | Typical use |
+|------|---------------------------|--------------------|-------------|
+| 0 -- Pixel sink | Raw or compressed frames | Upstream renderer | Legacy panels and remote display streams |
+| 1 -- Rendered UI | Composed widgets or UI description | Upstream renderer or display runtime | Browser widgets and configurable dashboards |
+| 2 -- Native UI | Widget definitions and layout hints | Display runtime | Smart displays with a native widget framework |
+| 3 -- Data-driven | Typed data or semantic entities | Display method on device or graph service | E-ink status panel, phone UI, device-specific display |
+
+The display method MUST declare what it needs; implementations MUST NOT infer
+that a tier number alone guarantees support for a particular widget, schema, or
+interaction.
+
+### Screen endpoint profile
+
+`ScreenEndpoint` is the visual endpoint profile used for small and embedded
+displays. Full-size monitors and projectors use the same content/method model
+with their own resolution, color, refresh, and interaction capabilities.
+
+Every screen endpoint MUST declare its supported rendering tiers. The tiers
+and advertised methods determine where rendering happens and what formats its
+sink port accepts.
 
 ```yaml
 ScreenEndpoint:
@@ -38,29 +86,28 @@ ScreenEndpoint:
   brightness_nits: float?       # if known
   viewing_angle: float?         # degrees
   touch: bool                   # does the panel accept touch input?
-  rendering_tier: uint          # 0, 1, or 2 (see below)
+  rendering_tiers: uint[]       # supported tiers from the table above
+  display_methods: DisplayMethod[] # methods and content forms accepted
   connection: ConnectionInfo    # how this screen connects
 ```
 
-#### Rendering tiers
+The routing graph MUST model each selected display method honestly:
 
-| Tier | Rendering location | Sink format | Latency | Resource cost |
-|------|-------------------|-------------|---------|---------------|
-| 0 -- Push frame | Controller renders, pushes raw/JPEG frames | `screen` (raw_rgb, jpeg) | Depends on controller | CPU/GPU on controller per screen |
-| 1 -- Server render | Node.js renderer on controller, pushes pre-rendered frames | `screen` (raw_rgb, jpeg) | ~10-50ms render + transport | CPU on controller, ~50-200 MB per renderer |
-| 2 -- Native render | Controller pushes widget definitions, device renders locally | `screen` (widget_def) | <1ms definition push, device renders | Minimal on controller; CPU/flash on device |
+- **Pixel rendering**: If content requires upstream rendering, the graph MUST
+  include a renderer participant with a source port and account for its
+  resources. The renderer may be on the controller, a node, or another
+  reachable service.
 
-The routing graph MUST model rendering tiers honestly:
+- **Structured content**: If the display method accepts typed data or semantic
+  entities, the route MUST preserve that representation to the method. The
+  device or selected renderer owns presentation. Resource costs are charged to
+  the participant that performs the rendering.
 
-- **Tier 0/1**: The controller MUST instantiate a rendering device (software
-  renderer or Node.js process) with a video source port. A link MUST connect
-  it to the screen's sink port. The rendering device MUST declare resource
-  costs on the controller.
-
-- **Tier 2**: The controller SHALL send widget definitions (tiny JSON payloads)
-  to the device. The device does its own rendering. The link MUST carry
-  `screen` format with `encoding: widget_def`. Resource cost on the controller
-  is negligible; the device's capacity determines what it can render.
+- **Method negotiation**: The resolver MUST match content type/schema and
+  required interactions against advertised methods. If no method can consume
+  the content, it MAY find a renderer/converter path or report the requirement
+  as unmet; it MUST NOT silently pretend that a pixel-only path preserves
+  semantic structure.
 
 #### Compound screen devices
 

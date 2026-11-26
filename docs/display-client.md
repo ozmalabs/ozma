@@ -12,7 +12,10 @@ The existing Ozma stack has a clear producer side: nodes and agents capture
 keyboard, mouse, video, and audio from target machines and route it through
 the controller. What is missing is a **dedicated consumer** — an application
 whose job is to receive and present that content in a coherent, configurable,
-multi-source display environment.
+multi-source display environment. Display content is not limited to decoded
+video: when the endpoint advertises a compatible display method, Ozma can
+route structured values or semantic entities to it and let that method choose
+the presentation.
 
 **Ozma Display** fills this role. It is a native application (Windows, Linux,
 embedded Linux) that:
@@ -87,6 +90,7 @@ Ozma Display can consume any of the following, selectable in any combination:
 | Ozma camera node | HLS / RTSP | Camera node enrolled in mesh |
 | Frigate camera stream | HLS | Frigate + camera node |
 | Ozma screen widgets / dashboard | WebSocket (Tier 2 native render) | Controller |
+| Structured entities / typed data | Negotiated display method and schema | Compatible display endpoint or renderer service |
 | Jellyfin / media server | HLS, DASH | Jellyfin reachable on mesh |
 | Sunshine game stream | Moonlight protocol | Sunshine on target |
 | Local desktop / screen capture | PipeWire capture (Linux) / DXGI (Windows) | None |

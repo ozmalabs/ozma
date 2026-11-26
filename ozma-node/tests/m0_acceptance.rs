@@ -67,6 +67,7 @@ async fn m0_fake_session_reaches_streaming() {
         },
         privacy: Default::default(),
         transport: Default::default(),
+        quality: None,
         ttl_seconds: 60,
     };
 

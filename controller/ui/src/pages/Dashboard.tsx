@@ -6,6 +6,7 @@
  * • Renders a NodeCard grid and the active scenario banner.
  */
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { useOzmaStore } from '../store/ozmaStore'
 import { useWebSocket } from '../ws/useWebSocket'
 import { gqlFetch, GET_NODES, GET_SCENARIOS } from '../graphql/queries'
@@ -119,6 +120,24 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6 p-6">
+      <section className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-indigo-700/60 bg-indigo-950/35 p-5 sm:p-6">
+        <div className="max-w-2xl">
+          <p className="text-xs font-medium uppercase tracking-[0.16em] text-indigo-300">Set up Ozma</p>
+          <h1 className="mt-1 text-xl font-semibold text-zinc-100">
+            {scenarios.length === 0 ? 'What would you like to do?' : 'Create or adjust a setup'}
+          </h1>
+          <p className="mt-2 text-sm text-zinc-300">
+            Start with an outcome. Ozma will check the available connection paths and help you choose what to share.
+          </p>
+        </div>
+        <Link
+          to="/setup"
+          className="inline-flex min-h-11 items-center justify-center rounded-lg bg-indigo-500 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-400 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-300"
+        >
+          {scenarios.length === 0 ? 'Start setup' : 'Open setup'}
+        </Link>
+      </section>
+
       {/* Connection status pill */}
       <div className="flex items-center gap-2 text-sm">
         <span
@@ -157,5 +176,4 @@ export default function Dashboard() {
       )}
     </div>
   )
-  return <div className="p-6 text-oz-text">Dashboard</div>
 }

@@ -39,6 +39,7 @@ ozma-capture  = { path = "../ozma-capture" }
 ozma-encode   = { path = "../ozma-encode" }
 ozma-session  = { path = "../ozma-session" }
 ozma-auth     = { path = "../ozma-auth" }
+ozma-aperture = { path = "../ozma-aperture" }
 ozma-transport = { path = "../ozma-transport" }
 ozma-rtsp     = { path = "../ozma-rtsp" }
 ozma-display  = { path = "../ozma-display" }

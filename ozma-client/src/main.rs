@@ -881,6 +881,7 @@ fn build_session_spec(args: &ConnectArgs) -> SessionSpec {
             disconnect_on_local_unlock: false,
         },
         transport: TransportPreference::Quic,
+        quality: None,
         ttl_seconds: 300,
     }
 }

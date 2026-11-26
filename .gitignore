@@ -37,6 +37,8 @@ images/
 
 # HLS stream segment cache
 controller/static/streams/
+controller/static/ui/
+controller/ui/*.tsbuildinfo
 
 # Site dependencies (install with npm install)
 site/node_modules/

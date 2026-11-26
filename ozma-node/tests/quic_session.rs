@@ -58,6 +58,7 @@ fn session_spec(control: bool) -> SessionSpec {
         },
         privacy: Default::default(),
         transport: Default::default(),
+        quality: None,
         ttl_seconds: 60,
     }
 }

@@ -44,6 +44,7 @@ fn session_with(permissions: PermissionSet) -> Session {
         input: Default::default(),
         privacy: Default::default(),
         transport: Default::default(),
+        quality: None,
         ttl_seconds: 60,
     };
     let mut session = Session::new(SessionId::new("session-test"), spec, permissions, 1);

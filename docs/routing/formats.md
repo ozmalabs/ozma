@@ -90,7 +90,7 @@ HidFormat:
   absolute_positioning: bool    # true for tablets/touchscreens, mouse uses absolute
 ```
 
-**ScreenFormat** (rendered content for small/embedded screens):
+**ScreenFormat** (visual content for displays, including small/embedded screens):
 
 ```yaml
 ScreenFormat:
@@ -104,21 +104,24 @@ ScreenFormat:
   rotation: uint?               # 0, 90, 180, 270 -- panel orientation
   dithering: bool?              # whether the sink supports dithering (for low-depth panels)
   partial_update: bool?         # can the sink accept partial frame updates?
-  rendering_tier: uint          # 0=push raw frames, 1=server-rendered,
-                                # 2=native render from widget defs,
-                                # 3=data-driven (device has its own UI, consumes typed data)
+  rendering_tier: uint          # 0=pixel sink, 1=upstream UI render,
+                                # 2=native widget render, 3=data-driven render
   data_schema: DataSchema?      # for tier 3: what data fields the device accepts
 ```
 
-Screen encoding `typed_data` (tier 3) is for devices that have their own
-display logic and UI -- they do not receive frames or widget definitions, they
-receive structured data and render it themselves. Examples: an ESP32 with a
-custom firmware that shows temperature/status, a phone app showing scenario
-state, a wall-mounted tablet running its own dashboard, or an e-ink display
-that formats its own layout from received values.
+Screen encoding `typed_data` (tier 3) is for devices or display methods that
+consume structured data and choose their own presentation. They do not need to
+receive a reconstructed frame. Examples: an ESP32 with custom firmware that
+shows temperature/status, a phone app showing scenario state, a wall-mounted
+tablet running its own dashboard, or an e-ink display that formats its own
+layout from received values. A device may advertise several methods, including
+both a typed-data method and a pixel sink.
 
-Tier-3 devices MUST include a `data_schema` in their advertised ScreenFormat.
-The controller MUST NOT send data fields that are absent from the schema.
+Every typed-data method MUST identify the schema or schemas it consumes. The
+publisher MUST validate data against the negotiated schema, and MUST NOT send
+fields that the recipient has not declared or negotiated. Schema and field
+identifiers SHOULD be namespaced so independently developed providers and
+display methods can interoperate without a closed global field enum.
 
 **DataSchema** -- describes what typed data a tier-3 screen accepts:
 
@@ -129,7 +132,7 @@ DataSchema:
   max_update_rate_hz: float?    # maximum rate the device can handle (null = unlimited)
 
 DataField:
-  key: string                   # field identifier (e.g., "cpu_temp", "active_scenario", "node_status")
+  key: string                   # namespaced field identifier (e.g., "org.ozma/node.status")
   type: string                  # "string", "number", "bool", "enum", "timestamp", "list", "object"
   unit: string?                 # for numbers: "celsius", "percent", "bytes", "bps", etc.
   enum_values: string[]?        # for enum type: allowed values
@@ -138,12 +141,33 @@ DataField:
   default: any?                 # value to display if not provided
 ```
 
-This makes `data` a first-class format for screen endpoints. The controller
-publishes data, the device subscribes to what it needs. A tier-3 device MAY
-advertise that it accepts `{active_scenario: string, node_count: number,
-cpu_temp: number, alerts: list}` and the controller pushes updates when those
-values change. The device renders however it wants -- the controller does not
-know or care about the device's UI.
+`DisplayMethod` describes a rendering method available on a display or
+reachable renderer service:
+
+```yaml
+DisplayMethod:
+  id: string                    # namespaced method identifier
+  accepts: string[]             # content types, semantic entity kinds, UI descriptions, or pixel formats
+  schemas: string[]?            # structured-data schemas accepted by this method
+  location: device | graph_service | either
+  outputs: FormatSet            # concrete visual formats emitted by the method
+  interactions: string[]?       # supported inputs such as touch, buttons, pointer
+  configuration_schema: string? # optional method-specific configuration
+```
+
+Method identifiers and schemas are extensible. The display resolver matches
+the content representation and any interaction requirements to the methods a
+display or renderer advertises. A method may consume semantic entities, typed
+data, a widget tree, or pixels; those are distinct accepted representations.
+
+This makes structured `data` a first-class format for display endpoints. A
+provider publishes typed values or semantic entities; a display method
+subscribes to the fields it understands and renders them according to its own
+layout, style, and physical capabilities. A method MAY accept, for example,
+`{active_scenario: string, node_count: number, cpu_temp: number, alerts: list}`
+and update only when values change. The method may run on the display or as a
+graph service. The route delivers the declared representation; it does not
+assume the controller must construct a bitmap first.
 
 **RgbFormat** (LED color data for addressable LEDs, RGB zones, fixtures):
 

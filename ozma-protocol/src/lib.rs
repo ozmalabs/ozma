@@ -49,7 +49,7 @@ pub use media::{AudioFormat, Codec, ColorFormat, MediaFormat};
 pub use permission::{Permission, PermissionSet};
 pub use session::{
     AudioSpec, ConsentRequest, ConsentRequirement, EndReason, InputSpec, LocalDisplayAction,
-    Participant, ParticipantRole, PointerMode, PrivacyPolicy, Session, SessionEvent, SessionSpec,
+    Participant, ParticipantRole, PointerMode, PrivacyPolicy, QualityPreference, Session, SessionEvent, SessionSpec,
     SessionState, TrackKind, TrackSpec, TransportPreference,
 };
 pub use transport::{

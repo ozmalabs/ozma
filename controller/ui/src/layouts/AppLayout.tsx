@@ -1,4 +1,5 @@
 import { Outlet, useNavigate } from 'react-router-dom';
+import { useAuth } from '../auth/AuthContext';
 import Sidebar from '../components/Sidebar';
 import TopBar from '../components/TopBar';
 
@@ -8,10 +9,10 @@ interface AppLayoutProps {
 
 export default function AppLayout({ activeNodeName }: AppLayoutProps) {
   const navigate = useNavigate();
+  const { logout } = useAuth();
 
   function handleLogout() {
-    // Clear any stored auth tokens
-    localStorage.removeItem('token');
+    logout();
     navigate('/login');
   }
 

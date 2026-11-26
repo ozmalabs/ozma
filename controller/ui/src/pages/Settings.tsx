@@ -53,9 +53,6 @@ const btnPrimary =
 const btnDanger =
   'border border-red-300 text-red-600 text-sm font-medium px-4 py-2 rounded-lg hover:bg-red-50 disabled:opacity-50'
 
-const btnGhost =
-  'border border-gray-300 text-gray-600 text-sm font-medium px-4 py-2 rounded-lg hover:bg-gray-50'
-
 // ---------------------------------------------------------------------------
 // Connect section
 // ---------------------------------------------------------------------------
