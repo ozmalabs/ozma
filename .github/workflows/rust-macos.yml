@@ -42,6 +42,11 @@ jobs:
         run: cargo build --release -p ozma-node --target aarch64-apple-darwin
 
       - name: Build ozma-node (x86_64-apple-darwin)
+        env:
+          # audiopus_sys builds its bundled Opus when cross-compiling Intel
+          # from the ARM runner. CMake 4 requires legacy projects to opt into
+          # at least the 3.5 policy baseline.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build --release -p ozma-node --target x86_64-apple-darwin
 
       - name: Package universal binary and DMG
