@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
 use ozma_api::{ClientCaptureSink, NodeBackend};
@@ -67,6 +68,16 @@ fn session_spec() -> SessionSpec {
         quality: None,
         ttl_seconds: 120,
     }
+}
+
+fn local_session_request(uri: String) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(header::HOST, "127.0.0.1:3000")
+        .header(header::ORIGIN, "http://127.0.0.1:3000")
+        .extension(ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 12345))))
+        .body(Body::empty())
+        .unwrap()
 }
 
 async fn connect(
@@ -339,12 +350,10 @@ async fn native_client_camera_and_microphone_reach_the_node() {
 
     let response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/sessions/{}/capture", session.id))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(local_session_request(format!(
+            "/api/v1/sessions/{}/capture",
+            session.id
+        )))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -359,12 +368,10 @@ async fn native_client_camera_and_microphone_reach_the_node() {
 
     let response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/sessions/{}/capture/frame.ppm", session.id))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(local_session_request(format!(
+            "/api/v1/sessions/{}/capture/frame.ppm",
+            session.id
+        )))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
