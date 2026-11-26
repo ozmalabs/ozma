@@ -9,7 +9,13 @@ client advertises them, keeping **Raw** as the always-valid fallback, and
 answers the **Cursor** pseudo-encoding with a typed empty cursor. Tight now
 covers **JpegCompression** (honouring the -32..-23 quality pseudo-encoding),
 the **GradientFilter**, and the -256..-247 compression-level hint in addition
-to Fill/Palette/Copy. **The transport is still plain TCP: VNC authentication
+to Fill/Palette/Copy. The server also implements **server-initiated
+ExtendedDesktopSize** (-308): when the capture source changes geometry after
+`ServerInit` (or on its first frame), each viewer that advertised -308 gets a
+typed resize rectangle followed by the new framebuffer. A client
+**`SetDesktopSize`** message is parsed and explicitly **denied**, because the
+capture source has no resize API; the server never claims a resize it did not
+perform. **The transport is still plain TCP: VNC authentication
 is not encryption and there is no TLS. ZRLE, ZLib, and Tight are compression,
 not encryption.** The node also has an **opt-in, bounded clipboard bridge**
 (`--vnc-clipboard`) that uses the desktop-profile X11 clipboard; it is off by
@@ -22,8 +28,10 @@ Added:
 
 - `ozma-node/src/vnc_server.rs` — a bound RFB listener, handshake, optional
   RFB security type 2 (DES challenge/response), Raw, Hextile, ZLib, Tight, and
-  ZRLE framebuffer encoders, Cursor pseudo-encoding, client-message parser,
-  input adapter, opt-in bounded clipboard bridge, and per-listener counters.
+  ZRLE framebuffer encoders, Cursor pseudo-encoding, server-initiated
+  ExtendedDesktopSize resize, typed `SetDesktopSize` denial, client-message
+  parser, input adapter, opt-in bounded clipboard bridge, and per-listener
+  counters.
 - `ozma-node/Cargo.toml` — the `flate2` dependency for the per-client ZRLE,
   ZLib, and Tight zlib streams (already present in `Cargo.lock` through the
   image stack) and the `jpeg-encoder` dependency for Tight JPEG (the same
@@ -137,11 +145,12 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
 | Type | Message | Behavior |
 |---|---|---|
 | `0` | `SetPixelFormat` | Accepts 32-bit true-colour with 8 bits per channel and either RGB (r16/g8/b0) or BGR (r0/g8/b16) shifts, little- or big-endian. Any other format closes the connection; RFB has no per-message error, and continuing would send pixels in a format the client did not request. |
-| `2` | `SetEncodings` | Parsed with a 1024-entry bound. Every supported entry is kept in the client's stated order: Raw (0), Hextile (5), ZLib (6), Tight (7), and ZRLE (16). The first usable entry is used; if it fails during encoding only that encoding is disabled and the next listed encoding (or Raw) is used. Tight pseudo-encodings are remembered per client: JPEG quality `-32..-23` (0..9, later entries win) and compression level `-256..-247` (0..9). Other pseudo-encodings are ignored, and an empty or all-unsupported list falls back to Raw. The Cursor pseudo-encoding (-239) is remembered. |
+| `2` | `SetEncodings` | Parsed with a 1024-entry bound. Every supported entry is kept in the client's stated order: Raw (0), Hextile (5), ZLib (6), Tight (7), and ZRLE (16). The first usable entry is used; if it fails during encoding only that encoding is disabled and the next listed encoding (or Raw) is used. Tight pseudo-encodings are remembered per client: JPEG quality `-32..-23` (0..9, later entries win) and compression level `-256..-247` (0..9). The Cursor pseudo-encoding (-239) and ExtendedDesktopSize (-308) are remembered. Other pseudo-encodings are ignored, and an empty or all-unsupported list falls back to Raw. |
 | `3` | `FramebufferUpdateRequest` | Full (`incremental=0`) or incremental (`incremental=1`), with bounded rectangle clipping. Multiple pending requests are merged into at most eight rectangles. |
 | `4` | `KeyEvent` | Keysym → USB HID usage, forwarded to the shared `InputSink`. Unknown keysyms are counted and dropped rather than guessed. |
 | `5` | `PointerEvent` | Absolute pointer position (scaled to the sink's 0..=32767 report space) plus button/wheel transitions. |
 | `6` | `ClientCutText` | Parsed up to 1 MiB. With `--vnc-clipboard` on a desktop/X11 node, the ISO-8859-1 text is sanitised (NUL/C0/C1 controls removed except tab/CR/LF) and written through the desktop clipboard path when it fits `--vnc-clipboard-max-bytes`; otherwise it is consumed and counted as rejected. With the bridge off it is parsed and ignored. A length above 1 MiB closes the connection instead of trusting the field. |
+| `251` | `SetDesktopSize` | Parsed with a bounded one-screen policy. The capture source cannot be resized by VNC, so a structurally valid layout is denied (`Prohibited`); zero-sized/screenless/too-many-screen layouts get `InvalidScreenLayout`, and over-16-megapixel layouts get `OutOfResources`. Every screen record is consumed. The client's current geometry is echoed in an ExtendedDesktopSize rectangle with reason=1 (client) only when the client advertised -308; otherwise the denial is counted with no wire reply. The server never applies a size it did not obtain from the capture source. |
 | other | unknown | The connection is closed with a typed protocol diagnostic; the RFB framing cannot be recovered safely. |
 
 ### Framebuffer updates
@@ -160,6 +169,33 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
   response without re-sending pixel data.
 - `ClientCutText` and unsupported encodings do not desynchronise the message
   stream.
+
+### Desktop resize (ExtendedDesktopSize)
+
+- Geometry is no longer frozen forever after `ServerInit`. The capture pump
+  accepts a new frame whose width/height changed, as long as the pixel layout is
+  unchanged and the geometry is non-zero, at most `u16::MAX` in each dimension,
+  and at most 16 megapixels (64 MiB at four bytes per pixel). Invalid or
+  oversized frames are dropped and counted in `source_errors`; the previous
+  framebuffer stays live.
+- A viewer that listed **ExtendedDesktopSize (-308)** in `SetEncodings` gets a
+  -308 pseudo-rectangle **before** any pixels in the first update that observes
+  the new size. The rectangle carries reason=0 (server-initiated), result=0
+  (success), the new width/height, and one screen record (id 0, x/y 0, the full
+  new size, flags 0). The same update then sends the whole new framebuffer
+  through the viewer's selected Raw/Hextile/ZLib/Tight/ZRLE encoder, so no part
+  of the resized framebuffer is left undefined.
+- The per-client geometry used for request clipping and pointer scaling moves
+  to the announced size only after the resize rectangle has been written.
+  ZRLE, ZLib, and Tight per-client zlib streams are **not** reset by a resize;
+  the new rectangle simply continues the existing stream.
+- A client that did **not** advertise -308 keeps its `ServerInit` geometry. A
+  grown frame is clipped to that old size, and a shrunk frame clips requests to
+  the new smaller size; the viewer is never sent out-of-bounds pixels or a
+  pseudo-encoding it did not request. Those clients still need a reconnect to
+  see the new size, but an existing session is not desynchronised.
+- `SetDesktopSize` is never treated as a server resize command. The capture
+  source exposes no resize API, so the server cannot truthfully accept it.
 
 ### Encoding preference and fallback
 
@@ -319,16 +355,20 @@ sessions:
   payload. It never fabricates a visible pointer shape.
 - The empty cursor is sent once per connection. A client that did not request
   Cursor never receives a Cursor rectangle.
-- `DesktopSize` (-223) is not advertised: geometry is fixed at `ServerInit`.
+- `DesktopSize` (-223) is not advertised. Only `ExtendedDesktopSize` (-308) is
+  implemented; clients that do not request it keep their `ServerInit` geometry
+  as described above.
 
 ## Capture feed and bounds
 
 - One capture source is opened from the node's existing `CaptureRegistry`:
   the first capability found by `scan()`. Per-provider discovery errors do not
   hide a working source from another provider.
-- Geometry is frozen from the source format when it is known, or from the first
-  valid frame for dynamic QMP/D-Bus sources. Later frames with a different
-  geometry are dropped, not reinterpreted.
+- Geometry comes from the source format when it is known, or from the first
+  valid frame for dynamic QMP/D-Bus sources. A later frame with a different
+  width/height is accepted when it passes the same bounds and the pixel layout
+  is unchanged; it is published as a resize (see Desktop resize). A frame with a
+  different pixel layout is still dropped, not reinterpreted.
 - Frames are copied into a single last-frame snapshot. Viewers always read the
   newest published frame; intermediate frames are counted in
   `frames_coalesced`, not queued.
@@ -343,10 +383,16 @@ sessions:
   - 64 pending update-request commands per viewer;
   - 1 MiB `ClientCutText`;
   - 1024 `SetEncodings` entries;
+  - 16 screens in one `SetDesktopSize` message (the wire count is consumed up
+    to its `u8` maximum, but layouts above 16 are denied as invalid);
   - 5 s handshake timeout and 10 s per-update write timeout. A viewer that
     cannot drain an update is closed and counted as `slow_clients`.
-- A frame whose format or byte length no longer matches `ServerInit` is dropped
-  and counted, never reinterpreted.
+- A frame whose pixel format or byte length no longer matches its format is
+  dropped and counted, never reinterpreted. A width/height change with the same
+  pixel layout is handled as a bounded resize instead of being dropped.
+- Per-viewer resize state is bounded too: one announced geometry, at most one
+  -308 rectangle per geometry change, and no extra buffers proportional to
+  frame count.
 - The capture source is stopped during the cooperative shutdown window; the
   listener and in-flight viewers are aborted only if that window expires.
 
@@ -432,20 +478,53 @@ unavailable.
 
 ### Automated
 
-`cargo test -p ozma-node --lib vnc` — **70 passed, 0 failed** for the RFB,
-clipboard-bridge, config, and registration coverage. Because the main working
-tree also contained unrelated in-progress HLS/video edits, this pass was
-validated in a clean `HEAD` worktree with only the VNC clipboard files applied;
-`cargo check -p ozma-node --all-targets` passed there. The wider full-suite
-number from the previous pass was **552 passed, 0 failed, 4 ignored**; the
-ignored tests are pre-existing opt-in WebRTC/GStreamer live tests.
+`cargo test -p ozma-node --lib vnc` — **77 passed, 0 failed** for the RFB,
+resize, clipboard-bridge, config, and registration coverage. The main working
+tree currently contains unrelated in-progress edits and a broken `ozma-mesh`
+import (`DiscoveryAuthStatus`), so this pass was validated in a clean `HEAD`
+worktree (`f6e215b`) with only `ozma-node/src/vnc_server.rs` copied in;
+`cargo check -p ozma-node --all-targets` passed there, with only pre-existing
+warnings in other crates. The wider full-suite number from an earlier pass was
+**552 passed, 0 failed, 4 ignored**; the ignored tests are pre-existing opt-in
+WebRTC/GStreamer live tests.
 
-This clipboard pass changed only `ozma-node/src/vnc_server.rs`, the VNC flag
-wiring/validation in `ozma-node/src/main.rs` and `ozma-node/src/config.rs`, the
-test-config fields in `ozma-node/src/platform.rs`, and this report. It did not
-change `docs/parity-matrix.md` or `docs/plan-execution-status.md`. The main
-working tree also had unrelated in-progress HLS/video edits; those were not
-touched.
+This resize pass changed only `ozma-node/src/vnc_server.rs` and this report. It
+did not change `docs/parity-matrix.md` or `docs/plan-execution-status.md`, and
+did not touch `ozma-usb`, `ozma-mesh`, `ozma-multiseat`, `ozma-audio`, or
+`ozma-softnode`. The main working tree also has unrelated in-progress edits;
+those were not touched.
+
+New resize tests in `ozma-node/src/vnc_server.rs`:
+
+- `server_resize_sends_extended_desktop_size_and_resized_pixels_for_all_encodings`
+  — for Raw, ZRLE, Hextile, ZLib, and Tight in turn, a live RFB connection
+  serves the `ServerInit` 4x2 frame, then the capture source publishes an 8x4
+  frame. The next update begins with a -308 rectangle (reason 0/server, result
+  0/success, 8x4, one full-screen record) followed by the 8x4 pixel rectangle
+  decoded through the same persistent encoder stream as the initial frame. This
+  proves the per-client ZRLE/ZLib/Tight streams are not reset by a resize.
+- `first_frame_geometry_change_after_server_init_sends_resize` — `ServerInit`
+  uses the source's declared 4x2 geometry before any frame exists; the first
+  real frame is 8x4, so the first update carries -308 plus the new Raw pixels.
+- `resize_is_not_announced_to_a_client_without_extended_desktop_size` — a
+  viewer that advertised only Raw never receives -308. Growing to 8x4 is
+  clipped to its 4x2 geometry; shrinking to 2x1 clips to 2x1. The connection
+  stays valid and `desktop_resize_sent` stays zero.
+- `oversized_resize_frames_are_dropped_without_moving_the_framebuffer` — a
+  frame wider than the RFB `u16` geometry range increments `source_errors` and
+  does not publish a new generation; the old 4x2 framebuffer still serves.
+- `set_desktop_size_bounds_are_typed` — zero width/height, zero screens, and
+  more than 16 screens are `InvalidScreenLayout`; 65535x65535 is
+  `OutOfResources`; a valid 8x4 and the exact 16-megapixel 4096x4096 layout are
+  `Prohibited` because the capture source cannot be resized.
+- `set_desktop_size_is_parsed_and_denied_without_fake_success` — a live
+  `SetDesktopSize` 8x4 receives a -308 rectangle with reason 1 (client),
+  result 1 (prohibited), and the **current** 4x2 geometry; zero and oversized
+  requests get result 3 and 2. A later 4x2 framebuffer request still returns
+  the unchanged pixels. Counters show 3 requests, 3 denials, 0 server resizes.
+- `set_desktop_size_without_extended_desktop_size_gets_no_wire_reply` — a
+  client that did not advertise -308 gets no pseudo-rectangle at all; its next
+  message is the normal Raw update, and the request/denial are still counted.
 
 New encoding tests in `ozma-node/src/vnc_server.rs`:
 
@@ -760,6 +839,43 @@ sent even though the client advertised it. This is live wire evidence for the
 gradient filter, JPEG sub-encoding, quality-level negotiation (including the
 TigerVNC `jpeg_quality=8` hint), and the compression-level hint.
 
+### Live ExtendedDesktopSize / SetDesktopSize smoke (2026-11-26)
+
+The fake-source node was run at `127.0.0.1:15999` with
+`--capture-provider fake` (1280x720). A Python stdlib raw RFB 3.8 probe
+advertised `SetEncodings` `[Raw (0), ExtendedDesktopSize (-308)]` and sent a
+`SetDesktopSize` request for 640x480 with one screen. It received:
+
+```text
+ServerInit 1280x720 name=b'Ozma SFFPC (fake0)'
+SetDesktopSize reply framebuffer update rects 1
+denial rect reason=1 result=1 geom=1280x720 encoding=-308 screens=1
+screen id=0 x=0 y=0 1280x720 flags=0
+framebuffer rect 1280x720 encoding=0 bytes=3686400
+RESIZE_PROBE_OK
+```
+
+Reason 1 is a client-initiated reply, result 1 is `Prohibited`, and the
+rectangle echoes the real current 1280x720 framebuffer rather than the
+requested 640x480. The subsequent full request still returned a Raw 1280x720
+rectangle, so the denial did not change the session geometry. The node log
+showed the same request as `result=Prohibited`, the denial as sent, and no
+`ExtendedDesktopSize resize` line (no source resize occurred).
+
+TigerVNC 1.16.2 under Xvfb connected to the same listener. Its 27-encoding
+list was logged with `order=[Tight, Zrle, Hextile, Raw] cursor=true
+extended_desktop_size=true jpeg_quality=8 compression_level=2`, and it decoded
+frames for the 5 s test window with no protocol, zlib, or decode error before
+the timeout stopped it. This is live evidence that a real desktop viewer
+negotiates -308 and remains healthy.
+
+**Limitation:** the fake capture source never changes geometry, so this smoke
+does not produce a live server→client resize rectangle. That path is covered by
+the in-process live RFB connection tests with a test-controlled
+`ChannelSource`, which exercise Raw, ZRLE, Hextile, ZLib, and Tight after both
+a first-frame and a mid-session resize. No hardware/QMP/D-Bus source resize was
+available in this environment.
+
 ### Commands
 
 ```sh
@@ -768,14 +884,16 @@ cargo check -p ozma-node --all-targets
 rustfmt --edition 2021 --check ozma-node/src/vnc_server.rs
 ```
 
-All passed: **62 vnc tests**, check clean apart from pre-existing warnings in
-other crates (`unused_mut` in `controller_compat.rs`, unused imports in
-`ozma-pipewire`), rustfmt exit 0. The commands and live run used a clean
-worktree at `487c396` with only `ozma-node/src/vnc_server.rs`,
-`ozma-node/Cargo.toml`, and `Cargo.lock` copied from this change, because the
-main working tree currently carries unrelated uncommitted `mesh_service`
-changes that do not compile (`kernel_is_none` is missing). The wider
-`ozma-node` lib suite was not re-run for this Tight pass.
+All passed: **77 vnc tests** (`cargo test -p ozma-node --lib vnc`),
+`cargo check -p ozma-node --all-targets` clean apart from pre-existing warnings
+in other crates (unused imports in `ozma-pipewire`), rustfmt exit 0. For this
+resize pass the commands ran in a clean `HEAD` worktree (`f6e215b`) with only
+`ozma-node/src/vnc_server.rs` copied in, because the main working tree carries
+unrelated uncommitted `ozma-mesh` changes that do not compile
+(`DiscoveryAuthStatus` is missing). The main tree's file was still formatted
+with the same `rustfmt --check`. A full `ozma-node` lib run was attempted but
+aborted with `SIGBUS` in this environment; the targeted `vnc` filter is green
+and is the evidence used here.
 
 ## Remaining VNC gaps
 
@@ -808,10 +926,19 @@ changes that do not compile (`kernel_is_none` is missing). The wider
   capture pipeline, so the node tells a requesting client that there is no
   local cursor. It does not inspect QMP/QEMU cursor state or synthesize a
   pointer image.
-- **No desktop resize or continuous updates.** No `SetDesktopSize` (-223), no
-  Extended Desktop Size, no continuous-updates pseudo-encoding, and no fence.
-  Geometry is fixed at `ServerInit`; a resolution change requires a viewer
-  reconnect and node restart.
+- **Server-initiated resize only; client resize is denied.** ExtendedDesktopSize
+  (-308) is implemented for resize events that come from the capture source.
+  `SetDesktopSize` is parsed and always denied because the source exposes no
+  resize API; the server never claims success by echoing a requested size. There
+  is still no continuous-updates pseudo-encoding and no fence. A client that did
+  not advertise -308 must reconnect to see a new geometry; its existing session
+  stays valid but is clipped to the old size.
+- **Capture-source resize policy is conservative.** Width/height changes are
+  accepted only when the pixel layout is unchanged, both dimensions are
+  non-zero and at most `u16::MAX`, and the frame stays within 16 megapixels.
+  Invalid or oversized frames are dropped and counted; the server does not scale,
+  crop-and-pad, or fabricate a geometry. A source that changes pixel layout
+  (for example RGB24 to BGRA) is still unsupported and needs a new session.
 - **Only packed RGB24/BGRA capture sources.** YUYV, NV12, P010, and compressed
   sources are refused at startup; this server does not convert pixel layouts.
   Raw, Hextile, ZLib, Tight, and ZRLE still send only 32-bit true-colour client
@@ -821,10 +948,9 @@ changes that do not compile (`kernel_is_none` is missing). The wider
 - **No frame-rate pacing in the server.** The capture pump runs at the source's
   own pace even when no viewer is connected; the snapshot is overwritten rather
   than queued.
-- **One source, no resize.** Geometry is fixed at `ServerInit` (or at the first
-  dynamic frame). A capture source that changes resolution after that has those
-  frames dropped; `SetDesktopSize` and continuous resize are not implemented,
-  so the viewer must reconnect after a resolution change and node restart.
+- **One source, read-only geometry from VNC.** The framebuffer follows the
+  capture source's geometry, but VNC cannot command the source to resize. A
+  `SetDesktopSize` request is a typed denial, not a remote resolution control.
 - **One shared input sink.** Multiple viewers share keyboard/pointer state, and
   any disconnect releases all held input. This is conservative (no stuck keys)
   but not true per-viewer input isolation.
@@ -849,7 +975,11 @@ changes that do not compile (`kernel_is_none` is missing). The wider
   `--vnc-max-clients`, `--vnc-idle-timeout-seconds`, `--vnc-clipboard`, or
   `--vnc-clipboard-max-bytes`.
 - **Optional live tooling.** The live smoke used `--capture-provider fake`; no
-  hardware V4L2, QMP, D-Bus, or guest VNC source was exercised in this task.
+  hardware V4L2, QMP, D-Bus, or guest VNC source was exercised in this task. In
+  particular, the fake source cannot resize, so the live run proves -308
+  negotiation and `SetDesktopSize` denial but not a live server→client resize;
+  that path is covered by in-process RFB connection tests with a scripted
+  source.
 
 ## Live re-validation with a QMP source (2026-11-25)
 

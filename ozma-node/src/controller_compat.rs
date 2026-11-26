@@ -4361,6 +4361,17 @@ pub struct ConnectionResponse {
     pub hls: &'static str,
     /// Why HLS is not `running`, when it is configured and failing.
     pub hls_error: Option<String>,
+    /// Whether HLS audio was configured for the active pipeline.
+    ///
+    /// Configuration intent only; it never claims that ffmpeg opened the
+    /// monitor, decoded samples, or negotiated an audio track.
+    pub hls_audio_configured: bool,
+    /// Configured HLS audio monitor source, when one was supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hls_audio_source: Option<String>,
+    /// Exact ffmpeg HLS audio encoder, when audio was configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hls_audio_encoder: Option<String>,
     pub webrtc: &'static str,
     /// Why WebRTC is not `running`, when it is configured and failing.
     pub webrtc_error: Option<String>,
@@ -4649,6 +4660,46 @@ pub fn legacy_router(state: ConnectionState) -> Router {
         .with_state(state)
 }
 
+/// Resolve the active single-HLS status name/error from the controller or the
+/// static fallback status.
+fn hls_status_name(
+    controller: Option<&HlsController>,
+    fallback: Option<&HlsStatus>,
+) -> (&'static str, Option<String>) {
+    match (controller, fallback) {
+        (Some(controller), _) => {
+            let status = controller.status();
+            (status.status_name(), status.error())
+        }
+        (None, None) => ("not-configured", None),
+        (None, Some(status)) => (status.status_name(), status.error()),
+    }
+}
+
+/// Configuration intent for the active single-HLS audio track.
+fn hls_audio_intent(
+    controller: Option<&HlsController>,
+    fallback: Option<&HlsStatus>,
+) -> (bool, Option<String>, Option<String>) {
+    if let Some(controller) = controller {
+        return match controller.config().audio {
+            Some(audio) => {
+                let encoder = audio.encoder().to_owned();
+                (true, Some(audio.source), Some(encoder))
+            }
+            None => (false, None, None),
+        };
+    }
+    match fallback {
+        Some(status) => (
+            status.audio_configured(),
+            status.audio_source(),
+            status.audio_encoder(),
+        ),
+        None => (false, None, None),
+    }
+}
+
 async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResponse> {
     let info = &state.info;
     let power = match &state.power {
@@ -4676,39 +4727,57 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
             }
         }
     };
-    let (hls, hls_error, multi_console_hls) = match &state.multi_console_hls {
+    let (
+        hls,
+        hls_error,
+        multi_console_hls,
+        hls_audio_configured,
+        hls_audio_source,
+        hls_audio_encoder,
+    ) = match &state.multi_console_hls {
         Some(manager) if manager.supports_independent_consoles() => {
             let status = manager.active_status().await;
+            let multi = manager.status().await;
+            let active_audio = multi
+                .consoles
+                .iter()
+                .find(|console| console.active)
+                .map(|console| {
+                    (
+                        console.audio_configured,
+                        console.audio_source.clone(),
+                        console.audio_encoder.clone(),
+                    )
+                })
+                .unwrap_or((false, None, None));
             (
                 status.status_name(),
                 status.error(),
-                Some(manager.status().await),
+                Some(multi),
+                active_audio.0,
+                active_audio.1,
+                active_audio.2,
             )
         }
         Some(manager) => {
             // Single-head provider: the legacy active HLS pipeline (if any)
             // remains the stream source; the manager only reports why
             // per-console HLS is unsupported.
-            let (hls, error) = match (&state.hls_control, &state.hls) {
-                (Some(controller), _) => {
-                    let status = controller.status();
-                    (status.status_name(), status.error())
-                }
-                (None, None) => ("not-configured", None),
-                (None, Some(status)) => (status.status_name(), status.error()),
-            };
-            (hls, error, Some(manager.status().await))
+            let audio = hls_audio_intent(state.hls_control.as_ref(), state.hls.as_ref());
+            let (hls, error) = hls_status_name(state.hls_control.as_ref(), state.hls.as_ref());
+            (
+                hls,
+                error,
+                Some(manager.status().await),
+                audio.0,
+                audio.1,
+                audio.2,
+            )
         }
         None => {
-            let (hls, error) = match (&state.hls_control, &state.hls) {
-                (Some(controller), _) => {
-                    let status = controller.status();
-                    (status.status_name(), status.error())
-                }
-                (None, None) => ("not-configured", None),
-                (None, Some(status)) => (status.status_name(), status.error()),
-            };
-            (hls, error, None)
+            let audio = hls_audio_intent(state.hls_control.as_ref(), state.hls.as_ref());
+            let (hls, error) = hls_status_name(state.hls_control.as_ref(), state.hls.as_ref());
+            (hls, error, None, audio.0, audio.1, audio.2)
         }
     };
     let multi_console_webrtc = match state.multi_console_webrtc.as_ref() {
@@ -4801,6 +4870,9 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         codec,
         hls,
         hls_error,
+        hls_audio_configured,
+        hls_audio_source,
+        hls_audio_encoder,
         webrtc,
         webrtc_error,
         webrtc_geometry,
@@ -9910,6 +9982,8 @@ mod tests {
                     output_dir: root,
                     ..HlsConfig::default()
                 },
+                audio_source_template: None,
+                audio_bitrate_kbps: crate::hls::DEFAULT_AUDIO_BITRATE_KBPS,
             },
         );
         let outputs = vec![
@@ -10010,6 +10084,8 @@ mod tests {
                     output_dir: root,
                     ..HlsConfig::default()
                 },
+                audio_source_template: None,
+                audio_bitrate_kbps: crate::hls::DEFAULT_AUDIO_BITRATE_KBPS,
             },
         );
         manager
@@ -10324,6 +10400,58 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(body["code"], "display.console_unsupported");
+    }
+
+    #[tokio::test]
+    async fn connection_reports_hls_audio_intent_without_sample_claims() {
+        let directory = codec_test_dir("hls-audio-status");
+        let controller = HlsController::with_spawner(
+            pending_factory(),
+            HlsConfig {
+                output_dir: directory.clone(),
+                audio: Some(crate::hls::HlsAudioConfig::new("ozma-vm1.monitor", 128)),
+                ..HlsConfig::default()
+            },
+            Arc::new(CodecSpawner::new(Vec::new())),
+        );
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "vm-a._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_UINPUT,
+            ),
+            CompatStats::default(),
+        )
+        .with_hls_controller(Some(controller));
+        let (status, json) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["hls_audio_configured"], true);
+        assert_eq!(json["hls_audio_source"], "ozma-vm1.monitor");
+        assert_eq!(json["hls_audio_encoder"], "aac");
+
+        // Video-only is explicit, not an omitted/false audio claim.
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "vm-b._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_UINPUT,
+            ),
+            CompatStats::default(),
+        )
+        .with_hls_controller(Some(controller_with(
+            &codec_test_dir("hls-audio-video-only"),
+            Arc::new(CodecSpawner::new(Vec::new())),
+        )));
+        let (_, json) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(json["hls_audio_configured"], false);
+        assert!(json["hls_audio_source"].is_null());
+        assert!(json["hls_audio_encoder"].is_null());
     }
 
     #[tokio::test]
@@ -15109,6 +15237,8 @@ mod tests {
                     output_dir: root,
                     ..HlsConfig::default()
                 },
+                audio_source_template: None,
+                audio_bitrate_kbps: crate::hls::DEFAULT_AUDIO_BITRATE_KBPS,
             },
         );
         let outputs: Vec<crate::display_outputs::DisplayOutput> = consoles

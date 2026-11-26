@@ -43,6 +43,14 @@ cannot overwrite each other's instance name.
 | `wg_port` | WireGuard UDP port (also present in SRV). |
 | `cap` | Comma-separated capabilities (bounded/sorted). |
 | `proto` | Schema version (`1`). |
+| `key_id` | Public cluster-key id, when `--mesh-cluster-key-file` is configured. |
+| `ts` | Unix seconds at signing time. |
+| `nonce` | Fresh random nonce (128-bit hex) bound to the signature. |
+| `sig` | Base64 Ed25519 signature over the canonical payload. |
+
+Signed TXT values are bounded well below one DNS character-string (the 32-byte
+signature is 88 base64 characters), and the private cluster key never appears in
+TXT, logs, status, or events. See `docs/phase4-mesh-discovery-auth-report.md`.
 
 Browsing sends a PTR query for `_ozma-mesh._udp.local` to `224.0.0.251:5353`
 with the DNS QU (unicast-response) bit from an ephemeral UDP socket. The local
@@ -57,18 +65,28 @@ truncation/bounds errors, and no panics on malformed packets.
 
 ## Trust model
 
-An advertisement is unauthenticated and is never sufficient on its own. An
-advertisement is accepted only when:
+An advertisement is unauthenticated by mDNS itself and is never believed on its
+own. Precedence is:
 
-1. its id exactly matches a configured static `--mesh-peer`, and the advertised
-   key/IP/port match that entry; or
-2. its id and public key match a `--mesh-trust` entry (optionally restricted to
-   one advertised mesh IP).
+1. **Static `--mesh-peer`** entries are authoritative out-of-band. An exact
+   match is `StaticMatched` (a signature is not required); a different
+   key/IP/port for that id remains a conflict.
+2. **Cluster key required when configured.** With
+   `--mesh-cluster-key-file`, every non-static advertisement must carry a valid
+   Ed25519 signature from the derived cluster public key, a timestamp inside the
+   bounded skew window (default `120 s`), and a non-replayed nonce. Missing,
+   invalid, tampered, or expired signatures never reach the peer table.
+3. **`--mesh-trust` remains a fallback and an optional restriction.** Without a
+   cluster key, discovery still requires an id/key trust entry exactly as
+   before. With a cluster key, a matching trust entry, when present, is enforced
+   as an additional key/IP allowlist; an id with no trust entry is authorized by
+   the valid cluster signature alone.
 
-Static peers are authoritative. A static id with a different key/IP/port, or a
-second id claiming a static peer's mesh IP, is a conflict: the static entry and
-route are untouched. A discovered id changing its WireGuard public key is also a
-conflict. Two discovered ids cannot share one mesh IP.
+A static id with a different key/IP/port, or a second id claiming a static
+peer's mesh IP, is a conflict: the static entry and route are untouched. A
+discovered id changing its WireGuard public key is also a conflict unless the
+old key is advertised in the signed `prev_pubkey` grace field. Two discovered
+ids cannot share one mesh IP.
 
 Typed failures:
 
@@ -76,6 +94,8 @@ Typed failures:
 |---|---|---|
 | `MeshError::DiscoveryInvalid` | `mesh.discovery-invalid` / `mesh.peer-invalid` | Malformed id/IP/key/port, capability bounds, or bad policy. |
 | `MeshError::DiscoveryUnauthorized` | `mesh.peer-unauthorized` | No trust entry, or advertised key/IP does not match it. |
+| `MeshError::DiscoverySignatureInvalid` | `mesh.discovery-signature-invalid` | Missing/mismatched/invalid cluster signature. |
+| `MeshError::DiscoveryStale` | `mesh.discovery-stale` | Timestamp outside the bounded skew window or a nonce replay. |
 | `MeshError::DiscoveryConflict` | `mesh.peer-conflict` | Static/other peer collision or key change. |
 | `MeshError::KeyError` / `Base64` | `mesh.peer-invalid` | Public key is not 32-byte base64 X25519 material. |
 
@@ -148,8 +168,8 @@ route, and static neighbor entry entirely.
 
 Run for this change:
 
-* `cargo test -p ozma-mesh -p ozma-node --lib` — **611 passed, 6 ignored**
-  (`ozma-mesh`: 48 passed, 2 ignored; `ozma-node`: 563 passed, 4 ignored).
+* `cargo test -p ozma-mesh -p ozma-node --lib` — **895 passed, 10 ignored**
+  (`ozma-mesh`: 94 passed, 2 ignored; `ozma-node`: 801 passed, 8 ignored).
 * `cargo test -p ozma-node --bin ozma-node mesh_` — **2 passed** (discovery
   flag defaults, trust parsing).
 * `cargo check -p ozma-mesh -p ozma-node --all-targets` — passes (pre-existing
@@ -168,7 +188,11 @@ Coverage highlights:
 * mDNS wire assembly: PTR + SRV + TXT + A become one validated descriptor;
 * node service: no handshake/route before authorization, route add/remove,
   status counters/peer origin/endpoint, `peer-discovered`/`route`/`conflict`
-  events, restart without stale deduplication.
+  events, restart without stale deduplication;
+* cluster signatures: sign/verify round-trip, tampered payload/signature,
+  expired/future timestamp, wrong/missing key, nonce replay, signed rotation
+  with `prev_pubkey`, bounded TXT, and node-level typed
+  `mesh.discovery-signature-invalid` / `mesh.discovery-stale` events.
 
 No default test binds a multicast socket, requires root/TUN, or touches a real
 network namespace. The live test below was run manually and cleaned up.
@@ -285,9 +309,12 @@ process. No host default route, DNS, firewall, or real interface was changed.
 
 ## Remaining gaps
 
-1. **mDNS is unauthenticated.** Authorization is the configured static peer or
-   `--mesh-trust` key; there is no signature, replay protection, or
-   controller-issued mesh CA yet.
+1. **Authentication is a shared cluster key, not per-node identity.** With
+   `--mesh-cluster-key-file` every advertisement is Ed25519-signed, verified,
+   freshness-checked, and replay-protected; without it the older static/
+   `--mesh-trust` model still applies. There is no per-node certificate, key
+   revocation, or controller-issued mesh CA yet, and the shared private key must
+   be distributed out of band (mode `0600`).
 2. **No IPv6 discovery or transport.** The advertisement and dataplane are
    IPv4-only.
 3. **Underlay endpoint is observed, not configured.** The mDNS response source

@@ -12,25 +12,35 @@
 //!
 //! # Trust model
 //!
-//! An mDNS record is **unauthenticated** and must never be believed on its own.
-//! [`DiscoveryEngine`] only authorizes an advertisement when:
+//! An mDNS record is **unauthenticated by itself** and must never be believed on
+//! its own. [`DiscoveryEngine`] authorizes an advertisement by the following
+//! precedence:
 //!
-//! 1. it is exactly one of the configured static peers (`--mesh-peer`), or
-//! 2. the advertised node id and WireGuard public key match a trusted entry
+//! 1. it exactly matches one of the configured static peers (`--mesh-peer`);
+//! 2. when a shared cluster key is configured (see
+//!    [`crate::discovery_auth`]), it must carry a valid Ed25519 signature, a
+//!    fresh timestamp, and a non-replayed nonce (a matching `--mesh-trust`
+//!    entry, if present, is still enforced);
+//! 3. otherwise its node id and WireGuard public key must match a trusted entry
 //!    (`--mesh-trust`), with any configured mesh-IP restriction.
 //!
 //! Static peers are authoritative: a conflicting advertisement is reported as
 //! a conflict and never replaces or adds a peer.  Duplicate advertisements are
 //! deduplicated by id and mesh IP, and entries expire after the configured TTL.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::discovery_auth::{
+    canonical_payload, AdvertisementAuth, DiscoveryAuthConfig, DiscoveryAuthError,
+};
 use crate::error::{MeshError, Result};
 use crate::node::{MeshNode, WgPublicKey};
 
@@ -112,6 +122,11 @@ pub struct DiscoveryConfig {
     pub static_peers: Vec<MeshNode>,
     /// Additional key/identity authorizations for discovered peers.
     pub trusted: Vec<TrustedPeer>,
+    /// Optional shared cluster-key signature verification. When present, a
+    /// non-static advertisement must carry a valid signature from this key
+    /// before it can be authorized. A matching `trusted` entry, when present,
+    /// is still enforced as an additional identity/key/IP restriction.
+    pub auth: Option<DiscoveryAuthConfig>,
     /// Maximum simultaneously discovered peers.
     pub max_peers: usize,
     /// How long a discovered peer may be absent before removal.
@@ -131,10 +146,17 @@ impl DiscoveryConfig {
             local_id: local_id.into(),
             static_peers,
             trusted,
+            auth: None,
             max_peers: DEFAULT_MAX_PEERS,
             ttl: DEFAULT_DISCOVERY_TTL,
             query_interval: DEFAULT_QUERY_INTERVAL,
         }
+    }
+
+    /// Require advertisements to be signed by this cluster key.
+    pub fn with_auth(mut self, auth: DiscoveryAuthConfig) -> Self {
+        self.auth = Some(auth);
+        self
     }
 
     pub fn with_max_peers(mut self, max_peers: usize) -> Self {
@@ -173,6 +195,9 @@ impl DiscoveryConfig {
             return Err(MeshError::DiscoveryInvalid(
                 "discovery query interval must be in 1..=60 seconds".to_owned(),
             ));
+        }
+        if let Some(auth) = &self.auth {
+            DiscoveryAuthConfig::new(auth.public_key, auth.key_id.clone(), auth.max_skew)?;
         }
 
         let mut static_ids = BTreeSet::new();
@@ -231,6 +256,11 @@ pub struct RawAdvertisement {
     pub capabilities: Vec<String>,
     /// Comma-separated `prev_pubkey` TXT value, split by the browser.
     pub previous_pubkeys: Vec<String>,
+    /// Cluster signature TXT fields, when the advertiser is signed.
+    pub cluster_key_id: Option<String>,
+    pub cluster_signature: Option<String>,
+    pub timestamp: Option<u64>,
+    pub nonce: Option<String>,
     pub instance: Option<String>,
     pub underlay_ip: Option<Ipv4Addr>,
     pub source: Option<SocketAddr>,
@@ -265,6 +295,11 @@ pub enum DiscoveryAction {
     Ignored { id: Option<String>, reason: String },
     /// Advertisement lacks a configured key/host authorization.
     Unauthorized { id: Option<String>, reason: String },
+    /// Advertisement is missing a signature or its signature is invalid.
+    SignatureInvalid { id: Option<String>, reason: String },
+    /// Advertisement timestamp is outside the freshness window or its nonce
+    /// was already bound to a different advertisement.
+    Stale { id: Option<String>, reason: String },
     /// Advertisement conflicts with a static peer or another discovered peer.
     Conflict { id: Option<String>, reason: String },
     /// The configured discovered-peer bound is full.
@@ -284,6 +319,8 @@ pub struct DiscoveryCounters {
     pub expired: u64,
     pub conflicts: u64,
     pub unauthorized: u64,
+    pub signature_invalid: u64,
+    pub stale: u64,
     pub invalid: u64,
     pub limit_dropped: u64,
     pub self_ignored: u64,
@@ -304,6 +341,15 @@ pub struct DiscoveredPeerView {
     pub expires_in_secs: u64,
 }
 
+/// Secret-free cluster-signature policy reported in discovery status.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryAuthStatus {
+    pub enabled: bool,
+    /// Public cluster key id; never private key material.
+    pub key_id: String,
+    pub max_skew_secs: u64,
+}
+
 /// Discovery status document for `/api/v1/connect/status`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryStatus {
@@ -313,6 +359,8 @@ pub struct DiscoveryStatus {
     pub ttl_secs: u64,
     pub static_peer_count: usize,
     pub trusted_key_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<DiscoveryAuthStatus>,
     pub discovered_count: usize,
     pub peers: Vec<DiscoveredPeerView>,
     pub counters: DiscoveryCounters,
@@ -324,6 +372,16 @@ struct SeenPeer {
     last_seen: Instant,
 }
 
+/// Bounded cache of nonces already accepted with a signed payload.
+#[derive(Clone, Debug)]
+struct SeenNonce {
+    payload_hash: u64,
+    accepted_at: SystemTime,
+}
+
+/// Maximum nonces retained by the replay cache.
+const MAX_REPLAY_NONCES: usize = 4_096;
+
 /// Deterministic discovery state machine.
 ///
 /// The engine performs no I/O. Call [`DiscoveryEngine::observe`] with each
@@ -333,6 +391,10 @@ pub struct DiscoveryEngine {
     config: DiscoveryConfig,
     peers: BTreeMap<String, SeenPeer>,
     counters: DiscoveryCounters,
+    /// Nonce -> signed-payload binding. Identical repeats (normal mDNS
+    /// re-announcements) are duplicates; a nonce reused for different signed
+    /// fields is a replay and is refused.
+    replays: HashMap<String, SeenNonce>,
 }
 
 impl DiscoveryEngine {
@@ -342,6 +404,7 @@ impl DiscoveryEngine {
             config,
             peers: BTreeMap::new(),
             counters: DiscoveryCounters::default(),
+            replays: HashMap::new(),
         })
     }
 
@@ -380,6 +443,11 @@ impl DiscoveryEngine {
             ttl_secs: self.config.ttl.as_secs(),
             static_peer_count: self.config.static_peers.len(),
             trusted_key_count: self.config.trusted.len(),
+            auth: self.config.auth.as_ref().map(|auth| DiscoveryAuthStatus {
+                enabled: true,
+                key_id: auth.key_id.clone(),
+                max_skew_secs: auth.max_skew.as_secs(),
+            }),
             discovered_count: self.peers.len(),
             peers,
             counters: self.counters.clone(),
@@ -388,6 +456,17 @@ impl DiscoveryEngine {
 
     /// Feed one browse result into the state machine.
     pub fn observe(&mut self, raw: RawAdvertisement, now: Instant) -> Vec<DiscoveryAction> {
+        self.observe_at(raw, now, SystemTime::now())
+    }
+
+    /// Like [`DiscoveryEngine::observe`], with an explicit wall clock used for
+    /// cluster-signature freshness and nonce replay checks.
+    pub fn observe_at(
+        &mut self,
+        raw: RawAdvertisement,
+        now: Instant,
+        wall: SystemTime,
+    ) -> Vec<DiscoveryAction> {
         self.counters.advertisements += 1;
         let advertisement = match validate_advertisement(&raw) {
             Ok(advertisement) => advertisement,
@@ -448,54 +527,82 @@ impl DiscoveryEngine {
             }];
         }
 
+        // Cluster-key authentication is required whenever it is configured.
+        // Static peers above are already authoritative out-of-band; this covers
+        // every dynamically discovered advertisement.
+        if let Some(auth_config) = self.config.auth.clone() {
+            match self.verify_signature(&raw, &advertisement, &auth_config, wall) {
+                Ok(()) => {}
+                Err(DiscoveryAuthError::SignatureInvalid(reason)) => {
+                    self.counters.signature_invalid += 1;
+                    return vec![DiscoveryAction::SignatureInvalid {
+                        id: Some(id),
+                        reason,
+                    }];
+                }
+                Err(DiscoveryAuthError::Stale(reason)) => {
+                    self.counters.stale += 1;
+                    return vec![DiscoveryAction::Stale {
+                        id: Some(id),
+                        reason,
+                    }];
+                }
+            }
+        }
+
         let trusted_index = self
             .config
             .trusted
             .iter()
             .position(|trusted| trusted.id == advertisement.node.id);
-        let Some(trusted_index) = trusted_index else {
+        if let Some(trusted_index) = trusted_index {
+            // A matching trust entry is an additional restriction even when a
+            // valid cluster signature is present.
+            let trusted = &self.config.trusted[trusted_index];
+            let key_matches = trusted.wg_pubkey == advertisement.node.wg_pubkey.0;
+            let rotated_from_trust = !key_matches
+                && advertisement
+                    .previous_pubkeys
+                    .iter()
+                    .any(|key| key == &trusted.wg_pubkey);
+            if !key_matches && !rotated_from_trust {
+                self.counters.unauthorized += 1;
+                return vec![DiscoveryAction::Unauthorized {
+                    id: Some(id),
+                    reason: "advertised public key does not match the configured trust entry"
+                        .to_owned(),
+                }];
+            }
+            if let Some(mesh_ip) = &trusted.mesh_ip {
+                if mesh_ip != &advertisement.node.mesh_ip {
+                    self.counters.unauthorized += 1;
+                    return vec![DiscoveryAction::Unauthorized {
+                        id: Some(id),
+                        reason: format!(
+                            "advertised mesh IP {} does not match the authorized address {mesh_ip}",
+                            advertisement.node.mesh_ip
+                        ),
+                    }];
+                }
+            }
+            // Adopt the rotated key in memory so a later rotation chain is
+            // still authorized. This never rewrites the operator's trust file;
+            // a restart falls back to the configured key.
+            if rotated_from_trust {
+                self.config.trusted[trusted_index].wg_pubkey =
+                    advertisement.node.wg_pubkey.0.clone();
+            }
+        } else if self.config.auth.is_none() {
+            // A valid cluster signature authenticates cluster membership even
+            // without a per-node --mesh-trust allowlist entry. Without a
+            // cluster key the old explicit trust model remains mandatory.
             self.counters.unauthorized += 1;
             return vec![DiscoveryAction::Unauthorized {
                 id: Some(id),
                 reason: "no --mesh-trust entry authorizes this node id/key".to_owned(),
             }];
-        };
-
-        let trusted = &self.config.trusted[trusted_index];
-        let key_matches = trusted.wg_pubkey == advertisement.node.wg_pubkey.0;
-        let rotated_from_trust = !key_matches
-            && advertisement
-                .previous_pubkeys
-                .iter()
-                .any(|key| key == &trusted.wg_pubkey);
-        if !key_matches && !rotated_from_trust {
-            self.counters.unauthorized += 1;
-            return vec![DiscoveryAction::Unauthorized {
-                id: Some(id),
-                reason: "advertised public key does not match the configured trust entry"
-                    .to_owned(),
-            }];
-        }
-        if let Some(mesh_ip) = &trusted.mesh_ip {
-            if mesh_ip != &advertisement.node.mesh_ip {
-                self.counters.unauthorized += 1;
-                return vec![DiscoveryAction::Unauthorized {
-                    id: Some(id),
-                    reason: format!(
-                        "advertised mesh IP {} does not match the authorized address {mesh_ip}",
-                        advertisement.node.mesh_ip
-                    ),
-                }];
-            }
         }
         self.counters.authorized += 1;
-
-        // Adopt the rotated key in memory so a later rotation chain is still
-        // authorized. This never rewrites the operator's trust file; a restart
-        // falls back to the configured key.
-        if rotated_from_trust {
-            self.config.trusted[trusted_index].wg_pubkey = advertisement.node.wg_pubkey.0.clone();
-        }
 
         let mesh_ip_owner = self.owner_of(&advertisement.node.mesh_ip);
         if let Some(existing) = self.peers.get_mut(&id) {
@@ -617,6 +724,104 @@ impl DiscoveryEngine {
         self.peers.get(id).map(|seen| &seen.peer)
     }
 
+    /// Verify a signed advertisement and enforce nonce replay protection.
+    fn verify_signature(
+        &mut self,
+        raw: &RawAdvertisement,
+        peer: &DiscoveredPeer,
+        config: &DiscoveryAuthConfig,
+        wall: SystemTime,
+    ) -> std::result::Result<(), DiscoveryAuthError> {
+        let key_id = raw.cluster_key_id.as_deref().ok_or_else(|| {
+            DiscoveryAuthError::SignatureInvalid(
+                "cluster key is configured but the advertisement has no key id".to_owned(),
+            )
+        })?;
+        let signature = raw.cluster_signature.as_deref().ok_or_else(|| {
+            DiscoveryAuthError::SignatureInvalid(
+                "cluster key is configured but the advertisement has no signature".to_owned(),
+            )
+        })?;
+        let timestamp = raw.timestamp.ok_or_else(|| {
+            DiscoveryAuthError::SignatureInvalid(
+                "cluster key is configured but the advertisement has no timestamp".to_owned(),
+            )
+        })?;
+        let nonce = raw.nonce.as_deref().ok_or_else(|| {
+            DiscoveryAuthError::SignatureInvalid(
+                "cluster key is configured but the advertisement has no nonce".to_owned(),
+            )
+        })?;
+        let auth = AdvertisementAuth {
+            key_id: key_id.to_owned(),
+            timestamp,
+            nonce: nonce.to_owned(),
+            signature: signature.to_owned(),
+        };
+        config.verify(
+            &peer.node.id,
+            &peer.node.mesh_ip,
+            &peer.node.wg_pubkey.0,
+            peer.node.wg_port,
+            &peer.previous_pubkeys,
+            &peer.capabilities,
+            &auth,
+            wall,
+        )?;
+
+        // Signature and freshness are valid. The same nonce with the same
+        // signed payload is a normal mDNS re-announcement (the engine dedupes
+        // it); the same nonce bound to different fields is a replay.
+        let payload = canonical_payload(
+            &peer.node.id,
+            &peer.node.mesh_ip,
+            &peer.node.wg_pubkey.0,
+            peer.node.wg_port,
+            &peer.previous_pubkeys,
+            &peer.capabilities,
+            timestamp,
+            nonce,
+        );
+        let mut hasher = DefaultHasher::new();
+        payload.hash(&mut hasher);
+        let payload_hash = hasher.finish();
+        if let Some(seen) = self.replays.get(nonce) {
+            if seen.payload_hash != payload_hash {
+                return Err(DiscoveryAuthError::Stale(format!(
+                    "advertisement nonce {nonce} was already used for a different signed payload"
+                )));
+            }
+            return Ok(());
+        }
+        self.prune_replays(wall, config.max_skew);
+        if self.replays.len() >= MAX_REPLAY_NONCES {
+            if let Some(oldest) = self
+                .replays
+                .iter()
+                .min_by_key(|(_, seen)| seen.accepted_at)
+                .map(|(nonce, _)| nonce.clone())
+            {
+                self.replays.remove(&oldest);
+            }
+        }
+        self.replays.insert(
+            nonce.to_owned(),
+            SeenNonce {
+                payload_hash,
+                accepted_at: wall,
+            },
+        );
+        Ok(())
+    }
+
+    fn prune_replays(&mut self, now: SystemTime, max_skew: Duration) {
+        let window = max_skew.saturating_mul(2);
+        self.replays.retain(|_, seen| {
+            now.duration_since(seen.accepted_at)
+                .map_or(true, |age| age <= window)
+        });
+    }
+
     fn owner_of(&self, mesh_ip: &str) -> Option<String> {
         self.peers
             .iter()
@@ -695,7 +900,7 @@ pub fn validate_advertisement(raw: &RawAdvertisement) -> Result<DiscoveredPeer> 
 }
 
 /// Bound and validate `prev_pubkey` grace entries.
-fn normalize_previous_pubkeys(raw: &[String], current: &str) -> Result<Vec<String>> {
+pub(crate) fn normalize_previous_pubkeys(raw: &[String], current: &str) -> Result<Vec<String>> {
     let mut keys = Vec::new();
     for entry in raw {
         for key in entry.split(',') {
@@ -1013,6 +1218,22 @@ impl MdnsBrowser {
                         .collect()
                 })
                 .unwrap_or_default();
+            let cluster_key_id = pending
+                .txt
+                .get("key_id")
+                .or_else(|| pending.txt.get("cluster_key_id"))
+                .cloned();
+            let cluster_signature = pending
+                .txt
+                .get("sig")
+                .or_else(|| pending.txt.get("signature"))
+                .cloned();
+            let timestamp = pending
+                .txt
+                .get("ts")
+                .or_else(|| pending.txt.get("timestamp"))
+                .and_then(|value| value.parse::<u64>().ok());
+            let nonce = pending.txt.get("nonce").cloned();
             // The response source is the interface address that actually
             // reached us; prefer it over an A record, which may list unrelated
             // bridge addresses on a multi-homed peer.
@@ -1035,6 +1256,10 @@ impl MdnsBrowser {
                 wg_port: Some(wg_port),
                 capabilities,
                 previous_pubkeys,
+                cluster_key_id,
+                cluster_signature,
+                timestamp,
+                nonce,
                 instance: Some(instance.clone()),
                 underlay_ip,
                 source: pending.source,
@@ -1242,6 +1467,7 @@ fn build_query(service: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery_auth::ClusterSigningKey;
     use crate::node::MeshNode;
 
     fn key(seed: u8) -> (MeshNode, String) {
@@ -1477,6 +1703,225 @@ mod tests {
             [DiscoveryAction::IgnoredSelf { .. }]
         ));
         assert_eq!(engine.counters().self_ignored, 1);
+    }
+
+    // ── Cluster signature tests ─────────────────────────────────────────────
+
+    fn auth_engine(signer: &ClusterSigningKey, trusted: Vec<TrustedPeer>) -> DiscoveryEngine {
+        DiscoveryEngine::new(
+            DiscoveryConfig::new("self", Vec::new(), trusted)
+                .with_ttl(Duration::from_secs(10))
+                .with_query_interval(Duration::from_secs(1))
+                .with_auth(signer.verifier(Duration::from_secs(30)).unwrap()),
+        )
+        .expect("signed discovery config")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn signed_advertisement(
+        signer: &ClusterSigningKey,
+        peer: &MeshNode,
+        mesh_ip: &str,
+        previous: &[String],
+        capabilities: &[String],
+        wall: SystemTime,
+        nonce: &str,
+    ) -> RawAdvertisement {
+        let port = 51_820;
+        let auth = signer.sign_advertisement_with_nonce(
+            &peer.id,
+            mesh_ip,
+            &peer.wg_pubkey.0,
+            port,
+            previous,
+            capabilities,
+            crate::discovery_auth::unix_seconds(wall),
+            nonce,
+        );
+        RawAdvertisement {
+            id: Some(peer.id.clone()),
+            wg_pubkey: Some(peer.wg_pubkey.0.clone()),
+            mesh_ip: Some(mesh_ip.to_owned()),
+            wg_port: Some(port),
+            capabilities: capabilities.to_vec(),
+            previous_pubkeys: previous.to_vec(),
+            cluster_key_id: Some(auth.key_id),
+            cluster_signature: Some(auth.signature),
+            timestamp: Some(auth.timestamp),
+            nonce: Some(auth.nonce),
+            ..RawAdvertisement::default()
+        }
+    }
+
+    #[test]
+    fn cluster_key_requires_a_signature() {
+        let signer = ClusterSigningKey::generate();
+        let (peer, pubkey) = key(20);
+        let mut engine = auth_engine(&signer, Vec::new());
+        let actions = engine.observe(
+            advertisement(&peer.id, "10.200.1.2", &pubkey),
+            Instant::now(),
+        );
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::SignatureInvalid { .. }]
+        ));
+        assert_eq!(engine.counters().signature_invalid, 1);
+        assert_eq!(engine.counters().added, 0);
+    }
+
+    #[test]
+    fn signed_advertisement_adds_without_a_trust_entry() {
+        let signer = ClusterSigningKey::generate();
+        let (peer, _) = key(21);
+        let mut engine = auth_engine(&signer, Vec::new());
+        let wall = SystemTime::now();
+        let now = Instant::now();
+        let raw = signed_advertisement(
+            &signer,
+            &peer,
+            "10.200.1.2",
+            &[],
+            &["video".to_owned(), "audio".to_owned()],
+            wall,
+            "00112233445566778899aabbccddeeff",
+        );
+        let actions = engine.observe_at(raw.clone(), now, wall);
+        assert!(matches!(actions.as_slice(), [DiscoveryAction::Add(_)]));
+        assert_eq!(engine.counters().authorized, 1);
+
+        // An identical mDNS re-announcement (same nonce/payload) is a
+        // duplicate, not a replay.
+        let actions = engine.observe_at(raw, now + Duration::from_secs(1), wall);
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::Unchanged { .. }]
+        ));
+        assert_eq!(engine.counters().stale, 0);
+    }
+
+    #[test]
+    fn signed_advertisement_with_tampered_payload_is_rejected() {
+        let signer = ClusterSigningKey::generate();
+        let (peer, _) = key(22);
+        let mut engine = auth_engine(&signer, Vec::new());
+        let wall = SystemTime::now();
+        let mut raw = signed_advertisement(
+            &signer,
+            &peer,
+            "10.200.1.2",
+            &[],
+            &["video".to_owned()],
+            wall,
+            "ffeeddccbbaa99887766554433221100",
+        );
+        raw.mesh_ip = Some("10.200.1.99".to_owned());
+        let actions = engine.observe_at(raw, Instant::now(), wall);
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::SignatureInvalid { .. }]
+        ));
+        assert_eq!(engine.counters().signature_invalid, 1);
+    }
+
+    #[test]
+    fn signed_advertisement_with_wrong_cluster_key_is_rejected() {
+        let signer = ClusterSigningKey::generate();
+        let other = ClusterSigningKey::generate();
+        let (peer, _) = key(23);
+        let mut engine = auth_engine(&signer, Vec::new());
+        let wall = SystemTime::now();
+        let raw = signed_advertisement(
+            &other,
+            &peer,
+            "10.200.1.2",
+            &[],
+            &[],
+            wall,
+            "0123456789abcdef0123456789abcdef",
+        );
+        let actions = engine.observe_at(raw, Instant::now(), wall);
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::SignatureInvalid { .. }]
+        ));
+        assert_eq!(engine.counters().signature_invalid, 1);
+    }
+
+    #[test]
+    fn signed_advertisement_with_expired_timestamp_is_stale() {
+        let signer = ClusterSigningKey::generate();
+        let (peer, _) = key(24);
+        let mut engine = auth_engine(&signer, Vec::new());
+        let wall = SystemTime::now();
+        let raw = signed_advertisement(
+            &signer,
+            &peer,
+            "10.200.1.2",
+            &[],
+            &[],
+            wall,
+            "11112222333344445555666677778888",
+        );
+        let actions = engine.observe_at(raw, Instant::now(), wall + Duration::from_secs(31));
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::Stale { .. }]
+        ));
+        assert_eq!(engine.counters().stale, 1);
+    }
+
+    #[test]
+    fn replayed_nonce_with_different_payload_is_stale() {
+        let signer = ClusterSigningKey::generate();
+        let (peer, _) = key(25);
+        let mut engine = auth_engine(&signer, Vec::new());
+        let wall = SystemTime::now();
+        let nonce = "aaaabbbbccccddddeeeeffff00001111";
+        let first = signed_advertisement(&signer, &peer, "10.200.1.2", &[], &[], wall, nonce);
+        assert!(matches!(
+            engine.observe_at(first, Instant::now(), wall).as_slice(),
+            [DiscoveryAction::Add(_)]
+        ));
+
+        // A second, correctly signed advertisement reuses the same nonce but
+        // changes the payload. This is a replay, not a normal duplicate.
+        let second = signed_advertisement(&signer, &peer, "10.200.1.3", &[], &[], wall, nonce);
+        let actions = engine.observe_at(second, Instant::now(), wall);
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::Stale { .. }]
+        ));
+        assert_eq!(engine.counters().stale, 1);
+    }
+
+    #[test]
+    fn signed_rotation_advertisement_covers_previous_key() {
+        let signer = ClusterSigningKey::generate();
+        let old_public = key(26).1;
+        let (peer, _) = key(27);
+        let mut engine = auth_engine(&signer, vec![TrustedPeer::new(&peer.id, &old_public)]);
+        let wall = SystemTime::now();
+        let raw = signed_advertisement(
+            &signer,
+            &peer,
+            "10.200.1.2",
+            &[old_public.clone()],
+            &["video".to_owned()],
+            wall,
+            "55556666777788889999000011112222",
+        );
+        let actions = engine.observe_at(raw.clone(), Instant::now(), wall);
+        assert!(matches!(actions.as_slice(), [DiscoveryAction::Add(_)]));
+
+        // Altering the grace list breaks the signature over the whole payload.
+        let mut tampered = raw;
+        tampered.previous_pubkeys.clear();
+        let actions = engine.observe_at(tampered, Instant::now(), wall + Duration::from_secs(1));
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::SignatureInvalid { .. }]
+        ));
     }
 
     // ── DNS wire tests ──────────────────────────────────────────────────────

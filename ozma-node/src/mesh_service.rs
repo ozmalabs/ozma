@@ -48,10 +48,10 @@ use ozma_mesh::pump::{
 #[cfg(test)]
 use ozma_mesh::pump::{PumpStats, TunIo};
 use ozma_mesh::{
-    DiscoveryAction, DiscoveryConfig, DiscoveryEngine, DiscoveryStatus, KernelWgSettings,
-    KernelWgStatus, KernelWireguard, KeyRotation, MdnsBrowser, MeshManager, MeshNode, PeerChange,
-    PeerOrigin, RawAdvertisement, RotationSchedule, RotationScheduleStatus, RotationStatus,
-    WgPrivateKey,
+    ClusterSigningKey, DiscoveryAction, DiscoveryConfig, DiscoveryEngine, DiscoveryStatus,
+    KernelWgSettings, KernelWgStatus, KernelWireguard, KeyRotation, MdnsBrowser, MeshManager,
+    MeshNode, PeerChange, PeerOrigin, RawAdvertisement, RotationSchedule, RotationScheduleStatus,
+    RotationStatus, WgPrivateKey, DEFAULT_MAX_SKEW,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -109,6 +109,7 @@ impl MeshServiceError {
                 | "mesh.dataplane-not-configured"
                 | "mesh.tun-unsupported"
                 | "mesh.discovery-invalid"
+                | "mesh.cluster-key-invalid"
                 | "mesh.rotation-invalid"
                 | "mesh.rotation-unsupported"
         )
@@ -339,6 +340,10 @@ pub struct MeshServiceConfig {
     pub capabilities: Vec<String>,
     /// Opt-in mDNS peer discovery policy. `None` keeps discovery disabled.
     pub discovery: Option<DiscoveryConfig>,
+    /// Optional shared Ed25519 cluster key. When set, every advertisement is
+    /// signed and discovered advertisements must verify against the derived
+    /// public key. The private key is never logged or serialised.
+    pub cluster_key: Option<Arc<ClusterSigningKey>>,
     /// Optional automatic key rotation (`--mesh-rotate-hours`). Off by default.
     pub rotation_schedule: Option<RotationSchedule>,
     /// Optional kernel dataplane (TUN, routes, forwarding, NAT). `None` keeps
@@ -362,6 +367,7 @@ impl Default for MeshServiceConfig {
             peer_endpoints: BTreeMap::new(),
             capabilities: Vec::new(),
             discovery: None,
+            cluster_key: None,
             rotation_schedule: None,
             dataplane: None,
             event_capacity: None,
@@ -642,6 +648,13 @@ pub trait MeshBackend: Send + Sync {
         None
     }
 
+    /// Refresh a signed advertisement before its signature goes stale.
+    ///
+    /// Unsigned backends treat this as a no-op.
+    async fn refresh_advertisement(&self) -> Result<(), MeshServiceError> {
+        Ok(())
+    }
+
     /// Kernel WireGuard link status, present only for the kernel backend.
     fn kernel_status(&self) -> Option<KernelWgStatus> {
         None
@@ -695,6 +708,8 @@ pub struct BoringtunMeshBackend {
     private_key: Mutex<WgPrivateKey>,
     configured_peers: Vec<MeshNode>,
     capabilities: Vec<String>,
+    /// Optional shared cluster key used to sign advertisements.
+    cluster_key: Option<Arc<ClusterSigningKey>>,
     /// `MeshManager` is `Send` but not `Sync` (libmdns uses an internal
     /// `RefCell`), so it lives behind a Tokio mutex. The mutex is shared with
     /// the packet-pump adapter so outbound packets use the same peer tunnels.
@@ -715,6 +730,7 @@ impl BoringtunMeshBackend {
         private_key: WgPrivateKey,
         configured_peers: Vec<MeshNode>,
         capabilities: Vec<String>,
+        cluster_key: Option<Arc<ClusterSigningKey>>,
         log: MeshEventLog,
     ) -> Self {
         Self {
@@ -722,6 +738,7 @@ impl BoringtunMeshBackend {
             private_key: Mutex::new(private_key),
             configured_peers,
             capabilities,
+            cluster_key,
             manager: Arc::new(tokio::sync::Mutex::new(None)),
             tunnel_io: Mutex::new(None),
             state: Mutex::new(MeshState::Stopped),
@@ -794,10 +811,11 @@ impl MeshBackend for BoringtunMeshBackend {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .clone();
-            match MeshManager::new_with_capabilities(
+            match MeshManager::new_with_capabilities_and_signer(
                 identity,
                 private_key,
                 self.capabilities.clone(),
+                self.cluster_key.clone(),
             )
             .await
             {
@@ -871,6 +889,22 @@ impl MeshBackend for BoringtunMeshBackend {
         self.set_state(MeshState::Stopped);
         self.set_error(None);
         Ok(())
+    }
+
+    async fn refresh_advertisement(&self) -> Result<(), MeshServiceError> {
+        let manager = self.manager.lock().await;
+        let Some(manager) = manager.as_ref() else {
+            return Ok(());
+        };
+        manager
+            .refresh_advertisement()
+            .map(|_| ())
+            .map_err(|error| {
+                MeshServiceError::new(
+                    "mesh.advertisement-refresh-failed",
+                    format!("signed advertisement refresh failed: {error}"),
+                )
+            })
     }
 
     async fn add_peer(&self, node: MeshNode) -> Result<(), MeshServiceError> {
@@ -1104,6 +1138,8 @@ impl MeshBackend for BoringtunMeshBackend {
 pub struct KernelMeshBackend {
     identity: Mutex<MeshNode>,
     capabilities: Vec<String>,
+    /// Optional shared cluster key used to sign advertisements.
+    cluster_key: Option<Arc<ClusterSigningKey>>,
     kernel: KernelWireguard,
     advertiser: Mutex<Option<ozma_mesh::MeshAdvertiser>>,
     state: Mutex<MeshState>,
@@ -1121,6 +1157,7 @@ impl KernelMeshBackend {
         configured_peers: Vec<MeshNode>,
         peer_endpoints: BTreeMap<String, SocketAddr>,
         capabilities: Vec<String>,
+        cluster_key: Option<Arc<ClusterSigningKey>>,
         runner: Arc<dyn CommandRunner>,
         sysfs: Arc<dyn Sysfs>,
         log: MeshEventLog,
@@ -1128,6 +1165,7 @@ impl KernelMeshBackend {
         Self {
             identity: Mutex::new(identity),
             capabilities,
+            cluster_key,
             kernel: KernelWireguard::new_with_peer_endpoints(
                 settings,
                 private_key,
@@ -1208,7 +1246,13 @@ impl MeshBackend for KernelMeshBackend {
 
         let port = status.listen_port;
         let identity = self.identity_snapshot();
-        match ozma_mesh::MeshAdvertiser::new(&identity, port, &self.capabilities) {
+        match ozma_mesh::MeshAdvertiser::new_with_previous_and_signer(
+            &identity,
+            &[],
+            port,
+            &self.capabilities,
+            self.cluster_key.clone(),
+        ) {
             Ok(advertiser) => {
                 *self
                     .advertiser
@@ -1266,6 +1310,22 @@ impl MeshBackend for KernelMeshBackend {
             .map_err(MeshServiceError::from)
     }
 
+    async fn refresh_advertisement(&self) -> Result<(), MeshServiceError> {
+        let mut advertiser = self
+            .advertiser
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(advertiser) = advertiser.as_mut() {
+            advertiser.refresh(Instant::now()).map_err(|error| {
+                MeshServiceError::new(
+                    "mesh.advertisement-refresh-failed",
+                    format!("signed advertisement refresh failed: {error}"),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     async fn add_discovered_peer(
         &self,
         node: MeshNode,
@@ -1318,11 +1378,12 @@ impl MeshBackend for KernelMeshBackend {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
-        let advertiser = ozma_mesh::MeshAdvertiser::new_with_previous(
+        let advertiser = ozma_mesh::MeshAdvertiser::new_with_previous_and_signer(
             &identity,
             &[old_public],
             port,
             &self.capabilities,
+            self.cluster_key.clone(),
         )
         .map_err(|error| {
             MeshServiceError::new(
@@ -1848,6 +1909,8 @@ pub struct MeshService {
     rotation_schedule: Option<RotationSchedule>,
     /// Automatic rotation task handle.
     rotation_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Signed-advertisement refresh task handle.
+    advertisement_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Wall-clock time of the next scheduled rotation (status only).
     next_rotation: Arc<Mutex<Option<SystemTime>>>,
     /// Test/diagnostic override for the scheduler delay.
@@ -1919,6 +1982,20 @@ impl MeshService {
                 // caller build a discovery policy that disagrees with it.
                 discovery.local_id = config.node_id.clone();
                 discovery.static_peers = config.peers.clone();
+                if let Some(key) = &config.cluster_key {
+                    match key.verifier(DEFAULT_MAX_SKEW) {
+                        Ok(auth) => discovery.auth = Some(auth),
+                        Err(error) => {
+                            return Self::unsupported(
+                                MeshServiceError::new(
+                                    "mesh.cluster-key-invalid",
+                                    error.to_string(),
+                                ),
+                                log,
+                            )
+                        }
+                    }
+                }
                 match DiscoveryEngine::new(discovery) {
                     Ok(engine) => Some(Arc::new(Mutex::new(engine))),
                     Err(error) => {
@@ -1956,6 +2033,7 @@ impl MeshService {
                 config.peers.clone(),
                 config.peer_endpoints.clone(),
                 config.capabilities.clone(),
+                config.cluster_key.clone(),
                 runner,
                 sysfs,
                 log.clone(),
@@ -1965,6 +2043,7 @@ impl MeshService {
                 private_key,
                 config.peers.clone(),
                 config.capabilities.clone(),
+                config.cluster_key.clone(),
                 log.clone(),
             )),
         };
@@ -2008,6 +2087,7 @@ impl MeshService {
             discovery_browse: false,
             rotation_schedule: None,
             rotation_task: Arc::new(Mutex::new(None)),
+            advertisement_task: Arc::new(Mutex::new(None)),
             next_rotation: Arc::new(Mutex::new(None)),
             rotation_interval_override: None,
             log,
@@ -2073,6 +2153,7 @@ impl MeshService {
             discovery_browse: auto_browse,
             rotation_schedule: None,
             rotation_task: Arc::new(Mutex::new(None)),
+            advertisement_task: Arc::new(Mutex::new(None)),
             next_rotation: Arc::new(Mutex::new(None)),
             rotation_interval_override: None,
             log,
@@ -2345,6 +2426,7 @@ impl MeshService {
         }
 
         self.start_discovery();
+        self.start_advertisement_refresh();
         self.start_rotation_scheduler();
         self.log
             .record(MeshEventKind::Started, "mesh service started", None);
@@ -2355,6 +2437,7 @@ impl MeshService {
     /// reverse start order.
     pub async fn stop(&self) -> Result<(), MeshServiceError> {
         self.stop_discovery();
+        self.stop_advertisement_refresh();
         self.stop_rotation_scheduler();
         let pump_stopped = self.stop_packet_pump();
         let dataplane_result = match &self.dataplane {
@@ -2579,6 +2662,40 @@ impl MeshService {
             .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
+    /// Keep a signed advertisement fresh; unsigned backends no-op.
+    fn start_advertisement_refresh(&self) {
+        let mut guard = self
+            .advertisement_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if guard.is_some() {
+            return;
+        }
+        let service = self.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = service.backend.refresh_advertisement().await {
+                    service.log.record(MeshEventKind::Error, error.reason, None);
+                }
+            }
+        });
+        *guard = Some(handle);
+    }
+
+    fn stop_advertisement_refresh(&self) {
+        if let Some(handle) = self
+            .advertisement_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+    }
+
     /// Discovery status, present only when discovery is configured.
     pub fn discovery_status(&self) -> Option<DiscoveryStatus> {
         let engine = self.discovery.as_ref()?;
@@ -2798,6 +2915,20 @@ impl MeshService {
                         peer.node.id
                     ),
                     Some(peer.node.id.clone()),
+                );
+            }
+            DiscoveryAction::SignatureInvalid { id, reason } => {
+                self.log.record(
+                    MeshEventKind::Conflict,
+                    format!("mesh.discovery-signature-invalid: {reason}"),
+                    id.clone(),
+                );
+            }
+            DiscoveryAction::Stale { id, reason } => {
+                self.log.record(
+                    MeshEventKind::Conflict,
+                    format!("mesh.discovery-stale: {reason}"),
+                    id.clone(),
                 );
             }
             DiscoveryAction::Conflict { id, reason }
@@ -4761,6 +4892,68 @@ mod tests {
         }
     }
 
+    fn signed_discovery_service(
+        signer: &ClusterSigningKey,
+        trusted: Vec<ozma_mesh::TrustedPeer>,
+    ) -> (Arc<FakeMeshBackend>, MeshService, Arc<NodeRunner>) {
+        let log = MeshEventLog::new(32);
+        let backend = Arc::new(FakeMeshBackend::new(
+            fake_node("self", "10.200.9.1"),
+            log.clone(),
+        ));
+        let runner = Arc::new(NodeRunner::default());
+        let dataplane = Arc::new(MeshDataplane::new(
+            DataplaneConfig::new("ozma0", Ipv4Addr::new(10, 200, 9, 1), 24, 1420),
+            runner.clone(),
+            Arc::new(NodeSysfs::rooted()),
+        ));
+        let engine = DiscoveryEngine::new(
+            DiscoveryConfig::new("self", Vec::new(), trusted)
+                .with_ttl(Duration::from_secs(30))
+                .with_auth(signer.verifier(Duration::from_secs(30)).unwrap()),
+        )
+        .expect("signed discovery engine");
+        let service = MeshService::with_backend_dataplane_and_discovery(
+            backend.clone(),
+            Some(dataplane),
+            log,
+            None,
+            Some(Arc::new(Mutex::new(engine))),
+            false,
+        );
+        (backend, service, runner)
+    }
+
+    fn signed_advertisement(
+        signer: &ClusterSigningKey,
+        peer: &MeshNode,
+        capabilities: &[&str],
+    ) -> RawAdvertisement {
+        let capabilities: Vec<String> =
+            capabilities.iter().map(|value| value.to_string()).collect();
+        let auth = signer.sign_advertisement(
+            &peer.id,
+            &peer.mesh_ip,
+            &peer.wg_pubkey.0,
+            peer.wg_port,
+            &[],
+            &capabilities,
+            SystemTime::now(),
+        );
+        RawAdvertisement {
+            id: Some(peer.id.clone()),
+            wg_pubkey: Some(peer.wg_pubkey.0.clone()),
+            mesh_ip: Some(peer.mesh_ip.clone()),
+            wg_port: Some(peer.wg_port),
+            capabilities,
+            cluster_key_id: Some(auth.key_id),
+            cluster_signature: Some(auth.signature),
+            timestamp: Some(auth.timestamp),
+            nonce: Some(auth.nonce),
+            ..RawAdvertisement::default()
+        }
+    }
+
     fn route_command(runner: &NodeRunner, verb: &str, route: &str) -> bool {
         runner.calls().iter().any(|command| {
             command.program == "ip"
@@ -4841,6 +5034,109 @@ mod tests {
         assert!(kinds.contains(&MeshEventKind::PeerDiscovered));
         assert!(kinds.contains(&MeshEventKind::Route));
         assert!(kinds.contains(&MeshEventKind::Conflict));
+    }
+
+    #[tokio::test]
+    async fn signed_discovery_accepts_only_valid_cluster_signatures() {
+        let signer = ClusterSigningKey::from_seed([7u8; 32]);
+        let other = ClusterSigningKey::generate();
+        let peer = peer("peer-a", "10.200.9.2");
+        let (backend, service, runner) = signed_discovery_service(&signer, Vec::new());
+        service.start().await.unwrap();
+
+        // Unsigned advertisement: the cluster key is configured, so the old
+        // trust fallback is not silently used.
+        let actions = service
+            .apply_discovery_advertisement(advertisement(&peer, &["video"]))
+            .await;
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::SignatureInvalid { .. }]
+        ));
+        assert!(service.peers().await.is_empty());
+        assert!(backend.handshakes().is_empty());
+
+        // Signed, but by a different cluster key.
+        let actions = service
+            .apply_discovery_advertisement(signed_advertisement(&other, &peer, &["video"]))
+            .await;
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::SignatureInvalid { .. }]
+        ));
+
+        // Signed and valid: no --mesh-trust entry is required.
+        let mut valid = signed_advertisement(&signer, &peer, &["video"]);
+        valid.underlay_ip = Some(Ipv4Addr::new(10, 10, 10, 2));
+        let actions = service.apply_discovery_advertisement(valid).await;
+        assert!(matches!(actions.as_slice(), [DiscoveryAction::Add(_)]));
+        assert_eq!(backend.handshakes(), vec!["peer-a".to_owned()]);
+        assert!(route_command(&runner, "replace", "10.200.9.2/32"));
+
+        let status = service.status().await;
+        let discovery = status.discovery.expect("discovery status");
+        assert_eq!(discovery.counters.signature_invalid, 2);
+        assert_eq!(discovery.counters.added, 1);
+        assert_eq!(
+            discovery.auth.as_ref().map(|auth| auth.key_id.as_str()),
+            Some(signer.key_id())
+        );
+
+        // Tampering the advertised overlay address invalidates the signature.
+        let mut tampered = signed_advertisement(&signer, &peer, &["video"]);
+        tampered.mesh_ip = Some("10.200.9.99".to_owned());
+        let actions = service.apply_discovery_advertisement(tampered).await;
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::SignatureInvalid { .. }]
+        ));
+
+        let events = service.events(32);
+        assert!(events
+            .iter()
+            .any(|event| event.message.contains("mesh.discovery-signature-invalid")));
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let all_text = format!("{events:?}{discovery:?}");
+        let private = B64.encode([7u8; 32]);
+        assert!(
+            !all_text.contains(&private),
+            "status/events must not contain private cluster material"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_discovery_stale_timestamp_is_typed() {
+        let signer = ClusterSigningKey::generate();
+        let peer = peer("peer-a", "10.200.9.2");
+        let (_backend, service, _runner) = signed_discovery_service(&signer, Vec::new());
+        service.start().await.unwrap();
+
+        let mut stale = signed_advertisement(&signer, &peer, &["video"]);
+        // Keep the signature valid but move the timestamp outside the 30s
+        // freshness window by re-signing the old wall clock.
+        let old = SystemTime::now() - Duration::from_secs(120);
+        let auth = signer.sign_advertisement(
+            &peer.id,
+            &peer.mesh_ip,
+            &peer.wg_pubkey.0,
+            peer.wg_port,
+            &[],
+            &["video".to_owned()],
+            old,
+        );
+        stale.cluster_key_id = Some(auth.key_id);
+        stale.cluster_signature = Some(auth.signature);
+        stale.timestamp = Some(auth.timestamp);
+        stale.nonce = Some(auth.nonce);
+        let actions = service.apply_discovery_advertisement(stale).await;
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::Stale { .. }]
+        ));
+        assert!(service
+            .events(32)
+            .iter()
+            .any(|event| event.message.contains("mesh.discovery-stale")));
     }
 
     #[tokio::test]

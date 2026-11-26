@@ -32,6 +32,12 @@ pub enum MeshError {
     #[error("unauthorized mesh peer advertisement: {0}")]
     DiscoveryUnauthorized(String),
 
+    #[error("invalid mesh discovery signature: {0}")]
+    DiscoverySignatureInvalid(String),
+
+    #[error("stale mesh discovery advertisement: {0}")]
+    DiscoveryStale(String),
+
     #[error("mesh peer discovery conflict: {0}")]
     DiscoveryConflict(String),
 

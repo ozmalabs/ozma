@@ -45,7 +45,11 @@ use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
-use crate::discovery::{normalize_capabilities, validate_peer_node, MDNS_SERVICE_TYPE};
+use crate::discovery::{
+    normalize_capabilities, normalize_previous_pubkeys, validate_peer_node, MAX_ID_BYTES,
+    MDNS_SERVICE_TYPE,
+};
+use crate::discovery_auth::{ClusterSigningKey, DEFAULT_REFRESH_INTERVAL};
 use crate::error::{MeshError, Result};
 use crate::node::{MeshNode, WgPrivateKey, WgPublicKey};
 use crate::rotation::{validate_grace, KeyRotation, RotationSchedule, RotationStatus};
@@ -247,15 +251,21 @@ pub(crate) struct Inner {
 /// manager and the kernel backend advertise the same identity without owning a
 /// userspace WireGuard socket.
 pub struct MeshAdvertiser {
-    _responder: Responder,
-    _service: Service,
+    responder: Option<Responder>,
+    service: Option<Service>,
     port: u16,
+    node: MeshNode,
+    previous_public_keys: Vec<String>,
+    capabilities: Vec<String>,
+    signer: Option<Arc<ClusterSigningKey>>,
+    signed_at: Option<Instant>,
+    refresh_interval: Duration,
 }
 
 impl MeshAdvertiser {
     /// Register this node's mesh identity on the local network.
     pub fn new(node: &MeshNode, port: u16, capabilities: &[String]) -> Result<Self> {
-        Self::new_with_previous(node, &[], port, capabilities)
+        Self::new_with_previous_and_signer(node, &[], port, capabilities, None)
     }
 
     /// Register this node's mesh identity, optionally publishing the previous
@@ -269,44 +279,170 @@ impl MeshAdvertiser {
         port: u16,
         capabilities: &[String],
     ) -> Result<Self> {
-        let responder = Responder::new().map_err(|e| MeshError::Mdns(e.to_string()))?;
-        let instance = mdns_instance_name(&node.id);
-        let capability_text = mdns_capability_text(capabilities);
-        let mut properties = vec![
-            format!("id={}", node.id),
-            format!("mesh_ip={}", node.mesh_ip),
-            format!("pubkey={}", node.wg_pubkey),
-            format!("wg_port={port}"),
-            "proto=1".to_owned(),
-        ];
-        let previous: Vec<&str> = previous_public_keys
-            .iter()
-            .map(String::as_str)
-            .filter(|key| !key.is_empty() && !key.chars().any(char::is_control))
-            .take(2)
-            .collect();
-        if !previous.is_empty() {
-            // Bounded: the whole TXT record must stay well below one DNS
-            // character-string limit for practical responders.
-            properties.push(format!("prev_pubkey={}", previous.join(",")));
-        }
-        if !capability_text.is_empty() {
-            properties.push(format!("cap={capability_text}"));
-        }
-        let property_refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-        let service =
-            responder.register(MDNS_SERVICE_TYPE.to_owned(), instance, port, &property_refs);
-        Ok(Self {
-            _responder: responder,
-            _service: service,
+        Self::new_with_previous_and_signer(node, previous_public_keys, port, capabilities, None)
+    }
+
+    /// Register a possibly cluster-signed advertisement.
+    ///
+    /// When `signer` is present the TXT record carries `key_id`, `ts`, `nonce`,
+    /// and `sig` over the canonical advertisement payload. The signing key is
+    /// retained only to refresh the signature before it goes stale; it is never
+    /// placed in TXT or status.
+    pub fn new_with_previous_and_signer(
+        node: &MeshNode,
+        previous_public_keys: &[String],
+        port: u16,
+        capabilities: &[String],
+        signer: Option<Arc<ClusterSigningKey>>,
+    ) -> Result<Self> {
+        let mut advertiser = Self {
+            responder: None,
+            service: None,
             port,
-        })
+            node: node.clone(),
+            previous_public_keys: previous_public_keys.to_vec(),
+            capabilities: capabilities.to_vec(),
+            signer,
+            signed_at: None,
+            refresh_interval: DEFAULT_REFRESH_INTERVAL,
+        };
+        advertiser.register()?;
+        Ok(advertiser)
+    }
+
+    fn register(&mut self) -> Result<()> {
+        // Drop the old responder before binding a replacement on port 5353.
+        self.service = None;
+        self.responder = None;
+
+        let properties = advertisement_properties(
+            &self.node,
+            &self.previous_public_keys,
+            self.port,
+            &self.capabilities,
+            self.signer.as_deref(),
+            SystemTime::now(),
+        )?;
+        let responder = Responder::new().map_err(|e| MeshError::Mdns(e.to_string()))?;
+        let instance = mdns_instance_name(&self.node.id);
+        let property_refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+        let service = responder.register(
+            MDNS_SERVICE_TYPE.to_owned(),
+            instance,
+            self.port,
+            &property_refs,
+        );
+        self.responder = Some(responder);
+        self.service = Some(service);
+        self.signed_at = self.signer.as_ref().map(|_| Instant::now());
+        Ok(())
+    }
+
+    /// Re-sign and re-register the advertisement when its signature is nearing
+    /// expiry. Unsigned advertisers never refresh. Returns whether a new
+    /// advertisement was registered.
+    pub fn refresh(&mut self, now: Instant) -> Result<bool> {
+        if self.signer.is_none() {
+            return Ok(false);
+        }
+        if self
+            .signed_at
+            .is_some_and(|signed| now.saturating_duration_since(signed) < self.refresh_interval)
+        {
+            return Ok(false);
+        }
+        self.register()?;
+        Ok(true)
+    }
+
+    /// Override the signed-advertisement refresh cadence (tests/diagnostics).
+    pub fn set_refresh_interval(&mut self, interval: Duration) {
+        self.refresh_interval = interval;
     }
 
     /// UDP port advertised for this node.
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    /// Public cluster key id, when this advertisement is signed.
+    pub fn cluster_key_id(&self) -> Option<&str> {
+        self.signer.as_ref().map(|signer| signer.key_id())
+    }
+}
+
+/// Build the bounded TXT properties for one mesh advertisement.
+///
+/// Public so tests can assert the signed TXT stays well below DNS limits. The
+/// function never returns private key material.
+pub fn advertisement_properties(
+    node: &MeshNode,
+    previous_public_keys: &[String],
+    port: u16,
+    capabilities: &[String],
+    signer: Option<&ClusterSigningKey>,
+    now: SystemTime,
+) -> Result<Vec<String>> {
+    // Canonical identity values must match what the verifier reconstructs from
+    // the (trimmed) TXT record, and must not be able to inject payload lines.
+    let id = node.id.trim();
+    let mesh_ip = node
+        .mesh_ip
+        .trim()
+        .parse::<Ipv4Addr>()
+        .map_err(|_| {
+            MeshError::DiscoveryInvalid(format!("mesh IPv4 address {:?} is invalid", node.mesh_ip))
+        })?
+        .to_string();
+    let wg_pubkey = node.wg_pubkey.0.trim();
+    if id.is_empty() || id.len() > MAX_ID_BYTES || id.chars().any(char::is_control) {
+        return Err(MeshError::DiscoveryInvalid(
+            "mesh node id must be non-empty, bounded, and free of control characters".to_owned(),
+        ));
+    }
+    WgPublicKey(wg_pubkey.to_owned()).to_bytes()?;
+    let mut properties = vec![
+        format!("id={id}"),
+        format!("mesh_ip={mesh_ip}"),
+        format!("pubkey={wg_pubkey}"),
+        format!("wg_port={port}"),
+        "proto=1".to_owned(),
+    ];
+
+    let previous = normalize_previous_pubkeys(previous_public_keys, wg_pubkey)?;
+    if !previous.is_empty() {
+        // Bounded: the whole TXT record must stay well below one DNS
+        // character-string limit for practical responders.
+        properties.push(format!("prev_pubkey={}", previous.join(",")));
+    }
+
+    if signer.is_some() {
+        // The signed form canonicalises capabilities identically on both sides
+        // (validated, sorted, bounded).
+        let capabilities = normalize_capabilities(capabilities)?;
+        if !capabilities.is_empty() {
+            properties.push(format!("cap={}", capabilities.join(",")));
+        }
+        let auth = signer.expect("signer was checked").sign_advertisement(
+            id,
+            &mesh_ip,
+            wg_pubkey,
+            port,
+            &previous,
+            &capabilities,
+            now,
+        );
+        properties.push(format!("key_id={}", auth.key_id));
+        properties.push(format!("ts={}", auth.timestamp));
+        properties.push(format!("nonce={}", auth.nonce));
+        properties.push(format!("sig={}", auth.signature));
+    } else {
+        let capability_text = mdns_capability_text(capabilities);
+        if !capability_text.is_empty() {
+            properties.push(format!("cap={capability_text}"));
+        }
+    }
+    Ok(properties)
 }
 
 // ── MeshManager ───────────────────────────────────────────────────────────────
@@ -331,6 +467,10 @@ pub struct MeshManager {
 
     /// Capabilities included in every mDNS (re-)registration.
     capabilities: Arc<Vec<String>>,
+
+    /// Optional shared cluster signing key. Only the advertiser uses it; it is
+    /// never serialised or logged.
+    signer: Option<Arc<ClusterSigningKey>>,
 
     /// Current and grace-window key lineage.
     rotation: Arc<StdMutex<KeyRotation>>,
@@ -380,6 +520,17 @@ impl MeshManager {
         private_key: WgPrivateKey,
         capabilities: Vec<String>,
     ) -> Result<Self> {
+        Self::new_with_capabilities_and_signer(node, private_key, capabilities, None).await
+    }
+
+    /// Like [`MeshManager::new_with_capabilities`], with an optional shared
+    /// cluster key that signs every mDNS advertisement.
+    pub async fn new_with_capabilities_and_signer(
+        node: MeshNode,
+        private_key: WgPrivateKey,
+        capabilities: Vec<String>,
+        signer: Option<Arc<ClusterSigningKey>>,
+    ) -> Result<Self> {
         // Bind the WireGuard UDP socket on all interfaces.
         // Use port 0 to let the OS pick an ephemeral port when wg_port == 0.
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), node.wg_port);
@@ -401,12 +552,26 @@ impl MeshManager {
 
         // Advertise over a dedicated mesh service type so the node's
         // controller-facing `_ozma._udp` record (HTTP port/TXT) is untouched.
-        let advertiser = MeshAdvertiser::new(&node, actual_port, &capabilities)?;
+        let advertiser = MeshAdvertiser::new_with_previous_and_signer(
+            &node,
+            &[],
+            actual_port,
+            &capabilities,
+            signer.clone(),
+        )?;
 
-        info!(
-            node_id = %node.id,
-            "MeshManager: mDNS service registered (_ozma-mesh._udp.local)"
-        );
+        if signer.is_some() {
+            info!(
+                node_id = %node.id,
+                cluster_key_id = %advertiser.cluster_key_id().unwrap_or(""),
+                "MeshManager: signed mDNS service registered (_ozma-mesh._udp.local)"
+            );
+        } else {
+            info!(
+                node_id = %node.id,
+                "MeshManager: mDNS service registered (_ozma-mesh._udp.local)"
+            );
+        }
 
         let (packet_tx, packet_rx) = mpsc::channel(DEFAULT_PACKET_QUEUE);
         let rotation = Arc::new(StdMutex::new(KeyRotation::new(private_key)));
@@ -420,6 +585,7 @@ impl MeshManager {
             socket: Arc::new(socket),
             _mdns: Arc::new(StdMutex::new(Some(advertiser))),
             capabilities: Arc::new(capabilities),
+            signer,
             rotation,
             rotation_op: Arc::new(tokio::sync::Mutex::new(())),
             factory: Arc::new(BoringtunTunnelFactory),
@@ -485,6 +651,16 @@ impl MeshManager {
         self.socket.local_addr().unwrap().port()
     }
 
+    /// Re-sign and re-register the advertisement when its signature is nearing
+    /// expiry. No-op for unsigned managers. Safe to call on a timer.
+    pub fn refresh_advertisement(&self) -> Result<bool> {
+        let mut guard = self._mdns.lock().unwrap_or_else(|error| error.into_inner());
+        match guard.as_mut() {
+            Some(advertiser) => advertiser.refresh(Instant::now()),
+            None => Ok(false),
+        }
+    }
+
     /// Start the background async receive loop (spawns a Tokio task).
     ///
     /// The loop reads WireGuard-encapsulated UDP datagrams, routes each packet
@@ -525,6 +701,7 @@ impl MeshManager {
         let identity = Arc::clone(&self.identity);
         let mdns = Arc::clone(&self._mdns);
         let capabilities = Arc::clone(&self.capabilities);
+        let signer = self.signer.clone();
         let port = self.wg_port();
 
         tokio::spawn(async move {
@@ -537,12 +714,14 @@ impl MeshManager {
                 let received = tokio::select! {
                     _ = stop_notify.notified() => break,
                     _ = ticker.tick() => {
+                        refresh_advertisement(&mdns);
                         expire_grace(
                             &inner,
                             &rotation,
                             &identity,
                             &mdns,
                             &capabilities,
+                            &signer,
                             port,
                         )
                         .await;
@@ -699,17 +878,22 @@ impl MeshManager {
         }
         let previous = vec![old_public.0.clone()];
         let advertiser = if advertise {
-            match MeshAdvertiser::new_with_previous(
+            match MeshAdvertiser::new_with_previous_and_signer(
                 &candidate,
                 &previous,
                 self.wg_port(),
                 &self.capabilities,
+                self.signer.clone(),
             ) {
                 Ok(advertiser) => Some(advertiser),
                 Err(error) => {
-                    if let Ok(restored) =
-                        MeshAdvertiser::new(&self.node(), self.wg_port(), &self.capabilities)
-                    {
+                    if let Ok(restored) = MeshAdvertiser::new_with_previous_and_signer(
+                        &self.node(),
+                        &[],
+                        self.wg_port(),
+                        &self.capabilities,
+                        self.signer.clone(),
+                    ) {
                         *self._mdns.lock().unwrap_or_else(|error| error.into_inner()) =
                             Some(restored);
                     }
@@ -791,14 +975,25 @@ impl MeshManager {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
-        match MeshAdvertiser::new(&node, self.wg_port(), &self.capabilities) {
+        match MeshAdvertiser::new_with_previous_and_signer(
+            &node,
+            &[],
+            self.wg_port(),
+            &self.capabilities,
+            self.signer.clone(),
+        ) {
             Ok(advertiser) => {
                 *self._mdns.lock().unwrap_or_else(|error| error.into_inner()) = Some(advertiser);
             }
             Err(error) => {
                 warn!(%error, "MeshManager: could not re-advertise after grace expiry");
-                if let Ok(restored) = MeshAdvertiser::new(&node, self.wg_port(), &self.capabilities)
-                {
+                if let Ok(restored) = MeshAdvertiser::new_with_previous_and_signer(
+                    &node,
+                    &[],
+                    self.wg_port(),
+                    &self.capabilities,
+                    self.signer.clone(),
+                ) {
                     *self._mdns.lock().unwrap_or_else(|error| error.into_inner()) = Some(restored);
                 }
             }
@@ -1270,6 +1465,16 @@ impl MeshManager {
     }
 }
 
+/// Refresh a signed advertisement when its signature is nearing expiry.
+fn refresh_advertisement(mdns: &Arc<StdMutex<Option<MeshAdvertiser>>>) {
+    let mut guard = mdns.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(advertiser) = guard.as_mut() {
+        if let Err(error) = advertiser.refresh(Instant::now()) {
+            warn!(%error, "MeshManager: signed mDNS advertisement refresh failed");
+        }
+    }
+}
+
 /// Drop grace tunnels and stop advertising the old public key once the window
 /// elapsed. Safe to call on every timer tick.
 async fn expire_grace(
@@ -1278,6 +1483,7 @@ async fn expire_grace(
     identity: &Arc<StdMutex<MeshNode>>,
     mdns: &Arc<StdMutex<Option<MeshAdvertiser>>>,
     capabilities: &Arc<Vec<String>>,
+    signer: &Option<Arc<ClusterSigningKey>>,
     port: u16,
 ) {
     let expired = rotation
@@ -1309,13 +1515,25 @@ async fn expire_grace(
     mdns.lock()
         .unwrap_or_else(|error| error.into_inner())
         .take();
-    match MeshAdvertiser::new(&node, port, capabilities) {
+    match MeshAdvertiser::new_with_previous_and_signer(
+        &node,
+        &[],
+        port,
+        capabilities,
+        signer.clone(),
+    ) {
         Ok(advertiser) => {
             *mdns.lock().unwrap_or_else(|error| error.into_inner()) = Some(advertiser);
         }
         Err(error) => {
             warn!(%error, "MeshManager: could not re-advertise after grace expiry");
-            if let Ok(restored) = MeshAdvertiser::new(&node, port, capabilities) {
+            if let Ok(restored) = MeshAdvertiser::new_with_previous_and_signer(
+                &node,
+                &[],
+                port,
+                capabilities,
+                signer.clone(),
+            ) {
                 *mdns.lock().unwrap_or_else(|error| error.into_inner()) = Some(restored);
             }
         }
@@ -1444,6 +1662,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use boringtun::noise::errors::WireGuardError;
 
     use crate::node::WgPublicKey;
@@ -1558,6 +1777,7 @@ mod tests {
             socket: Arc::new(socket),
             _mdns: Arc::new(StdMutex::new(None)),
             capabilities: Arc::new(Vec::new()),
+            signer: None,
             rotation: Arc::new(StdMutex::new(KeyRotation::new(private_key))),
             rotation_op: Arc::new(tokio::sync::Mutex::new(())),
             factory,
@@ -2001,5 +2221,64 @@ mod tests {
             }
         );
         assert_eq!(manager.list_peers().await, vec![rotated]);
+    }
+
+    #[test]
+    fn signed_advertisement_txt_is_bounded_and_secret_free() {
+        let signer = Arc::new(crate::discovery_auth::ClusterSigningKey::from_seed(
+            [42u8; 32],
+        ));
+        let (node, _) = MeshNode::generate("node-a", "10.200.9.1", 51_820);
+        let previous = vec![WgPrivateKey::generate().public_key().0];
+        let capabilities = vec!["video".to_owned(), "audio".to_owned(), "hid".to_owned()];
+        let properties = advertisement_properties(
+            &node,
+            &previous,
+            51_820,
+            &capabilities,
+            Some(&signer),
+            SystemTime::now(),
+        )
+        .expect("signed properties");
+
+        for property in &properties {
+            assert!(
+                property.len() <= 255,
+                "TXT property exceeds one DNS character-string: {} bytes",
+                property.len()
+            );
+        }
+        let joined = properties.join("\u{1f}");
+        assert!(joined.contains("key_id="));
+        assert!(joined.contains("ts="));
+        assert!(joined.contains("nonce="));
+        assert!(joined.contains("sig="));
+        assert!(joined.contains("prev_pubkey="));
+        let private = B64.encode([42u8; 32]);
+        assert!(
+            !joined.contains(&private),
+            "private cluster seed must never appear in TXT"
+        );
+        assert!(properties.len() < 32);
+        assert!(joined.len() < 1_024);
+    }
+
+    #[test]
+    fn unsigned_advertisement_keeps_the_existing_txt_shape() {
+        let (node, _) = MeshNode::generate("node-b", "10.200.9.2", 51_820);
+        let properties = advertisement_properties(
+            &node,
+            &[],
+            51_820,
+            &["video".to_owned()],
+            None,
+            SystemTime::now(),
+        )
+        .unwrap();
+        let joined = properties.join("\u{1f}");
+        assert!(joined.contains("id=node-b"));
+        assert!(joined.contains("cap=video"));
+        assert!(!joined.contains("sig="));
+        assert!(!joined.contains("nonce="));
     }
 }

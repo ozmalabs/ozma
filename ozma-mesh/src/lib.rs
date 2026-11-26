@@ -43,6 +43,7 @@
 
 pub mod dataplane;
 pub mod discovery;
+pub mod discovery_auth;
 pub mod error;
 pub mod kernel;
 pub mod keys;
@@ -58,8 +59,13 @@ pub use dataplane::{
     FileOpener, MeshDataplane, NatConfig, Sysfs,
 };
 pub use discovery::{
-    DiscoveredPeer, DiscoveryAction, DiscoveryConfig, DiscoveryCounters, DiscoveryEngine,
-    DiscoveryStatus, MdnsBrowser, RawAdvertisement, TrustedPeer, MDNS_FQDN, MDNS_SERVICE_TYPE,
+    DiscoveredPeer, DiscoveryAction, DiscoveryAuthStatus, DiscoveryConfig, DiscoveryCounters,
+    DiscoveryEngine, DiscoveryStatus, MdnsBrowser, RawAdvertisement, TrustedPeer, MDNS_FQDN,
+    MDNS_SERVICE_TYPE,
+};
+pub use discovery_auth::{
+    canonical_payload, key_id_for, AdvertisementAuth, ClusterSigningKey, DiscoveryAuthConfig,
+    DiscoveryAuthError, DEFAULT_MAX_SKEW, DEFAULT_REFRESH_INTERVAL, MAX_SIGNATURE_BYTES,
 };
 pub use error::{MeshError, Result};
 pub use kernel::{

@@ -50,7 +50,8 @@ use crate::display_control::{
 };
 use crate::display_outputs::{DisplayOutput, DisplayOutputSelection};
 use crate::hls::{
-    HlsConfig, HlsController, HlsEncoder, HlsError, HlsRestartOutcome, HlsSourceFactory, HlsStatus,
+    HlsAudioConfig, HlsConfig, HlsController, HlsEncoder, HlsError, HlsRestartOutcome,
+    HlsSourceFactory, HlsStatus, DEFAULT_AUDIO_BITRATE_KBPS,
 };
 
 /// Default maximum number of simultaneous per-console HLS pipelines.
@@ -73,6 +74,16 @@ pub struct MultiConsoleHlsConfig {
     pub root: PathBuf,
     /// Base HLS configuration; `output_dir` is replaced per console.
     pub base: HlsConfig,
+    /// Optional per-console audio monitor template.
+    ///
+    /// `{console}` and `{index}` expand to the console's zero-based index, for
+    /// example `ozma-vm{console}.monitor`. Unset keeps the base configuration's
+    /// shared monitor for every console (or video-only when the base has none).
+    pub audio_source_template: Option<String>,
+    /// AAC bitrate for template-expanded per-console audio, in kbps.
+    ///
+    /// A base [`HlsConfig::audio`] bitrate wins when one is configured.
+    pub audio_bitrate_kbps: u32,
 }
 
 impl MultiConsoleHlsConfig {
@@ -83,6 +94,8 @@ impl MultiConsoleHlsConfig {
             idle_timeout: DEFAULT_CONSOLE_HLS_IDLE_TIMEOUT,
             root: root.into(),
             base,
+            audio_source_template: None,
+            audio_bitrate_kbps: DEFAULT_AUDIO_BITRATE_KBPS,
         }
     }
 
@@ -123,6 +136,18 @@ pub trait ConsoleHlsPipeline: Send + Sync {
     fn encoder(&self) -> HlsEncoder;
     /// Bitrate this generation currently targets, in kbps.
     fn bitrate_kbps(&self) -> u32;
+    /// True when this generation was configured with HLS audio.
+    fn audio_configured(&self) -> bool {
+        false
+    }
+    /// Configured monitor source, when HLS audio was requested.
+    fn audio_source(&self) -> Option<String> {
+        None
+    }
+    /// Exact ffmpeg audio encoder, when HLS audio was requested.
+    fn audio_encoder(&self) -> Option<String> {
+        None
+    }
     /// Stop the source and reap ffmpeg with the pipeline's bounded wait.
     async fn stop(&self) -> Result<(), String>;
     /// Restart this generation with an encoder and optional bitrate.
@@ -187,6 +212,21 @@ impl ConsoleHlsPipeline for ControllerHlsPipeline {
 
     fn bitrate_kbps(&self) -> u32 {
         self.controller.config().bitrate_kbps
+    }
+
+    fn audio_configured(&self) -> bool {
+        self.controller.config().audio.is_some()
+    }
+
+    fn audio_source(&self) -> Option<String> {
+        self.controller.config().audio.map(|audio| audio.source)
+    }
+
+    fn audio_encoder(&self) -> Option<String> {
+        self.controller
+            .config()
+            .audio
+            .map(|audio| audio.encoder().to_owned())
     }
 
     async fn stop(&self) -> Result<(), String> {
@@ -285,6 +325,17 @@ pub struct ConsoleHlsStreamStatus {
     /// Bitrate this console's pipeline currently targets, when one is running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate_kbps: Option<u32>,
+    /// True when this console's pipeline was configured with HLS audio.
+    ///
+    /// Configuration intent only; it never claims the monitor opened or
+    /// produced samples.
+    pub audio_configured: bool,
+    /// Configured audio monitor source, when HLS audio was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_source: Option<String>,
+    /// Exact ffmpeg audio encoder, when HLS audio was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_encoder: Option<String>,
     /// Controller-relative playlist path once a pipeline owns the console.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist: Option<String>,
@@ -308,6 +359,16 @@ pub struct MultiConsoleHlsStatus {
     pub max_pipelines: usize,
     /// Idle timeout applied to non-active consoles (zero = disabled).
     pub idle_timeout_seconds: u64,
+    /// True when per-console HLS audio is configured (base monitor or template).
+    ///
+    /// Configuration intent only; no sample or monitor-open claim is made.
+    pub audio_configured: bool,
+    /// Per-console audio monitor template, when one was supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_source_template: Option<String>,
+    /// Exact ffmpeg audio encoder for configured consoles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_encoder: Option<String>,
     /// Active HLS/WebRTC console.
     pub active_console: u32,
     /// Why some advertised consoles are not encoded (provider/bound/transport).
@@ -453,6 +514,37 @@ impl MultiConsoleHls {
     /// Base HLS configuration (output directory is replaced per console).
     pub fn base_config(&self) -> HlsConfig {
         self.inner.config.base.clone()
+    }
+
+    /// True when per-console HLS audio is configured.
+    ///
+    /// This is intent from the base monitor or template, not a claim that any
+    /// monitor opened or produced samples.
+    pub fn audio_configured(&self) -> bool {
+        self.inner.config.audio_source_template.is_some() || self.inner.config.base.audio.is_some()
+    }
+
+    /// Configured per-console audio monitor template, when one was supplied.
+    pub fn audio_source_template(&self) -> Option<&str> {
+        self.inner.config.audio_source_template.as_deref()
+    }
+
+    /// Exact ffmpeg audio encoder used by configured consoles.
+    pub fn audio_encoder(&self) -> Option<&'static str> {
+        self.audio_configured()
+            .then_some(crate::hls::HLS_AUDIO_ENCODER)
+    }
+
+    fn console_audio(&self, console: u32) -> Option<HlsAudioConfig> {
+        config_for_console(
+            &self.inner.config.base,
+            &self.inner.config.root,
+            self.inner.config.audio_source_template.as_deref(),
+            self.inner.config.audio_bitrate_kbps,
+            console,
+        )
+        .ok()
+        .and_then(|config| config.audio)
     }
 
     /// Directory for one console (`<root>/console-<N>`).
@@ -607,9 +699,17 @@ impl MultiConsoleHls {
                 }
             }
 
-            let mut config = self.inner.config.base.clone();
-            config.output_dir = console_dir_for(&self.inner.config.root, console);
-            let result = self.inner.factory.start(console, config).await;
+            let config = config_for_console(
+                &self.inner.config.base,
+                &self.inner.config.root,
+                self.inner.config.audio_source_template.as_deref(),
+                self.inner.config.audio_bitrate_kbps,
+                console,
+            );
+            let result = match config {
+                Ok(config) => self.inner.factory.start(console, config).await,
+                Err(error) => Err(error),
+            };
             let now = Instant::now();
             match result {
                 Ok(pipeline) => {
@@ -672,9 +772,17 @@ impl MultiConsoleHls {
             }
         }
 
-        let mut config = self.inner.config.base.clone();
-        config.output_dir = console_dir_for(&self.inner.config.root, console);
-        let result = self.inner.factory.start(console, config).await;
+        let config = config_for_console(
+            &self.inner.config.base,
+            &self.inner.config.root,
+            self.inner.config.audio_source_template.as_deref(),
+            self.inner.config.audio_bitrate_kbps,
+            console,
+        );
+        let result = match config {
+            Ok(config) => self.inner.factory.start(console, config).await,
+            Err(error) => Err(error),
+        };
         let now = Instant::now();
         match result {
             Ok(pipeline) => {
@@ -792,6 +900,7 @@ impl MultiConsoleHls {
         for output in &state.selection.outputs {
             let capturable = supported && output_is_capturable(output, provider);
             let entry = state.entries.get(&output.index);
+            let intent = self.console_audio(output.index);
             let (status, error, manifest_path, encoder, bitrate_kbps) = if !capturable {
                 (
                     "unsupported".to_owned(),
@@ -838,6 +947,21 @@ impl MultiConsoleHls {
                     None,
                 )
             };
+            let (audio_configured, audio_source, audio_encoder) =
+                match entry.and_then(|entry| entry.pipeline.as_ref()) {
+                    Some(pipeline) => (
+                        pipeline.audio_configured(),
+                        pipeline.audio_source(),
+                        pipeline.audio_encoder(),
+                    ),
+                    None => match intent {
+                        Some(audio) => {
+                            let encoder = audio.encoder().to_owned();
+                            (true, Some(audio.source), Some(encoder))
+                        }
+                        None => (false, None, None),
+                    },
+                };
             let output_dir = console_dir_for(&self.inner.config.root, output.index);
             consoles.push(ConsoleHlsStreamStatus {
                 console: output.index,
@@ -846,6 +970,9 @@ impl MultiConsoleHls {
                 error,
                 encoder,
                 bitrate_kbps,
+                audio_configured,
+                audio_source,
+                audio_encoder,
                 playlist: manifest_path
                     .is_some()
                     .then(|| format!("/stream/console-{}/stream.m3u8", output.index)),
@@ -859,6 +986,9 @@ impl MultiConsoleHls {
             provider: provider.map(|provider| provider.as_str().to_owned()),
             max_pipelines: self.inner.config.max_pipelines,
             idle_timeout_seconds: self.inner.config.idle_timeout.as_secs(),
+            audio_configured: self.audio_configured(),
+            audio_source_template: self.inner.config.audio_source_template.clone(),
+            audio_encoder: self.audio_encoder().map(str::to_owned),
             active_console: active,
             limitation: state.limitation.clone(),
             consoles,
@@ -1170,6 +1300,89 @@ fn content_type(file: &str) -> &'static str {
     }
 }
 
+/// Largest accepted per-console audio source/template length.
+const MAX_AUDIO_SOURCE_CHARS: usize = 256;
+
+/// Validate a per-console HLS audio monitor template.
+///
+/// Expands console `0` and the largest possible console index so a template
+/// that is valid early but over-long later is rejected at startup.
+pub fn validate_audio_source_template(template: &str) -> Result<(), String> {
+    expand_audio_source_template(template, 0)?;
+    expand_audio_source_template(template, MAX_VM_CONSOLES as u32 - 1)?;
+    Ok(())
+}
+
+/// Expand `{console}`/`{index}` in a per-console HLS audio monitor template.
+pub fn expand_audio_source_template(template: &str, console: u32) -> Result<String, String> {
+    if template.trim().is_empty() {
+        return Err("the per-console HLS audio source template must not be empty".to_owned());
+    }
+    if template.chars().count() > MAX_AUDIO_SOURCE_CHARS {
+        return Err(format!(
+            "the per-console HLS audio source template must be at most \
+             {MAX_AUDIO_SOURCE_CHARS} characters"
+        ));
+    }
+    if template.chars().any(char::is_control) {
+        return Err(
+            "the per-console HLS audio source template must not contain control characters"
+                .to_owned(),
+        );
+    }
+    let index = console.to_string();
+    let source = template
+        .replace("{console}", &index)
+        .replace("{index}", &index);
+    if source.trim().is_empty() {
+        return Err(format!(
+            "the per-console HLS audio source for Console_{console} must not be empty or \
+             whitespace"
+        ));
+    }
+    if source.chars().count() > MAX_AUDIO_SOURCE_CHARS {
+        return Err(format!(
+            "the per-console HLS audio source for Console_{console} must be at most \
+             {MAX_AUDIO_SOURCE_CHARS} characters"
+        ));
+    }
+    if source.chars().any(char::is_control) {
+        return Err(format!(
+            "the per-console HLS audio source for Console_{console} must not contain control \
+             characters"
+        ));
+    }
+    if source.contains('{') || source.contains('}') {
+        return Err(format!(
+            "the per-console HLS audio source template for Console_{console} contains an \
+             unknown placeholder; only {{console}} and {{index}} are supported"
+        ));
+    }
+    Ok(source)
+}
+
+/// Build the base configuration for one console, applying the audio template.
+fn config_for_console(
+    base: &HlsConfig,
+    root: &Path,
+    template: Option<&str>,
+    audio_bitrate_kbps: u32,
+    console: u32,
+) -> Result<HlsConfig, String> {
+    let mut config = base.clone();
+    config.output_dir = console_dir_for(root, console);
+    if let Some(template) = template {
+        let source = expand_audio_source_template(template, console)?;
+        let bitrate_kbps = base
+            .audio
+            .as_ref()
+            .map(|audio| audio.bitrate_kbps)
+            .unwrap_or(audio_bitrate_kbps);
+        config.audio = Some(HlsAudioConfig::new(source, bitrate_kbps));
+    }
+    Ok(config)
+}
+
 fn console_dir_for(root: &Path, console: u32) -> PathBuf {
     root.join(format!("console-{console}"))
 }
@@ -1285,6 +1498,7 @@ mod tests {
         stopped: Arc<StdMutex<Vec<u32>>>,
         encoder: StdMutex<HlsEncoder>,
         bitrate_kbps: StdMutex<u32>,
+        audio: Option<HlsAudioConfig>,
         fail_restart: Arc<StdMutex<HashSet<(u32, HlsEncoder)>>>,
         restarts: Arc<StdMutex<Vec<(u32, HlsEncoder, u32)>>>,
     }
@@ -1309,6 +1523,18 @@ mod tests {
 
         fn bitrate_kbps(&self) -> u32 {
             *self.bitrate_kbps.lock().expect("bitrate")
+        }
+
+        fn audio_configured(&self) -> bool {
+            self.audio.is_some()
+        }
+
+        fn audio_source(&self) -> Option<String> {
+            self.audio.as_ref().map(|audio| audio.source.clone())
+        }
+
+        fn audio_encoder(&self) -> Option<String> {
+            self.audio.as_ref().map(|audio| audio.encoder().to_owned())
         }
 
         async fn stop(&self) -> Result<(), String> {
@@ -1424,6 +1650,7 @@ mod tests {
                 stopped: self.stopped.clone(),
                 encoder: StdMutex::new(config.video_encoder),
                 bitrate_kbps: StdMutex::new(config.bitrate_kbps),
+                audio: config.audio,
                 fail_restart: self.fail_restart.clone(),
                 restarts: self.restarts.clone(),
             }))
@@ -1446,6 +1673,8 @@ mod tests {
                     output_dir: root.to_path_buf(),
                     ..HlsConfig::default()
                 },
+                audio_source_template: None,
+                audio_bitrate_kbps: DEFAULT_AUDIO_BITRATE_KBPS,
             },
         )
     }
@@ -1802,6 +2031,7 @@ mod tests {
             stopped: Arc::new(StdMutex::new(Vec::new())),
             encoder: StdMutex::new(HlsEncoder::H264),
             bitrate_kbps: StdMutex::new(4_000),
+            audio: None,
             fail_restart: factory.fail_restart.clone(),
             restarts: factory.restarts.clone(),
         });
@@ -1825,5 +2055,99 @@ mod tests {
             factory.restarts(),
             vec![(99, HlsEncoder::Hevc, 2_000), (0, HlsEncoder::Hevc, 2_000)]
         );
+    }
+
+    #[test]
+    fn audio_template_expands_console_and_index_and_rejects_unknown_placeholders() {
+        assert_eq!(
+            expand_audio_source_template("ozma-vm{console}.monitor", 1).unwrap(),
+            "ozma-vm1.monitor"
+        );
+        assert_eq!(
+            expand_audio_source_template("ozma-vm{index}.monitor", 3).unwrap(),
+            "ozma-vm3.monitor"
+        );
+        assert!(validate_audio_source_template("ozma-vm{console}.monitor").is_ok());
+        assert!(validate_audio_source_template("   ").is_err());
+        assert!(validate_audio_source_template("bad\u{7}monitor").is_err());
+        let error = validate_audio_source_template("ozma-vm{consol}.monitor")
+            .expect_err("unknown placeholder");
+        assert!(error.contains("unknown placeholder"), "{error}");
+    }
+
+    #[test]
+    fn console_audio_template_uses_the_configured_bitrate_without_base_audio() {
+        let config = config_for_console(
+            &HlsConfig::default(),
+            Path::new("/tmp/ozma-console-audio"),
+            Some("ozma-vm{console}.monitor"),
+            96,
+            1,
+        )
+        .expect("template config");
+        let audio = config.audio.expect("template configures audio");
+        assert_eq!(audio.source, "ozma-vm1.monitor");
+        assert_eq!(audio.bitrate_kbps, 96);
+    }
+
+    #[tokio::test]
+    async fn per_console_audio_template_scopes_each_pipeline_and_status() {
+        let root = temp_dir("audio-template");
+        let factory = Arc::new(FakeFactory::new(Some(VmConsoleBackend::Dbus)));
+        let manager = MultiConsoleHls::new(
+            factory,
+            MultiConsoleHlsConfig {
+                max_pipelines: 2,
+                idle_timeout: Duration::ZERO,
+                root: root.clone(),
+                base: HlsConfig {
+                    output_dir: root.clone(),
+                    audio: Some(HlsAudioConfig::new("shared.monitor", 96)),
+                    ..HlsConfig::default()
+                },
+                audio_source_template: Some("ozma-vm{console}.monitor".to_owned()),
+                audio_bitrate_kbps: DEFAULT_AUDIO_BITRATE_KBPS,
+            },
+        );
+        manager.sync(&selection(0, &[0, 1], "dbus")).await;
+
+        let status = manager.status().await;
+        assert!(status.audio_configured);
+        assert_eq!(
+            status.audio_source_template.as_deref(),
+            Some("ozma-vm{console}.monitor")
+        );
+        assert_eq!(status.audio_encoder.as_deref(), Some("aac"));
+        assert_eq!(status.consoles.len(), 2);
+        assert!(status
+            .consoles
+            .iter()
+            .all(|console| console.audio_configured));
+        assert_eq!(
+            status.consoles[0].audio_source.as_deref(),
+            Some("ozma-vm0.monitor")
+        );
+        assert_eq!(
+            status.consoles[1].audio_source.as_deref(),
+            Some("ozma-vm1.monitor")
+        );
+        assert!(status
+            .consoles
+            .iter()
+            .all(|console| console.audio_encoder.as_deref() == Some("aac")));
+    }
+
+    #[tokio::test]
+    async fn per_console_audio_without_template_stays_video_only() {
+        let root = temp_dir("audio-unset");
+        let factory = Arc::new(FakeFactory::new(Some(VmConsoleBackend::Dbus)));
+        let manager = manager(factory, &root, 2, Duration::ZERO);
+        manager.sync(&selection(0, &[0, 1], "dbus")).await;
+        let status = manager.status().await;
+        assert!(!status.audio_configured);
+        assert!(status.audio_source_template.is_none());
+        assert!(status.audio_encoder.is_none());
+        assert!(!status.consoles[0].audio_configured);
+        assert!(status.consoles[0].audio_source.is_none());
     }
 }

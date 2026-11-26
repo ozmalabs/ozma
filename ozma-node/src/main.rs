@@ -50,7 +50,8 @@ use ozma_node::{
         SwitchablePipeline, WebRtcPipelineSwitch,
     },
     hls::{
-        HlsConfig, HlsController, HlsEncoder, HlsError, HlsPixelFormat, HlsSourceFactory, HlsStatus,
+        HlsAudioConfig, HlsConfig, HlsController, HlsEncoder, HlsError, HlsPixelFormat,
+        HlsSourceFactory, HlsStatus,
     },
     input_select,
     keyboard_layout::KeyboardLayout,
@@ -874,6 +875,17 @@ pub struct Args {
     )]
     pub mesh_trust: Vec<String>,
 
+    /// Shared Ed25519 cluster signing key file (mode 0600). When set, mesh
+    /// advertisements are signed and discovered peers must verify against the
+    /// derived public key. The private key is never logged or advertised.
+    #[arg(
+        long = "mesh-cluster-key-file",
+        env = "OZMA_MESH_CLUSTER_KEY_FILE",
+        value_name = "PATH",
+        requires = "mesh"
+    )]
+    pub mesh_cluster_key_file: Option<std::path::PathBuf>,
+
     /// Program a kernel mesh dataplane (TUN link, peer routes, IPv4 forwarding).
     ///
     /// Off by default. Requires root, `/dev/net/tun`, and `ip`; failure is a
@@ -1211,6 +1223,45 @@ pub struct Args {
     #[arg(long, env = "OZMA_HLS_COLOR_MATRIX", value_name = "NAME")]
     pub hls_color_matrix: Option<String>,
 
+    /// Enable opt-in AAC audio in the local HLS stream.
+    ///
+    /// Without `--hls-audio-source` the monitor is derived from `--audio-sink`
+    /// (`<sink>.monitor`) or a `monitor:<sink>` `--audio-capture-target`. When
+    /// neither names a sink, startup fails with a typed error instead of
+    /// synthesizing silence. A configured monitor that does not exist fails the
+    /// generation; the node never claims audio it did not mux.
+    #[arg(long, env = "OZMA_HLS_AUDIO")]
+    pub hls_audio: bool,
+
+    /// PulseAudio/PipeWire monitor source for HLS audio, for example
+    /// `ozma-vm1.monitor` (the `<sink>.monitor` convention). Implies
+    /// `--hls-audio`.
+    #[arg(long, env = "OZMA_HLS_AUDIO_SOURCE", value_name = "MONITOR")]
+    pub hls_audio_source: Option<String>,
+
+    /// AAC bitrate for HLS audio in kbps (bounded to 8–512; default 128).
+    #[arg(
+        long,
+        env = "OZMA_HLS_AUDIO_BITRATE_KBPS",
+        default_value_t = 128,
+        value_name = "KBPS"
+    )]
+    pub hls_audio_bitrate_kbps: u32,
+
+    /// Optional per-console HLS audio monitor template.
+    ///
+    /// `{console}` and `{index}` expand to the advertised console's zero-based
+    /// index, for example `ozma-vm{console}.monitor` gives
+    /// `ozma-vm0.monitor` and `ozma-vm1.monitor`. Unset keeps the base HLS
+    /// monitor for every per-console pipeline (or video-only when that is also
+    /// unset). Only applies with `--multi-console-hls`.
+    #[arg(
+        long,
+        env = "OZMA_MULTI_CONSOLE_HLS_AUDIO_SOURCE",
+        value_name = "TEMPLATE"
+    )]
+    pub multi_console_hls_audio_source: Option<String>,
+
     /// Enable one independent HLS pipeline per advertised VM console.
     ///
     /// Opt-in and VM/D-Bus only: each advertised `Console_N` gets its own
@@ -1494,6 +1545,50 @@ fn resolve_hls_pixel_format(
             .to_owned());
     }
     Ok(resolved)
+}
+
+/// Resolve the opt-in HLS audio monitor source.
+///
+/// An explicit `--hls-audio-source` wins. Otherwise `--hls-audio` derives
+/// `<sink>.monitor` from `--audio-sink` or a `monitor:<sink>`
+/// `--audio-capture-target`. A request with no named sink is a typed startup
+/// error: the node must not invent a default source or synthesize silence.
+fn resolve_hls_audio_source(
+    requested: bool,
+    explicit: Option<&str>,
+    audio_sink: Option<&str>,
+    capture_target: &ozma_audio::AudioTarget,
+) -> Result<Option<String>, String> {
+    if let Some(source) = explicit {
+        let source = source.trim();
+        if source.is_empty() {
+            return Err("--hls-audio-source must not be empty or whitespace".to_owned());
+        }
+        return Ok(Some(source.to_owned()));
+    }
+    if !requested {
+        return Ok(None);
+    }
+    if let Some(sink) = audio_sink.map(str::trim).filter(|sink| !sink.is_empty()) {
+        return Ok(Some(monitor_for_sink(sink)));
+    }
+    if let ozma_audio::AudioTarget::SinkMonitor(sink) = capture_target {
+        return Ok(Some(monitor_for_sink(sink)));
+    }
+    Err(
+        "--hls-audio requires --hls-audio-source, a named --audio-sink, or a \
+         monitor:<sink> --audio-capture-target"
+            .to_owned(),
+    )
+}
+
+fn monitor_for_sink(sink: &str) -> String {
+    let sink = sink.trim();
+    if sink.ends_with(".monitor") {
+        sink.to_owned()
+    } else {
+        ozma_audio::AudioTarget::monitor_name(sink)
+    }
 }
 
 /// The dev/test synthetic capture flags only make sense with the fake provider.
@@ -2311,6 +2406,13 @@ async fn run() -> std::process::ExitCode {
         }
     }
 
+    if let Some(template) = args.multi_console_hls_audio_source.as_deref() {
+        if let Err(error) = ozma_node::multi_hls::validate_audio_source_template(template) {
+            error!("Invalid --multi-console-hls-audio-source: {error}");
+            std::process::exit(2);
+        }
+    }
+
     // Local HLS compatibility pipeline. HLS is opt-in; a missing source or
     // ffmpeg leaves it unavailable and reported as `failed`, never as running.
     // The controller owns the live pipeline so POST /codec can restart it with
@@ -2351,10 +2453,25 @@ async fn run() -> std::process::ExitCode {
                 std::process::exit(2);
             }
         };
+        let audio_source = match resolve_hls_audio_source(
+            args.hls_audio,
+            args.hls_audio_source.as_deref(),
+            config.audio_sink.as_deref(),
+            &config.audio_capture_target,
+        ) {
+            Ok(source) => source,
+            Err(error) => {
+                error!("Invalid HLS audio configuration: {error}");
+                std::process::exit(2);
+            }
+        };
+        let audio =
+            audio_source.map(|source| HlsAudioConfig::new(source, args.hls_audio_bitrate_kbps));
         let hls_config = HlsConfig {
             output_dir: directory.clone(),
             fps: args.hls_fps,
             bitrate_kbps: args.hls_bitrate_kbps,
+            audio,
             video_encoder: encoder,
             pixel_format,
             color_primaries: args.hls_color_primaries.clone(),
@@ -2917,6 +3034,8 @@ async fn run() -> std::process::ExitCode {
                 idle_timeout: Duration::from_secs(args.multi_console_hls_idle_seconds),
                 root: root.clone(),
                 base,
+                audio_source_template: args.multi_console_hls_audio_source.clone(),
+                audio_bitrate_kbps: args.hls_audio_bitrate_kbps,
             },
         );
         let selection = display_control
@@ -4654,6 +4773,22 @@ fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
         }
     }
 
+    let cluster_key = match &args.mesh_cluster_key_file {
+        Some(path) => match ozma_mesh::ClusterSigningKey::load(path) {
+            Ok(key) => Some(std::sync::Arc::new(key)),
+            Err(error) => {
+                return Some(mesh_service::MeshService::unsupported(
+                    mesh_service::MeshServiceError::new(
+                        "mesh.cluster-key-invalid",
+                        format!("--mesh-cluster-key-file could not be loaded: {error}"),
+                    ),
+                    log(),
+                ))
+            }
+        },
+        None => None,
+    };
+
     let capabilities: Vec<String> = args
         .cap
         .split(',')
@@ -4712,6 +4847,7 @@ fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
         peer_endpoints,
         capabilities,
         discovery,
+        cluster_key,
         rotation_schedule,
         // Kernel mode owns its link and routes; a TUN dataplane/pump would be
         // a competing second interface, so it is not built.
@@ -5247,6 +5383,63 @@ mod tests {
     }
 
     #[test]
+    fn hls_audio_source_is_explicit_or_derived_from_a_named_monitor() {
+        let default_target = ozma_audio::AudioTarget::Default;
+        assert_eq!(
+            resolve_hls_audio_source(false, None, None, &default_target).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_hls_audio_source(true, Some("ozma-vm1.monitor"), None, &default_target)
+                .unwrap()
+                .as_deref(),
+            Some("ozma-vm1.monitor")
+        );
+        assert_eq!(
+            resolve_hls_audio_source(true, None, Some("ozma-vm1"), &default_target)
+                .unwrap()
+                .as_deref(),
+            Some("ozma-vm1.monitor")
+        );
+        assert_eq!(
+            resolve_hls_audio_source(true, None, Some("ozma-vm1.monitor"), &default_target)
+                .unwrap()
+                .as_deref(),
+            Some("ozma-vm1.monitor"),
+            "an already-monitor sink is not suffixed twice"
+        );
+        assert_eq!(
+            resolve_hls_audio_source(
+                true,
+                None,
+                None,
+                &ozma_audio::AudioTarget::SinkMonitor("ozma-vm2".to_owned())
+            )
+            .unwrap()
+            .as_deref(),
+            Some("ozma-vm2.monitor")
+        );
+        let error =
+            resolve_hls_audio_source(true, None, None, &default_target).expect_err("no named sink");
+        assert!(error.contains("--hls-audio-source"), "{error}");
+        assert!(
+            resolve_hls_audio_source(true, Some("   "), Some("sink"), &default_target).is_err()
+        );
+
+        let args = Args::parse_from([
+            "ozma-node",
+            "--hls-audio",
+            "--hls-audio-source",
+            "ozma-vm1.monitor",
+            "--hls-audio-bitrate-kbps",
+            "96",
+        ]);
+        assert!(args.hls_audio);
+        assert_eq!(args.hls_audio_source.as_deref(), Some("ozma-vm1.monitor"));
+        assert_eq!(args.hls_audio_bitrate_kbps, 96);
+    }
+
+    #[test]
     fn desktop_capture_and_audio_target_flags_parse() {
         let defaults = Args::parse_from(["ozma-node", "--profile", "desktop"]);
         assert_eq!(defaults.desktop_capture_target, "default");
@@ -5515,6 +5708,7 @@ mod tests {
         assert_eq!(defaults.mesh_discover_max_peers, 32);
         assert!(defaults.mesh_trust.is_empty());
         assert!(defaults.mesh_peer_endpoint.is_empty());
+        assert!(defaults.mesh_cluster_key_file.is_none());
         assert!(!defaults.mesh_kernel);
 
         let (id, endpoint) = parse_mesh_peer_endpoint("node-b=10.10.30.2:51820").unwrap();
@@ -5533,10 +5727,16 @@ mod tests {
             "15",
             "--mesh-discover-max-peers",
             "8",
+            "--mesh-cluster-key-file",
+            "/tmp/ozma-cluster.key",
         ]);
         assert!(args.mesh_discover);
         assert_eq!(args.mesh_discover_ttl, 15);
         assert_eq!(args.mesh_discover_max_peers, 8);
+        assert_eq!(
+            args.mesh_cluster_key_file.as_deref(),
+            Some(std::path::Path::new("/tmp/ozma-cluster.key"))
+        );
 
         let (node, _key) = ozma_mesh::MeshNode::generate("node-a", "10.200.9.1", 51_820);
         let compact = parse_mesh_trust(&format!("node-a={}", node.wg_pubkey.0)).unwrap();

@@ -64,7 +64,7 @@ use std::io;
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -147,6 +147,41 @@ pub const ENCODING_TIGHT: i32 = 7;
 pub const ENCODING_ZRLE: i32 = 16;
 /// RFB Cursor pseudo-encoding number (RFC 6143 section 7.8.1).
 pub const ENCODING_CURSOR: i32 = -239;
+/// RFB ExtendedDesktopSize pseudo-encoding number (the RFB community
+/// specification used by TigerVNC and libvncserver).
+pub const ENCODING_EXTENDED_DESKTOP_SIZE: i32 = -308;
+/// RFB `SetDesktopSize` client message type.
+pub const CLIENT_MESSAGE_SET_DESKTOP_SIZE: u8 = 251;
+/// Largest number of screens accepted in one `SetDesktopSize` request. The
+/// wire count is a `u8`, but a real single-source node has one screen; this
+/// bound keeps the parser and any future layout honest.
+pub const MAX_DESKTOP_SCREENS: usize = 16;
+/// ExtendedDesktopSize reason: the server changed the framebuffer size.
+const DESKTOP_SIZE_REASON_SERVER: u16 = 0;
+/// ExtendedDesktopSize reason: this rectangle answers a client
+/// `SetDesktopSize` request.
+const DESKTOP_SIZE_REASON_CLIENT: u16 = 1;
+
+/// Typed outcome carried by an ExtendedDesktopSize rectangle's `result` field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopSizeResult {
+    /// The layout was applied. This server never uses it today because the
+    /// capture source has no resize API.
+    Success = 0,
+    /// The server refused the layout (the normal answer here).
+    Prohibited = 1,
+    /// The requested geometry is valid but exceeds server resources.
+    OutOfResources = 2,
+    /// Zero-sized, screenless, or otherwise malformed layout.
+    InvalidScreenLayout = 3,
+}
+
+impl DesktopSizeResult {
+    fn code(self) -> u16 {
+        self as u16
+    }
+}
+
 /// Tight JPEG quality-level pseudo-encoding range. `-32` is the lowest
 /// (fastest/smallest) quality and `-23` the highest.
 pub const ENCODING_JPEG_QUALITY_LOW: i32 = -32;
@@ -829,6 +864,15 @@ pub struct VncServerStats {
     pub source_errors: u64,
     /// Viewers closed because a framebuffer write exceeded the timeout.
     pub slow_clients: u64,
+    /// Accepted capture-source geometry changes published to viewers.
+    pub framebuffer_resizes: u64,
+    /// ExtendedDesktopSize server resize rectangles written to viewers.
+    pub desktop_resize_sent: u64,
+    /// `SetDesktopSize` client messages received.
+    pub desktop_resize_requests: u64,
+    /// `SetDesktopSize` client messages denied because the capture source
+    /// cannot be resized by VNC.
+    pub desktop_resize_denied: u64,
     /// The clipboard bridge is configured (`--vnc-clipboard`).
     pub clipboard_enabled: bool,
     /// A clipboard backend is currently usable. Always `false` when disabled.
@@ -859,6 +903,10 @@ struct VncStats {
     protocol_errors: AtomicU64,
     source_errors: AtomicU64,
     slow_clients: AtomicU64,
+    framebuffer_resizes: AtomicU64,
+    desktop_resize_sent: AtomicU64,
+    desktop_resize_requests: AtomicU64,
+    desktop_resize_denied: AtomicU64,
     generation: AtomicU64,
     clipboard_enabled: bool,
     clipboard_available: AtomicBool,
@@ -892,6 +940,10 @@ impl VncStats {
             protocol_errors: self.protocol_errors.load(Ordering::Relaxed),
             source_errors: self.source_errors.load(Ordering::Relaxed),
             slow_clients: self.slow_clients.load(Ordering::Relaxed),
+            framebuffer_resizes: self.framebuffer_resizes.load(Ordering::Relaxed),
+            desktop_resize_sent: self.desktop_resize_sent.load(Ordering::Relaxed),
+            desktop_resize_requests: self.desktop_resize_requests.load(Ordering::Relaxed),
+            desktop_resize_denied: self.desktop_resize_denied.load(Ordering::Relaxed),
             clipboard_enabled: self.clipboard_enabled,
             clipboard_available: self.clipboard_available.load(Ordering::Relaxed),
             clipboard_last_direction: ClipboardSyncDirection::from_u8(
@@ -1247,29 +1299,53 @@ async fn frame_pump(
 
         match result {
             Ok(frame) => {
+                let actual = frame.format();
+                // The pixel layout never changes for a session. A source that
+                // switches between packed RGB24 and BGRA cannot be reinterpreted
+                // without a decoder, so keep dropping those frames.
+                if actual.pixel_format != expected.pixel_format {
+                    stats.source_errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        expected = %expected.pixel_format,
+                        actual = %actual.pixel_format,
+                        "dropping VNC frame whose pixel format differs from the source"
+                    );
+                    continue;
+                }
+                // Zero-sized, over-16-megapixel, or out-of-RFB-range geometry is
+                // ignored rather than published. This also covers the first
+                // dynamic QMP/D-Bus frame.
+                if let Err(error) = validate_concrete_geometry(actual) {
+                    stats.source_errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        error = %error,
+                        width = actual.width,
+                        height = actual.height,
+                        "dropping VNC frame with unusable geometry"
+                    );
+                    continue;
+                }
                 if expected.width == 0 || expected.height == 0 {
-                    let actual = frame.format();
-                    if actual.pixel_format != expected.pixel_format {
-                        stats.source_errors.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            expected = %expected.pixel_format,
-                            actual = %actual.pixel_format,
-                            "dropping first VNC frame whose pixel format differs from the source"
-                        );
-                        continue;
-                    }
-                    if let Err(error) = validate_concrete_geometry(actual) {
-                        stats.source_errors.fetch_add(1, Ordering::Relaxed);
-                        warn!(error = %error, "first VNC frame has unusable geometry");
-                        continue;
-                    }
                     info!(
                         width = actual.width,
                         height = actual.height,
                         "VNC capture source published its first frame; ServerInit geometry fixed"
                     );
-                    expected = actual;
+                } else if actual.width != expected.width || actual.height != expected.height {
+                    // The capture source resized. Publish the new geometry; each
+                    // viewer either receives ExtendedDesktopSize (if it
+                    // advertised -308) or keeps its ServerInit geometry and sees
+                    // only the clipped overlap.
+                    info!(
+                        old_width = expected.width,
+                        old_height = expected.height,
+                        width = actual.width,
+                        height = actual.height,
+                        "VNC capture source resized; publishing new framebuffer geometry"
+                    );
+                    stats.framebuffer_resizes.fetch_add(1, Ordering::Relaxed);
                 }
+                expected = actual;
                 if let Some(snapshot) = snapshot_frame(frame, expected, &stats) {
                     stats.frames_published.fetch_add(1, Ordering::Relaxed);
                     frames.send_replace(Some(snapshot));
@@ -1425,8 +1501,11 @@ impl Drop for ClientGuard {
 
 struct ClientContext {
     id: u64,
-    width: u32,
-    height: u32,
+    /// Geometry last announced to this viewer (ServerInit or the most recent
+    /// ExtendedDesktopSize rectangle). A client that did not advertise -308
+    /// keeps its ServerInit size forever and sees only the overlapping pixels.
+    width: AtomicU32,
+    height: AtomicU32,
     sink: SharedSink,
     stats: Arc<VncStats>,
     input_active: Arc<AtomicBool>,
@@ -1434,6 +1513,20 @@ struct ClientContext {
     clipboard_max_bytes: usize,
     pixel: Mutex<ClientPixelFormat>,
     encoding: Mutex<ClientEncodingState>,
+}
+
+impl ClientContext {
+    fn geometry(&self) -> (u32, u32) {
+        (
+            self.width.load(Ordering::Acquire),
+            self.height.load(Ordering::Acquire),
+        )
+    }
+
+    fn set_geometry(&self, width: u32, height: u32) {
+        self.width.store(width, Ordering::Release);
+        self.height.store(height, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1508,6 +1601,9 @@ struct ClientEncodingState {
     order: [UpdateEncoding; 5],
     count: usize,
     cursor: bool,
+    /// The client advertised ExtendedDesktopSize (-308), so the server may
+    /// send desktop-size rectangles and answer `SetDesktopSize` on the wire.
+    extended_desktop_size: bool,
     /// Tight JPEG quality level 0..=9. `None` means the client did not
     /// advertise a JPEG quality pseudo-encoding, so JPEG must never be sent.
     jpeg_quality: Option<u8>,
@@ -1521,6 +1617,7 @@ impl Default for ClientEncodingState {
             order: [UpdateEncoding::Raw; 5],
             count: 0,
             cursor: false,
+            extended_desktop_size: false,
             jpeg_quality: None,
             compression_level: None,
         }
@@ -1551,6 +1648,7 @@ impl ClientEncodingState {
             ENCODING_TIGHT => self.push(UpdateEncoding::Tight),
             ENCODING_ZRLE => self.push(UpdateEncoding::Zrle),
             ENCODING_CURSOR => self.cursor = true,
+            ENCODING_EXTENDED_DESKTOP_SIZE => self.extended_desktop_size = true,
             // -32 (low) .. -23 (high). Later entries win, matching the usual
             // RFB "last hint received" interpretation.
             ENCODING_JPEG_QUALITY_LOW..=ENCODING_JPEG_QUALITY_HIGH => {
@@ -1684,15 +1782,21 @@ struct Rect {
 
 #[derive(Debug)]
 enum ClientCommand {
-    Update { incremental: bool, rects: Vec<Rect> },
+    Update {
+        incremental: bool,
+        rects: Vec<Rect>,
+    },
+    /// A parsed `SetDesktopSize` request plus its typed result. The reader never
+    /// applies geometry itself; the writer answers the client so all wire
+    /// traffic stays on the single write task.
+    SetDesktopSize(DesktopSizeRequest),
 }
 
-impl ClientCommand {
-    fn into_pending(self) -> PendingUpdate {
-        match self {
-            Self::Update { incremental, rects } => PendingUpdate { incremental, rects },
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DesktopSizeRequest {
+    width: u16,
+    height: u16,
+    result: DesktopSizeResult,
 }
 
 #[derive(Debug)]
@@ -1702,8 +1806,7 @@ struct PendingUpdate {
 }
 
 impl PendingUpdate {
-    fn merge(&mut self, other: ClientCommand) {
-        let ClientCommand::Update { incremental, rects } = other;
+    fn merge(&mut self, incremental: bool, rects: Vec<Rect>) {
         self.incremental = self.incremental && incremental;
         for rect in rects {
             if self.rects.len() < MAX_PENDING_RECTS {
@@ -1774,8 +1877,8 @@ async fn handle_client(
 
     let context = Arc::new(ClientContext {
         id: client_id,
-        width: geometry.width,
-        height: geometry.height,
+        width: AtomicU32::new(geometry.width),
+        height: AtomicU32::new(geometry.height),
         sink,
         stats,
         input_active,
@@ -1882,11 +1985,17 @@ async fn handshake(
         .map_err(ProtocolError::io)?;
 
     // Dynamic sources (QMP/D-Bus) know their geometry only after the first
-    // frame. The client has already completed version/security/ClientInit, so
-    // it waits normally for ServerInit instead of receiving a fabricated size.
-    let geometry = match known_geometry {
-        Some(geometry) => geometry,
-        None => wait_for_first_geometry(frames).await?,
+    // frame. Prefer an already-published frame over the geometry captured at
+    // start, so a source that resized before this viewer connected gets an
+    // accurate ServerInit instead of an immediate resize. If neither exists,
+    // wait for the first frame rather than fabricating a size.
+    let published = { frames.borrow().clone() };
+    let geometry = match published {
+        Some(frame) => frame.format,
+        None => match known_geometry {
+            Some(geometry) => geometry,
+            None => wait_for_first_geometry(frames).await?,
+        },
     };
 
     // ServerInit: geometry, default 32-bit true-colour RGB order, name.
@@ -2214,6 +2323,9 @@ async fn client_read_loop(
             4 => read_key_event(&mut read, &context).await,
             5 => read_pointer_event(&mut read, &context, &mut buttons).await,
             6 => read_client_cut_text(&mut read, &context).await,
+            CLIENT_MESSAGE_SET_DESKTOP_SIZE => {
+                read_set_desktop_size(&mut read, &context, &commands).await
+            }
             other => Err(ProtocolError::UnknownMessage(other)),
         };
 
@@ -2326,6 +2438,7 @@ async fn read_set_encodings(
         count,
         order = ?&state.order[..state.count],
         cursor = state.cursor,
+        extended_desktop_size = state.extended_desktop_size,
         jpeg_quality = state.jpeg_quality,
         compression_level = state.compression_level,
         "VNC client encoding preferences applied"
@@ -2349,11 +2462,78 @@ async fn read_update_request(
         width: u16::from_be_bytes([body[5], body[6]]),
         height: u16::from_be_bytes([body[7], body[8]]),
     };
-    let rects = clip_rects(&[rect], context.width, context.height);
+    let rects = clip_rects(&[rect], context.geometry().0, context.geometry().1);
     commands
         .send(ClientCommand::Update { incremental, rects })
         .await
         .map_err(|_| ProtocolError::ClientGone)
+}
+
+/// Parse one RFB `SetDesktopSize` (type 251) message.
+///
+/// The capture source cannot be resized by VNC, so every valid request is
+/// denied with `Prohibited`; malformed bounds get a more specific result. The
+/// whole message is always consumed, including every screen record, so a
+/// denial never desynchronises later client messages. The wire reply (if the
+/// client advertised ExtendedDesktopSize) is emitted by the single write task.
+async fn read_set_desktop_size(
+    read: &mut OwnedReadHalf,
+    context: &ClientContext,
+    commands: &mpsc::Sender<ClientCommand>,
+) -> Result<(), ProtocolError> {
+    // 1 padding byte, width, height, screen count, 1 padding byte.
+    let mut header = [0u8; 7];
+    read.read_exact(&mut header)
+        .await
+        .map_err(ProtocolError::io)?;
+    let width = u16::from_be_bytes([header[1], header[2]]);
+    let height = u16::from_be_bytes([header[3], header[4]]);
+    let screens = header[5];
+    // Consume every advertised screen record even when the count is over the
+    // server's bound: RFB framing depends on it and the count is only a u8.
+    let mut screen_bytes = vec![0u8; usize::from(screens) * 16];
+    read.read_exact(&mut screen_bytes)
+        .await
+        .map_err(ProtocolError::io)?;
+
+    let result = validate_set_desktop_size(width, height, u16::from(screens));
+    context
+        .stats
+        .desktop_resize_requests
+        .fetch_add(1, Ordering::Relaxed);
+    context
+        .stats
+        .desktop_resize_denied
+        .fetch_add(1, Ordering::Relaxed);
+    debug!(
+        client = context.id,
+        requested_width = width,
+        requested_height = height,
+        screens,
+        result = ?result,
+        "VNC SetDesktopSize request denied; the capture source has no resize API"
+    );
+    commands
+        .send(ClientCommand::SetDesktopSize(DesktopSizeRequest {
+            width,
+            height,
+            result,
+        }))
+        .await
+        .map_err(|_| ProtocolError::ClientGone)
+}
+
+/// Classify a `SetDesktopSize` layout without applying it. A valid layout is
+/// still `Prohibited` because this server's only geometry source is the
+/// capture feed, which VNC cannot resize.
+fn validate_set_desktop_size(width: u16, height: u16, screens: u16) -> DesktopSizeResult {
+    if width == 0 || height == 0 || screens == 0 || usize::from(screens) > MAX_DESKTOP_SCREENS {
+        return DesktopSizeResult::InvalidScreenLayout;
+    }
+    if u64::from(width) * u64::from(height) > MAX_FRAMEBUFFER_PIXELS {
+        return DesktopSizeResult::OutOfResources;
+    }
+    DesktopSizeResult::Prohibited
 }
 
 async fn read_key_event(
@@ -2411,8 +2591,8 @@ async fn read_pointer_event(
     // The shared sink's default mapping is identity HID report space. Convert
     // framebuffer pixels to 0..=32767 here so a viewer coordinate is not
     // interpreted as a tiny pixel coordinate by the USB/uinput sink.
-    let report_x = axis_to_report(x, context.width);
-    let report_y = axis_to_report(y, context.height);
+    let report_x = axis_to_report(x, context.geometry().0);
+    let report_y = axis_to_report(y, context.geometry().1);
     submit(
         context,
         InputEvent::PointerAbsolute {
@@ -2737,17 +2917,61 @@ async fn client_write_loop(
             );
             let preferred = encoding.select(disabled);
             let cursor_pending = encoding.cursor && !cursor_sent;
+            let (client_width, client_height) = context.geometry();
+            // A frame with a new geometry is announced only to a client that
+            // advertised ExtendedDesktopSize. Other clients keep their
+            // ServerInit geometry and receive only the clipped overlap, so a
+            // capture resize can never desynchronise them.
+            let resize = snapshot.as_ref().and_then(|frame| {
+                let width = frame.format.width;
+                let height = frame.format.height;
+                if !encoding.extended_desktop_size
+                    || width == 0
+                    || height == 0
+                    || width > u32::from(u16::MAX)
+                    || height > u32::from(u16::MAX)
+                    || (width == client_width && height == client_height)
+                {
+                    None
+                } else {
+                    Some((width as u16, height as u16))
+                }
+            });
             let should_send = snapshot.as_ref().is_some_and(|frame| {
-                !request.incremental || frame.generation > last_sent_generation || cursor_pending
+                resize.is_some()
+                    || !request.incremental
+                    || frame.generation > last_sent_generation
+                    || cursor_pending
             });
 
             if should_send {
                 let frame = snapshot.expect("checked above");
                 let pixel = *lock(&context.pixel);
-                let newer_frame = !request.incremental || frame.generation > last_sent_generation;
-                // An incremental request with no new frame may still carry the
-                // one-time cursor shape; do not re-send unchanged pixels.
-                let rects: &[Rect] = if newer_frame { &request.rects } else { &[] };
+                let newer_frame = resize.is_some()
+                    || !request.incremental
+                    || frame.generation > last_sent_generation;
+                // A resize leaves the rest of the client framebuffer undefined,
+                // so that update carries the whole new framebuffer. An
+                // incremental request with no new frame may still carry the
+                // one-time cursor shape; unchanged pixels are not re-sent.
+                let full_rect;
+                let rects: &[Rect] = if let Some((width, height)) = resize {
+                    full_rect = Rect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    };
+                    std::slice::from_ref(&full_rect)
+                } else if newer_frame {
+                    &request.rects
+                } else {
+                    &[]
+                };
+                let (clip_width, clip_height) = match resize {
+                    Some((width, height)) => (u32::from(width), u32::from(height)),
+                    None => (client_width, client_height),
+                };
                 let zrle_stream = if preferred == UpdateEncoding::Zrle {
                     Some(&mut zrle)
                 } else {
@@ -2773,6 +2997,8 @@ async fn client_write_loop(
                     tight_stream,
                     encoding.jpeg_quality,
                     cursor_pending,
+                    resize,
+                    (clip_width, clip_height),
                 );
                 if let Some(failed) = built.failed_encoding {
                     disabled.disable(failed);
@@ -2788,6 +3014,17 @@ async fn client_write_loop(
                 }
                 match tokio::time::timeout(write_timeout, write.write_all(&built.bytes)).await {
                     Ok(Ok(())) => {
+                        if let Some((width, height)) = resize {
+                            context.set_geometry(u32::from(width), u32::from(height));
+                            context
+                                .stats
+                                .desktop_resize_sent
+                                .fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                client = context.id,
+                                width, height, "sent VNC ExtendedDesktopSize resize"
+                            );
+                        }
                         if newer_frame {
                             if frame.generation > last_sent_generation.saturating_add(1) {
                                 context.stats.frames_coalesced.fetch_add(
@@ -2826,14 +3063,44 @@ async fn client_write_loop(
             }
             command = commands.recv() => {
                 match command {
-                    Some(command) => {
-                        let next = command.into_pending();
+                    Some(ClientCommand::Update { incremental, rects }) => {
                         match pending.as_mut() {
-                            Some(pending) => pending.merge(ClientCommand::Update {
-                                incremental: next.incremental,
-                                rects: next.rects,
-                            }),
-                            None => pending = Some(next),
+                            Some(pending) => pending.merge(incremental, rects),
+                            None => pending = Some(PendingUpdate { incremental, rects }),
+                        }
+                    }
+                    Some(ClientCommand::SetDesktopSize(request)) => {
+                        let encoding = *lock(&context.encoding);
+                        if !encoding.extended_desktop_size {
+                            debug!(
+                                client = context.id,
+                                requested_width = request.width,
+                                requested_height = request.height,
+                                "VNC SetDesktopSize denied without a wire reply: the client did not advertise ExtendedDesktopSize"
+                            );
+                            continue;
+                        }
+                        let (width, height) = context.geometry();
+                        let bytes = build_desktop_size_reply(
+                            width as u16,
+                            height as u16,
+                            request.result,
+                        );
+                        match tokio::time::timeout(write_timeout, write.write_all(&bytes)).await {
+                            Ok(Ok(())) => {
+                                debug!(
+                                    client = context.id,
+                                    requested_width = request.width,
+                                    requested_height = request.height,
+                                    result = ?request.result,
+                                    "sent VNC SetDesktopSize denial"
+                                );
+                            }
+                            Ok(Err(error)) => return Err(ProtocolError::io(error)),
+                            Err(_) => {
+                                context.stats.slow_clients.fetch_add(1, Ordering::Relaxed);
+                                return Err(ProtocolError::WriteTimeout(write_timeout));
+                            }
                         }
                     }
                     None => return Ok(()),
@@ -2860,6 +3127,49 @@ fn push_rect_header(out: &mut Vec<u8>, rect: Rect, encoding: i32) {
     out.extend_from_slice(&encoding.to_be_bytes());
 }
 
+/// Write one ExtendedDesktopSize (-308) rectangle covering a single screen.
+///
+/// The pseudo-rectangle reuses the normal rectangle header: `x` carries the
+/// reason (0 = server resize, 1 = reply to `SetDesktopSize`), `y` carries the
+/// result code, and width/height are the new framebuffer size.
+fn push_extended_desktop_size_rect(
+    out: &mut Vec<u8>,
+    width: u16,
+    height: u16,
+    reason: u16,
+    result: DesktopSizeResult,
+) {
+    out.extend_from_slice(&reason.to_be_bytes());
+    out.extend_from_slice(&result.code().to_be_bytes());
+    out.extend_from_slice(&width.to_be_bytes());
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&ENCODING_EXTENDED_DESKTOP_SIZE.to_be_bytes());
+    out.push(1); // one screen
+    out.extend_from_slice(&0u32.to_be_bytes()); // screen id
+    out.extend_from_slice(&0u16.to_be_bytes()); // screen x
+    out.extend_from_slice(&0u16.to_be_bytes()); // screen y
+    out.extend_from_slice(&width.to_be_bytes());
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // flags
+}
+
+/// A FramebufferUpdate containing only a `SetDesktopSize` denial. The client's
+/// current geometry is echoed so it does not guess a new size.
+fn build_desktop_size_reply(width: u16, height: u16, result: DesktopSizeResult) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(4 + 12 + 17);
+    bytes.push(0); // FramebufferUpdate
+    bytes.push(0); // padding
+    bytes.extend_from_slice(&1u16.to_be_bytes());
+    push_extended_desktop_size_rect(
+        &mut bytes,
+        width,
+        height,
+        DESKTOP_SIZE_REASON_CLIENT,
+        result,
+    );
+    bytes
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_update(
     frame: &FrameSnapshot,
@@ -2871,8 +3181,15 @@ fn build_update(
     mut tight: Option<&mut TightStream>,
     jpeg_quality: Option<u8>,
     send_cursor: bool,
+    desktop_resize: Option<(u16, u16)>,
+    client_geometry: (u32, u32),
 ) -> BuiltUpdate {
-    let non_empty = clip_rects(rects, frame.format.width, frame.format.height);
+    // A client that did not negotiate resize keeps its ServerInit geometry; a
+    // resized frame is clipped to the overlap instead of exceeding the size the
+    // client believes the framebuffer has.
+    let limit_width = frame.format.width.min(client_geometry.0);
+    let limit_height = frame.format.height.min(client_geometry.1);
+    let non_empty = clip_rects(rects, limit_width, limit_height);
     let mut body = Vec::new();
     let mut payload_bytes = 0usize;
     let mut failed_encoding: Option<UpdateEncoding> = None;
@@ -2984,11 +3301,22 @@ fn build_update(
         wire_rects += 1;
     }
 
-    let rect_count = wire_rects + usize::from(send_cursor);
+    let rect_count = wire_rects + usize::from(send_cursor) + usize::from(desktop_resize.is_some());
     let mut bytes = Vec::with_capacity(4 + rect_count * 12 + body.len());
     bytes.push(0); // FramebufferUpdate
     bytes.push(0); // padding
     bytes.extend_from_slice(&(rect_count as u16).to_be_bytes());
+    if let Some((width, height)) = desktop_resize {
+        // ExtendedDesktopSize must precede the pixel rectangles of the same
+        // update: the client resizes its framebuffer before painting them.
+        push_extended_desktop_size_rect(
+            &mut bytes,
+            width,
+            height,
+            DESKTOP_SIZE_REASON_SERVER,
+            DesktopSizeResult::Success,
+        );
+    }
     bytes.extend_from_slice(&body);
     if send_cursor {
         // The node has no cursor-shape source. A 0x0 Cursor rectangle is the
@@ -4702,6 +5030,121 @@ mod tests {
         }
     }
 
+    /// A capture source driven directly by the test. `next_frame` blocks until
+    /// the test sends a frame, so a resize can happen at an exact point in a
+    /// live session instead of racing the pump.
+    struct ChannelSource {
+        format: FrameFormat,
+        frames: mpsc::UnboundedReceiver<Frame>,
+    }
+
+    impl ChannelSource {
+        fn new(format: FrameFormat, frames: mpsc::UnboundedReceiver<Frame>) -> Self {
+            Self { format, frames }
+        }
+    }
+
+    #[async_trait]
+    impl CaptureSource for ChannelSource {
+        fn id(&self) -> &str {
+            "test-vnc-channel-source"
+        }
+
+        fn format(&self) -> FrameFormat {
+            self.format
+        }
+
+        async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+            match self.frames.recv().await {
+                Some(frame) => Ok(frame),
+                None => {
+                    std::future::pending::<()>().await;
+                    unreachable!("pending never resolves")
+                }
+            }
+        }
+
+        async fn stop(&mut self) -> Result<(), MediaError> {
+            Ok(())
+        }
+    }
+
+    fn solid_rgb_frame(width: usize, height: usize, colour: (u8, u8, u8)) -> Frame {
+        let mut data = vec![0u8; width * height * 3];
+        for pixel in data.chunks_exact_mut(3) {
+            pixel[0] = colour.0;
+            pixel[1] = colour.1;
+            pixel[2] = colour.2;
+        }
+        Frame::with_data(
+            FrameFormat::rgb24(width as u32, height as u32),
+            0,
+            0,
+            true,
+            data,
+        )
+        .expect("valid test frame")
+    }
+
+    /// Write an RFB `SetDesktopSize` message. Screen records cover the whole
+    /// requested framebuffer with zero flags.
+    async fn write_set_desktop_size(stream: &mut TcpStream, width: u16, height: u16, screens: u8) {
+        let mut message = vec![CLIENT_MESSAGE_SET_DESKTOP_SIZE, 0];
+        message.extend_from_slice(&width.to_be_bytes());
+        message.extend_from_slice(&height.to_be_bytes());
+        message.push(screens);
+        message.push(0);
+        for id in 0..u32::from(screens) {
+            message.extend_from_slice(&id.to_be_bytes());
+            message.extend_from_slice(&0u16.to_be_bytes());
+            message.extend_from_slice(&0u16.to_be_bytes());
+            message.extend_from_slice(&width.to_be_bytes());
+            message.extend_from_slice(&height.to_be_bytes());
+            message.extend_from_slice(&0u32.to_be_bytes());
+        }
+        write_all(stream, &message).await;
+    }
+
+    fn decode_raw_pixels(
+        data: &[u8],
+        width: usize,
+        height: usize,
+        pixel: ClientPixelFormat,
+    ) -> Vec<(u8, u8, u8)> {
+        let mut position = 0usize;
+        let mut pixels = Vec::with_capacity(width * height);
+        for _ in 0..width * height {
+            pixels.push(decode_rgb(
+                decode_pixel(data, &mut position, pixel.big_endian),
+                pixel,
+            ));
+        }
+        assert_eq!(position, data.len(), "trailing Raw pixel bytes");
+        pixels
+    }
+
+    /// Decode one wire rectangle with the matching test decoder. ZRLE, ZLib,
+    /// and Tight decoders are persistent because the server keeps one stream
+    /// per encoding for the whole connection.
+    fn decode_wire_rect(
+        rect: &WireRect,
+        pixel: ClientPixelFormat,
+        zrle: &mut TestZlibDecoder,
+        zlib: &mut TestZlibDecoder,
+        tight: &mut TestZlibDecoder,
+    ) -> Vec<(u8, u8, u8)> {
+        let width = usize::from(rect.width);
+        let height = usize::from(rect.height);
+        match rect.encoding {
+            ENCODING_RAW => decode_raw_pixels(&rect.data, width, height, pixel),
+            ENCODING_ZRLE => decode_zrle(zrle, &rect.data, width, height, pixel).0,
+            ENCODING_HEXTILE => decode_hextile(&rect.data, width, height, pixel).0,
+            ENCODING_ZLIB => decode_zlib_rect(zlib, &rect.data, width, height, pixel),
+            ENCODING_TIGHT => decode_tight(tight, &rect.data, width, height, pixel).0,
+            other => panic!("unexpected encoded rectangle {other}"),
+        }
+    }
+
     /// 64x32 pixels chosen to make consecutive Hextile tiles exercise the
     /// solid-reuse, new-background, foreground-subrect, coloured-subrect, and
     /// raw subencodings.
@@ -5005,7 +5448,7 @@ mod tests {
         read_exact(stream, &mut header).await;
         assert_eq!(header[0], 0, "expected FramebufferUpdate");
         let rectangles = u16::from_be_bytes([header[2], header[3]]);
-        assert!(rectangles <= MAX_PENDING_RECTS as u16 + 1);
+        assert!(rectangles <= MAX_PENDING_RECTS as u16 + 2);
         let mut rects = Vec::new();
         for _ in 0..rectangles {
             let mut rect = [0u8; 12];
@@ -5039,6 +5482,16 @@ mod tests {
                 }
                 ENCODING_TIGHT => read_tight_payload(stream, width, height, pixel).await,
                 ENCODING_HEXTILE => read_hextile_payload(stream, width, height).await,
+                ENCODING_EXTENDED_DESKTOP_SIZE => {
+                    // One byte screen count, then 16 bytes per screen.
+                    let mut screens = [0u8; 1];
+                    read_exact(stream, &mut screens).await;
+                    let mut data = vec![screens[0]];
+                    let mut bodies = vec![0u8; usize::from(screens[0]) * 16];
+                    read_exact(stream, &mut bodies).await;
+                    data.extend_from_slice(&bodies);
+                    data
+                }
                 ENCODING_CURSOR => Vec::new(),
                 other => panic!("unexpected encoding {other}"),
             };
@@ -7525,6 +7978,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            (4, 2),
         );
         assert_eq!(built.failed_encoding, Some(UpdateEncoding::Zrle));
         assert_eq!(first_rect_encoding(&built.bytes), ENCODING_RAW);
@@ -7540,6 +7995,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            (4, 2),
         );
         assert_eq!(built.failed_encoding, Some(UpdateEncoding::Hextile));
         assert_eq!(first_rect_encoding(&built.bytes), ENCODING_RAW);
@@ -7555,6 +8012,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            (4, 2),
         );
         assert_eq!(built.failed_encoding, Some(UpdateEncoding::ZLib));
         assert_eq!(first_rect_encoding(&built.bytes), ENCODING_RAW);
@@ -7570,6 +8029,8 @@ mod tests {
             Some(&mut tight),
             None,
             false,
+            None,
+            (4, 2),
         );
         assert_eq!(built.failed_encoding, Some(UpdateEncoding::Tight));
         assert_eq!(first_rect_encoding(&built.bytes), ENCODING_RAW);
@@ -7586,6 +8047,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            (4, 2),
         );
         assert_eq!(built.failed_encoding, None);
         assert_eq!(first_rect_encoding(&built.bytes), ENCODING_RAW);
@@ -7859,6 +8322,367 @@ mod tests {
             high_length > low_length,
             "quality -23 ({high_length}) must produce more JPEG bytes than -32 ({low_length})"
         );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn server_resize_sends_extended_desktop_size_and_resized_pixels_for_all_encodings() {
+        let first = (10u8, 20u8, 30u8);
+        let second = (200u8, 100u8, 50u8);
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        let cases = [
+            (ENCODING_RAW, "raw"),
+            (ENCODING_ZRLE, "zrle"),
+            (ENCODING_HEXTILE, "hextile"),
+            (ENCODING_ZLIB, "zlib"),
+            (ENCODING_TIGHT, "tight"),
+        ];
+
+        for (encoding, name) in cases {
+            let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+            let server = start_server(
+                Box::new(ChannelSource::new(FrameFormat::rgb24(4, 2), frames_rx)),
+                Arc::new(FakeInputSink::new()),
+                1,
+            )
+            .await;
+            let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+            let (width, height, _) = handshake_client(&mut client).await;
+            assert_eq!((width, height), (4, 2));
+
+            frames_tx.send(solid_rgb_frame(4, 2, first)).unwrap();
+            wait_for(|| server.stats().frames_published >= 1).await;
+            set_pixel_format(&mut client, pixel).await;
+            set_encodings(&mut client, &[encoding, ENCODING_EXTENDED_DESKTOP_SIZE]).await;
+
+            // Serve the ServerInit-sized frame first.
+            request_update(&mut client, false, 4, 2).await;
+            let rects = read_update_with_pixel(&mut client, pixel).await;
+            assert_eq!(rects.len(), 1, "{name}: initial update");
+            assert_eq!(rects[0].encoding, encoding, "{name}: initial encoding");
+            assert_eq!((rects[0].width, rects[0].height), (4, 2));
+            let mut zrle_decoder = TestZlibDecoder::new();
+            let mut zlib_decoder = TestZlibDecoder::new();
+            let mut tight_decoder = TestZlibDecoder::new();
+            assert_eq!(
+                decode_wire_rect(
+                    &rects[0],
+                    pixel,
+                    &mut zrle_decoder,
+                    &mut zlib_decoder,
+                    &mut tight_decoder,
+                ),
+                vec![first; 4 * 2],
+                "{name}: initial pixels"
+            );
+
+            // The capture source resizes. The next update must announce it
+            // before the new pixels, even though the client asked for the old
+            // 4x2 rectangle incrementally.
+            frames_tx.send(solid_rgb_frame(8, 4, second)).unwrap();
+            wait_for(|| server.stats().frames_published >= 2).await;
+            request_update(&mut client, true, 4, 2).await;
+            let rects = read_update_with_pixel(&mut client, pixel).await;
+            assert_eq!(rects.len(), 2, "{name}: resize update");
+            let resize = &rects[0];
+            assert_eq!(
+                resize.encoding, ENCODING_EXTENDED_DESKTOP_SIZE,
+                "{name}: ExtendedDesktopSize must precede pixels"
+            );
+            assert_eq!(
+                (resize.x, resize.y),
+                (
+                    DESKTOP_SIZE_REASON_SERVER,
+                    DesktopSizeResult::Success.code()
+                ),
+                "{name}: server-initiated success reason/result"
+            );
+            assert_eq!((resize.width, resize.height), (8, 4));
+            assert_eq!(resize.data[0], 1, "{name}: one screen");
+            assert_eq!(
+                u16::from_be_bytes([resize.data[9], resize.data[10]]),
+                8,
+                "{name}: screen width"
+            );
+            assert_eq!(
+                u16::from_be_bytes([resize.data[11], resize.data[12]]),
+                4,
+                "{name}: screen height"
+            );
+
+            let pixels = &rects[1];
+            assert_eq!(pixels.encoding, encoding, "{name}: resized encoding");
+            assert_eq!((pixels.x, pixels.y), (0, 0));
+            assert_eq!((pixels.width, pixels.height), (8, 4));
+            assert_eq!(
+                decode_wire_rect(
+                    pixels,
+                    pixel,
+                    &mut zrle_decoder,
+                    &mut zlib_decoder,
+                    &mut tight_decoder,
+                ),
+                vec![second; 8 * 4],
+                "{name}: resized pixels through the same encoder stream"
+            );
+
+            assert!(server.stats().desktop_resize_sent >= 1);
+            assert!(server.stats().framebuffer_resizes >= 1);
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn first_frame_geometry_change_after_server_init_sends_resize() {
+        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let server = start_server(
+            Box::new(ChannelSource::new(FrameFormat::rgb24(4, 2), frames_rx)),
+            Arc::new(FakeInputSink::new()),
+            1,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        let (width, height, _) = handshake_client(&mut client).await;
+        assert_eq!(
+            (width, height),
+            (4, 2),
+            "ServerInit uses the source's declared geometry before any frame"
+        );
+
+        let colour = (40u8, 50u8, 60u8);
+        frames_tx.send(solid_rgb_frame(8, 4, colour)).unwrap();
+        wait_for(|| server.stats().frames_published >= 1).await;
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        set_pixel_format(&mut client, pixel).await;
+        set_encodings(&mut client, &[ENCODING_RAW, ENCODING_EXTENDED_DESKTOP_SIZE]).await;
+        request_update(&mut client, false, 4, 2).await;
+
+        let rects = read_update_with_pixel(&mut client, pixel).await;
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].encoding, ENCODING_EXTENDED_DESKTOP_SIZE);
+        assert_eq!((rects[0].x, rects[0].y), (0, 0));
+        assert_eq!((rects[0].width, rects[0].height), (8, 4));
+        assert_eq!(rects[1].encoding, ENCODING_RAW);
+        assert_eq!((rects[1].width, rects[1].height), (8, 4));
+        assert_eq!(
+            decode_raw_pixels(&rects[1].data, 8, 4, pixel),
+            vec![colour; 8 * 4]
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn resize_is_not_announced_to_a_client_without_extended_desktop_size() {
+        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let server = start_server(
+            Box::new(ChannelSource::new(FrameFormat::rgb24(4, 2), frames_rx)),
+            Arc::new(FakeInputSink::new()),
+            1,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        set_pixel_format(&mut client, pixel).await;
+        // No -308: the client cannot be told that the framebuffer changed.
+        set_encodings(&mut client, &[ENCODING_RAW]).await;
+
+        frames_tx.send(solid_rgb_frame(4, 2, (1, 2, 3))).unwrap();
+        wait_for(|| server.stats().frames_published >= 1).await;
+        request_update(&mut client, false, 4, 2).await;
+        let rects = read_update_with_pixel(&mut client, pixel).await;
+        assert_eq!(rects.len(), 1);
+        assert_eq!((rects[0].width, rects[0].height), (4, 2));
+
+        // Growing beyond the client's ServerInit size is clipped, not sent as
+        // out-of-bounds pixels or a pseudo-encoding the client never requested.
+        frames_tx.send(solid_rgb_frame(8, 4, (4, 5, 6))).unwrap();
+        wait_for(|| server.stats().frames_published >= 2).await;
+        request_update(&mut client, false, 4, 2).await;
+        let rects = read_update_with_pixel(&mut client, pixel).await;
+        assert_eq!(
+            rects.len(),
+            1,
+            "no ExtendedDesktopSize for a -308-less client"
+        );
+        assert_eq!(rects[0].encoding, ENCODING_RAW);
+        assert_eq!((rects[0].width, rects[0].height), (4, 2));
+
+        // Shrinking is clamped to the new frame as well.
+        frames_tx.send(solid_rgb_frame(2, 1, (7, 8, 9))).unwrap();
+        wait_for(|| server.stats().frames_published >= 3).await;
+        request_update(&mut client, false, 4, 2).await;
+        let rects = read_update_with_pixel(&mut client, pixel).await;
+        assert_eq!(rects.len(), 1);
+        assert_eq!((rects[0].width, rects[0].height), (2, 1));
+        assert!(server.stats().framebuffer_resizes >= 2);
+        assert_eq!(server.stats().desktop_resize_sent, 0);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_resize_frames_are_dropped_without_moving_the_framebuffer() {
+        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let server = start_server(
+            Box::new(ChannelSource::new(FrameFormat::rgb24(4, 2), frames_rx)),
+            Arc::new(FakeInputSink::new()),
+            1,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        set_pixel_format(&mut client, pixel).await;
+        set_encodings(&mut client, &[ENCODING_RAW, ENCODING_EXTENDED_DESKTOP_SIZE]).await;
+
+        frames_tx.send(solid_rgb_frame(4, 2, (1, 2, 3))).unwrap();
+        wait_for(|| server.stats().frames_published >= 1).await;
+        request_update(&mut client, false, 4, 2).await;
+        let rects = read_update_with_pixel(&mut client, pixel).await;
+        assert_eq!(rects.len(), 1);
+
+        // Width exceeds the RFB u16 geometry range, so the pump must drop it
+        // rather than publish a framebuffer it cannot describe in ServerInit or
+        // a rectangle header.
+        frames_tx
+            .send(solid_rgb_frame(u16::MAX as usize + 1, 1, (9, 9, 9)))
+            .unwrap();
+        wait_for(|| server.stats().source_errors >= 1).await;
+        assert_eq!(server.stats().frames_published, 1);
+        assert_eq!(server.stats().framebuffer_resizes, 0);
+
+        request_update(&mut client, false, 4, 2).await;
+        let rects = read_update_with_pixel(&mut client, pixel).await;
+        assert_eq!(rects.len(), 1, "the old 4x2 framebuffer stays intact");
+        assert_eq!((rects[0].width, rects[0].height), (4, 2));
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn set_desktop_size_bounds_are_typed() {
+        assert_eq!(
+            validate_set_desktop_size(0, 4, 1),
+            DesktopSizeResult::InvalidScreenLayout
+        );
+        assert_eq!(
+            validate_set_desktop_size(4, 0, 1),
+            DesktopSizeResult::InvalidScreenLayout
+        );
+        assert_eq!(
+            validate_set_desktop_size(4, 2, 0),
+            DesktopSizeResult::InvalidScreenLayout
+        );
+        assert_eq!(
+            validate_set_desktop_size(4, 2, MAX_DESKTOP_SCREENS as u16 + 1),
+            DesktopSizeResult::InvalidScreenLayout
+        );
+        assert_eq!(
+            validate_set_desktop_size(u16::MAX, u16::MAX, 1),
+            DesktopSizeResult::OutOfResources
+        );
+        // Exactly the 16-megapixel bound is structurally valid but still
+        // prohibited: the capture source has no resize API.
+        assert_eq!(
+            validate_set_desktop_size(4096, 4096, 1),
+            DesktopSizeResult::Prohibited
+        );
+        assert_eq!(
+            validate_set_desktop_size(8, 4, 1),
+            DesktopSizeResult::Prohibited
+        );
+    }
+
+    #[tokio::test]
+    async fn set_desktop_size_is_parsed_and_denied_without_fake_success() {
+        let server = start_server(
+            Box::new(TestSource::new(4, 2).solid(10, 20, 30)),
+            Arc::new(FakeInputSink::new()),
+            1,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        set_pixel_format(&mut client, pixel).await;
+        set_encodings(&mut client, &[ENCODING_RAW, ENCODING_EXTENDED_DESKTOP_SIZE]).await;
+
+        // A structurally valid request is still denied: the pixel source is
+        // read-only from VNC's perspective.
+        write_set_desktop_size(&mut client, 8, 4, 1).await;
+        let rects = read_update_with_pixel(&mut client, pixel).await;
+        assert_eq!(rects.len(), 1);
+        let denial = &rects[0];
+        assert_eq!(denial.encoding, ENCODING_EXTENDED_DESKTOP_SIZE);
+        assert_eq!(
+            (denial.x, denial.y),
+            (
+                DESKTOP_SIZE_REASON_CLIENT,
+                DesktopSizeResult::Prohibited.code()
+            ),
+            "SetDesktopSize must be reported as a client-reason prohibition"
+        );
+        assert_eq!(
+            (denial.width, denial.height),
+            (4, 2),
+            "a denial echoes the current geometry, never the requested one"
+        );
+        assert_eq!(denial.data[0], 1);
+        assert_eq!(u16::from_be_bytes([denial.data[9], denial.data[10]]), 4);
+        assert_eq!(u16::from_be_bytes([denial.data[11], denial.data[12]]), 2);
+
+        // Zero-sized and oversized layouts get their specific result codes.
+        write_set_desktop_size(&mut client, 0, 0, 1).await;
+        let rects = read_update_with_pixel(&mut client, pixel).await;
+        assert_eq!(rects[0].y, DesktopSizeResult::InvalidScreenLayout.code());
+        write_set_desktop_size(&mut client, u16::MAX, u16::MAX, 1).await;
+        let rects = read_update_with_pixel(&mut client, pixel).await;
+        assert_eq!(rects[0].y, DesktopSizeResult::OutOfResources.code());
+
+        // The framebuffer itself is untouched and still serves 4x2 pixels.
+        request_update(&mut client, false, 4, 2).await;
+        let rects = read_update_with_pixel(&mut client, pixel).await;
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].encoding, ENCODING_RAW);
+        assert_eq!((rects[0].width, rects[0].height), (4, 2));
+        assert_eq!(
+            decode_raw_pixels(&rects[0].data, 4, 2, pixel),
+            vec![(10, 20, 30); 4 * 2]
+        );
+
+        let stats = server.stats();
+        assert_eq!(stats.desktop_resize_requests, 3);
+        assert_eq!(stats.desktop_resize_denied, 3);
+        assert_eq!(stats.desktop_resize_sent, 0);
+        assert_eq!(stats.framebuffer_resizes, 0);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_desktop_size_without_extended_desktop_size_gets_no_wire_reply() {
+        let server = start_server(
+            Box::new(TestSource::new(4, 2).solid(10, 20, 30)),
+            Arc::new(FakeInputSink::new()),
+            1,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        set_pixel_format(&mut client, pixel).await;
+        set_encodings(&mut client, &[ENCODING_RAW]).await;
+
+        write_set_desktop_size(&mut client, 8, 4, 1).await;
+
+        // The next message must be the requested framebuffer update, not a
+        // denial pseudo-rectangle the client never negotiated.
+        request_update(&mut client, false, 4, 2).await;
+        let rects = read_update_with_pixel(&mut client, pixel).await;
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].encoding, ENCODING_RAW);
+        assert_eq!((rects[0].width, rects[0].height), (4, 2));
+        assert_eq!(server.stats().desktop_resize_requests, 1);
+        assert_eq!(server.stats().desktop_resize_denied, 1);
+        assert_eq!(server.stats().desktop_resize_sent, 0);
         server.shutdown().await;
     }
 

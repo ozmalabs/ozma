@@ -26,6 +26,9 @@
 //!   boundaries follow the source's real keyframes, and a source with no
 //!   keyframes writes no playlist rather than a fabricated one. Other layouts
 //!   remain a typed refusal rather than being mislabelled as raw pixels.
+//! * Audio is opt-in (`HlsConfig::audio`): a PulseAudio/PipeWire monitor is a
+//!   second ffmpeg input muxed as AAC alongside the video. Video-only remains
+//!   the default, and no silence is ever synthesized.
 //! * A source whose frame size changes (a guest reset or display mode switch)
 //!   restarts ffmpeg with the new `-s WxH` instead of failing. The new
 //!   generation appends to the existing playlist with
@@ -67,6 +70,14 @@ pub const DEFAULT_PLAYLIST_SIZE: u32 = 4;
 pub const DEFAULT_FPS: u32 = 30;
 /// Default video bitrate in kbps (4 Mbps).
 pub const DEFAULT_BITRATE_KBPS: u32 = 4_000;
+/// Default AAC bitrate for opt-in HLS audio, in kbps.
+pub const DEFAULT_AUDIO_BITRATE_KBPS: u32 = 128;
+/// Smallest accepted HLS audio bitrate, in kbps.
+pub const MIN_AUDIO_BITRATE_KBPS: u32 = 8;
+/// Largest accepted HLS audio bitrate, in kbps.
+pub const MAX_AUDIO_BITRATE_KBPS: u32 = 512;
+/// Exact ffmpeg audio encoder used for HLS audio.
+pub const HLS_AUDIO_ENCODER: &str = "aac";
 /// Largest error string retained for `/api/v1/connection`.
 const MAX_STATUS_ERROR_CHARS: usize = 512;
 
@@ -765,6 +776,60 @@ fn hw_alias(value: &str) -> Option<HwAccel> {
     }
 }
 
+/// Opt-in AAC audio for the HLS pipeline.
+///
+/// `source` is a PulseAudio/PipeWire source name, normally a sink monitor such
+/// as `ozma-vm1.monitor`. This is configuration intent, not proof that the
+/// monitor exists or produced samples: ffmpeg opens it as a second input and a
+/// missing/undecodable source fails the generation instead of synthesizing
+/// audio.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HlsAudioConfig {
+    /// PulseAudio/PipeWire monitor source name (for example
+    /// `ozma-vm1.monitor`).
+    pub source: String,
+    /// AAC bitrate in kbps, bounded to
+    /// [`MIN_AUDIO_BITRATE_KBPS`]..=[`MAX_AUDIO_BITRATE_KBPS`].
+    pub bitrate_kbps: u32,
+}
+
+impl HlsAudioConfig {
+    /// Build an audio configuration with an explicit AAC bitrate.
+    pub fn new(source: impl Into<String>, bitrate_kbps: u32) -> Self {
+        Self {
+            source: source.into().trim().to_owned(),
+            bitrate_kbps,
+        }
+    }
+
+    /// Exact ffmpeg audio encoder.
+    pub fn encoder(&self) -> &'static str {
+        HLS_AUDIO_ENCODER
+    }
+
+    /// Reject an empty source or a bitrate ffmpeg cannot use.
+    pub fn validate(&self) -> Result<(), HlsError> {
+        if self.source.trim().is_empty() {
+            return Err(HlsError::AudioSource {
+                message: "the source must not be empty or whitespace".to_owned(),
+            });
+        }
+        if self.source.chars().any(char::is_control) {
+            return Err(HlsError::AudioSource {
+                message: "the source must not contain control characters".to_owned(),
+            });
+        }
+        if !(MIN_AUDIO_BITRATE_KBPS..=MAX_AUDIO_BITRATE_KBPS).contains(&self.bitrate_kbps) {
+            return Err(HlsError::InvalidConfig(format!(
+                "HLS audio bitrate must be between {MIN_AUDIO_BITRATE_KBPS} and \
+                 {MAX_AUDIO_BITRATE_KBPS} kbps, got {}",
+                self.bitrate_kbps
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for the ffmpeg-backed HLS pipeline.
 ///
 /// `width`/`height` optionally pin the input size advertised to ffmpeg. When
@@ -786,6 +851,12 @@ pub struct HlsConfig {
     pub fps: u32,
     /// Video bitrate in kbps (ignored by the constant-quality MJPEG path).
     pub bitrate_kbps: u32,
+    /// Opt-in AAC audio from a PulseAudio/PipeWire monitor.
+    ///
+    /// `None` keeps the historical video-only pipeline (`-an`). When set,
+    /// ffmpeg opens `source` as a second input and muxes AAC into the same HLS
+    /// segments as the selected H.264/HEVC/AV1 video.
+    pub audio: Option<HlsAudioConfig>,
     /// Video encoder selected for this pipeline generation.
     pub video_encoder: HlsEncoder,
     /// Encoded bit depth / chroma layout (SDR 8-bit by default).
@@ -843,6 +914,7 @@ impl Default for HlsConfig {
             playlist_size: DEFAULT_PLAYLIST_SIZE,
             fps: DEFAULT_FPS,
             bitrate_kbps: DEFAULT_BITRATE_KBPS,
+            audio: None,
             video_encoder: HlsEncoder::default(),
             pixel_format: HlsPixelFormat::default(),
             color_primaries: None,
@@ -895,6 +967,9 @@ impl HlsConfig {
             return Err(HlsError::InvalidConfig(
                 "--hls-bitrate-kbps must be at least 1".to_owned(),
             ));
+        }
+        if let Some(audio) = &self.audio {
+            audio.validate()?;
         }
         if !matches!(
             self.input_pixel_format,
@@ -1110,6 +1185,12 @@ pub enum HlsError {
         /// What failed, including the restoration outcome.
         message: String,
     },
+    /// HLS audio was requested without a usable monitor source.
+    #[error("HLS audio source is not available: {message}")]
+    AudioSource {
+        /// Why the source cannot be used.
+        message: String,
+    },
     /// A capture format cannot be fed to ffmpeg.
     #[error(
         "HLS cannot feed `{0}` frames to ffmpeg; rgb24, bgra, mjpeg, yuyv, nv12, p010, h264, \
@@ -1228,11 +1309,22 @@ pub enum HlsState {
     Stopped,
 }
 
+/// Audio configuration retained for status.
+///
+/// This is intent only: it never claims the monitor opened, decoded, or
+/// produced samples.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HlsAudioIntent {
+    source: String,
+    encoder: String,
+}
+
 #[derive(Debug, Default)]
 struct HlsStatusInner {
     state: HlsState,
     error: Option<String>,
     manifest: Option<PathBuf>,
+    audio: Option<HlsAudioIntent>,
 }
 
 /// Cloneable, bounded status of the HLS pipeline.
@@ -1256,6 +1348,7 @@ impl HlsStatus {
                 state: HlsState::Failed,
                 error: Some(bounded(message.into())),
                 manifest: None,
+                audio: None,
             })),
         }
     }
@@ -1272,6 +1365,7 @@ impl HlsStatus {
                 state: HlsState::Running,
                 error: None,
                 manifest: Some(manifest.into()),
+                audio: None,
             })),
         }
     }
@@ -1282,6 +1376,7 @@ impl HlsStatus {
                 state: HlsState::Starting,
                 error: None,
                 manifest: Some(manifest),
+                audio: None,
             })),
         }
     }
@@ -1312,6 +1407,36 @@ impl HlsStatus {
             inner.state = HlsState::Stopped;
             inner.error = Some(bounded(message.into()));
         }
+    }
+
+    /// Record the audio configuration for this generation.
+    ///
+    /// This is configuration intent only. It does not claim that ffmpeg opened
+    /// the monitor or decoded any samples.
+    fn set_audio_intent(&self, audio: Option<&HlsAudioConfig>) {
+        let mut inner = self.lock();
+        inner.audio = audio.map(|audio| HlsAudioIntent {
+            source: audio.source.clone(),
+            encoder: audio.encoder().to_owned(),
+        });
+    }
+
+    /// True when this generation was configured with HLS audio.
+    pub fn audio_configured(&self) -> bool {
+        self.lock().audio.is_some()
+    }
+
+    /// Configured monitor source, when HLS audio was requested.
+    pub fn audio_source(&self) -> Option<String> {
+        self.lock().audio.as_ref().map(|audio| audio.source.clone())
+    }
+
+    /// Exact ffmpeg audio encoder name, when HLS audio was requested.
+    pub fn audio_encoder(&self) -> Option<String> {
+        self.lock()
+            .audio
+            .as_ref()
+            .map(|audio| audio.encoder.clone())
     }
 
     /// Current lifecycle state.
@@ -3140,6 +3265,7 @@ impl HlsPipeline {
 
         let manifest = config.manifest_path();
         let status = HlsStatus::starting(manifest.clone());
+        status.set_audio_intent(config.audio.as_ref());
         // The feeder converts BGRA/MJPEG/YUYV/NV12 to packed RGB24 in Rust;
         // P010 is passed through byte-for-byte, and compressed H.264/HEVC/AV1
         // access units are written to a compressed ffmpeg input. Store the exact
@@ -4121,7 +4247,7 @@ pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
 /// and `discont_start` tells players not to interpolate across the boundary.
 /// The feeder writes raw bytes only, so frame sequence/PTS order is unchanged.
 fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -> Vec<String> {
-    let mut argv = ffmpeg_stream_argv(config, width, height);
+    let mut argv = ffmpeg_stream_argv(config, width, height, config.audio.is_some());
     append_hls_output(
         &mut argv,
         config,
@@ -4140,7 +4266,8 @@ fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -
 /// [`HlsConfig::video_encoder`] is muxed with `-c:v copy` instead of being
 /// decoded and re-encoded.
 pub fn ffmpeg_mpegts_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
-    let mut argv = ffmpeg_stream_argv(config, width, height);
+    // `/video` is a video-only MPEG-TS response; HLS audio is not muxed into it.
+    let mut argv = ffmpeg_stream_argv(config, width, height, false);
     argv.extend([
         // Emit one packet per flush so the HTTP response carries a real
         // keyframe promptly instead of waiting for an internal buffer.
@@ -4161,7 +4288,8 @@ pub fn ffmpeg_mpegts_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<St
 /// commits only after it has both the init segment and a fragment whose first
 /// sample is a sync sample.
 pub fn ffmpeg_fmp4_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
-    let mut argv = ffmpeg_stream_argv(config, width, height);
+    // `/video` is a video-only fMP4 response; HLS audio is not muxed into it.
+    let mut argv = ffmpeg_stream_argv(config, width, height, false);
     argv.extend([
         "-flush_packets".to_owned(),
         "1".to_owned(),
@@ -4175,11 +4303,25 @@ pub fn ffmpeg_fmp4_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<Stri
 }
 
 /// Format/encoder half of the argv, before the muxer/output arguments.
-fn ffmpeg_stream_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
+///
+/// `include_audio` is true only for the HLS path. `/video` stays video-only so
+/// it does not change its historical MPEG-TS/fMP4 contract when an operator
+/// enables HLS audio.
+fn ffmpeg_stream_argv(
+    config: &HlsConfig,
+    width: u32,
+    height: u32,
+    include_audio: bool,
+) -> Vec<String> {
     let bitrate = format!("{}k", config.bitrate_kbps);
     let target = config.pixel_format;
     let compressed = compressed_input(config);
     let stream_copy = input_is_stream_copy(config);
+    let audio = if include_audio {
+        config.audio.as_ref()
+    } else {
+        None
+    };
     let mut argv = vec![
         config.ffmpeg_bin.display().to_string(),
         "-hide_banner".to_owned(),
@@ -4199,7 +4341,6 @@ fn ffmpeg_stream_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String
                 config.fps.to_string(),
                 "-i".to_owned(),
                 "-".to_owned(),
-                "-an".to_owned(),
             ]);
         }
         None => {
@@ -4216,9 +4357,44 @@ fn ffmpeg_stream_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String
                 config.fps.to_string(),
                 "-i".to_owned(),
                 "-".to_owned(),
-                "-an".to_owned(),
             ]);
         }
+    }
+
+    if let Some(audio) = audio {
+        // PulseAudio input also works through PipeWire's pulse compatibility
+        // server, which is how the node's monitor sources are exposed. The
+        // monitor is a second, real input, never a synthesized silence source.
+        //
+        // `wallclock=0` makes the demuxer start at PTS 0 rather than the
+        // current wall clock, so audio and the zero-based raw-video timeline
+        // share an epoch. `fragment_size` bounds the monitor buffering (about
+        // 21 ms at 48 kHz stereo s16) instead of leaving it to the server
+        // default. The Rust feeder's bounded stdin writes provide the video
+        // backpressure; ffmpeg's own packet queues remain bounded.
+        argv.extend([
+            "-f".to_owned(),
+            "pulse".to_owned(),
+            "-wallclock".to_owned(),
+            "0".to_owned(),
+            "-fragment_size".to_owned(),
+            "4096".to_owned(),
+            "-i".to_owned(),
+            audio.source.clone(),
+        ]);
+        // Select exactly the video and monitor streams. Without explicit maps
+        // ffmpeg could pick an unexpected audio stream or fail on a monitor
+        // that exposes more than one channel layout.
+        argv.extend([
+            "-map".to_owned(),
+            "0:v:0".to_owned(),
+            "-map".to_owned(),
+            "1:a:0".to_owned(),
+        ]);
+    } else {
+        // Video-only is the historical behavior and is never silently replaced
+        // by generated audio.
+        argv.push("-an".to_owned());
     }
 
     if stream_copy {
@@ -4237,6 +4413,7 @@ fn ffmpeg_stream_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String
                 "hvc1".to_owned(),
             ]);
         }
+        append_audio_output(&mut argv, audio);
         return argv;
     }
 
@@ -4420,7 +4597,32 @@ fn ffmpeg_stream_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String
         config.force_key_frames_expr(),
     ]);
 
+    append_audio_output(&mut argv, audio);
     argv
+}
+
+/// Append the AAC encoder arguments for an audio-enabled generation.
+///
+/// `aresample=async=1:first_pts=0` aligns the monitor to the same zero-based
+/// media timeline as the raw video input and lets ffmpeg insert/drop samples
+/// when the monitor clock drifts. The bitrate is a real bounded `-b:a` target,
+/// not a claim about the produced sample rate.
+fn append_audio_output(argv: &mut Vec<String>, audio: Option<&HlsAudioConfig>) {
+    let Some(audio) = audio else {
+        return;
+    };
+    argv.extend([
+        "-af".to_owned(),
+        "aresample=async=1:first_pts=0".to_owned(),
+        "-c:a".to_owned(),
+        audio.encoder().to_owned(),
+        "-b:a".to_owned(),
+        format!("{}k", audio.bitrate_kbps),
+        "-ar".to_owned(),
+        "48000".to_owned(),
+        "-ac".to_owned(),
+        "2".to_owned(),
+    ]);
 }
 
 /// Append the shared HLS muxer arguments.
@@ -4443,6 +4645,10 @@ fn append_hls_output(argv: &mut Vec<String>, config: &HlsConfig, restart: bool, 
         config.segment_pattern()
     };
     argv.extend([
+        // Bound the muxer's packet queue. This is a muxer option in n9.1 (it
+        // is not accepted on an input URL), so it is applied to the HLS output.
+        "-thread_queue_size".to_owned(),
+        "512".to_owned(),
         "-f".to_owned(),
         "hls".to_owned(),
         "-hls_time".to_owned(),
@@ -4970,6 +5176,62 @@ mod tests {
         }
     }
 
+    /// Real-time source used by the opt-in audio muxing test.
+    struct PacedSource {
+        format: FrameFormat,
+        total: usize,
+        remaining: usize,
+        period: Duration,
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl PacedSource {
+        fn new(format: FrameFormat, frames: usize, period: Duration) -> (Self, Arc<AtomicBool>) {
+            let stopped = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    format,
+                    total: frames,
+                    remaining: frames,
+                    period,
+                    stopped: stopped.clone(),
+                },
+                stopped,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl CaptureSource for PacedSource {
+        fn id(&self) -> &str {
+            "paced-hls"
+        }
+
+        fn format(&self) -> FrameFormat {
+            self.format
+        }
+
+        async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+            if self.remaining == 0 {
+                return Err(MediaError::EndOfStream);
+            }
+            tokio::time::sleep(self.period).await;
+            self.remaining -= 1;
+            let sequence = (self.total - self.remaining) as u64;
+            Ok(rgb_frame(
+                self.format.width,
+                self.format.height,
+                sequence,
+                sequence as u8,
+            ))
+        }
+
+        async fn stop(&mut self) -> Result<(), MediaError> {
+            self.stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     /// Manually advanced monotonic clock for deterministic pacing tests.
     struct ManualClock {
         now: Mutex<Instant>,
@@ -5311,6 +5573,153 @@ mod tests {
     }
 
     #[test]
+    fn ffmpeg_argv_adds_a_pulse_monitor_and_aac_when_audio_is_configured() {
+        let config = HlsConfig {
+            output_dir: PathBuf::from("/tmp/ozma-stream-audio"),
+            audio: Some(HlsAudioConfig::new("ozma-vm1.monitor", 96)),
+            ..HlsConfig::default()
+        };
+        let argv = ffmpeg_argv(&config, 640, 480);
+
+        assert!(
+            argv.windows(2).any(|window| window == ["-f", "pulse"]),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2).any(|window| window == ["-wallclock", "0"]),
+            "audio must share the zero-based video timeline: {argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|window| window == ["-fragment_size", "4096"]),
+            "monitor buffering must be bounded: {argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|window| window == ["-i", "ozma-vm1.monitor"]),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2).any(|window| window == ["-map", "0:v:0"]),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2).any(|window| window == ["-map", "1:a:0"]),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2).any(|window| window == ["-c:a", "aac"]),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2).any(|window| window == ["-b:a", "96k"]),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|window| window == ["-af", "aresample=async=1:first_pts=0"]),
+            "{argv:?}"
+        );
+        assert!(
+            !argv.contains(&"-an".to_owned()),
+            "audio-enabled argv must not disable audio: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn video_only_argv_has_no_audio_input_even_when_audio_is_configured() {
+        let config = HlsConfig {
+            output_dir: PathBuf::from("/tmp/ozma-stream-video-only"),
+            audio: Some(HlsAudioConfig::new("ozma-vm1.monitor", 128)),
+            ..HlsConfig::default()
+        };
+        // The `/video` MPEG-TS/fMP4 live responses stay video-only: enabling
+        // HLS audio must not silently add a monitor input to them.
+        for argv in [
+            ffmpeg_mpegts_argv(&config, 320, 240),
+            ffmpeg_fmp4_argv(&config, 320, 240),
+        ] {
+            assert!(
+                !argv.windows(2).any(|window| window == ["-f", "pulse"]),
+                "{argv:?}"
+            );
+            assert!(!argv.contains(&"ozma-vm1.monitor".to_owned()), "{argv:?}");
+            assert!(argv.contains(&"-an".to_owned()), "{argv:?}");
+        }
+
+        let video_only = HlsConfig {
+            audio: None,
+            ..config
+        };
+        let argv = ffmpeg_argv(&video_only, 320, 240);
+        assert!(argv.contains(&"-an".to_owned()), "{argv:?}");
+        assert!(!argv.windows(2).any(|window| window == ["-f", "pulse"]));
+    }
+
+    #[test]
+    fn audio_configuration_rejects_blank_sources_and_unbounded_bitrates() {
+        assert!(matches!(
+            HlsAudioConfig::new("   ", 128).validate(),
+            Err(HlsError::AudioSource { .. })
+        ));
+        assert!(matches!(
+            HlsAudioConfig::new("bad\nmonitor", 128).validate(),
+            Err(HlsError::AudioSource { .. })
+        ));
+        assert!(matches!(
+            HlsAudioConfig::new("test.monitor", MIN_AUDIO_BITRATE_KBPS - 1).validate(),
+            Err(HlsError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            HlsAudioConfig::new("test.monitor", MAX_AUDIO_BITRATE_KBPS + 1).validate(),
+            Err(HlsError::InvalidConfig(_))
+        ));
+        HlsAudioConfig::new("test.monitor", DEFAULT_AUDIO_BITRATE_KBPS)
+            .validate()
+            .expect("valid audio config");
+
+        let config = HlsConfig {
+            audio: Some(HlsAudioConfig::new("", 128)),
+            ..HlsConfig::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(HlsError::AudioSource { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn status_reports_audio_intent_without_claiming_samples() {
+        let directory = temp_dir("audio-status");
+        let (source, _) = FakeSource::new(
+            FrameFormat::rgb24(2, 2),
+            vec![Ok(rgb_frame(2, 2, 0, 0x22))],
+            false,
+        );
+        let config = HlsConfig {
+            output_dir: directory.clone(),
+            audio: Some(HlsAudioConfig::new(
+                "test.monitor",
+                DEFAULT_AUDIO_BITRATE_KBPS,
+            )),
+            ..HlsConfig::default()
+        };
+        let mut pipeline = HlsPipeline::start_with_spawner_and_probe(
+            Box::new(source),
+            config,
+            spawner(RecordingSpawner::default()),
+            Arc::new(StaticEncoderProbe::software()),
+        )
+        .expect("start pipeline");
+        let status = pipeline.status();
+        assert!(status.audio_configured());
+        assert_eq!(status.audio_source().as_deref(), Some("test.monitor"));
+        assert_eq!(status.audio_encoder().as_deref(), Some("aac"));
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn ffmpeg_argv_matches_the_compatibility_pipeline() {
         let config = HlsConfig {
             output_dir: PathBuf::from("/tmp/ozma-stream-node"),
@@ -5353,6 +5762,8 @@ mod tests {
                 "0",
                 "-force_key_frames",
                 "expr:gte(t,n_forced*1)",
+                "-thread_queue_size",
+                "512",
                 "-f",
                 "hls",
                 "-hls_time",
@@ -7549,6 +7960,199 @@ mod tests {
         assert!(argv.contains(&"3000k".to_owned()));
         controller.stop().await.expect("stop");
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Opt-in live audio test: create a disposable null sink, play a generated
+    /// tone into it, feed a real-time fake video source, and require ffprobe to
+    /// see both the video codec and AAC with plausible durations in a segment.
+    ///
+    /// This intentionally uses a disposable sink named after the test process
+    /// and unloads it in a guard; it never reads or writes the default sink.
+    #[tokio::test]
+    #[ignore = "requires ffmpeg/ffprobe/pactl; set OZMA_FFMPEG_AUDIO_TEST=1 and run with --ignored"]
+    async fn real_ffmpeg_muxes_a_monitor_tone_into_hls_audio_and_video() {
+        if std::env::var("OZMA_FFMPEG_AUDIO_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        if std::process::Command::new("pactl")
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+
+        struct Guard {
+            module: Option<String>,
+            tone: Option<std::process::Child>,
+            sink: String,
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                if let Some(mut tone) = self.tone.take() {
+                    let _ = tone.kill();
+                    let _ = tone.wait();
+                }
+                if let Some(module) = self.module.take() {
+                    let _ = std::process::Command::new("pactl")
+                        .args(["unload-module", &module])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+                let _ = self.sink;
+            }
+        }
+
+        let sink = format!("ozma-hls-audio-{}", std::process::id());
+        let loaded = std::process::Command::new("pactl")
+            .args([
+                "load-module",
+                "module-null-sink",
+                &format!("sink_name={sink}"),
+                "rate=48000",
+                "channels=2",
+            ])
+            .output()
+            .expect("run pactl load-module");
+        assert!(
+            loaded.status.success(),
+            "pactl load-module failed: {}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        let module = String::from_utf8_lossy(&loaded.stdout).trim().to_owned();
+        let mut guard = Guard {
+            module: Some(module),
+            tone: None,
+            sink: sink.clone(),
+        };
+
+        // Give the monitor a deterministic tone. `-re` keeps it paced.
+        guard.tone = Some(
+            std::process::Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-re",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000:duration=12",
+                    "-f",
+                    "pulse",
+                    &sink,
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn tone"),
+        );
+
+        // Wait for the monitor source to appear.
+        let monitor = format!("{sink}.monitor");
+        for _ in 0..100 {
+            let sources = std::process::Command::new("pactl")
+                .args(["list", "short", "sources"])
+                .output()
+                .expect("list sources");
+            if String::from_utf8_lossy(&sources.stdout).contains(&monitor) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        for (label, encoder) in [("h264", HlsEncoder::H264), ("hevc", HlsEncoder::Hevc)] {
+            let directory = temp_dir(&format!("real-audio-{label}"));
+            let config = HlsConfig {
+                output_dir: directory.clone(),
+                fps: 10,
+                segment_seconds: 0.5,
+                playlist_size: 4,
+                video_encoder: encoder,
+                audio: Some(HlsAudioConfig::new(monitor.clone(), 128)),
+                ..HlsConfig::default()
+            };
+            let (source, _) =
+                PacedSource::new(FrameFormat::rgb24(64, 48), 25, Duration::from_millis(100));
+            let mut pipeline = HlsPipeline::start_with_spawner_and_probe(
+                Box::new(source),
+                config,
+                Arc::new(SystemFfmpegSpawner),
+                Arc::new(StaticEncoderProbe::software()),
+            )
+            .unwrap_or_else(|error| panic!("{label}: start audio pipeline: {error}"));
+
+            // Probe an already-closed segment (the second newest), not the file
+            // ffmpeg may still be appending to.
+            let latest = loop {
+                if pipeline.manifest_path().is_file() {
+                    if let Ok(entries) = std::fs::read_dir(pipeline.output_dir()) {
+                        let mut segments: Vec<PathBuf> = entries
+                            .filter_map(Result::ok)
+                            .map(|entry| entry.path())
+                            .filter(|path| {
+                                path.extension().and_then(|ext| ext.to_str()) == Some("ts")
+                            })
+                            .collect();
+                        segments.sort();
+                        if segments.len() >= 2 {
+                            break segments[segments.len() - 2].clone();
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+
+            // Let the chosen segment finalise before probing it.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let probe = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name,codec_type,duration",
+                    "-of",
+                    "default=nw=1",
+                ])
+                .arg(&latest)
+                .output()
+                .expect("run ffprobe");
+            assert!(
+                probe.status.success(),
+                "{label}: ffprobe failed: {}",
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            let report = String::from_utf8_lossy(&probe.stdout);
+            eprintln!("{label} segment {}:\n{report}", latest.display());
+            assert!(
+                report.contains(&format!("codec_name={label}")),
+                "{label}: video codec missing:\n{report}"
+            );
+            assert!(
+                report.contains("codec_name=aac"),
+                "{label}: AAC audio missing:\n{report}"
+            );
+            assert!(
+                report.contains("codec_type=video") && report.contains("codec_type=audio"),
+                "{label}: both stream types missing:\n{report}"
+            );
+            let durations: Vec<f64> = report
+                .lines()
+                .filter_map(|line| line.strip_prefix("duration="))
+                .filter_map(|value| value.parse::<f64>().ok())
+                .collect();
+            assert!(
+                !durations.is_empty() && durations.iter().all(|duration| *duration > 0.2),
+                "{label}: segment streams have no plausible duration:\n{report}"
+            );
+
+            pipeline.stop().await.expect("stop audio pipeline");
+            let _ = std::fs::remove_dir_all(directory);
+        }
+        drop(guard);
     }
 
     /// Opt-in real-ffmpeg pass-through test: generate genuine H.264, HEVC, and

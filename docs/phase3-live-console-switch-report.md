@@ -548,6 +548,28 @@ Routes and status:
   and bitrate per active/per-console pipeline) and `fan_out` (enabled, running
   count, last target count, applied/rollback state, failed labels).
 
+**HLS audio (follow-up).** The HLS path is video-only unless audio is
+explicitly requested. `--hls-audio` derives `<sink>.monitor` from
+`--audio-sink` or a `monitor:<sink>` `--audio-capture-target`;
+`--hls-audio-source <monitor>` sets it directly; `--hls-audio-bitrate-kbps`
+bounds the AAC target (8–512 kbps, default 128). The monitor is a real second
+ffmpeg input (`-f pulse -wallclock 0 -fragment_size 4096 -i <monitor>`) muxed
+as AAC (`-c:a aac`) into the same HLS segments as H.264/HEVC/AV1;
+`aresample=async=1:first_pts=0` aligns it to the zero-based video timeline.
+No default source is invented, no silence is synthesized, and a missing named
+monitor fails the generation rather than claiming audio. `/video` remains
+video-only.
+
+Per-console HLS uses `--multi-console-hls-audio-source <template>`
+(`{console}`/`{index}`, for example `ozma-vm{console}.monitor`). Without a
+template every per-console pipeline keeps the base monitor, or stays video-only
+when the base has none. `/api/v1/connection.hls` adds
+`hls_audio_configured`/`hls_audio_source`/`hls_audio_encoder`;
+`multi_console_hls` adds the same per console plus the aggregate template.
+These are configuration-intent fields and never claim samples. Full argv,
+failure behavior, and live ffprobe evidence are in
+`docs/phase4-hls-audio-report.md`.
+
 **Live smoke (2026-11-25, QEMU 11.1.3, Alpine 3.21, disposable two-head
 D-Bus).** Node command (abridged):
 
