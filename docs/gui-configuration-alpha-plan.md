@@ -423,16 +423,17 @@ discovery remains available without a token.
   both license files into a Windows x64 zip attached to tagged releases. This
   release workflow is complemented by `.github/workflows/ozma-desktop-windows.yml`,
   which builds and uploads the executable and icon on tray-related pull
-  requests and pushes. On the pre-merge work commit `ed3c2ed`, the
-  [Windows x64 tray build workflow](https://github.com/ozmalabs/ozma/actions/runs/45755264312)
-  completed successfully. The
-  [node workflow](https://github.com/ozmalabs/ozma/actions/runs/45755264206)
-  passed its node library suite (899 passed, 16 ignored), aarch64
-  cross-compile, and Debian package steps, but its x86_64 unit-test step failed
-  three AIDA64 integration tests: `api_selection_returns_jsonp`,
-  `panel_layout_is_ozma_widget_json`, and `sensors_api_returns_aida_ids`.
-  These are pre-merge CI results for `ed3c2ed`; they do not validate the
-  subsequently integrated worktree. The MSVC cross-build was rerun against the current worktree with
+  requests and pushes. The
+  [Windows x64 tray build](https://github.com/ozmalabs/ozma/actions/runs/45763473637)
+  passed on the latest integration commit. The
+  [macOS node workflow](https://github.com/ozmalabs/ozma/actions/runs/45769930319)
+  passed for both ARM64 and Intel, including universal binary and DMG upload.
+  The
+  [Linux node workflow](https://github.com/ozmalabs/ozma/actions/runs/45768845837)
+  passed all jobs, including x86_64 build and tests, aarch64 cross-compilation,
+  and aarch64 Debian packaging. A prior integrated-code run
+  [also passed its aarch64 build and package jobs](https://github.com/ozmalabs/ozma/actions/runs/45759614338).
+  The MSVC cross-build was rerun against the current worktree with
   `cargo xwin build --release -p ozma-desktop --target
   x86_64-pc-windows-msvc`; the result is a PE32+ x64 Windows GUI executable.
   The current local Windows x64 package is
@@ -446,23 +447,21 @@ discovery remains available without a token.
   untouched; the earlier disposable clone was shut down and its overlay
   removed after the cloned `ozma` account rejected the documented default
   password. No separate safe clone was available for this continuation, so no
-  attempt was made to stop or modify the running source VM. The Windows CI run
-  establishes compilation/package success only, not native shell behavior.
+  attempt was made to stop or modify the running source VM. The Windows tray CI
+  establishes tray compilation/package success only; a full Windows `ozma-node`
+  build and native shell behavior remain unverified.
   Legacy Windows 98/XP images are not valid targets for this alpha and were not
   used.
 - **Aperture clarification.** Aperture means progressive configuration
   complexity and precision, not just permissions. Repository search found no
   foveation implementation yet; Fine-tune and Expert describe the setting and
   show it as unavailable until a real runtime path consumes and reports it.
-- Verification so far: `cargo check -p ozma-protocol -p ozma-api -p ozma-node`,
+- Verification: `cargo check -p ozma-protocol -p ozma-api -p ozma-node`,
   `npm run build`, Python syntax compilation, workflow YAML parsing, and
-  `git diff --check` pass. Full relevant Rust suites pass:
-  `cargo test -p ozma-node --lib` (799 passed, 8 ignored in the earlier local
-  run; the pre-merge CI node library suite passed 899, 16 ignored) and
-  `cargo test -p ozma-api --lib` (11 passed). The two relevant controller test
-  files pass in full (165 passed, one upstream Starlette/httpx deprecation
-  warning) when pytest temp files are put on the workspace disk; the system
-  `/tmp` tmpfs filled during an earlier run. The controller test command is:
+  `git diff --check` pass. `cargo test -p ozma-api --lib` passed 11 tests.
+  The two relevant controller test files passed 165 tests when pytest temp
+  files were placed on the workspace disk; the system `/tmp` tmpfs filled
+  during an earlier run. The command was:
 
   ```sh
   TMPDIR="$PWD/target/controller-test-tmp" pytest -q \
@@ -471,29 +470,26 @@ discovery remains available without a token.
     tests/unit/controller/test_node_api_token_proxy.py
   ```
 
-  The repeatable Wine tray smoke
-  `./ozma-desktop/smoke-wine.sh` passes: it opens the popup callback and exits
-  through Quit. The UI type-check
-  covers the app entry and all imported routes; orphaned legacy screens are
-  outside the bundle/type-check graph. The MSVC
-  release build is reproducible with `cargo install cargo-xwin --locked`
-  followed by `cargo xwin build --release -p ozma-desktop --target
-  x86_64-pc-windows-msvc`; the artifact is
-  `target/x86_64-pc-windows-msvc/release/ozma-desktop.exe`. The working
-  tree also contains unrelated in-progress changes;
-  preserve them and review changes by file before committing.
+  The full local `cargo test -p ozma-node` suite passed 899 library tests
+  (16 ignored), 26 binary tests, all integration tests, and doctests after the
+  camera, `m0_acceptance`, AIDA64, and native node test fixes. The run required
+  `BINDGEN_EXTRA_CLANG_ARGS='-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include'`;
+  the focused AIDA64 run also used a temporary `libpam.so` symlink to the
+  system `libpam.so.0`. `npm ci` followed by `npm run build` completed with
+  Vite 6.4.6 (210 modules).
 
-  Post-merge checks on the integrated worktree also passed: the two relevant
-  controller test files completed with 165 passed, and `npm ci` plus
-  `npm run build` completed with Vite 6.4.6 (210 modules). The three AIDA64
-  tests were made independent of host hardware. Post-merge,
-  `cargo check -p ozma-node --tests` passed with
-  `BINDGEN_EXTRA_CLANG_ARGS='-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include'`.
-  `cargo test -p ozma-node --test aida64` then passed all 6 tests with that
-  bindgen setting and a temporary symlink from `libpam.so` to the system
-  `libpam.so.0`. This covers the pre-merge CI failures. Internal infrastructure
-  docs contain no Windows guest credentials. The opt-in Windows test
-  bootstrap targets the same `images/win10.qcow2` disk and local bootstrap
-  state as the running original
-  VM, so using it would collide with that VM. Native shell validation remains
-  deferred until a safely independent guest and valid login are available.
+  The repeatable Wine tray smoke `./ozma-desktop/smoke-wine.sh` passes: it
+  opens the popup callback and exits through Quit. Wine does not provide a
+  usable Windows notification area, so this does not validate shell icon
+  registration or real mouse interaction. The UI type-check covers the app
+  entry and all imported routes; orphaned legacy screens are outside the
+  bundle/type-check graph. The MSVC release build is reproducible with
+  `cargo install cargo-xwin --locked` followed by `cargo xwin build --release
+  -p ozma-desktop --target x86_64-pc-windows-msvc`; the artifact is
+  `target/x86_64-pc-windows-msvc/release/ozma-desktop.exe`.
+
+  Internal infrastructure docs contain no Windows guest credentials. The
+  opt-in Windows test bootstrap targets the same `images/win10.qcow2` disk and
+  local bootstrap state as the running original VM, so using it would collide
+  with that VM. Native shell validation remains deferred until a safely
+  independent guest and valid login are available.
