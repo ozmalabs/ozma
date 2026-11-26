@@ -545,6 +545,16 @@ pub fn input_capability_for(sink: Option<SinkKind>) -> InputCapability {
             release_all: true,
             ..InputCapability::default()
         },
+        #[cfg(target_os = "windows")]
+        Some(SinkKind::SendInput) => InputCapability {
+            keyboard: true,
+            mouse_absolute: true,
+            mouse_relative: true,
+            release_all: true,
+            ..InputCapability::default()
+        },
+        #[cfg(not(target_os = "windows"))]
+        Some(SinkKind::SendInput) => InputCapability::default(),
         // A recording sink validates events but injects nothing.
         Some(SinkKind::Recording) | None => InputCapability::default(),
     }

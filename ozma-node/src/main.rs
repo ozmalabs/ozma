@@ -62,7 +62,7 @@ use ozma_node::{
     multi_webrtc::{MultiConsoleWebrtc, MultiConsoleWebrtcConfig},
     platform, registration, serial, shutdown,
     software::report::{InventoryReporter, DEFAULT_REPORT_INTERVAL},
-    usb_audio, usb_uac2,
+    usb_uac2,
     webrtc::{
         probe_settled_geometry, select_helper, FitProbe, HelperSelection, WebRtcAudioBackend,
         WebRtcBackend, WebRtcConfig, WebRtcControl, WebRtcGeometryStatus, WebRtcHelper,
