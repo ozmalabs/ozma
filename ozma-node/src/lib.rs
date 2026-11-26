@@ -15,6 +15,7 @@ pub mod backend;
 pub mod backup;
 pub mod bluetooth;
 pub mod browser_scene;
+pub mod buses;
 pub mod client_capture;
 pub mod config;
 pub mod controller_compat;

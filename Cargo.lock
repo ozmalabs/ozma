@@ -2066,6 +2066,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "i2cdev"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b940f7497c4f95b863b21cd34c3737b53a67d80d94cf29055d7f7eeca6ffdb4"
+dependencies = [
+ "bitflags 2.11.0",
+ "byteorder",
+ "libc",
+ "nix 0.26.4",
+]
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3809,6 +3821,7 @@ dependencies = [
  "futures-util",
  "hostname 0.4.2",
  "http-body-util",
+ "i2cdev",
  "jpeg-decoder",
  "jpeg-encoder",
  "libc",
@@ -3844,6 +3857,7 @@ dependencies = [
  "serde_json",
  "serialport",
  "sha2 0.10.9",
+ "spidev",
  "sysinfo 0.29.11",
  "tempfile",
  "thiserror 1.0.69",
@@ -5307,6 +5321,17 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spidev"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f611021817865236902d15bdf8d729b0bd232141b568d56bb88409a8dc27397"
+dependencies = [
+ "bitflags 2.11.0",
+ "libc",
+ "nix 0.29.0",
 ]
 
 [[package]]

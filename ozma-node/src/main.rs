@@ -1125,6 +1125,148 @@ pub struct Args {
     )]
     pub serial_buffer_bytes: usize,
 
+    /// Serial flow control: `none`, `rtscts`, or `xonxoff`
+    /// (`--serial-device` only).
+    #[arg(
+        long,
+        env = "OZMA_SERIAL_FLOW_CONTROL",
+        value_name = "MODE",
+        requires = "serial_device",
+        default_value = "none"
+    )]
+    pub serial_flow_control: String,
+
+    /// Assert DTR when the serial device is opened (`--serial-device` only).
+    ///
+    /// Omit to leave DTR untouched. `--serial-dtr` asserts it;
+    /// `--serial-dtr=false` deasserts it. Applied again on every reconnect.
+    #[arg(
+        long,
+        env = "OZMA_SERIAL_DTR",
+        value_name = "BOOL",
+        requires = "serial_device",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub serial_dtr: Option<bool>,
+
+    /// Assert RTS when the serial device is opened (`--serial-device` only).
+    ///
+    /// Omit to leave RTS untouched. `--serial-rts` asserts it;
+    /// `--serial-rts=false` deasserts it. Applied again on every reconnect.
+    #[arg(
+        long,
+        env = "OZMA_SERIAL_RTS",
+        value_name = "BOOL",
+        requires = "serial_device",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub serial_rts: Option<bool>,
+
+    /// Enable `POST /serial/control` to change DTR/RTS (`--serial-device`
+    /// only).
+    ///
+    /// Off by default: without this flag the control route returns a typed
+    /// 403 `serial.control-disabled`. The endpoint accepts only booleans for
+    /// `dtr` and `rts`.
+    #[arg(long, env = "OZMA_SERIAL_CONTROL", requires = "serial_device")]
+    pub serial_control: bool,
+
+    /// Reconnect attempts after a serial removal/read error
+    /// (`--serial-device` only).
+    ///
+    /// Zero disables reconnect. The same explicit device path is retried with
+    /// exponential backoff; another device is never opened.
+    #[arg(
+        long,
+        env = "OZMA_SERIAL_RECONNECT_ATTEMPTS",
+        value_name = "N",
+        requires = "serial_device",
+        default_value_t = crate::serial::DEFAULT_RECONNECT_ATTEMPTS
+    )]
+    pub serial_reconnect_attempts: u32,
+
+    /// First serial reconnect delay in milliseconds (`--serial-device` only).
+    #[arg(
+        long,
+        env = "OZMA_SERIAL_RECONNECT_MIN_MS",
+        value_name = "MS",
+        requires = "serial_device",
+        default_value_t = crate::serial::DEFAULT_RECONNECT_MIN_MS
+    )]
+    pub serial_reconnect_min_ms: u64,
+
+    /// Maximum serial reconnect delay in milliseconds (`--serial-device`
+    /// only).
+    #[arg(
+        long,
+        env = "OZMA_SERIAL_RECONNECT_MAX_MS",
+        value_name = "MS",
+        requires = "serial_device",
+        default_value_t = crate::serial::DEFAULT_RECONNECT_MAX_MS
+    )]
+    pub serial_reconnect_max_ms: u64,
+
+    /// Enable the read-only 1-Wire sysfs surface. With no value, uses the
+    /// kernel default root; an explicit path is allowed for staging/tests.
+    #[arg(
+        long,
+        env = "OZMA_ONEWIRE",
+        value_name = "ROOT",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub onewire: Option<String>,
+
+    /// Exact I²C `BUS:ADDR` allowlist (repeatable or comma-separated).
+    ///
+    /// Nothing is probed or opened without an entry. Reserved/broadcast
+    /// addresses are always rejected.
+    #[arg(
+        long,
+        env = "OZMA_I2C_ALLOW",
+        value_name = "BUS:ADDR",
+        value_delimiter = ','
+    )]
+    pub i2c_allow: Vec<String>,
+
+    /// Exact SPI `/dev/spidevX.Y` allowlist (repeatable or comma-separated).
+    #[arg(
+        long,
+        env = "OZMA_SPI_ALLOW",
+        value_name = "/dev/spidevX.Y",
+        value_delimiter = ','
+    )]
+    pub spi_allow: Vec<String>,
+
+    /// Maximum bytes in one SPI bus transfer.
+    #[arg(
+        long,
+        env = "OZMA_BUS_MAX_TRANSFER_BYTES",
+        value_name = "BYTES",
+        default_value_t = ozma_node::buses::DEFAULT_MAX_TRANSFER_BYTES
+    )]
+    pub bus_max_transfer_bytes: usize,
+
+    /// Maximum SMBus block bytes for I²C read/write.
+    #[arg(
+        long,
+        env = "OZMA_BUS_MAX_BLOCK_BYTES",
+        value_name = "BYTES",
+        default_value_t = ozma_node::buses::DEFAULT_MAX_BLOCK_BYTES
+    )]
+    pub bus_max_block_bytes: usize,
+
+    /// Maximum allowlisted/reported bus devices.
+    #[arg(
+        long,
+        env = "OZMA_BUS_MAX_DEVICES",
+        value_name = "COUNT",
+        default_value_t = ozma_node::buses::DEFAULT_MAX_DEVICES
+    )]
+    pub bus_max_devices: usize,
+
     /// Opt in to bounded application control for pids listed by `/apps`
     /// (`/apps/{pid}/terminate`, `/signal`, `/suspend`, `/resume`).
     ///
@@ -3237,6 +3379,16 @@ async fn run() -> std::process::ExitCode {
                     std::process::exit(2);
                 }
             };
+            let flow_control = match args
+                .serial_flow_control
+                .parse::<serial::SerialFlowControl>()
+            {
+                Ok(flow_control) => flow_control,
+                Err(detail) => {
+                    error!(error = %detail, "invalid --serial-flow-control");
+                    std::process::exit(2);
+                }
+            };
             let mut serial_config = match serial::SerialConfig::new(
                 device,
                 args.serial_baud,
@@ -3257,6 +3409,15 @@ async fn run() -> std::process::ExitCode {
                 }
             };
             serial_config.buffer_bytes = args.serial_buffer_bytes;
+            serial_config.flow_control = flow_control;
+            serial_config.initial_dtr = args.serial_dtr;
+            serial_config.initial_rts = args.serial_rts;
+            serial_config.control_enabled = args.serial_control;
+            serial_config.reconnect = serial::SerialReconnectConfig {
+                max_attempts: args.serial_reconnect_attempts,
+                min_delay: Duration::from_millis(args.serial_reconnect_min_ms),
+                max_delay: Duration::from_millis(args.serial_reconnect_max_ms),
+            };
             if let Err(error) = serial_config.validate() {
                 error!(
                     code = error.code(),
@@ -3271,13 +3432,16 @@ async fn run() -> std::process::ExitCode {
                 Ok(()) => info!(
                     device = %service.device().display(),
                     baud = args.serial_baud,
+                    flow_control = flow_control.as_str(),
+                    control_enabled = args.serial_control,
+                    reconnect_attempts = args.serial_reconnect_attempts,
                     "serial provider opened; /serial/status|write|read|stream enabled"
                 ),
                 Err(error) => warn!(
                     code = error.code(),
                     error = %error,
                     remediation = error.remediation(),
-                    "serial device was configured but could not be opened; /serial/* reports the typed failure"
+                    "serial device was configured but could not be opened; /serial/* reports the typed failure and retries the same path"
                 ),
             }
             Some(service)
@@ -3287,6 +3451,44 @@ async fn run() -> std::process::ExitCode {
         .as_ref()
         .is_some_and(|service| service.status().connected);
     set_capability(&mut args, &mut config, "serial", serial_available);
+    // Opt-in low-speed buses. Nothing is probed or opened without an explicit
+    // allowlist; the default state keeps every route at typed 503.
+    let bus_config = match ozma_node::buses::BusConfig::from_cli_with_limits(
+        args.onewire.as_deref(),
+        &args.i2c_allow,
+        &args.spi_allow,
+        args.bus_max_transfer_bytes,
+        args.bus_max_block_bytes,
+        args.bus_max_devices,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            error!(
+                code = error.code(),
+                error = %error,
+                remediation = error.remediation(),
+                "invalid bus configuration"
+            );
+            std::process::exit(2);
+        }
+    };
+    let bus_state = match ozma_node::buses::BusState::new(bus_config) {
+        Ok(state) => state,
+        Err(error) => {
+            error!(
+                code = error.code(),
+                error = %error,
+                remediation = error.remediation(),
+                "invalid bus configuration"
+            );
+            std::process::exit(2);
+        }
+    };
+    let bus_status = bus_state.status();
+    let buses_configured = bus_status.onewire.configured
+        || bus_status.i2c.configured
+        || bus_status.spi.configured;
+    set_capability(&mut args, &mut config, "buses", buses_configured);
     // Opt-in application control. Nothing is signalled unless this flag is
     // present; without it the routes stay mounted and return a typed 503.
     let app_control = args.app_control.then(|| {
@@ -3368,6 +3570,7 @@ async fn run() -> std::process::ExitCode {
             .with_backup(backup_service)
             .with_bluetooth(bluetooth_service)
             .with_serial(serial_service.clone())
+            .with_buses(bus_state)
             .with_app_control(app_control);
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with

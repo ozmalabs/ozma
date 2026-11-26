@@ -9,9 +9,11 @@
 //! The implementation is deliberately conservative:
 //!
 //! * The device path is explicit, absolute, and validated before it is opened.
-//!   There is no auto-detection and no probe of unrelated devices.
-//! * Line settings (baud/data bits/parity/stop bits/read timeout) are fixed at
-//!   startup. The provider opens exactly one device and never changes it.
+//!   There is no auto-detection, no probe of unrelated devices, and no fallback
+//!   to a different path.
+//! * Line settings (baud/data bits/parity/stop bits/flow control/read timeout)
+//!   and optional initial DTR/RTS levels are applied on every open. A driver
+//!   that cannot honour flow control or line control returns a typed error.
 //! * Received bytes go into a fixed-size ring buffer. Both the retained buffer
 //!   and every read response are bounded, so a noisy UART cannot grow memory
 //!   without limit.
@@ -20,15 +22,19 @@
 //! * `GET /serial/stream` is an SSE stream over the same bounded buffer. It
 //!   ends on an idle timeout or a disconnected reader, and dropping the client
 //!   response only unsubscribes that client.
+//! * A removal/read error closes the port and retries the same path with a
+//!   bounded exponential backoff. Retained bytes are cleared on reconnect and
+//!   the retry counter only resets after a stable connection.
+//! * `POST /serial/control` is opt-in and can change DTR/RTS only.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Query, State};
@@ -70,6 +76,23 @@ const STREAM_SIGNAL_CAPACITY: usize = 32;
 const READ_CHUNK_BYTES: usize = 4096;
 /// Longest error detail copied into a response.
 const MAX_ERROR_DETAIL: usize = 400;
+/// Default reconnect attempts after a removal/read error.
+pub const DEFAULT_RECONNECT_ATTEMPTS: u32 = 5;
+/// Default first reconnect delay.
+pub const DEFAULT_RECONNECT_MIN_MS: u64 = 1_000;
+/// Default reconnect delay cap.
+pub const DEFAULT_RECONNECT_MAX_MS: u64 = 30_000;
+/// Largest accepted reconnect attempt count.
+pub const MAX_RECONNECT_ATTEMPTS: u32 = 100;
+/// A connection that lasts this long resets the reconnect attempt counter.
+///
+/// Without this a device that opens and immediately fails would reset the
+/// counter every time and produce an unbounded reconnect storm.
+const STABLE_CONNECTION: Duration = Duration::from_secs(5);
+/// Granularity of the interruptible backoff sleep.
+const BACKOFF_POLL: Duration = Duration::from_millis(25);
+/// HARD bound for `POST /serial/control` request bodies.
+const MAX_CONTROL_BODY_BYTES: usize = 1024;
 
 /// Serial parity setting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -118,6 +141,53 @@ impl FromStr for SerialParity {
     }
 }
 
+/// Serial flow-control mode applied when the device is opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SerialFlowControl {
+    /// No hardware or software flow control.
+    #[default]
+    None,
+    /// Hardware RTS/CTS flow control.
+    RtsCts,
+    /// Software XON/XOFF flow control.
+    XonXoff,
+}
+
+impl SerialFlowControl {
+    /// Stable lowercase name used by the CLI, status document, and errors.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::RtsCts => "rtscts",
+            Self::XonXoff => "xonxoff",
+        }
+    }
+
+    fn native(self) -> serialport::FlowControl {
+        match self {
+            Self::None => serialport::FlowControl::None,
+            Self::RtsCts => serialport::FlowControl::Hardware,
+            Self::XonXoff => serialport::FlowControl::Software,
+        }
+    }
+}
+
+impl FromStr for SerialFlowControl {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" => Ok(Self::None),
+            "rtscts" | "rts-cts" | "hardware" | "hw" => Ok(Self::RtsCts),
+            "xonxoff" | "xon-xoff" | "software" | "sw" => Ok(Self::XonXoff),
+            other => Err(format!(
+                "unknown serial flow control {other:?}; expected none, rtscts, or xonxoff"
+            )),
+        }
+    }
+}
+
 /// Serial line settings reported on `GET /serial/status`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct SerialLineSettings {
@@ -138,12 +208,43 @@ impl Default for SerialLineSettings {
     }
 }
 
+/// Bounded reconnect policy after a device removal or read error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SerialReconnectConfig {
+    /// Retries after one failure. Zero disables reconnect entirely.
+    pub max_attempts: u32,
+    /// First retry delay; doubles for each subsequent attempt.
+    pub min_delay: Duration,
+    /// Upper bound for one retry delay.
+    pub max_delay: Duration,
+}
+
+impl Default for SerialReconnectConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_RECONNECT_ATTEMPTS,
+            min_delay: Duration::from_millis(DEFAULT_RECONNECT_MIN_MS),
+            max_delay: Duration::from_millis(DEFAULT_RECONNECT_MAX_MS),
+        }
+    }
+}
+
 /// Validated serial provider configuration.
 #[derive(Clone, Debug)]
 pub struct SerialConfig {
     /// Explicit absolute device path.
     pub device: PathBuf,
     pub line: SerialLineSettings,
+    /// Flow control applied on every open.
+    pub flow_control: SerialFlowControl,
+    /// Initial DTR level requested on open; `None` leaves it untouched.
+    pub initial_dtr: Option<bool>,
+    /// Initial RTS level requested on open; `None` leaves it untouched.
+    pub initial_rts: Option<bool>,
+    /// Opt in to `POST /serial/control` (DTR/RTS only).
+    pub control_enabled: bool,
+    /// Bounded reconnect policy after removal/read error.
+    pub reconnect: SerialReconnectConfig,
     /// Blocking read timeout. It also bounds a stalled write.
     pub read_timeout: Duration,
     /// Fixed receive-buffer capacity.
@@ -174,6 +275,11 @@ impl SerialConfig {
                 parity,
                 stop_bits,
             },
+            flow_control: SerialFlowControl::None,
+            initial_dtr: None,
+            initial_rts: None,
+            control_enabled: false,
+            reconnect: SerialReconnectConfig::default(),
             read_timeout,
             buffer_bytes: DEFAULT_BUFFER_BYTES,
             max_read_bytes: DEFAULT_READ_BYTES,
@@ -228,6 +334,27 @@ impl SerialConfig {
                 detail: format!(
                     "stream idle timeout must be between {MIN_STREAM_IDLE_MS} and {MAX_STREAM_IDLE_MS} ms"
                 ),
+            });
+        }
+        if self.reconnect.max_attempts > MAX_RECONNECT_ATTEMPTS {
+            return Err(SerialError::InvalidConfig {
+                detail: format!(
+                    "reconnect attempts must be between 0 and {MAX_RECONNECT_ATTEMPTS}"
+                ),
+            });
+        }
+        let min_ms = self.reconnect.min_delay.as_millis() as u64;
+        let max_ms = self.reconnect.max_delay.as_millis() as u64;
+        if !(1..=60_000).contains(&min_ms) {
+            return Err(SerialError::InvalidConfig {
+                detail: "reconnect minimum delay must be between 1 and 60000 ms".to_owned(),
+            });
+        }
+        if !(min_ms..=300_000).contains(&max_ms) {
+            return Err(SerialError::InvalidConfig {
+                detail:
+                    "reconnect maximum delay must be at least the minimum and at most 300000 ms"
+                        .to_owned(),
             });
         }
         Ok(())
@@ -294,6 +421,16 @@ pub enum SerialError {
     WriteFailed { detail: String },
     #[error("serial read failed: {detail}")]
     ReadFailed { detail: String },
+    #[error("serial flow control {flow_control} is not supported by {path}")]
+    FlowControlUnsupported { path: String, flow_control: String },
+    #[error("serial line control for {line} is not supported by this device")]
+    LineControlUnsupported { line: String },
+    #[error("serial reconnect failed after {attempts} attempts: {detail}")]
+    ReconnectExhausted { attempts: u32, detail: String },
+    #[error("POST /serial/control is disabled; restart with --serial-control to enable it")]
+    ControlDisabled,
+    #[error("serial control requires exactly one or both of `dtr` and `rts` booleans")]
+    InvalidControl,
     #[error("invalid serial configuration: {detail}")]
     InvalidConfig { detail: String },
 }
@@ -315,6 +452,11 @@ impl SerialError {
             Self::InvalidCursor => "serial.invalid-cursor",
             Self::WriteFailed { .. } => "serial.write-failed",
             Self::ReadFailed { .. } => "serial.read-failed",
+            Self::FlowControlUnsupported { .. } => "serial.flow-control-unsupported",
+            Self::LineControlUnsupported { .. } => "serial.line-control-unsupported",
+            Self::ReconnectExhausted { .. } => "serial.reconnect-exhausted",
+            Self::ControlDisabled => "serial.control-disabled",
+            Self::InvalidControl => "serial.invalid-control",
             Self::InvalidConfig { .. } => "serial.invalid-config",
         }
     }
@@ -325,15 +467,20 @@ impl SerialError {
             Self::NotConfigured | Self::DeviceMissing { .. } | Self::NotConnected => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
-            Self::PermissionDenied { .. } => StatusCode::FORBIDDEN,
+            Self::ReconnectExhausted { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::PermissionDenied { .. } | Self::ControlDisabled => StatusCode::FORBIDDEN,
             Self::DeviceBusy { .. } => StatusCode::CONFLICT,
             Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::WriteFailed { .. } | Self::ReadFailed { .. } => StatusCode::BAD_GATEWAY,
+            Self::FlowControlUnsupported { .. } | Self::LineControlUnsupported { .. } => {
+                StatusCode::NOT_IMPLEMENTED
+            }
             Self::InvalidDevice { .. }
             | Self::InvalidPayload
             | Self::InvalidHex { .. }
             | Self::InvalidLimit { .. }
             | Self::InvalidCursor
+            | Self::InvalidControl
             | Self::InvalidConfig { .. } => StatusCode::BAD_REQUEST,
         }
     }
@@ -348,16 +495,16 @@ impl SerialError {
                 "Use an explicit absolute device path and valid line settings; restart the node after fixing the flags."
             }
             Self::DeviceMissing { .. } => {
-                "Check --serial-device; no serial device is opened or fabricated when the path is absent."
+                "Check --serial-device; reconnect retries the same explicit path, and no other device is opened."
             }
             Self::PermissionDenied { .. } => {
                 "Grant the node user read/write access to the serial device (for example via its group), or choose a different device."
             }
             Self::DeviceBusy { .. } => {
-                "Stop the other process using this UART/USB-serial device, then restart the node."
+                "Stop the other process using this UART/USB-serial device; the node retries the same path on a bounded backoff."
             }
             Self::NotConnected => {
-                "Read GET /serial/status.last_error; reconnect the device and restart the node."
+                "Read GET /serial/status.last_error and reconnect.state; the node retries the configured path on a bounded backoff."
             }
             Self::InvalidPayload | Self::InvalidHex { .. } => {
                 "Send exactly one of {\"text\": \"...\"} or {\"hex\": \"0a0d\"}."
@@ -366,8 +513,21 @@ impl SerialError {
             Self::InvalidLimit { .. } => "Use a bounded max value within the advertised limit.",
             Self::InvalidCursor => "Use the next cursor returned by the previous read.",
             Self::WriteFailed { .. } | Self::ReadFailed { .. } => {
-                "Inspect GET /serial/status.last_error and the node log; reconnect the device if it was removed."
+                "Inspect GET /serial/status.last_error and the node log; the node retries the same path after a bounded backoff."
             }
+            Self::FlowControlUnsupported { .. } => {
+                "Choose --serial-flow-control none, or a device/driver that implements the requested RTS/CTS or XON/XOFF mode."
+            }
+            Self::LineControlUnsupported { .. } => {
+                "Use a device that exposes DTR/RTS modem control, or remove --serial-dtr/--serial-rts and the control request."
+            }
+            Self::ReconnectExhausted { .. } => {
+                "Fix the explicit device path and restart the node, or raise --serial-reconnect-attempts within its advertised bound."
+            }
+            Self::ControlDisabled => {
+                "Restart the node with --serial-control to allow POST /serial/control to change DTR/RTS."
+            }
+            Self::InvalidControl => "Send {\"dtr\": true|false} and/or {\"rts\": true|false}; no other fields are accepted.",
         }
     }
 
@@ -381,6 +541,18 @@ impl SerialError {
             "error": self.to_string(),
             "remediation": self.remediation(),
         })
+    }
+
+    /// True when retrying the same explicit path can plausibly succeed.
+    fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::DeviceMissing { .. }
+                | Self::DeviceBusy { .. }
+                | Self::NotConnected
+                | Self::WriteFailed { .. }
+                | Self::ReadFailed { .. }
+        )
     }
 }
 
@@ -426,6 +598,44 @@ pub struct SerialBufferStatus {
     pub capacity: usize,
 }
 
+/// Modem control-line state. Input pins are `null` when the device or driver
+/// cannot report them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SerialLineStates {
+    /// Last commanded DTR output level, or `null` when never set.
+    pub dtr: Option<bool>,
+    /// Last commanded RTS output level, or `null` when never set.
+    pub rts: Option<bool>,
+    /// Clear To Send input.
+    pub cts: Option<bool>,
+    /// Data Set Ready input.
+    pub dsr: Option<bool>,
+    /// Data Carrier Detect input.
+    pub dcd: Option<bool>,
+    /// Ring Indicator input.
+    pub ri: Option<bool>,
+}
+
+/// Reconnect state included in `GET /serial/status`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SerialReconnectStatus {
+    /// True when a non-zero retry budget is configured and shutdown has not
+    /// stopped the reader.
+    pub enabled: bool,
+    /// Failures since the last stable connection.
+    pub attempt: u32,
+    /// Configured retry budget after one failure.
+    pub max_attempts: u32,
+    /// True while the reader sleeps before the next open attempt.
+    pub backoff: bool,
+    /// Delay of the current/most recent backoff, in milliseconds.
+    pub next_retry_ms: Option<u64>,
+    /// True when the retry budget was exhausted; no further opens happen.
+    pub exhausted: bool,
+    /// Successful opens after the initial attempt (lifetime).
+    pub reconnects: u64,
+}
+
 /// `GET /serial/status` response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SerialStatus {
@@ -436,6 +646,14 @@ pub struct SerialStatus {
     pub state: &'static str,
     pub device: String,
     pub line: SerialLineSettings,
+    /// Flow control applied on every open.
+    pub flow_control: SerialFlowControl,
+    /// True when `POST /serial/control` is enabled.
+    pub control_enabled: bool,
+    /// Current modem control-line levels.
+    pub lines: SerialLineStates,
+    /// Reconnect state and configured retry budget.
+    pub reconnect: SerialReconnectStatus,
     pub read_timeout_ms: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
@@ -488,6 +706,39 @@ pub struct SerialWrite {
     pub encoding: &'static str,
     pub bytes_out: u64,
     pub buffer: SerialBufferStatus,
+}
+
+/// `POST /serial/control` response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SerialControl {
+    pub ok: bool,
+    pub supported: bool,
+    pub configured: bool,
+    pub connected: bool,
+    /// DTR level applied by this request, if requested.
+    pub dtr: Option<bool>,
+    /// RTS level applied by this request, if requested.
+    pub rts: Option<bool>,
+    pub lines: SerialLineStates,
+}
+
+/// Request body for `POST /serial/control`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SerialControlRequest {
+    #[serde(default)]
+    pub dtr: Option<bool>,
+    #[serde(default)]
+    pub rts: Option<bool>,
+}
+
+impl SerialControlRequest {
+    fn changes(&self) -> Result<(Option<bool>, Option<bool>), SerialError> {
+        if self.dtr.is_none() && self.rts.is_none() {
+            return Err(SerialError::InvalidControl);
+        }
+        Ok((self.dtr, self.rts))
+    }
 }
 
 /// Request body for `POST /serial/write`.
@@ -606,6 +857,12 @@ impl SerialBuffer {
         self.data.extend(bytes.iter().copied());
     }
 
+    /// Discard retained data after a reconnect while keeping offsets monotonic.
+    fn reset(&mut self) {
+        self.start += self.data.len() as u64;
+        self.data.clear();
+    }
+
     fn read(&self, since: Option<u64>, max: usize) -> Result<BufferRead, SerialError> {
         let status = self.status();
         let (offset, dropped) = match since {
@@ -639,15 +896,107 @@ impl SerialBuffer {
     }
 }
 
+/// Minimal serial-port surface used by the provider and its fake test backend.
+///
+/// Keeping this narrower than `serialport::SerialPort` makes modem control and
+/// reconnect behaviour testable without hardware while production still uses
+/// the real crate.
+trait SerialPortOps: Send {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()>;
+    fn flush(&mut self) -> io::Result<()>;
+    fn try_clone_box(&self) -> io::Result<Box<dyn SerialPortOps>>;
+    fn set_dtr(&mut self, level: bool) -> Result<(), serialport::Error>;
+    fn set_rts(&mut self, level: bool) -> Result<(), serialport::Error>;
+    fn read_pin(&mut self, pin: SerialPin) -> Result<bool, serialport::Error>;
+    fn clear_buffers(&mut self);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SerialPin {
+    Cts,
+    Dsr,
+    Dcd,
+    Ri,
+}
+
+type OpenFn = dyn Fn(&SerialConfig) -> Result<Box<dyn SerialPortOps>, SerialError> + Send + Sync;
+
+struct RealSerialPort {
+    port: Box<dyn serialport::SerialPort>,
+}
+
+impl SerialPortOps for RealSerialPort {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.port.read(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.port.write_all(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.port.flush()
+    }
+
+    fn try_clone_box(&self) -> io::Result<Box<dyn SerialPortOps>> {
+        self.port
+            .try_clone()
+            .map(|port| Box::new(RealSerialPort { port }) as Box<dyn SerialPortOps>)
+            .map_err(io::Error::from)
+    }
+
+    fn set_dtr(&mut self, level: bool) -> Result<(), serialport::Error> {
+        self.port.write_data_terminal_ready(level)
+    }
+
+    fn set_rts(&mut self, level: bool) -> Result<(), serialport::Error> {
+        self.port.write_request_to_send(level)
+    }
+
+    fn read_pin(&mut self, pin: SerialPin) -> Result<bool, serialport::Error> {
+        match pin {
+            SerialPin::Cts => self.port.read_clear_to_send(),
+            SerialPin::Dsr => self.port.read_data_set_ready(),
+            SerialPin::Dcd => self.port.read_carrier_detect(),
+            SerialPin::Ri => self.port.read_ring_indicator(),
+        }
+    }
+
+    fn clear_buffers(&mut self) {
+        let _ = self.port.clear(serialport::ClearBuffer::All);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DesiredLines {
+    dtr: Option<bool>,
+    rts: Option<bool>,
+}
+
+/// Mutable reconnect state shared by the worker and `GET /serial/status`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReconnectRuntime {
+    attempt: u32,
+    backoff: bool,
+    next_retry_ms: Option<u64>,
+    exhausted: bool,
+}
+
 struct SerialInner {
     config: SerialConfig,
+    opener: Arc<OpenFn>,
     buffer: Mutex<SerialBuffer>,
-    writer: Mutex<Option<Box<dyn serialport::SerialPort>>>,
+    writer: Mutex<Option<Box<dyn SerialPortOps>>>,
+    desired_lines: Mutex<DesiredLines>,
+    reconnect: Mutex<ReconnectRuntime>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     connected: AtomicBool,
     started: AtomicBool,
     shutdown: AtomicBool,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    reconnects: AtomicU64,
     last_error: Mutex<Option<SerialStatusError>>,
     signal: broadcast::Sender<()>,
 }
@@ -661,17 +1010,30 @@ pub struct SerialService {
 impl SerialService {
     /// Build a service. This never opens the device; call [`Self::start`].
     pub fn new(config: SerialConfig) -> Self {
+        Self::build(config, Arc::new(open_real))
+    }
+
+    fn build(config: SerialConfig, opener: Arc<OpenFn>) -> Self {
         let (signal, _) = broadcast::channel(STREAM_SIGNAL_CAPACITY);
+        let desired = DesiredLines {
+            dtr: config.initial_dtr,
+            rts: config.initial_rts,
+        };
         Self {
             inner: Arc::new(SerialInner {
                 buffer: Mutex::new(SerialBuffer::new(config.buffer_bytes)),
                 config,
+                opener,
                 writer: Mutex::new(None),
+                desired_lines: Mutex::new(desired),
+                reconnect: Mutex::new(ReconnectRuntime::default()),
+                worker: Mutex::new(None),
                 connected: AtomicBool::new(false),
                 started: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
                 bytes_in: AtomicU64::new(0),
                 bytes_out: AtomicU64::new(0),
+                reconnects: AtomicU64::new(0),
                 last_error: Mutex::new(None),
                 signal,
             }),
@@ -683,103 +1045,111 @@ impl SerialService {
         &self.inner.config.device
     }
 
+    /// True when `POST /serial/control` was opted into.
+    pub fn control_enabled(&self) -> bool {
+        self.inner.config.control_enabled
+    }
+
     /// Open the configured device once and start the background reader.
     ///
-    /// A failure is retained as `last_error`; the service stays installed so
-    /// `GET /serial/status` can report the typed reason and the other routes
-    /// return `serial.not-connected`.
+    /// A retryable open failure is retained as `last_error`; when reconnect is
+    /// enabled the worker retries the same explicit path on a bounded backoff.
+    /// The service stays installed so `GET /serial/status` can report the typed
+    /// reason and the other routes return `serial.not-connected`.
     pub fn start(&self) -> Result<(), SerialError> {
         if self.inner.started.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        let port = match self.open() {
-            Ok(port) => port,
-            Err(error) => {
-                self.set_error(&error);
-                return Err(error);
-            }
-        };
-        let writer = match port.try_clone() {
-            Ok(writer) => writer,
-            Err(error) => {
-                let error = map_open_error(self.device(), &error);
-                self.set_error(&error);
-                return Err(error);
-            }
-        };
-        *lock(&self.inner.writer) = Some(writer);
-        *lock(&self.inner.last_error) = None;
-        self.inner.connected.store(true, Ordering::SeqCst);
-        let inner = self.inner.clone();
-        std::thread::Builder::new()
-            .name("ozma-serial".to_owned())
-            .spawn(move || read_loop(inner, port))
-            .map_err(|error| {
-                let error = SerialError::ReadFailed {
-                    detail: bounded(&error.to_string()),
-                };
-                self.set_error(&error);
-                self.inner.connected.store(false, Ordering::SeqCst);
-                *lock(&self.inner.writer) = None;
-                error
-            })?;
-        Ok(())
-    }
+        if self.inner.shutdown.load(Ordering::SeqCst) {
+            return Err(SerialError::NotConnected);
+        }
 
-    /// Stop the reader after its current bounded read timeout.
-    pub fn stop(&self) {
-        self.inner.shutdown.store(true, Ordering::SeqCst);
-    }
-
-    fn open(&self) -> Result<Box<dyn serialport::SerialPort>, SerialError> {
-        validate_device_path(self.device())?;
-        match std::fs::metadata(self.device()) {
-            Ok(metadata) if metadata.is_dir() => {
-                return Err(SerialError::InvalidDevice {
-                    reason: "device path is a directory".to_owned(),
-                });
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(SerialError::DeviceMissing {
-                    path: self.device().display().to_string(),
-                });
-            }
+        let mut initial_reader = None;
+        let mut initial_error = None;
+        match (self.inner.opener)(&self.inner.config) {
+            Ok(port) => match install_session(&self.inner, port, false) {
+                Ok(reader) => initial_reader = Some(reader),
+                Err(error) => {
+                    set_error_inner(&self.inner, &error);
+                    initial_error = Some(error);
+                }
+            },
             Err(error) => {
-                return Err(map_io_error(self.device(), &error));
+                set_error_inner(&self.inner, &error);
+                initial_error = Some(error);
             }
         }
-        let line = self.inner.config.line;
-        let data_bits = match line.data_bits {
-            5 => serialport::DataBits::Five,
-            6 => serialport::DataBits::Six,
-            7 => serialport::DataBits::Seven,
-            _ => serialport::DataBits::Eight,
-        };
-        let stop_bits = if line.stop_bits == 2 {
-            serialport::StopBits::Two
-        } else {
-            serialport::StopBits::One
-        };
-        serialport::new(self.device().to_string_lossy(), line.baud_rate)
-            .data_bits(data_bits)
-            .parity(line.parity.native())
-            .stop_bits(stop_bits)
-            .timeout(self.inner.config.read_timeout)
-            .open()
-            .map_err(|error| map_open_error(self.device(), &error))
+
+        let retry = initial_error.as_ref().is_some_and(SerialError::retryable)
+            && self.inner.config.reconnect.max_attempts > 0;
+        let should_spawn = initial_reader.is_some() || retry;
+        if should_spawn {
+            let inner = self.inner.clone();
+            let failed = initial_error.is_some();
+            match std::thread::Builder::new()
+                .name("ozma-serial".to_owned())
+                .spawn(move || serial_worker(inner, initial_reader, failed))
+            {
+                Ok(handle) => *lock(&self.inner.worker) = Some(handle),
+                Err(error) => {
+                    let error = SerialError::ReadFailed {
+                        detail: bounded(&error.to_string()),
+                    };
+                    self.inner.connected.store(false, Ordering::SeqCst);
+                    *lock(&self.inner.writer) = None;
+                    set_error_inner(&self.inner, &error);
+                    return Err(error);
+                }
+            }
+        }
+
+        match initial_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
-    fn set_error(&self, error: &SerialError) {
-        *lock(&self.inner.last_error) = Some(SerialStatusError::from(error));
+    /// Stop the reader promptly and wait for the worker thread to exit.
+    ///
+    /// The backoff sleep is interruptible, so shutdown does not wait for the
+    /// next retry interval. A blocking read is bounded by the configured
+    /// read timeout.
+    pub fn stop(&self) {
+        self.inner.shutdown.store(true, Ordering::SeqCst);
+        let _ = self.inner.signal.send(());
+        if let Some(handle) = lock(&self.inner.worker).take() {
+            let _ = handle.join();
+        }
+        self.inner.connected.store(false, Ordering::SeqCst);
+        *lock(&self.inner.writer) = None;
+        let mut reconnect = lock(&self.inner.reconnect);
+        reconnect.backoff = false;
+        reconnect.next_retry_ms = None;
     }
 
     /// Current device/line/buffer state.
     pub fn status(&self) -> SerialStatus {
         let connected = self.inner.connected.load(Ordering::SeqCst);
         let last_error = lock(&self.inner.last_error).clone();
+        let runtime = *lock(&self.inner.reconnect);
+        let reconnect = SerialReconnectStatus {
+            enabled: self.inner.config.reconnect.max_attempts > 0
+                && !self.inner.shutdown.load(Ordering::SeqCst),
+            attempt: runtime.attempt,
+            max_attempts: self.inner.config.reconnect.max_attempts,
+            backoff: runtime.backoff,
+            next_retry_ms: runtime.next_retry_ms,
+            exhausted: runtime.exhausted,
+            reconnects: self.inner.reconnects.load(Ordering::SeqCst),
+        };
         let state = if connected {
             "connected"
+        } else if self.inner.shutdown.load(Ordering::SeqCst) {
+            "stopped"
+        } else if reconnect.exhausted {
+            "failed"
+        } else if reconnect.attempt > 0 || reconnect.backoff {
+            "reconnecting"
         } else if last_error.is_some() {
             "failed"
         } else {
@@ -793,6 +1163,10 @@ impl SerialService {
             state,
             device: self.device().display().to_string(),
             line: self.inner.config.line,
+            flow_control: self.inner.config.flow_control,
+            control_enabled: self.inner.config.control_enabled,
+            lines: self.line_states(),
+            reconnect,
             read_timeout_ms: self.inner.config.read_timeout.as_millis() as u64,
             bytes_in: self.inner.bytes_in.load(Ordering::SeqCst),
             bytes_out: self.inner.bytes_out.load(Ordering::SeqCst),
@@ -805,6 +1179,24 @@ impl SerialService {
             },
             last_error,
         }
+    }
+
+    /// Current modem control-line levels. DTR/RTS report the last commanded
+    /// output level; input pins are read from the open device when possible.
+    fn line_states(&self) -> SerialLineStates {
+        let desired = *lock(&self.inner.desired_lines);
+        let mut lines = SerialLineStates {
+            dtr: desired.dtr,
+            rts: desired.rts,
+            ..SerialLineStates::default()
+        };
+        if let Some(port) = lock(&self.inner.writer).as_mut() {
+            lines.cts = port.read_pin(SerialPin::Cts).ok();
+            lines.dsr = port.read_pin(SerialPin::Dsr).ok();
+            lines.dcd = port.read_pin(SerialPin::Dcd).ok();
+            lines.ri = port.read_pin(SerialPin::Ri).ok();
+        }
+        lines
     }
 
     /// Bounded buffered read. Reading is allowed after a disconnect so an
@@ -875,6 +1267,58 @@ impl SerialService {
         })
     }
 
+    /// Set DTR and/or RTS on the open device. Opt-in via `--serial-control`.
+    pub fn control(&self, request: SerialControlRequest) -> Result<SerialControl, SerialError> {
+        if !self.inner.config.control_enabled {
+            return Err(SerialError::ControlDisabled);
+        }
+        let (dtr, rts) = request.changes()?;
+        if !self.inner.connected.load(Ordering::SeqCst) {
+            return Err(SerialError::NotConnected);
+        }
+        let mut applied = DesiredLines::default();
+        let mut failure = None;
+        {
+            let mut writer = lock(&self.inner.writer);
+            let port = writer.as_mut().ok_or(SerialError::NotConnected)?;
+            if let Some(level) = dtr {
+                match port.set_dtr(level) {
+                    Ok(()) => applied.dtr = Some(level),
+                    Err(error) => failure = Some(map_line_error("DTR", &error)),
+                }
+            }
+            if failure.is_none() {
+                if let Some(level) = rts {
+                    match port.set_rts(level) {
+                        Ok(()) => applied.rts = Some(level),
+                        Err(error) => failure = Some(map_line_error("RTS", &error)),
+                    }
+                }
+            }
+        }
+        {
+            let mut desired = lock(&self.inner.desired_lines);
+            if applied.dtr.is_some() {
+                desired.dtr = applied.dtr;
+            }
+            if applied.rts.is_some() {
+                desired.rts = applied.rts;
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(SerialControl {
+            ok: true,
+            supported: true,
+            configured: true,
+            connected: true,
+            dtr,
+            rts,
+            lines: self.line_states(),
+        })
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<()> {
         self.inner.signal.subscribe()
     }
@@ -902,18 +1346,146 @@ impl SerialService {
         service.inner.connected.store(connected, Ordering::SeqCst);
         service
     }
+
+    #[cfg(test)]
+    fn with_opener(config: SerialConfig, opener: Arc<OpenFn>) -> Self {
+        Self::build(config, opener)
+    }
 }
 
-fn read_loop(inner: Arc<SerialInner>, mut port: Box<dyn serialport::SerialPort>) {
+fn install_session(
+    inner: &SerialInner,
+    mut port: Box<dyn SerialPortOps>,
+    reconnect: bool,
+) -> Result<Box<dyn SerialPortOps>, SerialError> {
+    port.clear_buffers();
+    let desired = *lock(&inner.desired_lines);
+    apply_serial_lines(port.as_mut(), desired.dtr, desired.rts)?;
+    let writer = port
+        .try_clone_box()
+        .map_err(|error| SerialError::ReadFailed {
+            detail: bounded(&error.to_string()),
+        })?;
+    *lock(&inner.writer) = Some(writer);
+    *lock(&inner.last_error) = None;
+    inner.connected.store(true, Ordering::SeqCst);
+    {
+        let mut runtime = lock(&inner.reconnect);
+        runtime.attempt = 0;
+        runtime.backoff = false;
+        runtime.next_retry_ms = None;
+        runtime.exhausted = false;
+    }
+    if reconnect {
+        lock(&inner.buffer).reset();
+        inner.reconnects.fetch_add(1, Ordering::SeqCst);
+    }
+    let _ = inner.signal.send(());
+    Ok(port)
+}
+
+fn serial_worker(
+    inner: Arc<SerialInner>,
+    initial: Option<Box<dyn SerialPortOps>>,
+    initial_failed: bool,
+) {
+    let mut reader = initial;
+    let mut failures = u32::from(initial_failed);
+    loop {
+        if inner.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        let mut port = match reader.take() {
+            Some(port) => port,
+            None => {
+                let max_attempts = inner.config.reconnect.max_attempts;
+                if failures > max_attempts {
+                    mark_exhausted(&inner, failures - 1, max_attempts);
+                    break;
+                }
+                let delay = backoff_delay(&inner.config.reconnect, failures.max(1));
+                {
+                    let mut runtime = lock(&inner.reconnect);
+                    runtime.attempt = failures;
+                    runtime.backoff = true;
+                    runtime.next_retry_ms = Some(delay.as_millis() as u64);
+                }
+                let _ = inner.signal.send(());
+                let woke = sleep_interruptible(&inner, delay);
+                {
+                    let mut runtime = lock(&inner.reconnect);
+                    runtime.backoff = false;
+                    runtime.next_retry_ms = None;
+                }
+                let _ = inner.signal.send(());
+                if !woke || inner.shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                match (inner.opener)(&inner.config) {
+                    Ok(port) => match install_session(&inner, port, true) {
+                        Ok(port) => {
+                            failures = 0;
+                            port
+                        }
+                        Err(error) => {
+                            set_error_inner(&inner, &error);
+                            if !error.retryable() {
+                                mark_stopped(&inner);
+                                break;
+                            }
+                            failures += 1;
+                            continue;
+                        }
+                    },
+                    Err(error) => {
+                        set_error_inner(&inner, &error);
+                        if !error.retryable() {
+                            mark_stopped(&inner);
+                            break;
+                        }
+                        failures += 1;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let started = Instant::now();
+        let error = read_until_error(&inner, port.as_mut());
+        inner.connected.store(false, Ordering::SeqCst);
+        *lock(&inner.writer) = None;
+        let _ = inner.signal.send(());
+        if inner.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        if let Some(error) = error {
+            set_error_inner(&inner, &error);
+        }
+        if started.elapsed() >= STABLE_CONNECTION {
+            failures = 0;
+        }
+        failures += 1;
+    }
+
+    {
+        let mut runtime = lock(&inner.reconnect);
+        runtime.backoff = false;
+        runtime.next_retry_ms = None;
+    }
+    let _ = inner.signal.send(());
+}
+
+fn read_until_error(inner: &SerialInner, port: &mut dyn SerialPortOps) -> Option<SerialError> {
     let mut chunk = vec![0u8; READ_CHUNK_BYTES];
-    while !inner.shutdown.load(Ordering::SeqCst) {
+    loop {
+        if inner.shutdown.load(Ordering::SeqCst) {
+            return None;
+        }
         match port.read(&mut chunk) {
             Ok(0) => {
-                *lock(&inner.last_error) =
-                    Some(SerialStatusError::from(&SerialError::ReadFailed {
-                        detail: "device returned end-of-file".to_owned(),
-                    }));
-                break;
+                return Some(SerialError::ReadFailed {
+                    detail: "device returned end-of-file".to_owned(),
+                })
             }
             Ok(read) => {
                 lock(&inner.buffer).push(&chunk[..read]);
@@ -923,22 +1495,149 @@ fn read_loop(inner: Arc<SerialInner>, mut port: Box<dyn serialport::SerialPort>)
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::Interrupted
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
                 ) => {}
             Err(error) => {
-                *lock(&inner.last_error) =
-                    Some(SerialStatusError::from(&SerialError::ReadFailed {
-                        detail: bounded(&error.to_string()),
-                    }));
-                break;
+                return Some(SerialError::ReadFailed {
+                    detail: bounded(&error.to_string()),
+                })
             }
         }
     }
-    inner.connected.store(false, Ordering::SeqCst);
-    *lock(&inner.writer) = None;
+}
+
+fn backoff_delay(policy: &SerialReconnectConfig, attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(31);
+    let factor = 1u64 << exponent;
+    let min_ms = policy.min_delay.as_millis() as u64;
+    let max_ms = policy.max_delay.as_millis() as u64;
+    Duration::from_millis(min_ms.saturating_mul(factor).min(max_ms))
+}
+
+fn sleep_interruptible(inner: &SerialInner, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        if inner.shutdown.load(Ordering::SeqCst) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        std::thread::sleep(remaining.min(BACKOFF_POLL));
+    }
+}
+
+fn mark_exhausted(inner: &SerialInner, attempts: u32, max_attempts: u32) {
+    let error = SerialError::ReconnectExhausted {
+        attempts: attempts.max(max_attempts),
+        detail: "no further open attempts are scheduled".to_owned(),
+    };
+    set_error_inner(inner, &error);
+    let mut runtime = lock(&inner.reconnect);
+    runtime.attempt = attempts.max(max_attempts);
+    runtime.backoff = false;
+    runtime.next_retry_ms = None;
+    runtime.exhausted = true;
+    drop(runtime);
     let _ = inner.signal.send(());
+}
+
+fn mark_stopped(inner: &SerialInner) {
+    let mut runtime = lock(&inner.reconnect);
+    runtime.backoff = false;
+    runtime.next_retry_ms = None;
+    runtime.exhausted = true;
+    drop(runtime);
+    let _ = inner.signal.send(());
+}
+
+fn set_error_inner(inner: &SerialInner, error: &SerialError) {
+    *lock(&inner.last_error) = Some(SerialStatusError::from(error));
+}
+
+fn apply_serial_lines(
+    port: &mut dyn SerialPortOps,
+    dtr: Option<bool>,
+    rts: Option<bool>,
+) -> Result<(), SerialError> {
+    if let Some(level) = dtr {
+        port.set_dtr(level)
+            .map_err(|error| map_line_error("DTR", &error))?;
+    }
+    if let Some(level) = rts {
+        port.set_rts(level)
+            .map_err(|error| map_line_error("RTS", &error))?;
+    }
+    Ok(())
+}
+
+fn map_line_error(line: &str, error: &serialport::Error) -> SerialError {
+    match error.kind {
+        serialport::ErrorKind::NoDevice => SerialError::NotConnected,
+        _ => SerialError::LineControlUnsupported {
+            line: line.to_owned(),
+        },
+    }
+}
+
+fn open_real(config: &SerialConfig) -> Result<Box<dyn SerialPortOps>, SerialError> {
+    let device = config.device.as_path();
+    validate_device_path(device)?;
+    match std::fs::metadata(device) {
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(SerialError::InvalidDevice {
+                reason: "device path is a directory".to_owned(),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(SerialError::DeviceMissing {
+                path: device.display().to_string(),
+            });
+        }
+        Err(error) => {
+            return Err(map_io_error(device, &error));
+        }
+    }
+    let line = config.line;
+    let data_bits = match line.data_bits {
+        5 => serialport::DataBits::Five,
+        6 => serialport::DataBits::Six,
+        7 => serialport::DataBits::Seven,
+        _ => serialport::DataBits::Eight,
+    };
+    let stop_bits = if line.stop_bits == 2 {
+        serialport::StopBits::Two
+    } else {
+        serialport::StopBits::One
+    };
+    let port = serialport::new(device.to_string_lossy(), line.baud_rate)
+        .data_bits(data_bits)
+        .parity(line.parity.native())
+        .stop_bits(stop_bits)
+        .flow_control(config.flow_control.native())
+        .timeout(config.read_timeout)
+        .open()
+        .map_err(|error| map_open_error_with_flow(device, config.flow_control, &error))?;
+
+    // Verify the driver actually accepted the requested mode. A driver may
+    // silently ignore a flag it cannot implement.
+    if config.flow_control != SerialFlowControl::None {
+        match port.flow_control() {
+            Ok(actual) if actual == config.flow_control.native() => {}
+            _ => {
+                return Err(SerialError::FlowControlUnsupported {
+                    path: device.display().to_string(),
+                    flow_control: config.flow_control.as_str().to_owned(),
+                })
+            }
+        }
+    }
+    let _ = port.clear(serialport::ClearBuffer::All);
+    Ok(Box::new(RealSerialPort { port }))
 }
 
 fn map_open_error(path: &Path, error: &serialport::Error) -> SerialError {
@@ -960,6 +1659,27 @@ fn map_open_error(path: &Path, error: &serialport::Error) -> SerialError {
             detail: bounded(&error.description),
         },
     }
+}
+
+fn map_open_error_with_flow(
+    path: &Path,
+    flow_control: SerialFlowControl,
+    error: &serialport::Error,
+) -> SerialError {
+    if flow_control != SerialFlowControl::None
+        && matches!(
+            error.kind,
+            serialport::ErrorKind::InvalidInput
+                | serialport::ErrorKind::Io(io::ErrorKind::InvalidInput)
+                | serialport::ErrorKind::Io(io::ErrorKind::Unsupported)
+        )
+    {
+        return SerialError::FlowControlUnsupported {
+            path: path.display().to_string(),
+            flow_control: flow_control.as_str().to_owned(),
+        };
+    }
+    map_open_error(path, error)
 }
 
 fn map_io_error(path: &Path, error: &std::io::Error) -> SerialError {
@@ -1026,6 +1746,11 @@ pub fn router(service: Option<SerialService>) -> Router {
         .route("/serial/write", post(write_handler))
         .route("/serial/read", get(read_handler))
         .route("/serial/stream", get(stream_handler))
+        .route(
+            "/serial/control",
+            post(control_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_CONTROL_BODY_BYTES)),
+        )
         .with_state(SerialRouteState { service })
 }
 
@@ -1072,6 +1797,40 @@ async fn write_handler(
     let result = tokio::task::spawn_blocking(move || service.write(request)).await;
     match result {
         Ok(Ok(write)) => match serde_json::to_value(write) {
+            Ok(body) => json_no_store(StatusCode::OK, body),
+            Err(_) => SerialError::WriteFailed {
+                detail: "could not serialize response".to_owned(),
+            }
+            .into_response(),
+        },
+        Ok(Err(error)) => error.into_response(),
+        Err(error) => SerialError::WriteFailed {
+            detail: bounded(&error.to_string()),
+        }
+        .into_response(),
+    }
+}
+
+async fn control_handler(
+    State(state): State<SerialRouteState>,
+    body: Result<Json<SerialControlRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Some(service) = state.service else {
+        return not_configured();
+    };
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return SerialError::PayloadTooLarge {
+                max: MAX_CONTROL_BODY_BYTES,
+            }
+            .into_response()
+        }
+        Err(_) => return SerialError::InvalidControl.into_response(),
+    };
+    let result = tokio::task::spawn_blocking(move || service.control(request)).await;
+    match result {
+        Ok(Ok(control)) => match serde_json::to_value(control) {
             Ok(body) => json_no_store(StatusCode::OK, body),
             Err(_) => SerialError::WriteFailed {
                 detail: "could not serialize response".to_owned(),
@@ -1252,6 +2011,8 @@ mod tests {
         .expect("valid test config");
         config.buffer_bytes = 64 * 1024;
         config.stream_idle = Duration::from_millis(400);
+        // Most tests exercise a single open; reconnect-specific tests opt in.
+        config.reconnect.max_attempts = 0;
         config
     }
 
@@ -1294,6 +2055,198 @@ mod tests {
         serde_json::from_slice(bytes).expect("JSON body")
     }
 
+    #[derive(Clone, Copy, Debug, Default)]
+    enum FakeEnd {
+        #[default]
+        Block,
+        Error,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FakePortState {
+        reads: VecDeque<Vec<u8>>,
+        end: FakeEnd,
+        dtr: Option<bool>,
+        rts: Option<bool>,
+        cts: Option<bool>,
+        dsr: Option<bool>,
+        dcd: Option<bool>,
+        ri: Option<bool>,
+        reject_dtr: bool,
+        reject_rts: bool,
+        written: Vec<u8>,
+        clears: u32,
+    }
+
+    #[derive(Clone)]
+    struct FakePort {
+        state: Arc<Mutex<FakePortState>>,
+    }
+
+    impl SerialPortOps for FakePort {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let mut state = lock(&self.state);
+            if let Some(chunk) = state.reads.pop_front() {
+                let take = chunk.len().min(buf.len());
+                buf[..take].copy_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    state.reads.push_front(chunk[take..].to_vec());
+                }
+                return Ok(take);
+            }
+            let end = state.end;
+            drop(state);
+            match end {
+                FakeEnd::Block => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "fake idle"))
+                }
+                FakeEnd::Error => Err(io::Error::new(io::ErrorKind::BrokenPipe, "fake removal")),
+            }
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            lock(&self.state).written.extend_from_slice(buf);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn try_clone_box(&self) -> io::Result<Box<dyn SerialPortOps>> {
+            Ok(Box::new(Self {
+                state: self.state.clone(),
+            }))
+        }
+
+        fn set_dtr(&mut self, level: bool) -> Result<(), serialport::Error> {
+            let mut state = lock(&self.state);
+            if state.reject_dtr {
+                return Err(serialport::Error::new(
+                    serialport::ErrorKind::InvalidInput,
+                    "fake DTR unsupported",
+                ));
+            }
+            state.dtr = Some(level);
+            Ok(())
+        }
+
+        fn set_rts(&mut self, level: bool) -> Result<(), serialport::Error> {
+            let mut state = lock(&self.state);
+            if state.reject_rts {
+                return Err(serialport::Error::new(
+                    serialport::ErrorKind::InvalidInput,
+                    "fake RTS unsupported",
+                ));
+            }
+            state.rts = Some(level);
+            Ok(())
+        }
+
+        fn read_pin(&mut self, pin: SerialPin) -> Result<bool, serialport::Error> {
+            let state = lock(&self.state);
+            let value = match pin {
+                SerialPin::Cts => state.cts,
+                SerialPin::Dsr => state.dsr,
+                SerialPin::Dcd => state.dcd,
+                SerialPin::Ri => state.ri,
+            };
+            value.ok_or_else(|| {
+                serialport::Error::new(serialport::ErrorKind::InvalidInput, "fake pin unavailable")
+            })
+        }
+
+        fn clear_buffers(&mut self) {
+            lock(&self.state).clears += 1;
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeOpen {
+        path: PathBuf,
+        flow_control: SerialFlowControl,
+    }
+
+    #[derive(Clone)]
+    struct FakeSpec {
+        error: Option<SerialError>,
+        state: FakePortState,
+    }
+
+    impl FakeSpec {
+        fn ok(state: FakePortState) -> Self {
+            Self { error: None, state }
+        }
+
+        fn error(error: SerialError) -> Self {
+            Self {
+                error: Some(error),
+                state: FakePortState::default(),
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeFactory {
+        inner: Arc<Mutex<FakeFactoryInner>>,
+    }
+
+    #[derive(Default)]
+    struct FakeFactoryInner {
+        specs: VecDeque<FakeSpec>,
+        default: Option<FakeSpec>,
+        opens: Vec<FakeOpen>,
+        ports: Vec<Arc<Mutex<FakePortState>>>,
+    }
+
+    impl FakeFactory {
+        fn new(specs: Vec<FakeSpec>, default: Option<FakeSpec>) -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(FakeFactoryInner {
+                    specs: specs.into(),
+                    default,
+                    ..FakeFactoryInner::default()
+                })),
+            }
+        }
+
+        fn opener(&self) -> Arc<OpenFn> {
+            let factory = self.clone();
+            Arc::new(move |config: &SerialConfig| {
+                let mut inner = lock(&factory.inner);
+                let spec = inner
+                    .specs
+                    .pop_front()
+                    .or_else(|| inner.default.clone())
+                    .unwrap_or_else(|| FakeSpec::ok(FakePortState::default()));
+                inner.opens.push(FakeOpen {
+                    path: config.device.clone(),
+                    flow_control: config.flow_control,
+                });
+                if let Some(error) = spec.error {
+                    return Err(error);
+                }
+                let state = Arc::new(Mutex::new(spec.state));
+                inner.ports.push(state.clone());
+                Ok(Box::new(FakePort { state }) as Box<dyn SerialPortOps>)
+            })
+        }
+
+        fn opens(&self) -> Vec<FakeOpen> {
+            lock(&self.inner).opens.clone()
+        }
+
+        fn open_count(&self) -> usize {
+            lock(&self.inner).opens.len()
+        }
+
+        fn port(&self, index: usize) -> Option<FakePortState> {
+            let inner = lock(&self.inner);
+            inner.ports.get(index).map(|state| lock(state).clone())
+        }
+    }
+
     #[test]
     fn device_and_line_settings_are_validated_before_open() {
         let relative = SerialConfig::new(
@@ -1334,6 +2287,357 @@ mod tests {
             "ODD".parse::<SerialParity>().unwrap(),
             SerialParity::Odd,
             "parity parsing is case-insensitive"
+        );
+        assert_eq!(
+            "RTSCTS".parse::<SerialFlowControl>().unwrap(),
+            SerialFlowControl::RtsCts
+        );
+        assert_eq!(
+            "software".parse::<SerialFlowControl>().unwrap(),
+            SerialFlowControl::XonXoff
+        );
+        assert!(
+            "bad".parse::<SerialFlowControl>().is_err(),
+            "unknown flow control is rejected"
+        );
+    }
+
+    #[test]
+    fn reconnect_policy_is_validated_and_backoff_is_capped() {
+        let policy = SerialReconnectConfig::default();
+        assert_eq!(policy.max_attempts, 5);
+        assert_eq!(policy.min_delay, Duration::from_secs(1));
+        assert_eq!(policy.max_delay, Duration::from_secs(30));
+        let delays: Vec<u64> = (1..=6)
+            .map(|attempt| backoff_delay(&policy, attempt).as_millis() as u64)
+            .collect();
+        assert_eq!(delays, vec![1_000, 2_000, 4_000, 8_000, 16_000, 30_000]);
+
+        let mut config = test_config("/dev/fake-serial");
+        config.reconnect.max_attempts = MAX_RECONNECT_ATTEMPTS + 1;
+        assert_eq!(
+            config.validate().unwrap_err().code(),
+            "serial.invalid-config"
+        );
+
+        let mut config = test_config("/dev/fake-serial");
+        config.reconnect.min_delay = Duration::ZERO;
+        assert_eq!(
+            config.validate().unwrap_err().code(),
+            "serial.invalid-config"
+        );
+
+        let mut config = test_config("/dev/fake-serial");
+        config.reconnect.min_delay = Duration::from_secs(2);
+        config.reconnect.max_delay = Duration::from_secs(1);
+        assert_eq!(
+            config.validate().unwrap_err().code(),
+            "serial.invalid-config"
+        );
+    }
+
+    #[test]
+    fn flow_control_initial_lines_and_status_are_reported() {
+        let factory = FakeFactory::new(
+            vec![FakeSpec::ok(FakePortState {
+                cts: Some(true),
+                dsr: Some(false),
+                dcd: Some(true),
+                ri: Some(false),
+                ..FakePortState::default()
+            })],
+            None,
+        );
+        let mut config = test_config("/dev/fake-serial");
+        config.flow_control = SerialFlowControl::RtsCts;
+        config.initial_dtr = Some(true);
+        config.initial_rts = Some(false);
+        let service = SerialService::with_opener(config, factory.opener());
+        service.start().expect("fake open");
+        assert!(wait_for(Duration::from_secs(1), || service
+            .status()
+            .connected));
+
+        let status = service.status();
+        assert_eq!(status.flow_control, SerialFlowControl::RtsCts);
+        assert_eq!(status.lines.dtr, Some(true));
+        assert_eq!(status.lines.rts, Some(false));
+        assert_eq!(status.lines.cts, Some(true));
+        assert_eq!(status.lines.dsr, Some(false));
+        assert_eq!(status.lines.dcd, Some(true));
+        assert_eq!(status.lines.ri, Some(false));
+        assert!(!status.control_enabled);
+        assert_eq!(status.reconnect.max_attempts, 0);
+
+        let opens = factory.opens();
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].path, PathBuf::from("/dev/fake-serial"));
+        assert_eq!(opens[0].flow_control, SerialFlowControl::RtsCts);
+        let port = factory.port(0).expect("fake port state");
+        assert_eq!(port.dtr, Some(true));
+        assert_eq!(port.rts, Some(false));
+        assert_eq!(port.clears, 1, "kernel buffers are cleared on open");
+        service.stop();
+    }
+
+    #[test]
+    fn unsupported_flow_control_and_initial_line_are_typed() {
+        let factory = FakeFactory::new(
+            vec![FakeSpec::error(SerialError::FlowControlUnsupported {
+                path: "/dev/fake-serial".to_owned(),
+                flow_control: "rtscts".to_owned(),
+            })],
+            None,
+        );
+        let mut config = test_config("/dev/fake-serial");
+        config.flow_control = SerialFlowControl::RtsCts;
+        let service = SerialService::with_opener(config, factory.opener());
+        assert_eq!(
+            service.start().unwrap_err().code(),
+            "serial.flow-control-unsupported"
+        );
+        assert_eq!(
+            service.status().last_error.unwrap().code,
+            "serial.flow-control-unsupported"
+        );
+        service.stop();
+
+        let factory = FakeFactory::new(
+            vec![FakeSpec::ok(FakePortState {
+                reject_dtr: true,
+                ..FakePortState::default()
+            })],
+            None,
+        );
+        let mut config = test_config("/dev/fake-serial");
+        config.initial_dtr = Some(true);
+        let service = SerialService::with_opener(config, factory.opener());
+        assert_eq!(
+            service.start().unwrap_err().code(),
+            "serial.line-control-unsupported"
+        );
+        service.stop();
+    }
+
+    #[tokio::test]
+    async fn control_endpoint_is_opt_in_and_bounded() {
+        let factory = FakeFactory::new(vec![FakeSpec::ok(FakePortState::default())], None);
+        let config = test_config("/dev/fake-serial");
+        let disabled = SerialService::with_opener(config, factory.opener());
+        disabled.start().unwrap();
+        let app = router(Some(disabled.clone()));
+        let (status, body) = post(&app, "/serial/control", json!({"dtr": true})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body_json(&body)["code"], "serial.control-disabled");
+        disabled.stop();
+
+        let mut config = test_config("/dev/fake-serial");
+        config.control_enabled = true;
+        let service = SerialService::with_opener(config, factory.opener());
+        service.start().unwrap();
+        let app = router(Some(service.clone()));
+
+        let (status, body) = post(&app, "/serial/control", json!({"dtr": true})).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let control = body_json(&body);
+        assert_eq!(control["dtr"], true);
+        assert_eq!(control["lines"]["dtr"], true);
+        assert_eq!(factory.port(1).unwrap().dtr, Some(true));
+
+        let (status, _) = post(&app, "/serial/control", json!({"rts": false})).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = post(&app, "/serial/control", json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(&body)["code"], "serial.invalid-control");
+
+        let (status, body) = post(
+            &app,
+            "/serial/control",
+            json!({"dtr": true, "other": "nope"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(&body)["code"], "serial.invalid-control");
+
+        let (status, _) = post(
+            &app,
+            "/serial/control",
+            json!({"dtr": true, "padding": "x".repeat(2000)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        let (status, body) = post(&app, "/serial/control", json!({"dtr": false})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body_json(&body)["lines"]["dtr"], false);
+        service.stop();
+
+        // Enabled but the fake driver rejects DTR: typed 501, no fabricated
+        // success and no state change.
+        let factory = FakeFactory::new(
+            vec![FakeSpec::ok(FakePortState {
+                reject_dtr: true,
+                ..FakePortState::default()
+            })],
+            None,
+        );
+        let mut config = test_config("/dev/fake-serial");
+        config.control_enabled = true;
+        let service = SerialService::with_opener(config, factory.opener());
+        service.start().unwrap();
+        let app = router(Some(service.clone()));
+        let (status, body) = post(&app, "/serial/control", json!({"dtr": true})).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body_json(&body)["code"], "serial.line-control-unsupported");
+        assert_eq!(service.status().lines.dtr, None);
+        service.stop();
+
+        // Enabled but not connected: typed 503 rather than a fake pin change.
+        let mut config = test_config("/dev/fake-serial");
+        config.control_enabled = true;
+        let service = SerialService::with_opener(config, factory.opener());
+        let app = router(Some(service.clone()));
+        let (status, body) = post(&app, "/serial/control", json!({"dtr": true})).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(&body)["code"], "serial.not-connected");
+        service.stop();
+    }
+
+    #[test]
+    fn reconnect_backoff_reopens_same_path_and_resets_buffer() {
+        let factory = FakeFactory::new(
+            vec![
+                FakeSpec::ok(FakePortState {
+                    reads: VecDeque::from([b"boot-ok\n".to_vec()]),
+                    end: FakeEnd::Error,
+                    ..FakePortState::default()
+                }),
+                FakeSpec::ok(FakePortState {
+                    end: FakeEnd::Block,
+                    ..FakePortState::default()
+                }),
+            ],
+            None,
+        );
+        let mut config = test_config("/dev/fake-serial");
+        config.reconnect = SerialReconnectConfig {
+            max_attempts: 5,
+            min_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(40),
+        };
+        let service = SerialService::with_opener(config, factory.opener());
+        service.start().expect("initial fake open");
+        assert!(
+            wait_for(Duration::from_secs(2), || {
+                let status = service.status();
+                status.connected && status.reconnect.reconnects >= 1
+            }),
+            "worker should reopen the same path after the read error"
+        );
+
+        let status = service.status();
+        assert_eq!(status.state, "connected");
+        assert_eq!(status.reconnect.attempt, 0);
+        assert_eq!(status.reconnect.max_attempts, 5);
+        assert!(!status.reconnect.backoff);
+        assert!(!status.reconnect.exhausted);
+        assert_eq!(status.buffer.bytes, 0, "reconnect clears retained bytes");
+        assert!(status.last_error.is_none());
+
+        let opens = factory.opens();
+        assert_eq!(opens.len(), 2);
+        assert!(opens
+            .iter()
+            .all(|open| open.path == PathBuf::from("/dev/fake-serial")));
+        assert_eq!(status.bytes_in, 8, "lifetime counter survives reconnect");
+        service.stop();
+    }
+
+    #[test]
+    fn reconnect_cap_stops_and_does_not_storm() {
+        let factory = FakeFactory::new(
+            Vec::new(),
+            Some(FakeSpec::error(SerialError::DeviceMissing {
+                path: "/dev/fake-serial".to_owned(),
+            })),
+        );
+        let mut config = test_config("/dev/fake-serial");
+        config.reconnect = SerialReconnectConfig {
+            max_attempts: 2,
+            min_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(10),
+        };
+        let service = SerialService::with_opener(config, factory.opener());
+        assert_eq!(service.start().unwrap_err().code(), "serial.device-missing");
+        assert!(
+            wait_for(Duration::from_secs(2), || service
+                .status()
+                .reconnect
+                .exhausted),
+            "retry budget should be exhausted"
+        );
+        let status = service.status();
+        assert_eq!(status.state, "failed");
+        assert_eq!(status.reconnect.max_attempts, 2);
+        assert_eq!(status.reconnect.attempt, 2);
+        assert_eq!(
+            status.last_error.unwrap().code,
+            "serial.reconnect-exhausted"
+        );
+        assert_eq!(
+            factory.open_count(),
+            3,
+            "one initial open plus exactly two retries"
+        );
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            factory.open_count(),
+            3,
+            "no reconnect storm after exhaustion"
+        );
+        service.stop();
+    }
+
+    #[test]
+    fn stop_during_backoff_is_prompt_and_leaves_no_worker() {
+        let factory = FakeFactory::new(
+            Vec::new(),
+            Some(FakeSpec::error(SerialError::DeviceMissing {
+                path: "/dev/fake-serial".to_owned(),
+            })),
+        );
+        let mut config = test_config("/dev/fake-serial");
+        config.reconnect = SerialReconnectConfig {
+            max_attempts: 5,
+            min_delay: Duration::from_secs(60),
+            max_delay: Duration::from_secs(60),
+        };
+        let service = SerialService::with_opener(config, factory.opener());
+        assert!(service.start().is_err());
+        assert!(
+            wait_for(Duration::from_secs(1), || service
+                .status()
+                .reconnect
+                .backoff),
+            "worker should be sleeping in backoff"
+        );
+        let started = Instant::now();
+        service.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stop must interrupt the backoff sleep"
+        );
+        let status = service.status();
+        assert_eq!(status.state, "stopped");
+        assert!(!status.reconnect.backoff);
+        assert_eq!(status.reconnect.next_retry_ms, None);
+        assert_eq!(factory.open_count(), 1);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            factory.open_count(),
+            1,
+            "stopped worker must not reopen the device"
         );
     }
 
@@ -1462,6 +2766,7 @@ mod tests {
             ("POST", "/serial/write"),
             ("GET", "/serial/read"),
             ("GET", "/serial/stream"),
+            ("POST", "/serial/control"),
         ] {
             let response = app
                 .clone()
@@ -1577,6 +2882,67 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+    }
+
+    struct SocatAt {
+        child: Child,
+        left: PathBuf,
+        right: PathBuf,
+    }
+
+    impl SocatAt {
+        fn spawn(left: &Path, right: &Path) -> Option<Self> {
+            let _ = std::fs::remove_file(left);
+            let _ = std::fs::remove_file(right);
+            let child = Command::new("socat")
+                .arg("-d")
+                .arg("-d")
+                .arg(format!("pty,raw,echo=0,link={}", left.display()))
+                .arg(format!("pty,raw,echo=0,link={}", right.display()))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()?;
+            let pair = Self {
+                child,
+                left: left.to_path_buf(),
+                right: right.to_path_buf(),
+            };
+            if pair.wait_for_links(Duration::from_secs(2)) {
+                Some(pair)
+            } else {
+                None
+            }
+        }
+
+        fn wait_for_links(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if self.left.exists() && self.right.exists() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+
+        fn peer(&self) -> std::fs::File {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.right)
+                .expect("open socat peer")
+        }
+    }
+
+    impl Drop for SocatAt {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_file(&self.left);
+            let _ = std::fs::remove_file(&self.right);
         }
     }
 
@@ -1696,6 +3062,77 @@ mod tests {
         assert!(!status.connected);
         assert_eq!(status.state, "failed");
         assert!(status.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn live_socat_pty_removal_and_readd_reconnects() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(_) => return,
+        };
+        let left = dir.path().join("reconnect-a");
+        let right = dir.path().join("reconnect-b");
+        let Some(first) = SocatAt::spawn(&left, &right) else {
+            eprintln!("skipping live reconnect test: socat is unavailable");
+            return;
+        };
+        let mut config = test_config(&left);
+        config.reconnect = SerialReconnectConfig {
+            max_attempts: 20,
+            min_delay: Duration::from_millis(50),
+            max_delay: Duration::from_millis(200),
+        };
+        let service = SerialService::new(config);
+        service.start().expect("open first socat PTY");
+        assert!(
+            wait_for(Duration::from_secs(2), || service.status().connected),
+            "service should connect to the first socat PTY"
+        );
+
+        let mut peer = first.peer();
+        peer.write_all(b"before\n").expect("peer writes");
+        peer.flush().unwrap();
+        assert!(
+            wait_for(Duration::from_secs(2), || service.status().bytes_in >= 7),
+            "service should read from the first PTY"
+        );
+        drop(peer);
+        drop(first);
+
+        assert!(
+            wait_for(Duration::from_secs(2), || !service.status().connected),
+            "removing the first PTY should disconnect the reader"
+        );
+        let Some(second) = SocatAt::spawn(&left, &right) else {
+            eprintln!("skipping live re-add assertion: socat could not replace the PTY");
+            service.stop();
+            return;
+        };
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                let status = service.status();
+                status.connected && status.reconnect.reconnects >= 1
+            }),
+            "service should reconnect to the re-added path"
+        );
+        let status = service.status();
+        assert_eq!(status.device, left.display().to_string());
+        assert_eq!(status.reconnect.max_attempts, 20);
+        assert_eq!(status.buffer.bytes, 0, "reconnect clears retained bytes");
+
+        let mut peer = second.peer();
+        peer.write_all(b"after\n")
+            .expect("peer writes after re-add");
+        peer.flush().unwrap();
+        assert!(
+            wait_for(Duration::from_secs(2), || service.status().bytes_in >= 13),
+            "service should read from the re-added PTY"
+        );
+        let read = service.read(None, None).expect("buffered read");
+        let bytes = BASE64.decode(&read.data).unwrap();
+        assert!(bytes.ends_with(b"after\n"), "{bytes:?}");
+        service.stop();
+        drop(second);
     }
 
     #[tokio::test]

@@ -102,6 +102,13 @@ futures-util     = "0.3"
 # explicit operator-supplied path and never enumerates devices.
 serialport       = { version = "4.7", default-features = false }
 
+# Opt-in I²C/SPI bus surface. These safe wrappers are Linux-only; the bus
+# module's real backends are `#[cfg(target_os = "linux")]` and report a typed
+# `bus.unsupported` elsewhere.
+[target.'cfg(target_os = "linux")'.dependencies]
+i2cdev = "0.6.2"
+spidev = "0.7.1"
+
 # Optional AIDA64 shared-memory/Registry bridge. The Win32 calls are only
 # compiled on Windows; Linux/macOS builds use the portable protocol layer.
 [target.'cfg(windows)'.dependencies]

@@ -21,6 +21,7 @@ import pytest
 from api import build_app
 from auth import AuthConfig
 from config import Config
+import api as controller_api
 from device_metrics import MetricSource, MetricsCollector
 from scenarios import ScenarioManager
 from state import AppState, NodeInfo
@@ -128,6 +129,7 @@ def _build_app(
     global_token: str = "",
     node_token: str = "",
     auth_enabled: bool = False,
+    mesh_ca=None,
 ):
     state = AppState()
     state.node_api_token = global_token
@@ -142,6 +144,7 @@ def _build_app(
         streams=streams,
         auth_config=AuthConfig(enabled=auth_enabled),
         node_api_token=global_token,
+        mesh_ca=mesh_ca,
     )
     return app, state
 
@@ -293,6 +296,157 @@ def test_proxy_sends_configured_bearer_token(
     record = fake_node.requests[-1]
     assert record["path"].startswith(node_path)
     assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_native_session_availability_requires_transport_and_uses_node_token(fake_node, tmp_path):
+    fake_node.responder = lambda _method, record: (
+        200,
+        {"endpoint": "quic://127.0.0.1:7443"},
+        "application/json",
+    )
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(f"/api/v1/nodes/{NODE_ID}/session-availability")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"available": True}
+    record = fake_node.requests[-1]
+    assert record["path"] == "/api/v1/transport"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_native_session_availability_explains_missing_transport(fake_node, tmp_path):
+    fake_node.responder = lambda _method, _record: (
+        503,
+        {"error": "No native transport endpoint is configured"},
+        "application/json",
+    )
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(f"/api/v1/nodes/{NODE_ID}/session-availability")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "available": False,
+        "message": (
+            "This computer is not ready to accept a remote session. "
+            "Its native session connection needs to be enabled first."
+        ),
+    }
+
+
+def test_native_session_availability_requires_node_use_permission(
+    fake_node, tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    mesh_ca = SimpleNamespace(controller_keypair=SimpleNamespace(public_key=b"test-public-key"))
+    monkeypatch.setattr(
+        controller_api,
+        "verify_jwt",
+        lambda token, _key: (
+            {"sub": "no-node-access", "scopes": ["read"]}
+            if token == "signed-in-read-token"
+            else None
+        ),
+    )
+    app, state = _build_app(
+        fake_node.server_address[1],
+        tmp_path,
+        global_token=TOKEN,
+        auth_enabled=True,
+        mesh_ca=mesh_ca,
+    )
+    state.nodes[NODE_ID].owner_id = "node-owner"
+    response = _client(app).get(
+        f"/api/v1/nodes/{NODE_ID}/session-availability",
+        headers={"Authorization": "Bearer signed-in-read-token"},
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Use permission required for this node"
+    assert fake_node.requests == []
+
+
+def test_native_session_creation_is_rejected_before_target_consent_without_transport(
+    fake_node, tmp_path
+):
+    def responder(_method, record):
+        if record["path"] == "/api/v1/transport":
+            return 503, {"error": "No native transport endpoint is configured"}, "application/json"
+        return 201, {"session": {"id": "should-not-exist"}}, "application/json"
+
+    fake_node.responder = responder
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(f"/api/v1/nodes/{NODE_ID}/sessions", json={})
+
+    assert response.status_code == 503, response.text
+    assert "native session connection needs to be enabled" in response.json()["detail"]
+    assert [record["path"] for record in fake_node.requests] == ["/api/v1/transport"]
+
+
+def test_native_session_creation_checks_transport_and_derives_controller_identity(
+    fake_node, tmp_path
+):
+    def responder(_method, record):
+        if record["path"] == "/api/v1/transport":
+            return 200, {"endpoint": "quic://127.0.0.1:7443"}, "application/json"
+        return 201, {
+            "session": {
+                "id": "session-1",
+                "principal": record["body"]["principal"],
+            },
+            "aperture": {"effective": {"permissions": ["view"]}},
+        }, "application/json"
+
+    fake_node.responder = responder
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/nodes/{NODE_ID}/sessions",
+        json={
+            "tracks": [{"track_id": "screen0", "kind": "capture"}],
+            "quality": {"max_fps": 24, "max_bitrate_kbps": 4000},
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["session"]["principal"] == "none:testclient"
+    assert [record["path"] for record in fake_node.requests] == [
+        "/api/v1/transport",
+        "/api/v1/sessions",
+    ]
+    created = fake_node.requests[-1]
+    assert created["body"]["client_id"] == "controller:none:testclient"
+    assert created["body"]["quality"] == {"max_fps": 24, "max_bitrate_kbps": 4000}
+    assert created["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_native_session_creation_rejects_unsupported_quality_values(fake_node, tmp_path):
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/nodes/{NODE_ID}/sessions",
+        json={"quality": {"max_fps": 60}},
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "quality.max_fps must be 15, 24, or 30"
+    assert fake_node.requests == []
+
+
+def test_native_session_creation_rejects_unsupported_bitrate_values(fake_node, tmp_path):
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/nodes/{NODE_ID}/sessions",
+        json={"quality": {"max_bitrate_kbps": 10000}},
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "quality.max_bitrate_kbps must be 1000, 2000, or 4000"
+    assert fake_node.requests == []
 
 
 def test_apps_proxy_forwards_limit_to_the_node(fake_node, tmp_path):

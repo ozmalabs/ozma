@@ -3767,6 +3767,16 @@ pub const SERIAL_IMPLEMENTED_SURFACES: &[ControllerSurface] = &[
         code: "serial.stream",
         remediation: "",
     },
+    ControllerSurface {
+        surface: "/serial/control",
+        capability: "serial.control",
+        supported: true,
+        reason: "Sets DTR and/or RTS only when the node was started with --serial-control; otherwise the route answers a typed 403 serial.control-disabled.",
+        python_reference: "node/serial_capture.py::NodeSerialCapture.setup",
+        path_prefix: "/serial/control",
+        code: "serial.control",
+        remediation: "",
+    },
 ];
 
 /// Controller-only surfaces that this node advertises as unsupported.
@@ -3813,13 +3823,13 @@ pub const CONTROLLER_ONLY_SURFACES: &[ControllerSurface] = &[
         surface: "/serial/*",
         capability: "serial",
         supported: false,
-        reason: "Serial status/write/read/stream are implemented opt-in with --serial-device; the historical buffer/send/state/text/setup sub-surfaces remain unsupported.",
+        reason: "Serial status/write/read/stream/control are implemented opt-in with --serial-device; the historical buffer/send/state/text/setup sub-surfaces remain unsupported.",
         python_reference: "node/serial_capture.py",
         path_prefix: "/serial",
         code: "serial.unsupported",
         remediation: "Start the node with --serial-device PATH and use /serial/status, /serial/write, \
-                      /serial/read, or /serial/stream. Other /serial/* sub-surfaces are typed 501s; \
-                      no buffer or send result is fabricated.",
+                      /serial/read, /serial/stream, or /serial/control (with --serial-control). Other \
+                      /serial/* sub-surfaces are typed 501s; no buffer or send result is fabricated.",
     },
     ControllerSurface {
         surface: "/rgb/*",
@@ -3950,6 +3960,9 @@ pub struct ConnectionState {
     /// `serial.not-configured` and every other `/serial/*` path stays a typed
     /// 501. No device is opened unless the service is configured.
     pub serial: Option<crate::serial::SerialService>,
+    /// Opt-in 1-Wire/I²C/SPI bus surface. The default enables nothing and
+    /// every `/buses/*` route answers a typed 503 `bus.not-configured`.
+    pub buses: crate::buses::BusState,
 }
 
 /// Registration view of the optional internal RFB listener.
@@ -4040,6 +4053,7 @@ impl ConnectionState {
             backup: None,
             bluetooth: None,
             serial: None,
+            buses: crate::buses::BusState::default(),
         }
     }
 
@@ -4275,6 +4289,13 @@ impl ConnectionState {
         self
     }
 
+    /// Attach the opt-in bounded 1-Wire/I²C/SPI surface (`--onewire`,
+    /// `--i2c-allow`, `--spi-allow`). Defaults to a not-configured state.
+    pub fn with_buses(mut self, buses: crate::buses::BusState) -> Self {
+        self.buses = buses;
+        self
+    }
+
     /// Attach the opt-in bounded application-control surface (`--app-control`).
     ///
     /// Without it, `/apps` stays read-only and every `/apps/{pid}/*` control
@@ -4461,6 +4482,7 @@ pub fn compat_router(state: ConnectionState) -> Router {
         .merge(crate::backup::router(state.backup.clone()))
         .merge(crate::bluetooth::router(state.bluetooth.clone()))
         .merge(crate::serial::router(state.serial.clone()))
+        .merge(crate::buses::router(state.buses.clone()))
         .merge(legacy_router(state))
 }
 
@@ -16328,6 +16350,12 @@ mod tests {
                 "POST",
                 "/display/geometry",
                 Some(serde_json::json!({"output": "DP-1", "mode": "1280x720"})),
+            ),
+            ("GET", "/display/layout", None),
+            (
+                "POST",
+                "/display/layout",
+                Some(serde_json::json!({"outputs": [{"output": "DP-1", "mode": "1280x720"}]})),
             ),
             ("GET", "/clipboard", None),
             (
