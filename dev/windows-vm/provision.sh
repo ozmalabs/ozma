@@ -56,7 +56,7 @@ GADGET_PID=""
 build_usb_media() {
     # If prepare-media.sh has been run, the media directory already has everything.
     # If not, run it now.
-    if [ ! -d "$MEDIA_DIR/ozma" ] || [ ! -d "$MEDIA_DIR/python" ]; then
+    if [ ! -d "$MEDIA_DIR/ozma/src/ozma-node" ]; then
         echo "Media directory not prepared. Running prepare-media.sh..."
         MEDIA_DIR="$MEDIA_DIR" CONTROLLER_URL="$CONTROLLER_URL" \
             bash "$SCRIPT_DIR/prepare-media.sh"
@@ -119,7 +119,10 @@ except KeyboardInterrupt:
     done
     if [ -z "$USB_BUS" ]; then
         echo "WARNING: USB gadget device not found in lsusb"
-        echo "QEMU will start without USB passthrough"
+        echo "Building ISO fallback at $MEDIA_IMG..."
+        rm -f "$MEDIA_IMG"
+        genisoimage -iso-level 3 -joliet-long -o "$MEDIA_IMG" -V "OZMA" -R -J "$MEDIA_DIR" >/dev/null 2>&1 || \
+            mkisofs -iso-level 3 -joliet-long -o "$MEDIA_IMG" -V "OZMA" -R -J "$MEDIA_DIR" >/dev/null 2>&1 || true
     fi
 }
 
@@ -438,8 +441,7 @@ cmd_create() {
             # Pass through the real USB gadget — identical to hardware node
             echo "-device usb-host,bus=xhci.0,hostbus=$USB_BUS,hostaddr=$USB_DEV"
         elif [ -f "$MEDIA_IMG" ]; then
-            echo "-drive file=$MEDIA_IMG,format=raw,if=none,id=ozma-usb"
-            echo "-device usb-storage,bus=xhci.0,drive=ozma-usb,removable=on"
+            echo "-drive file=$MEDIA_IMG,media=cdrom,readonly=on"
         fi)
         -device usb-tablet,bus=xhci.0
         -vnc :31
@@ -489,8 +491,8 @@ cmd_create() {
 cmd_start() {
     echo "Starting $VM_NAME (boot from disk)..."
     [ ! -f "$DISK_IMAGE" ] && echo "No disk. Run: provision.sh create" && exit 1
-    [ -f "$PID_FILE" ] && kill "$(cat $PID_FILE)" 2>/dev/null; sleep 1
-    [ -f "$SOFTNODE_PID" ] && kill "$(cat $SOFTNODE_PID)" 2>/dev/null; sleep 1
+    [ -f "$PID_FILE" ] && kill "$(cat $PID_FILE)" 2>/dev/null || true; sleep 1
+    [ -f "$SOFTNODE_PID" ] && kill "$(cat $SOFTNODE_PID)" 2>/dev/null || true; sleep 1
 
     # Rebuild media (in case controller URL changed)
     build_usb_media 2>/dev/null
@@ -505,8 +507,7 @@ cmd_start() {
             # Pass through the real USB gadget — identical to hardware node
             echo "-device usb-host,bus=xhci.0,hostbus=$USB_BUS,hostaddr=$USB_DEV"
         elif [ -f "$MEDIA_IMG" ]; then
-            echo "-drive file=$MEDIA_IMG,format=raw,if=none,id=ozma-usb"
-            echo "-device usb-storage,bus=xhci.0,drive=ozma-usb,removable=on"
+            echo "-drive file=$MEDIA_IMG,media=cdrom,readonly=on"
         fi)
         -vnc :31
         -qmp "unix:$QMP_SOCKET,server,nowait"
@@ -546,7 +547,9 @@ import sys, json
 try:
     d = json.load(sys.stdin)
     for n in d.get('nodes', []):
-        if 'desktop' in n.get('hw','').lower() or 'windows' in n.get('hw','').lower():
+        hw = n.get('hw', '').lower()
+        caps = [c.lower() for c in (n.get('capabilities') or [])]
+        if 'agent' in caps or 'desktop' in hw or 'windows' in hw:
             print('connected')
             sys.exit(0)
 except: pass

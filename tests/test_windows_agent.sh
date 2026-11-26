@@ -114,89 +114,19 @@ fi
 
 echo "Windows image: $WINDOWS_IMAGE"
 
-# ── Step 2: Build the agent installer ─────────────────────────────────────────
-
-AGENT_EXE="$REPO_DIR/dist/ozma-agent/ozma-agent.exe"
-AGENT_SETUP="$REPO_DIR/dist/ozma-agent-setup.exe"
-
-if [ "$SKIP_BUILD" = false ]; then
-    echo ""
-    echo "Building agent installer..."
-
-    # Check if we have a pre-built .exe (built on Windows and committed/uploaded)
-    if [ -f "$AGENT_SETUP" ]; then
-        echo "Using pre-built installer: $AGENT_SETUP"
-    elif [ -f "$AGENT_EXE" ]; then
-        echo "Using pre-built agent exe: $AGENT_EXE"
-    else
-        echo "No pre-built Windows .exe found."
-        echo "Build it on a Windows machine with: powershell agent/installer/build-windows.ps1"
-        echo "Or copy the .exe to: $AGENT_SETUP"
-        echo ""
-        echo "Continuing with uv-based install method (will install via PowerShell in VM)..."
-        AGENT_EXE=""
-    fi
-fi
-
-# ── Step 3: Create agent delivery ISO ─────────────────────────────────────────
+# ── Step 2 & 3: Prepare Rust agent self-bootstrap delivery ISO ───────────────
 
 echo ""
-echo "Creating agent delivery ISO..."
+echo "Preparing Rust ozma-agent self-bootstrap media..."
 
 ISO_DIR=$(mktemp -d)
-mkdir -p "$ISO_DIR/ozma"
+MEDIA_DIR="$ISO_DIR" CONTROLLER_URL="$CONTROLLER_URL" \
+    bash "$REPO_DIR/dev/windows-vm/prepare-media.sh"
 
-# Auto-run PowerShell script that installs the agent
-cat > "$ISO_DIR/ozma/install-agent.ps1" << PSEOF
-# Ozma Agent Auto-Installer (runs from virtual CD-ROM)
-\$ErrorActionPreference = "Continue"
-
-Write-Host "=== Ozma Agent Auto-Install ===" -ForegroundColor Green
-
-# Wait for network
-Write-Host "Waiting for network..."
-\$timeout = 60
-while (\$timeout -gt 0) {
-    \$ping = Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet -ErrorAction SilentlyContinue
-    if (\$ping) { break }
-    Start-Sleep -Seconds 2
-    \$timeout -= 2
-}
-
-# Install Python if not present
-if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-    Write-Host "Installing Python..."
-    \$pyUrl = "https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe"
-    \$pyInstaller = "\$env:TEMP\python-installer.exe"
-    Invoke-WebRequest -Uri \$pyUrl -OutFile \$pyInstaller -UseBasicParsing
-    Start-Process -Wait -FilePath \$pyInstaller -ArgumentList "/quiet", "InstallAllUsers=1", "PrependPath=1"
-    \$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-}
-
-# Install ozma-agent
-Write-Host "Installing ozma-agent..."
-uv pip install --quiet ozma-agent 2>\$null
-if (\$LASTEXITCODE -ne 0) {
-    uv pip install --quiet "git+https://github.com/ozmalabs/ozma.git#subdirectory=agent"
-}
-
-# Install as service
-Write-Host "Registering as service..."
-ozma-agent install --name "$VM_NAME" --controller "$CONTROLLER_URL"
-
-Write-Host "=== Done ===" -ForegroundColor Green
+cat > "$ISO_DIR/ozma/install-agent.ps1" << 'PSEOF'
+# Wrapper for legacy CD-ROM path — delegates to install-offline.ps1
+& "$PSScriptRoot\install-offline.ps1"
 PSEOF
-
-# If we have the .exe installer, include it too
-if [ -f "$AGENT_SETUP" ]; then
-    cp "$AGENT_SETUP" "$ISO_DIR/ozma/ozma-agent-setup.exe"
-    # Alternative auto-run that uses the .exe
-    cat > "$ISO_DIR/ozma/install-exe.bat" << BATEOF
-@echo off
-echo Installing Ozma Agent...
-D:\ozma\ozma-agent-setup.exe /S /CONTROLLER=$CONTROLLER_URL /NAME=$VM_NAME
-BATEOF
-fi
 
 # Create the ISO
 if command -v genisoimage &>/dev/null; then
@@ -302,9 +232,9 @@ while [ $ELAPSED -lt $TIMEOUT ]; do
         python3 -c "
 import sys, json
 d = json.load(sys.stdin)
-# The agent registers as $VM_NAME._ozma._udp.local. with hw=desktop-windows
 for n in d.get('nodes', []):
-    if '$VM_NAME' in n.get('id','') and 'desktop' in n.get('hw',''):
+    caps = [c.lower() for c in (n.get('capabilities') or [])]
+    if 'agent' in caps or ('$VM_NAME' in n.get('id','') and 'desktop' in n.get('hw','')):
         print('connected')
         sys.exit(0)
 print('waiting')
@@ -329,8 +259,8 @@ if [ "$AGENT_CONNECTED" = true ]; then
     echo ""
     echo "Running tests..."
 
-    # Test 1: Check agent status via API
-    echo -n "  Agent HTTP API: "
+    # Test 1: Check ozma-node HTTP API (/health + /agent/metrics)
+    echo -n "  Node HTTP API (/health): "
     HEALTH=$(curl -s --connect-timeout 3 "http://localhost:7341/health" 2>/dev/null)
     if echo "$HEALTH" | grep -q "ok"; then
         echo "PASS"
@@ -338,23 +268,12 @@ if [ "$AGENT_CONNECTED" = true ]; then
         echo "FAIL ($HEALTH)"
     fi
 
-    # Test 2: Check PipeWire audio devices on the VM
-    echo -n "  Audio devices: "
-    AUDIO=$(curl -s --connect-timeout 3 "http://localhost:7341/audio/nodes" 2>/dev/null)
-    if echo "$AUDIO" | grep -q "nodes"; then
-        DEVICE_COUNT=$(echo "$AUDIO" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('nodes',[])))" 2>/dev/null)
-        echo "PASS ($DEVICE_COUNT devices)"
-    else
-        echo "SKIP (no PipeWire on Windows)"
-    fi
-
-    # Test 3: Prometheus metrics
-    echo -n "  Prometheus metrics: "
-    METRICS=$(curl -s --connect-timeout 3 "http://localhost:7341/metrics" 2>/dev/null)
-    if echo "$METRICS" | grep -q "ozma_node"; then
+    echo -n "  Agent metrics (/agent/metrics): "
+    METRICS=$(curl -s --connect-timeout 3 "http://localhost:7341/agent/metrics" 2>/dev/null)
+    if echo "$METRICS" | grep -q "cpu_usage"; then
         echo "PASS"
     else
-        echo "FAIL"
+        echo "FAIL ($METRICS)"
     fi
 
     echo ""

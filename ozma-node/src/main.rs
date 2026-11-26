@@ -33,6 +33,8 @@ use ozma_usb::{
 };
 use tracing::{error, info, warn};
 
+#[cfg(target_os = "linux")]
+use ozma_node::usb_audio;
 use ozma_node::{
     api, audio_runtime,
     config::{
@@ -2020,11 +2022,22 @@ async fn run() -> std::process::ExitCode {
             .capture_console
             .or(args.dbus_console)
             .unwrap_or(ozma_capture::DBUS_DEFAULT_CONSOLE_INDEX),
+        #[cfg(not(target_os = "linux"))]
+        dbus_console: args.dbus_console.unwrap_or(0),
+        #[cfg(target_os = "linux")]
         dbus_width: args.dbus_width.unwrap_or(ozma_capture::DBUS_DEFAULT_WIDTH),
+        #[cfg(not(target_os = "linux"))]
+        dbus_width: args.dbus_width.unwrap_or(1920),
+        #[cfg(target_os = "linux")]
         dbus_height: args
             .dbus_height
             .unwrap_or(ozma_capture::DBUS_DEFAULT_HEIGHT),
+        #[cfg(not(target_os = "linux"))]
+        dbus_height: args.dbus_height.unwrap_or(1080),
+        #[cfg(target_os = "linux")]
         dbus_fps: args.dbus_fps.unwrap_or(ozma_capture::DBUS_DEFAULT_FPS),
+        #[cfg(not(target_os = "linux"))]
+        dbus_fps: args.dbus_fps.unwrap_or(30),
         dbus_requested: args.dbus_console.is_some()
             || args.dbus_width.is_some()
             || args.dbus_height.is_some()
@@ -4158,6 +4171,7 @@ async fn run() -> std::process::ExitCode {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     if config.has_capability("audio")
         && config.profile != NodeProfile::Desktop
         && !config.usb_uac2_bridge
@@ -4929,16 +4943,33 @@ fn probe_failure_detail(status: &impl std::fmt::Display, stderr: &str) -> String
 
 /// Whether an executable named `name` exists on `PATH`.
 fn command_on_path(name: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
     std::env::split_paths(&path).any(|directory| {
-        let candidate = directory.join(name);
-        std::fs::metadata(&candidate)
-            .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let candidate = directory.join(name);
+            std::fs::metadata(&candidate)
+                .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return true;
+            }
+            #[cfg(windows)]
+            {
+                let exe = directory.join(format!("{name}.exe"));
+                if exe.is_file() {
+                    return true;
+                }
+            }
+            false
+        }
     })
 }
 
@@ -5244,6 +5275,7 @@ fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
 fn sink_kind_name(kind: SinkKind) -> &'static str {
     match kind {
         SinkKind::Uinput => controller_compat::SINK_UINPUT,
+        SinkKind::SendInput => controller_compat::SINK_SEND_INPUT,
         SinkKind::Qmp => controller_compat::SINK_QMP,
         SinkKind::HidGadget => controller_compat::SINK_HID_GADGET,
         SinkKind::Recording => controller_compat::SINK_FAKE_RECORDING,

@@ -109,6 +109,7 @@ pub const PACKET_MOUSE_RELATIVE: u8 = 0x05;
 pub const SINK_HID_GADGET: &str = "hid-gadget";
 /// Sink kind reported when input is injected through `/dev/uinput`.
 pub const SINK_UINPUT: &str = "uinput";
+pub const SINK_SEND_INPUT: &str = "send-input";
 /// Sink kind reported when input is injected through QMP `input-send-event`.
 pub const SINK_QMP: &str = "qmp";
 /// Sink kind reported when input is validated and recorded but not injected.

@@ -37,15 +37,20 @@ pub fn collect() -> SystemMetrics {
     }
 }
 
-use prometheus::{process_collector::ProcessCollector, Encoder, Registry, TextEncoder};
+#[cfg(unix)]
+use prometheus::process_collector::ProcessCollector;
+use prometheus::{Encoder, Registry, TextEncoder};
 use std::sync::Arc;
 use tracing::info;
 
 /// Build a Prometheus registry pre-populated with process metrics.
 pub fn build_registry() -> Arc<Registry> {
     let registry = Registry::new();
-    let pc = ProcessCollector::for_self();
-    registry.register(Box::new(pc)).ok();
+    #[cfg(unix)]
+    {
+        let pc = ProcessCollector::for_self();
+        registry.register(Box::new(pc)).ok();
+    }
     Arc::new(registry)
 }
 

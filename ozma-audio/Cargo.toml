@@ -9,7 +9,6 @@ license = "AGPL-3.0-only"
 ozma-protocol = { path = "../ozma-protocol" }
 ozma-pipewire = { path = "../ozma-pipewire" }
 ozma-usb = { path = "../ozma-usb" }
-alsa = { workspace = true }
 async-trait = "0.1"
 audiopus = "0.3.0-rc.0"
 serde = { workspace = true }
@@ -17,6 +16,9 @@ serde_json = { workspace = true }
 thiserror = "1"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "process", "io-util"] }
 tracing = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -135,21 +135,7 @@ pub fn timestamp_micros(seconds: i64, micros: i64) -> Option<u64> {
 /// The first frame is sequence zero. The source keeps its own counter rather
 /// than trusting the driver's `sequence` field, which can restart after a
 /// stream toggle.
-pub fn next_sequence(previous: Option<u64>) -> u64 {
-    previous.map_or(0, |sequence| sequence.saturating_add(1))
-}
-
-/// Keep a PTS sequence strictly increasing.
-///
-/// Drivers occasionally stamp two buffers with the same time or their clock
-/// restarts. PTS is part of the capture contract, so nudge a non-increasing
-/// candidate forward by one microsecond instead of passing it through.
-pub fn monotonic_pts(candidate: u64, previous: Option<u64>) -> u64 {
-    match previous {
-        Some(previous) => candidate.max(previous.saturating_add(1)),
-        None => candidate,
-    }
-}
+pub use crate::provider::{monotonic_pts, next_sequence};
 
 /// Whether a captured buffer is independently decodable.
 ///

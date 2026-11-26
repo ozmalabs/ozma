@@ -310,9 +310,8 @@ impl OzmaClient {
 
     /// Request a keyframe from the node's encoder.
     pub fn request_keyframe(&self) -> Result<(), JsValue> {
-        self.shared.send_control(ControlMessage::KeyframeRequest {
-            track: None,
-        })
+        self.shared
+            .send_control(ControlMessage::KeyframeRequest { track: None })
     }
 
     /// Start browser camera and/or microphone uplink.

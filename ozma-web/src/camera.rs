@@ -220,7 +220,11 @@ impl CameraPipeline {
             output_closure.as_ref().unchecked_ref(),
         );
         let encoder = VideoEncoder::new(&init).map_err(|value| {
-            error::api_from_js(&value, error::CAPTURE_UNSUPPORTED, "creating the H.264 encoder")
+            error::api_from_js(
+                &value,
+                error::CAPTURE_UNSUPPORTED,
+                "creating the H.264 encoder",
+            )
         })?;
 
         let (frame_width, frame_height) = layout_size(&video);
@@ -517,11 +521,8 @@ impl CameraLoop {
         match result {
             Ok(()) => Stats::increment(&self.stats.camera_frames),
             Err(value) => {
-                let api = error::api_from_js(
-                    &value,
-                    error::CAPTURE_FAILED,
-                    "submitting a camera frame",
-                );
+                let api =
+                    error::api_from_js(&value, error::CAPTURE_FAILED, "submitting a camera frame");
                 self.output.fatal.set(true);
                 self.output
                     .record_error(&api.code, &api.message, api.remediation.as_deref());

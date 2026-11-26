@@ -21,8 +21,8 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
-    AudioContext, AudioContextOptions, AudioContextState, AudioData, AudioDataInit,
-    AudioEncoder, AudioEncoderConfig, AudioEncoderInit, AudioProcessingEvent, AudioSampleFormat,
+    AudioContext, AudioContextOptions, AudioContextState, AudioData, AudioDataInit, AudioEncoder,
+    AudioEncoderConfig, AudioEncoderInit, AudioProcessingEvent, AudioSampleFormat,
     ChannelCountMode, ConstrainLongRange, MediaStream, MediaStreamAudioSourceNode,
     MediaStreamAudioSourceOptions, MediaStreamConstraints, MediaStreamTrack, MediaTrackConstraints,
     ScriptProcessorNode,
@@ -133,7 +133,11 @@ impl MicPipeline {
         let options = AudioContextOptions::new();
         options.set_sample_rate(SAMPLE_RATE);
         let context = AudioContext::new_with_context_options(&options).map_err(|value| {
-            error::api_from_js(&value, error::CAPTURE_FAILED, "creating the microphone context")
+            error::api_from_js(
+                &value,
+                error::CAPTURE_FAILED,
+                "creating the microphone context",
+            )
         })?;
         *guard.context.borrow_mut() = Some(context.clone());
         match context.resume() {
@@ -163,13 +167,15 @@ impl MicPipeline {
             }
         }
 
-        let source = MediaStreamAudioSourceNode::new(
-            &context,
-            &MediaStreamAudioSourceOptions::new(&stream),
-        )
-        .map_err(|value| {
-            error::api_from_js(&value, error::CAPTURE_FAILED, "creating the microphone source")
-        })?;
+        let source =
+            MediaStreamAudioSourceNode::new(&context, &MediaStreamAudioSourceOptions::new(&stream))
+                .map_err(|value| {
+                    error::api_from_js(
+                        &value,
+                        error::CAPTURE_FAILED,
+                        "creating the microphone source",
+                    )
+                })?;
         source.set_channel_count(CHANNELS);
         source.set_channel_count_mode(ChannelCountMode::Explicit);
 
@@ -189,7 +195,11 @@ impl MicPipeline {
         source
             .connect_with_audio_node(&processor)
             .map_err(|value| {
-                error::api_from_js(&value, error::CAPTURE_FAILED, "connecting the microphone source")
+                error::api_from_js(
+                    &value,
+                    error::CAPTURE_FAILED,
+                    "connecting the microphone source",
+                )
             })?;
         processor
             .connect_with_audio_node(&context.destination())
@@ -259,7 +269,11 @@ impl MicPipeline {
             output_closure.as_ref().unchecked_ref(),
         );
         let encoder = AudioEncoder::new(&init).map_err(|value| {
-            error::api_from_js(&value, error::CAPTURE_UNSUPPORTED, "creating the Opus encoder")
+            error::api_from_js(
+                &value,
+                error::CAPTURE_UNSUPPORTED,
+                "creating the Opus encoder",
+            )
         })?;
         if let Err(value) = encoder.configure(&config) {
             let api = error::api_from_js(
