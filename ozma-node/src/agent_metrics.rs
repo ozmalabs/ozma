@@ -559,9 +559,11 @@ fn disk_usage(path: &Path) -> Option<(u64, u64)> {
     } else {
         stats.f_frsize
     }
-    .max(1);
-    let total = stats.f_blocks.saturating_mul(block_size);
-    let free = stats.f_bavail.saturating_mul(block_size).min(total);
+    .max(1) as u64;
+    let total = (stats.f_blocks as u64).saturating_mul(block_size);
+    let free = (stats.f_bavail as u64)
+        .saturating_mul(block_size)
+        .min(total);
     Some((total, total.saturating_sub(free)))
 }
 
