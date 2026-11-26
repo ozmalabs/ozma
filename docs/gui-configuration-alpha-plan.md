@@ -423,8 +423,16 @@ discovery remains available without a token.
   both license files into a Windows x64 zip attached to tagged releases. This
   release workflow is complemented by `.github/workflows/ozma-desktop-windows.yml`,
   which builds and uploads the executable and icon on tray-related pull
-  requests and pushes. Neither workflow has yet run on GitHub for the current
-  worktree. The MSVC cross-build was rerun against the current worktree with
+  requests and pushes. On the pre-merge work commit `ed3c2ed`, the
+  [Windows x64 tray build workflow](https://github.com/ozmalabs/ozma/actions/runs/45755264312)
+  completed successfully. The
+  [node workflow](https://github.com/ozmalabs/ozma/actions/runs/45755264206)
+  passed its node library suite (899 passed, 16 ignored), aarch64
+  cross-compile, and Debian package steps, but its x86_64 unit-test step failed
+  three AIDA64 integration tests: `api_selection_returns_jsonp`,
+  `panel_layout_is_ozma_widget_json`, and `sensors_api_returns_aida_ids`.
+  These are pre-merge CI results for `ed3c2ed`; they do not validate the
+  subsequently integrated worktree. The MSVC cross-build was rerun against the current worktree with
   `cargo xwin build --release -p ozma-desktop --target
   x86_64-pc-windows-msvc`; the result is a PE32+ x64 Windows GUI executable.
   The current local Windows x64 package is
@@ -432,11 +440,16 @@ discovery remains available without a token.
   `baefda69508837c07c6f795cd4de6bd6f1647628058f8d4f19cf4ce0976bcb12`) and
   contains the tray executable, icon, setup guide, README, and both license
   files.
-  No supported Windows image is available locally. Legacy Windows 98/XP disk
-  images exist but are not valid targets for this alpha and were not used.
-  Microsoft's Windows download page rejects direct shell requests here, and no
-  in-app browser is connected. No unrelated Windows VM or disk was started or
-  reused.
+  Native notification-area registration and real right-click interaction
+  remain unverified. The available Windows 10 source image is directly
+  attached read/write to an existing running QEMU process. It was left
+  untouched; the earlier disposable clone was shut down and its overlay
+  removed after the cloned `ozma` account rejected the documented default
+  password. No separate safe clone was available for this continuation, so no
+  attempt was made to stop or modify the running source VM. The Windows CI run
+  establishes compilation/package success only, not native shell behavior.
+  Legacy Windows 98/XP images are not valid targets for this alpha and were not
+  used.
 - **Aperture clarification.** Aperture means progressive configuration
   complexity and precision, not just permissions. Repository search found no
   foveation implementation yet; Fine-tune and Expert describe the setting and
@@ -444,7 +457,8 @@ discovery remains available without a token.
 - Verification so far: `cargo check -p ozma-protocol -p ozma-api -p ozma-node`,
   `npm run build`, Python syntax compilation, workflow YAML parsing, and
   `git diff --check` pass. Full relevant Rust suites pass:
-  `cargo test -p ozma-node --lib` (799 passed, 8 ignored) and
+  `cargo test -p ozma-node --lib` (799 passed, 8 ignored in the earlier local
+  run; the pre-merge CI node library suite passed 899, 16 ignored) and
   `cargo test -p ozma-api --lib` (11 passed). The two relevant controller test
   files pass in full (165 passed, one upstream Starlette/httpx deprecation
   warning) when pytest temp files are put on the workspace disk; the system
@@ -468,3 +482,18 @@ discovery remains available without a token.
   `target/x86_64-pc-windows-msvc/release/ozma-desktop.exe`. The working
   tree also contains unrelated in-progress changes;
   preserve them and review changes by file before committing.
+
+  Post-merge checks on the integrated worktree also passed: the two relevant
+  controller test files completed with 165 passed, and `npm ci` plus
+  `npm run build` completed with Vite 6.4.6 (210 modules). The three AIDA64
+  tests were made independent of host hardware. Post-merge,
+  `cargo check -p ozma-node --tests` passed with
+  `BINDGEN_EXTRA_CLANG_ARGS='-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include'`.
+  `cargo test -p ozma-node --test aida64` then passed all 6 tests with that
+  bindgen setting and a temporary symlink from `libpam.so` to the system
+  `libpam.so.0`. This covers the pre-merge CI failures. Internal infrastructure
+  docs contain no Windows guest credentials. The opt-in Windows test
+  bootstrap targets the same `images/win10.qcow2` disk and local bootstrap
+  state as the running original
+  VM, so using it would collide with that VM. Native shell validation remains
+  deferred until a safely independent guest and valid login are available.
