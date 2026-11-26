@@ -9,7 +9,11 @@ use std::time::Duration;
 
 use clap::ValueEnum;
 use ozma_auth::MachineClass;
-use ozma_capture::{DBUS_DEFAULT_ID, QMP_DEFAULT_ID, VNC_DEFAULT_ID};
+use ozma_capture::{QMP_DEFAULT_ID, VNC_DEFAULT_ID};
+#[cfg(target_os = "linux")]
+use ozma_capture::DBUS_DEFAULT_ID;
+#[cfg(not(target_os = "linux"))]
+const DBUS_DEFAULT_ID: &str = "dbus0";
 use ozma_display::vm::{VmConsoleBackend, MAX_VM_CONSOLES};
 use ozma_input::SinkKind;
 use ozma_protocol::NodeId;

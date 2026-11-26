@@ -10,11 +10,11 @@ use ozma_protocol::{
 };
 
 use ozma_capture::{
-    CaptureRegistry, FakeCaptureProvider, LookingGlassProviderConfig, QmpDisplayConfig,
-    VncDisplayConfig, QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS, VNC_DEFAULT_ID,
+    CaptureRegistry, FakeCaptureProvider, QmpDisplayConfig, VncDisplayConfig, QMP_DEFAULT_ID,
+    QMP_DEFAULT_MAX_FPS, VNC_DEFAULT_ID,
 };
 #[cfg(target_os = "linux")]
-use ozma_capture::{DBusDisplayConfig, DBUS_DEFAULT_ID};
+use ozma_capture::{DBusDisplayConfig, LookingGlassProviderConfig, DBUS_DEFAULT_ID};
 use ozma_input::SinkKind;
 use ozma_media::FrameFormat;
 use ozma_qmp::SharedQmpClient;
@@ -318,6 +318,7 @@ fn vm_capture_registry(config: &NodeConfig, shared: Option<&SharedQmpClient>) ->
         // the KVMFR header; a missing file, foreign magic, or a region without
         // a published frame yields no source (never a synthetic frame). The
         // provider is registered explicitly here, not in `system*`.
+        #[cfg(target_os = "linux")]
         Some("looking-glass") => match &config.looking_glass_shm {
             Some(shm) => CaptureRegistry::new().with_looking_glass(
                 LookingGlassProviderConfig::new(shm.clone())
@@ -537,15 +538,23 @@ pub fn input_capability_for(sink: Option<SinkKind>) -> InputCapability {
             release_all: true,
             ..InputCapability::default()
         },
-        Some(SinkKind::SendInput) | Some(SinkKind::Qmp) | Some(SinkKind::HidGadget) => {
-            InputCapability {
-                keyboard: true,
-                mouse_absolute: true,
-                mouse_relative: true,
-                release_all: true,
-                ..InputCapability::default()
-            }
-        }
+        Some(SinkKind::Qmp) | Some(SinkKind::HidGadget) => InputCapability {
+            keyboard: true,
+            mouse_absolute: true,
+            mouse_relative: true,
+            release_all: true,
+            ..InputCapability::default()
+        },
+        #[cfg(target_os = "windows")]
+        Some(SinkKind::SendInput) => InputCapability {
+            keyboard: true,
+            mouse_absolute: true,
+            mouse_relative: true,
+            release_all: true,
+            ..InputCapability::default()
+        },
+        #[cfg(not(target_os = "windows"))]
+        Some(SinkKind::SendInput) => InputCapability::default(),
         // A recording sink validates events but injects nothing.
         Some(SinkKind::Recording) | None => InputCapability::default(),
     }

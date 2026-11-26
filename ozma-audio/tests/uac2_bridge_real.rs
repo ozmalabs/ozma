@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Opt-in real ALSA → UAC2 capture-packetiser test.
 //!

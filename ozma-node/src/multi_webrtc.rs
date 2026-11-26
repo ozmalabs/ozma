@@ -1828,7 +1828,10 @@ mod tests {
         assert_eq!(factory.backend(), WebRtcBackend::Native);
         assert!(factory.audio_configured());
         assert_eq!(factory.audio_source().as_deref(), Some("ozma-vm1.monitor"));
-        assert_eq!(factory.audio_source_for(1).as_deref(), Some("ozma-vm1.monitor"));
+        assert_eq!(
+            factory.audio_source_for(1).as_deref(),
+            Some("ozma-vm1.monitor")
+        );
 
         let config = factory.config_for(1, None).expect("console 1 config");
         assert_eq!(config.backend, WebRtcBackend::Native);

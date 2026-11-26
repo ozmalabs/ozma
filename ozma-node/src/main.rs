@@ -312,7 +312,7 @@ pub struct Args {
     #[arg(
         long,
         env = "OZMA_LOOKING_GLASS_FPS",
-        default_value_t = ozma_capture::LOOKING_GLASS_DEFAULT_FPS,
+        default_value_t = 30,
         value_name = "FPS"
     )]
     pub looking_glass_fps: u32,
@@ -321,7 +321,7 @@ pub struct Args {
     #[arg(
         long,
         env = "OZMA_LOOKING_GLASS_ID",
-        default_value = ozma_capture::LOOKING_GLASS_DEFAULT_ID
+        default_value = "looking-glass0"
     )]
     pub looking_glass_id: String,
 
@@ -329,7 +329,7 @@ pub struct Args {
     #[arg(
         long,
         env = "OZMA_LOOKING_GLASS_NAME",
-        default_value = ozma_capture::LOOKING_GLASS_DEFAULT_NAME
+        default_value = "Looking Glass IVSHMEM"
     )]
     pub looking_glass_name: String,
 
@@ -2069,9 +2069,7 @@ async fn run() -> std::process::ExitCode {
         portal_cursor: args.portal_cursor.unwrap_or_default(),
         portal_restore_token: args.portal_restore_token.clone(),
         portal_timeout: std::time::Duration::from_millis(
-            args.portal_timeout_ms.unwrap_or_else(|| {
-                ozma_capture::PORTAL_DEFAULT_RESPONSE_TIMEOUT.as_millis() as u64
-            }),
+            args.portal_timeout_ms.unwrap_or(180_000),
         ),
         portal_requested,
         audio_capture_target,
@@ -3101,7 +3099,9 @@ async fn run() -> std::process::ExitCode {
     // export/USB/IP listener and apply its persistence policy after the state is
     // served.
     let usb_media_shutdown = usb_control.clone();
+    #[cfg(target_os = "linux")]
     let mut uac2_alsa_runtime: Option<usb_uac2::Uac2BridgeRuntime> = None;
+    #[cfg(target_os = "linux")]
     if let Some(control) = usb_control.as_mut() {
         if !control.is_available() {
             if config.usb_uac2_bridge {
@@ -3139,6 +3139,7 @@ async fn run() -> std::process::ExitCode {
             )));
         }
     }
+    #[cfg(target_os = "linux")]
     if let Some(mut runtime) = uac2_alsa_runtime {
         let uac2_shutdown = shutdown.clone();
         background.push((
@@ -3148,6 +3149,14 @@ async fn run() -> std::process::ExitCode {
                 runtime.stop();
             }),
         ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(control) = usb_control.as_mut() {
+        if config.usb_uac2 || config.usb_uac2_bridge {
+            control.set_uac2_bridge(Some(usb_uac2::Uac2BridgeShared::unsupported(
+                "the UAC2 audio bridge is only available on Linux",
+            )));
+        }
     }
     if let Some(control) = usb_control
         .as_ref()

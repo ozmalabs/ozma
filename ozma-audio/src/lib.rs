@@ -153,10 +153,12 @@ pub use sweep::{
 };
 pub use target::{AudioTarget, MONITOR_PREFIX, NODE_PREFIX, OBJECT_PREFIX};
 pub use traits::{AudioEncoder, AudioSource, EncodedAudio, EncoderConfig};
+pub use uac2::{Uac2SinkHandle, Uac2SinkStats, Uac2SourceHandle, Uac2SourceStats};
+#[cfg(target_os = "linux")]
 pub use uac2::{
     AlsaPcmFactory, AlsaUac2Config, AlsaUac2Sink, AlsaUac2Source, Uac2PcmReader,
-    Uac2PcmReaderFactory, Uac2PcmWriter, Uac2PcmWriterFactory, Uac2SinkHandle, Uac2SinkStats,
-    Uac2SourceHandle, Uac2SourceStats, UAC2_DEFAULT_BUFFER_PERIODS, UAC2_DEFAULT_PERIOD_FRAMES,
+    Uac2PcmReaderFactory, Uac2PcmWriter, Uac2PcmWriterFactory, UAC2_DEFAULT_BUFFER_PERIODS,
+    UAC2_DEFAULT_PERIOD_FRAMES,
 };
 #[cfg(target_os = "linux")]
 pub use uac2::{PipeWireUac2Sink, PipeWireUac2Source};

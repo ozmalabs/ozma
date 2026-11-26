@@ -98,7 +98,7 @@ impl AgentMetricsSampler {
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn collect_sysinfo(&self, node_id: &str) -> Value {
-        use sysinfo::{Disks, Networks, System};
+        use sysinfo30::{Disks, Networks, System};
 
         let mut sys = System::new_all();
         sys.refresh_cpu();
@@ -135,7 +135,12 @@ impl AgentMetricsSampler {
             .iter()
             .find(|d| d.mount_point() == root_mount)
             .or_else(|| disks.iter().next())
-            .map(|d| (d.total_space(), d.total_space().saturating_sub(d.available_space())))
+            .map(|d| {
+                (
+                    d.total_space(),
+                    d.total_space().saturating_sub(d.available_space()),
+                )
+            })
             .unwrap_or((0, 0));
         if disk_total > 0 {
             metrics.insert("disk_total".to_owned(), Value::from(disk_total));
@@ -554,9 +559,11 @@ fn disk_usage(path: &Path) -> Option<(u64, u64)> {
     } else {
         stats.f_frsize
     }
-    .max(1);
-    let total = stats.f_blocks.saturating_mul(block_size);
-    let free = stats.f_bavail.saturating_mul(block_size).min(total);
+    .max(1) as u64;
+    let total = (stats.f_blocks as u64).saturating_mul(block_size);
+    let free = (stats.f_bavail as u64)
+        .saturating_mul(block_size)
+        .min(total);
     Some((total, total.saturating_sub(free)))
 }
 

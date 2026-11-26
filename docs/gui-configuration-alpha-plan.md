@@ -423,8 +423,17 @@ discovery remains available without a token.
   both license files into a Windows x64 zip attached to tagged releases. This
   release workflow is complemented by `.github/workflows/ozma-desktop-windows.yml`,
   which builds and uploads the executable and icon on tray-related pull
-  requests and pushes. Neither workflow has yet run on GitHub for the current
-  worktree. The MSVC cross-build was rerun against the current worktree with
+  requests and pushes. The
+  [Windows x64 tray build](https://github.com/ozmalabs/ozma/actions/runs/45763473637)
+  passed on the latest integration commit. The
+  [macOS node workflow](https://github.com/ozmalabs/ozma/actions/runs/45769930319)
+  passed for both ARM64 and Intel, including universal binary and DMG upload.
+  The
+  [Linux node workflow](https://github.com/ozmalabs/ozma/actions/runs/45768845837)
+  passed all jobs, including x86_64 build and tests, aarch64 cross-compilation,
+  and aarch64 Debian packaging. A prior integrated-code run
+  [also passed its aarch64 build and package jobs](https://github.com/ozmalabs/ozma/actions/runs/45759614338).
+  The MSVC cross-build was rerun against the current worktree with
   `cargo xwin build --release -p ozma-desktop --target
   x86_64-pc-windows-msvc`; the result is a PE32+ x64 Windows GUI executable.
   The current local Windows x64 package is
@@ -432,23 +441,27 @@ discovery remains available without a token.
   `baefda69508837c07c6f795cd4de6bd6f1647628058f8d4f19cf4ce0976bcb12`) and
   contains the tray executable, icon, setup guide, README, and both license
   files.
-  No supported Windows image is available locally. Legacy Windows 98/XP disk
-  images exist but are not valid targets for this alpha and were not used.
-  Microsoft's Windows download page rejects direct shell requests here, and no
-  in-app browser is connected. No unrelated Windows VM or disk was started or
-  reused.
+  Native notification-area registration and real right-click interaction
+  remain unverified. The available Windows 10 source image is directly
+  attached read/write to an existing running QEMU process. It was left
+  untouched; the earlier disposable clone was shut down and its overlay
+  removed after the cloned `ozma` account rejected the documented default
+  password. No separate safe clone was available for this continuation, so no
+  attempt was made to stop or modify the running source VM. The Windows tray CI
+  establishes tray compilation/package success only; a full Windows `ozma-node`
+  build and native shell behavior remain unverified.
+  Legacy Windows 98/XP images are not valid targets for this alpha and were not
+  used.
 - **Aperture clarification.** Aperture means progressive configuration
   complexity and precision, not just permissions. Repository search found no
   foveation implementation yet; Fine-tune and Expert describe the setting and
   show it as unavailable until a real runtime path consumes and reports it.
-- Verification so far: `cargo check -p ozma-protocol -p ozma-api -p ozma-node`,
+- Verification: `cargo check -p ozma-protocol -p ozma-api -p ozma-node`,
   `npm run build`, Python syntax compilation, workflow YAML parsing, and
-  `git diff --check` pass. Full relevant Rust suites pass:
-  `cargo test -p ozma-node --lib` (799 passed, 8 ignored) and
-  `cargo test -p ozma-api --lib` (11 passed). The two relevant controller test
-  files pass in full (165 passed, one upstream Starlette/httpx deprecation
-  warning) when pytest temp files are put on the workspace disk; the system
-  `/tmp` tmpfs filled during an earlier run. The controller test command is:
+  `git diff --check` pass. `cargo test -p ozma-api --lib` passed 11 tests.
+  The two relevant controller test files passed 165 tests when pytest temp
+  files were placed on the workspace disk; the system `/tmp` tmpfs filled
+  during an earlier run. The command was:
 
   ```sh
   TMPDIR="$PWD/target/controller-test-tmp" pytest -q \
@@ -457,14 +470,26 @@ discovery remains available without a token.
     tests/unit/controller/test_node_api_token_proxy.py
   ```
 
-  The repeatable Wine tray smoke
-  `./ozma-desktop/smoke-wine.sh` passes: it opens the popup callback and exits
-  through Quit. The UI type-check
-  covers the app entry and all imported routes; orphaned legacy screens are
-  outside the bundle/type-check graph. The MSVC
-  release build is reproducible with `cargo install cargo-xwin --locked`
-  followed by `cargo xwin build --release -p ozma-desktop --target
-  x86_64-pc-windows-msvc`; the artifact is
-  `target/x86_64-pc-windows-msvc/release/ozma-desktop.exe`. The working
-  tree also contains unrelated in-progress changes;
-  preserve them and review changes by file before committing.
+  The full local `cargo test -p ozma-node` suite passed 899 library tests
+  (16 ignored), 26 binary tests, all integration tests, and doctests after the
+  camera, `m0_acceptance`, AIDA64, and native node test fixes. The run required
+  `BINDGEN_EXTRA_CLANG_ARGS='-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include'`;
+  the focused AIDA64 run also used a temporary `libpam.so` symlink to the
+  system `libpam.so.0`. `npm ci` followed by `npm run build` completed with
+  Vite 6.4.6 (210 modules).
+
+  The repeatable Wine tray smoke `./ozma-desktop/smoke-wine.sh` passes: it
+  opens the popup callback and exits through Quit. Wine does not provide a
+  usable Windows notification area, so this does not validate shell icon
+  registration or real mouse interaction. The UI type-check covers the app
+  entry and all imported routes; orphaned legacy screens are outside the
+  bundle/type-check graph. The MSVC release build is reproducible with
+  `cargo install cargo-xwin --locked` followed by `cargo xwin build --release
+  -p ozma-desktop --target x86_64-pc-windows-msvc`; the artifact is
+  `target/x86_64-pc-windows-msvc/release/ozma-desktop.exe`.
+
+  Internal infrastructure docs contain no Windows guest credentials. The
+  opt-in Windows test bootstrap targets the same `images/win10.qcow2` disk and
+  local bootstrap state as the running original VM, so using it would collide
+  with that VM. Native shell validation remains deferred until a safely
+  independent guest and valid login are available.
