@@ -86,8 +86,9 @@ pub mod dbus_display;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod dbus_dmabuf;
-// Optional GBM/EGL import for tiled DMA-BUFs. Lazy `dlopen` means a host
+// Optional Linux GBM/EGL import for tiled DMA-BUFs. Lazy `dlopen` means a host
 // without EGL/GBM still builds and gets a typed capability result.
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod dmabuf_egl;
 pub mod fake;
@@ -334,6 +335,7 @@ mod tests {
             .all(|scan| scan.kind != CaptureKind::Qmp));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn looking_glass_and_virtual_capture_are_opt_in() {
         let directory = tempfile::tempdir().unwrap();
