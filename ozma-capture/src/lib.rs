@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn system_registry_starts_with_v4l2_discovery() {
+    fn system_registry_starts_with_native_discovery() {
         let registry = CaptureRegistry::system();
         assert_eq!(registry.provider_count(), 1);
         // Discovery on the build host is allowed to return any number of
@@ -288,28 +288,29 @@ mod tests {
     }
 
     #[test]
-    fn system_with_pipewire_registers_both_backends() {
+    fn system_with_pipewire_uses_platform_native_providers() {
         let registry = CaptureRegistry::system_with_pipewire();
-        #[cfg(target_os = "linux")]
-        assert_eq!(registry.provider_count(), 2);
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(registry.provider_count(), 1);
-        // V4L2 must still be present; a missing PipeWire session is reported
-        // as an empty source list, not a discovery failure.
         let scans = registry.scan();
-        assert!(scans.iter().any(|scan| scan.kind == CaptureKind::V4l2));
         #[cfg(target_os = "linux")]
         {
+            assert_eq!(registry.provider_count(), 2);
+            assert!(scans.iter().any(|scan| scan.kind == CaptureKind::V4l2));
             let pipewire = scans
                 .iter()
                 .find(|scan| scan.kind == CaptureKind::PipeWire)
                 .expect("PipeWire provider is registered");
-            assert_eq!(pipewire.kind, CaptureKind::PipeWire);
             assert!(
                 pipewire.is_ok(),
                 "a missing PipeWire session must not fail the scan: {:?}",
                 pipewire.error
             );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Non-Linux systems use their native capture provider without
+            // adding a separate PipeWire backend.
+            assert_eq!(registry.provider_count(), 1);
+            assert_eq!(scans.len(), 1);
         }
     }
 
