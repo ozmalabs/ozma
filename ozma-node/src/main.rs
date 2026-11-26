@@ -312,7 +312,7 @@ pub struct Args {
     #[arg(
         long,
         env = "OZMA_LOOKING_GLASS_FPS",
-        default_value_t = ozma_capture::LOOKING_GLASS_DEFAULT_FPS,
+        default_value_t = 30,
         value_name = "FPS"
     )]
     pub looking_glass_fps: u32,
@@ -321,7 +321,7 @@ pub struct Args {
     #[arg(
         long,
         env = "OZMA_LOOKING_GLASS_ID",
-        default_value = ozma_capture::LOOKING_GLASS_DEFAULT_ID
+        default_value = "looking-glass0"
     )]
     pub looking_glass_id: String,
 
@@ -329,7 +329,7 @@ pub struct Args {
     #[arg(
         long,
         env = "OZMA_LOOKING_GLASS_NAME",
-        default_value = ozma_capture::LOOKING_GLASS_DEFAULT_NAME
+        default_value = "Looking Glass IVSHMEM"
     )]
     pub looking_glass_name: String,
 
@@ -2018,6 +2018,7 @@ async fn run() -> std::process::ExitCode {
         vnc_idle_timeout_seconds: args.vnc_idle_timeout_seconds,
         vnc_clipboard: args.vnc_clipboard,
         vnc_clipboard_max_bytes: args.vnc_clipboard_max_bytes,
+        #[cfg(target_os = "linux")]
         dbus_console: args
             .capture_console
             .or(args.dbus_console)
@@ -2068,9 +2069,7 @@ async fn run() -> std::process::ExitCode {
         portal_cursor: args.portal_cursor.unwrap_or_default(),
         portal_restore_token: args.portal_restore_token.clone(),
         portal_timeout: std::time::Duration::from_millis(
-            args.portal_timeout_ms.unwrap_or_else(|| {
-                ozma_capture::PORTAL_DEFAULT_RESPONSE_TIMEOUT.as_millis() as u64
-            }),
+            args.portal_timeout_ms.unwrap_or(180_000),
         ),
         portal_requested,
         audio_capture_target,
