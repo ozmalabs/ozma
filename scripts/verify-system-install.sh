@@ -238,9 +238,10 @@ if grep -q 'GROUP="ozma-node"' "$R/etc/udev/rules.d/70-ozma-node-uinput.rules" &
    grep -q 'GROUP="ozma-node"' "$R/etc/udev/rules.d/70-ozma-node-hidg.rules" &&
    grep -q 'GROUP="ozma-node"' "$R/etc/udev/rules.d/70-ozma-node-gadget.rules" &&
    grep -q 'GROUP="render"' "$R/etc/udev/rules.d/70-ozma-node-render.rules" &&
+   grep -q 'TAG+="uaccess"' "$R/etc/udev/rules.d/70-ozma-node-render.rules" &&
    grep -q 'GROUP="video"' "$R/etc/udev/rules.d/70-ozma-node-v4l2.rules" &&
    grep -q "GROUP=\"$qmp_group\"" "$R/etc/udev/rules.d/70-ozma-node-input.rules"; then
-    pass "udev rules use the service, render, video, and QMP groups"
+    pass "udev rules use the service, render, video, and QMP groups (render also grants uaccess)"
 else
     fail "udev rule group rendering is inconsistent"
 fi

@@ -3,4 +3,11 @@
 # Ozma: DRM render nodes used by VAAPI/EGL hardware encode paths.
 # `render` is the conventional Linux group; scripts/install-system.sh adds the
 # service user.
-SUBSYSTEM=="drm", KERNEL=="renderD*", GROUP="render", MODE="0660"
+#
+# TAG+="uaccess" additionally grants the active local seat user an ACL. Group
+# membership alone is not enough for a long-running desktop session: systemd
+# --user (and the compositor it starts) keeps the supplementary group list it
+# had when the user manager started, so a user added to `render` later keeps
+# hitting EACCES until a full re-login or reboot. The ACL closes that window.
+# System services still rely on the `render` group.
+SUBSYSTEM=="drm", KERNEL=="renderD*", GROUP="render", MODE="0660", TAG+="uaccess"

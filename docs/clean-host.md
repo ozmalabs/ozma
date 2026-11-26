@@ -350,7 +350,12 @@ Group selection follows the profile: `hardware` gets `video input render`;
 
 Rules use the conventional `video`, `input`, and `render` groups, the
 `ozma-node` group for uinput/hidg, and `kvm` (or `root` when no `kvm` group
-exists) for QEMU-consumed virtual devices. `uinput` is loaded by the
+exists) for QEMU-consumed virtual devices. The render rule also sets
+`TAG+="uaccess"`, giving the active local seat an ACL. That keeps a desktop
+session working when the user was added to `render` after `systemd --user`
+started, because the running user manager keeps its old supplementary group
+list until a full re-login or reboot; the `render` group remains the path for
+system services. `uinput` is loaded by the
 modules-load snippet. The installer prints the exact reload commands and does
 not run them unless `--reload` is passed.
 
