@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Round-trip tests for the real audio adapters with in-memory PCM devices.
 //!

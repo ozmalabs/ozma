@@ -46,6 +46,10 @@ pub mod thermal;
 pub mod transport;
 #[cfg(target_os = "linux")]
 pub mod usb_audio;
+#[cfg(target_os = "linux")]
+pub mod usb_uac2;
+#[cfg(not(target_os = "linux"))]
+#[path = "usb_uac2_stub.rs"]
 pub mod usb_uac2;
 pub mod video;
 pub mod vnc_server;

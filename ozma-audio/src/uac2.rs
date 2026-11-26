@@ -32,6 +32,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+#[cfg(target_os = "linux")]
 use alsa::{
     pcm::{Access, Format, Frames, HwParams, PCM},
     Direction, ValueOr,
@@ -43,12 +44,15 @@ use ozma_usb::{
 use serde::{Deserialize, Serialize};
 
 /// Default ALSA period in frames (about 21 ms at 48 kHz).
+#[cfg(target_os = "linux")]
 pub const UAC2_DEFAULT_PERIOD_FRAMES: u32 = 1_024;
 /// Default ALSA ring length in periods.
+#[cfg(target_os = "linux")]
 pub const UAC2_DEFAULT_BUFFER_PERIODS: u32 = 4;
 
 /// Configuration for an ALSA-backed UAC2 sink or source.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
 pub struct AlsaUac2Config {
     /// ALSA PCM name, for example `default`, `hw:1,0`, or `plug:default`.
     pub device: String,
@@ -60,6 +64,7 @@ pub struct AlsaUac2Config {
     pub buffer_periods: u32,
 }
 
+#[cfg(target_os = "linux")]
 impl AlsaUac2Config {
     /// Config for an exact format.
     pub fn new(device: impl Into<String>, format: Uac2PcmFormat) -> Self {
@@ -170,6 +175,7 @@ impl Uac2SourceHandle {
 ///
 /// A returned length must be a whole number of interleaved frames. Returning
 /// `Ok(0)` is backpressure, not success.
+#[cfg(target_os = "linux")]
 pub trait Uac2PcmWriter: Send {
     /// Write interleaved PCM, returning the accepted byte count.
     fn write(&mut self, pcm: &[u8]) -> Result<usize, UsbError>;
@@ -180,6 +186,7 @@ pub trait Uac2PcmWriter: Send {
 }
 
 /// Byte-oriented capture device used by [`AlsaUac2Source`].
+#[cfg(target_os = "linux")]
 pub trait Uac2PcmReader: Send {
     /// Read up to `pcm.len()` bytes, returning the produced count.
     fn read(&mut self, pcm: &mut [u8]) -> Result<usize, UsbError>;
@@ -190,12 +197,14 @@ pub trait Uac2PcmReader: Send {
 }
 
 /// Factory for ALSA playback PCMs.
+#[cfg(target_os = "linux")]
 pub trait Uac2PcmWriterFactory: Send + Sync {
     /// Open a playback device.
     fn open(&self, config: &AlsaUac2Config) -> Result<Box<dyn Uac2PcmWriter>, UsbError>;
 }
 
 /// Factory for ALSA capture PCMs.
+#[cfg(target_os = "linux")]
 pub trait Uac2PcmReaderFactory: Send + Sync {
     /// Open a capture device.
     fn open(&self, config: &AlsaUac2Config) -> Result<Box<dyn Uac2PcmReader>, UsbError>;
@@ -203,14 +212,17 @@ pub trait Uac2PcmReaderFactory: Send + Sync {
 
 /// The production ALSA factory.
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(target_os = "linux")]
 pub struct AlsaPcmFactory;
 
+#[cfg(target_os = "linux")]
 impl Uac2PcmWriterFactory for AlsaPcmFactory {
     fn open(&self, config: &AlsaUac2Config) -> Result<Box<dyn Uac2PcmWriter>, UsbError> {
         AlsaPcmWriter::open(config).map(|writer| Box::new(writer) as Box<dyn Uac2PcmWriter>)
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Uac2PcmReaderFactory for AlsaPcmFactory {
     fn open(&self, config: &AlsaUac2Config) -> Result<Box<dyn Uac2PcmReader>, UsbError> {
         AlsaPcmReader::open(config).map(|reader| Box::new(reader) as Box<dyn Uac2PcmReader>)
@@ -218,12 +230,14 @@ impl Uac2PcmReaderFactory for AlsaPcmFactory {
 }
 
 /// ALSA playback adapter implementing [`Uac2AudioSink`].
+#[cfg(target_os = "linux")]
 pub struct AlsaUac2Sink {
     format: Uac2PcmFormat,
     io: Box<dyn Uac2PcmWriter>,
     stats: Arc<Mutex<Uac2SinkStats>>,
 }
 
+#[cfg(target_os = "linux")]
 impl std::fmt::Debug for AlsaUac2Sink {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -235,6 +249,7 @@ impl std::fmt::Debug for AlsaUac2Sink {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl AlsaUac2Sink {
     /// Open a real ALSA playback device with [`AlsaPcmFactory`].
     pub fn open(config: AlsaUac2Config) -> Result<Self, UsbError> {
@@ -275,6 +290,7 @@ impl AlsaUac2Sink {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Uac2AudioSink for AlsaUac2Sink {
     fn format(&self) -> Uac2PcmFormat {
         self.format
@@ -345,12 +361,14 @@ impl Uac2AudioSink for AlsaUac2Sink {
 }
 
 /// ALSA capture adapter implementing [`Uac2AudioSource`].
+#[cfg(target_os = "linux")]
 pub struct AlsaUac2Source {
     format: Uac2PcmFormat,
     io: Box<dyn Uac2PcmReader>,
     stats: Arc<Mutex<Uac2SourceStats>>,
 }
 
+#[cfg(target_os = "linux")]
 impl std::fmt::Debug for AlsaUac2Source {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -362,6 +380,7 @@ impl std::fmt::Debug for AlsaUac2Source {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl AlsaUac2Source {
     /// Open a real ALSA capture device with [`AlsaPcmFactory`].
     pub fn open(config: AlsaUac2Config) -> Result<Self, UsbError> {
@@ -400,6 +419,7 @@ impl AlsaUac2Source {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Uac2AudioSource for AlsaUac2Source {
     fn format(&self) -> Uac2PcmFormat {
         self.format
@@ -765,12 +785,14 @@ impl Uac2AudioSource for PipeWireUac2Source {
 }
 
 /// ALSA non-blocking playback handle.
+#[cfg(target_os = "linux")]
 struct AlsaPcmWriter {
     pcm: PCM,
     device: String,
     frame_bytes: usize,
 }
 
+#[cfg(target_os = "linux")]
 impl AlsaPcmWriter {
     fn open(config: &AlsaUac2Config) -> Result<Self, UsbError> {
         let pcm = open_alsa_pcm(config, Direction::Playback)?;
@@ -782,6 +804,7 @@ impl AlsaPcmWriter {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Uac2PcmWriter for AlsaPcmWriter {
     fn write(&mut self, pcm: &[u8]) -> Result<usize, UsbError> {
         if pcm.is_empty() {
@@ -829,12 +852,14 @@ impl Uac2PcmWriter for AlsaPcmWriter {
 }
 
 /// ALSA non-blocking capture handle.
+#[cfg(target_os = "linux")]
 struct AlsaPcmReader {
     pcm: PCM,
     device: String,
     frame_bytes: usize,
 }
 
+#[cfg(target_os = "linux")]
 impl AlsaPcmReader {
     fn open(config: &AlsaUac2Config) -> Result<Self, UsbError> {
         let pcm = open_alsa_pcm(config, Direction::Capture)?;
@@ -846,6 +871,7 @@ impl AlsaPcmReader {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Uac2PcmReader for AlsaPcmReader {
     fn read(&mut self, pcm: &mut [u8]) -> Result<usize, UsbError> {
         if pcm.is_empty() {
@@ -893,6 +919,7 @@ impl Uac2PcmReader for AlsaPcmReader {
 }
 
 /// Open and configure an ALSA PCM at exactly the requested format.
+#[cfg(target_os = "linux")]
 fn open_alsa_pcm(config: &AlsaUac2Config, direction: Direction) -> Result<PCM, UsbError> {
     config.validate()?;
     let address = match direction {
@@ -978,6 +1005,7 @@ fn open_alsa_pcm(config: &AlsaUac2Config, direction: Direction) -> Result<PCM, U
     Ok(pcm)
 }
 
+#[cfg(target_os = "linux")]
 fn alsa_format(size: Uac2SampleSize) -> Format {
     match size {
         Uac2SampleSize::S16 => Format::S16LE,
@@ -987,6 +1015,7 @@ fn alsa_format(size: Uac2SampleSize) -> Format {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn parameter_error(address: u8, device: &str, parameter: &str, error: alsa::Error) -> UsbError {
     UsbError::Uac2Endpoint {
         address,
@@ -995,6 +1024,7 @@ fn parameter_error(address: u8, device: &str, parameter: &str, error: alsa::Erro
     }
 }
 
+#[cfg(target_os = "linux")]
 fn is_would_block(error: &alsa::Error) -> bool {
     std::io::Error::from_raw_os_error(error.errno()).kind() == std::io::ErrorKind::WouldBlock
 }
@@ -1032,7 +1062,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use ozma_usb::{Uac2AudioSink, Uac2AudioSource};

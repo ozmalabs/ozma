@@ -3100,7 +3100,9 @@ async fn run() -> std::process::ExitCode {
     // export/USB/IP listener and apply its persistence policy after the state is
     // served.
     let usb_media_shutdown = usb_control.clone();
+    #[cfg(target_os = "linux")]
     let mut uac2_alsa_runtime: Option<usb_uac2::Uac2BridgeRuntime> = None;
+    #[cfg(target_os = "linux")]
     if let Some(control) = usb_control.as_mut() {
         if !control.is_available() {
             if config.usb_uac2_bridge {
@@ -3138,6 +3140,7 @@ async fn run() -> std::process::ExitCode {
             )));
         }
     }
+    #[cfg(target_os = "linux")]
     if let Some(mut runtime) = uac2_alsa_runtime {
         let uac2_shutdown = shutdown.clone();
         background.push((
@@ -3147,6 +3150,14 @@ async fn run() -> std::process::ExitCode {
                 runtime.stop();
             }),
         ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(control) = usb_control.as_mut() {
+        if config.usb_uac2 || config.usb_uac2_bridge {
+            control.set_uac2_bridge(Some(usb_uac2::Uac2BridgeShared::unsupported(
+                "the UAC2 audio bridge is only available on Linux",
+            )));
+        }
     }
     if let Some(control) = usb_control
         .as_ref()
