@@ -1,18 +1,21 @@
-# Phase 4 — opt-in 1-Wire, I²C, SPI, GPIO, and SocketCAN bus report
+# Phase 4 — opt-in 1-Wire, I²C/SMBus/PMBus, SPI, GPIO, SocketCAN, IIO, PWM, and DDC/CI bus report
 
 Status: **implemented, wired, opt-in, and bounded**. The bus module is
 `ozma-node/src/buses/` (`mod.rs`, `onewire.rs`, `i2c.rs`, `spi.rs`, `gpio.rs`,
-`can.rs`). It adds explicit allowlists, typed errors, and read/write/transfer/
-capture surfaces for the five protocols without auto-detecting any device.
+`can.rs`, `iio.rs`, `pwm.rs`, `ddc.rs`, `pmbus.rs`). It adds explicit
+allowlists, typed errors, and read/write/transfer/capture surfaces for the
+protocols without auto-detecting any device.
 
 The CLI, `ConnectionState`, router mount, and `buses` capability advertisement
 are wired:
 
-- `main.rs` builds `BusConfig::from_cli_full(...)` and `BusState::new(...)`;
+- `main.rs` builds `BusConfig::from_cli_all(...)` and `BusState::new(...)`;
 - `controller_compat::ConnectionState::with_buses` carries the state;
 - `controller_compat::compat_router` merges `crate::buses::router(...)` behind
   the node bearer guard;
-- the `buses` capability is true when any of the five protocols is configured.
+- the `buses` capability is true when any protocol (including IIO, PWM, or
+  DDC/CI) is configured. PMBus uses the I²C allowlist and adds no separate
+  capability.
 
 ## Configuration model
 
@@ -31,18 +34,27 @@ enables nothing.
 | `--can-allow IFACE[:send]` | `can.allow` | empty | Exact interface; `:send` opts that interface into TX |
 | `--can-send-allow IFACE` | `can.allow[*].send` | empty | Names must already be in `--can-allow` |
 | `--can-max-frames N` | `max_can_frames` | 128 | 1–1024 per interface |
+| `--iio-allow DEVICE:CHANNEL,...` | `iio.allow` | empty | Exact pairs; `DEVICE` normalizes to `iio:deviceN`; read-only |
+| `--iio-root PATH` | `iio.root` | `/sys/bus/iio/devices` | Absolute, no `.`/`..` |
+| `--pwm-allow CHIP:CHANNEL[:export]` | `pwm.allow` | empty | Exact pairs; `CHIP` normalizes to `pwmchipN`; `:export` is the only creation opt-in |
+| `--pwm-root PATH` | `pwm.root` | `/sys/class/pwm` | Absolute, no `.`/`..` |
+| `--ddc-allow BUS:ADDR[:write]` | `ddc.allow` | empty | Exact pairs; `ADDR` must be `0x37`; every pair must also be in `--i2c-allow`; `:write` opts into VCP writes |
+| `--i2c-pec` | `i2c.pec` | false | Enables SMBus PEC; the adapter must advertise it or the transaction is typed `bus.unsupported` |
 | `--bus-max-transfer-bytes N` | `max_transfer_bytes` | 4096 | 1–65,536 |
 | `--bus-max-block-bytes N` | `max_block_bytes` | 32 | 1–32 (SMBus block limit) |
 | `--bus-max-devices N` | `max_devices` | 64 | 1–256 (also caps GPIO lines/CAN interfaces) |
 
-`BusConfig::from_cli_full(onewire, i2c, spi, gpio, can, can_send, ...)` is the
-node startup adapter. `BusConfig::from_cli`/`from_cli_with_limits` remain for
+`BusConfig::from_cli_all(onewire, i2c, spi, gpio, can, can_send, iio,
+iio_root, pwm, pwm_root, ddc, i2c_pec, ...)` is the node startup adapter.
+`BusConfig::from_cli_full` remains as a compatibility wrapper for callers that
+predate IIO/PWM/DDC, and `BusConfig::from_cli`/`from_cli_with_limits` remain for
 callers that only use the original three protocols. `onewire` follows clap bool
 semantics: `None` disables the surface, `Some("")` or `Some("true")` selects the
 default sysfs root, and any other string is an explicit root (for
-containers/tests). Each allowlist string may contain comma- or whitespace-
-separated entries. I²C addresses accept decimal or `0x` hex; GPIO line offsets
-accept decimal or `0x` hex.
+containers/tests). IIO/PWM roots are normal optional paths; `None` keeps the
+kernel default. Each allowlist string may contain comma- or whitespace-
+separated entries. I²C addresses accept decimal or `0x` hex; GPIO line offsets,
+IIO device numbers, and PWM channels accept decimal or `0x` hex where numeric.
 
 GPIO `CHIP` accepts `gpiochipN`, `/dev/gpiochipN`, or a bare numeric `N` and is
 normalized to `/dev/gpiochipN`. A line defaults to `input`; a duplicate line
@@ -67,13 +79,13 @@ All routes are node routes and are meant to sit behind the bearer guard.
 
 | Route | Method | Behaviour |
 |---|---|---|
-| `/buses/status` | GET | 200 summary: per-protocol configured/available facts and advertised bounds. Never probes I²C or SPI. |
+| `/buses/status` | GET | 200 summary: per-protocol configured/available facts and advertised bounds. Never probes I²C, SPI, IIO, PWM, or DDC. |
 | `/buses/1wire/devices` | GET | Lists valid `family-id` directories, sorted, capped by `max_devices`; includes `family`, optional kernel `name`. |
 | `/buses/1wire/{id}` | GET | One validated id: family, `name`, `w1_slave_available`, `crc_valid`, `temperature_millicelsius`, `temperature_c`, and bounded/sanitized `raw_lines`. |
 | `/buses/i2c` | GET | Allowlisted buses, `/dev/i2c-N` existence, and exact addresses. No scan. |
 | `/buses/i2c/{bus}/detect` | GET | Bounded `i2cdetect -y -r BUS` quick scan; only allowlisted buses run and only allowlisted addresses are returned. |
-| `/buses/i2c/{bus}/{addr}/read` | POST | SMBus `byte`/`word`/`block` read. |
-| `/buses/i2c/{bus}/{addr}/write` | POST | SMBus `byte`/`word`/`block` write. |
+| `/buses/i2c/{bus}/{addr}/read` | POST | SMBus `byte`/`word`/`block`/`smbus-block` read, with optional PEC. |
+| `/buses/i2c/{bus}/{addr}/write` | POST | SMBus `byte`/`word`/`block`/`smbus-block` write, with optional PEC. |
 | `/buses/spi` | GET | Allowlisted `/dev/spidevX.Y` nodes and existence. No open. |
 | `/buses/spi/{device}/transfer` | POST | Full-duplex hex TX/RX; mode 0–3; 8/16 bits; bounded speed and length. |
 | `/buses/spi/dev/{device}/transfer` | POST | Alias for callers that spell the device as `dev/spidevX.Y`. |
@@ -84,12 +96,28 @@ All routes are node routes and are meant to sit behind the bearer guard.
 | `/buses/can/{iface}/status` | GET | `ip -details -statistics -json`: operstate, MTU, kind, bitrate, controller state, error counters, link stats. |
 | `/buses/can/{iface}/frames?limit=N` | GET | Bounded recent capture (default buffer 128, absolute 1024); starts one receive socket lazily. |
 | `/buses/can/{iface}/send` | POST | Classic/FD data, standard/extended ID, explicit RTR; requires `:send` or `--can-send-allow`. |
+| `/buses/pmbus/{bus}/{addr}` | GET | Best-effort PMBus identification for an address already in `--i2c-allow`: revision, MFR strings, raw VOUT/IOUT/temperature, and linear-format VOUT volts when available. Typed `bus.unavailable` when the revision register does not answer. No writes. |
+| `/buses/iio` | GET | Allowlisted IIO devices/channels and device-directory existence. No channel read and no write. |
+| `/buses/iio/{device}` | GET | Device `name` plus each allowlisted channel's raw/scale/offset/processed/sampling/type facts. |
+| `/buses/iio/{device}/{channel}` | GET | One channel's bounded facts. Missing optional files are `null`; a channel with no raw/input file is typed `bus.unavailable`. |
+| `/buses/pwm` | GET | Allowlisted PWM chip/channel pairs, export opt-in, chip/channel existence, and current values for already-exported channels. Never exports. |
+| `/buses/pwm/{chip}/{channel}` | GET | Current `period_ns`, `duty_ns`, `enabled`; typed `bus.unavailable` when the channel is not exported. |
+| `/buses/pwm/{chip}/{channel}/set` | POST | Bounded period/duty/enable writes. Requires the exact allowlisted pair; a missing channel additionally requires `:export`. |
+| `/buses/ddc` | GET | Allowlisted DDC/CI bus/address pairs, `/dev/i2c-N` existence, and write opt-in. No I/O. |
+| `/buses/ddc/{bus}/{addr}` | GET | DDC/CI target facts and the three supported VCP codes. |
+| `/buses/ddc/{bus}/{addr}/vcp/{code}` | GET | Bounded VCP read for `0x10` brightness, `0x12` contrast, or `0x60` input source. |
+| `/buses/ddc/{bus}/{addr}/vcp/{code}/set` | POST | Bounded VCP write; requires `:write` on the exact `--ddc-allow` pair. |
+| `/buses/ddc/{bus}/{addr}/capabilities` | GET | One bounded (32-byte) DDC/CI capabilities fragment, sanitized to printable ASCII. |
 
 Axum 0.7 uses `:param` internally; the docs above use the controller-facing
 `{param}` notation. SPI `{device}` accepts `spidev0.0`, `0.0`, `/dev/spidev0.0`,
 or `dev/spidev0.0`, always normalized to the exact allowlisted
 `/dev/spidevX.Y`. GPIO `{chip}` accepts `gpiochipN`, `/dev/gpiochipN`, or `N`;
 `{line}` is a decimal/`0x` offset. CAN `{iface}` is the exact interface name.
+IIO `{device}` accepts `iio:deviceN`, `deviceN`, or `N`; `{channel}` is a
+letters/digits/`_`/`-` name. PWM `{chip}` accepts `pwmchipN`,
+`/sys/class/pwm/pwmchipN`, or `N`; `{channel}` is a decimal/`0x` number.
+DDC `{bus}`/`{addr}` accept decimal or `0x` hex and `{addr}` must be `0x37`.
 
 ### I²C request bodies
 
@@ -99,6 +127,7 @@ Read (`POST /buses/i2c/1/0x50/read`):
 {"op":"byte","register":16}
 {"op":"word","register":17}
 {"op":"block","register":18,"length":3}
+{"op":"smbus-block","register":0x20,"length":4}
 ```
 
 Write (`POST /buses/i2c/1/0x50/write`):
@@ -107,19 +136,83 @@ Write (`POST /buses/i2c/1/0x50/write`):
 {"op":"byte","register":16,"value":90}
 {"op":"word","register":17,"value":4660}
 {"op":"block","register":18,"data":"01 02 03"}
+{"op":"smbus-block","register":0x21,"data":"aa bb"}
 ```
 
 - `byte` may omit `register` for the no-register `read_byte`/`write_byte`
   transaction.
-- `word` and `block` require `register`.
-- `block` reads require `length` (1–`max_block_bytes`); block writes require
+- `word`, `block`, and `smbus-block` require `register`.
+- `block` is the SMBus I²C-block form and requires `length`
+  (1–`max_block_bytes`). `smbus-block` is the count-prefixed SMBus block form;
+  `length` is optional and acts as an upper bound. Block writes require
   non-empty bounded hex `data`.
+- `--i2c-pec` enables SMBus Packet Error Checking on every allowlisted
+  transaction. Before the first PEC transaction on a bus, the node checks
+  adapter functionality with `i2cdetect -F` (capability query only, no device
+  addressing). If the adapter does not advertise SMBus PEC, the request is
+  typed `bus.unsupported` rather than silently degrading to a non-PEC
+  transaction. The response reports `pec:true|false`.
 - Unknown fields, wrong field combinations, out-of-range values, and oversized
   hex are `bus.invalid-request` before the backend is called.
-- Read responses include the exact `data` hex, `bytes`, `register`, and (for
-  `byte`/`word`) the assembled `value`. Word values are little-endian on the
-  SMBus wire.
-- Write responses include `bytes` written.
+- Read responses include the exact `data` hex, `bytes`, `register`, `pec`, and
+  (for `byte`/`word`) the assembled `value`. Word values are little-endian on
+  the SMBus wire.
+- Write responses include `bytes` written and `pec`.
+
+### PMBus identification
+
+`GET /buses/pmbus/{bus}/{addr}` accepts only an exact address already present in
+`--i2c-allow`. It reads `PMBUS_REVISION` (`0x98`) as the identification
+transaction; a NAK/no-response is typed `bus.unavailable`, never guessed. It
+then best-effort reads `MFR_ID`/`MFR_MODEL`/`MFR_REVISION`, `VOUT_MODE`,
+`READ_VOUT`, `READ_IOUT`, and `READ_TEMPERATURE_1`. VOUT is converted to volts
+only when `VOUT_MODE` reports the PMBus linear format; IOUT and temperature are
+returned as raw words because their exponent is device-specific. No PMBus write
+or configuration command exists.
+
+### IIO facts
+
+A channel read uses `in_{channel}_raw`, `in_{channel}_scale`,
+`in_{channel}_offset`, `in_{channel}_input`, `in_{channel}_type`, and
+`in_{channel}_sampling_frequency`, with the device `sampling_frequency` as a
+fallback. `processed` is the kernel `_input` value when present, otherwise
+`(raw + offset) * scale` when raw and scale are both present. Missing optional
+files are `null`, not invented. A channel with neither `_raw` nor `_input` is
+typed `bus.unavailable`. There is no IIO write, trigger, buffer, or event
+surface.
+
+### PWM request body
+
+```json
+{"period_ns":1000000,"duty_ns":250000,"enable":true}
+{"duty_ns":100000}
+{"enable":false}
+```
+
+`period_ns` must be 1–1,000,000,000,000 (1000 s); `duty_ns` must be 0–the
+period; at least one field is required. The exact channel is checked against
+`--pwm-allow` before any write. If the channel directory is absent, the pair
+must have been listed as `:export`; only then is the channel number written to
+the chip's `export`. Writes are ordered to remain kernel-valid: disable first
+when requested, lower duty to zero if the period shrinks below the current duty,
+write the period, write the duty, and enable last. The response reports the
+read-back `period_ns`, `duty_ns`, `enabled`, `exported_now`, and the changed
+fields. There is no `unexport` route and the node never writes `unexport`.
+
+### DDC/CI request body
+
+```json
+{"value":70}
+```
+
+`POST /buses/ddc/{bus}/{addr}/vcp/{code}/set` accepts a 16-bit `value` and only
+the three supported VCP codes: brightness `0x10`, contrast `0x12`, and input
+source `0x60`. Reads work for any allowlisted pair; writes require the exact
+pair to be listed as `BUS:0x37:write` and to be present in `--i2c-allow`. The
+real backend uses the DDC/CI framing (source `0x51`, length `0x80|n`, XOR
+checksum), a bounded 50 ms turnaround, and fixed bounded reply reads: 11 bytes
+for get-VCP and 35 bytes for one capabilities fragment. DDC/CI writes are only
+attempted with the explicit write opt-in.
 
 ### SPI request body
 
@@ -193,8 +286,11 @@ temperature/CRC, not an invented reading.
 
 - **No default bus or device.** I²C requires an exact `BUS:ADDR` pair; SPI
   requires an exact `/dev/spidevX.Y`; GPIO requires an exact `CHIP:LINE`; CAN
-  requires an exact interface name; 1-Wire requires the `--onewire` opt-in.
-  There is no implicit bus 0, chip 0, interface, glob, or fallback device.
+  requires an exact interface name; 1-Wire requires the `--onewire` opt-in;
+  IIO requires an exact `DEVICE:CHANNEL`; PWM requires an exact
+  `CHIP:CHANNEL`; DDC requires an exact `BUS:0x37` also present in
+  `--i2c-allow`. There is no implicit bus 0, chip 0, interface, glob, or
+  fallback device.
 - **GPIO is line-scoped.** No chip-wide request, export, scan, or line
   enumeration exists. A chip/line is checked against the allowlist before
   `/dev/gpiochipN` is opened. The line offset is then checked against the
@@ -214,26 +310,54 @@ temperature/CRC, not an invented reading.
   1024 absolute). Outbound sockets are capped at one in flight per interface.
   `?limit=N` is capped at the absolute frame bound and cannot over-read.
 - **Allowlist before any I/O.** I²C read/write checks the pair before opening
-  `/dev/i2c-N`; detect checks the bus before spawning `i2cdetect`; SPI checks the
-  normalized path before `Spidev::open`; 1-Wire validates the id before joining
-  it to the root.
+  `/dev/i2c-N`; detect checks the bus before spawning `i2cdetect`; SPI checks
+  the normalized path before `Spidev::open`; 1-Wire validates the id before
+  joining it to the root; IIO validates the device/channel pair before reading
+  sysfs; PWM checks the exact chip/channel before any write; DDC checks both
+  its own pair and the I²C allowlist before opening the bus.
 - **No broadcast/reserved I²C writes.** `0x00` (general call/broadcast),
   `0x01..=0x07`, and `0x78..=0x7f` are rejected at configuration and request
   time. This applies to reads as well as writes.
-- **No default probing.** `GET /buses/status`, `GET /buses/i2c`, and
-  `GET /buses/spi` only read configuration, stat `/dev` nodes, and optionally
-  list 1-Wire sysfs. They never scan I²C buses or open SPI devices.
+- **No default probing.** `GET /buses/status`, `GET /buses/i2c`,
+  `GET /buses/spi`, `GET /buses/iio`, `GET /buses/pwm`, and `GET /buses/ddc`
+  only read configuration, stat `/dev`/sysfs nodes, and optionally list 1-Wire
+  sysfs. They never scan I²C buses, open SPI devices, export PWM channels, or
+  address a DDC display.
 - **Bounded scans.** `i2cdetect -y -r` runs only for an allowlisted bus with a
   2 s default / 10 s maximum deadline. The child is killed on expiry and output
   is read with a 64 KiB cap. Only allowlisted addresses are returned.
 - **Bounded payloads.** I²C blocks are at most 32 bytes; SPI transfers are at
   most `max_transfer_bytes` (default 4 KiB, absolute 64 KiB); request bodies are
   capped before JSON extraction; listings and allowlists are capped by
-  `max_devices`.
+  `max_devices`. IIO sysfs values are read with a 256-byte cap. PWM period/duty
+  are capped at 1000 s and channel numbers at 4096. DDC/CI fragments are at
+  most 32 data bytes and capabilities text is capped per response.
+- **IIO is read-only and pair-scoped.** Only exact `DEVICE:CHANNEL` pairs are
+  readable. Device names normalize to `iio:deviceN`; channel names admit only
+  letters, digits, `_`, and `-`. No trigger, buffer, write, or event file is
+  ever opened.
+- **PWM is pair-scoped and never unexports.** The exact chip/channel pair is
+  checked before any write. Only `period`, `duty_cycle`, `enable`, and (with
+  `:export`) the chip `export` file are written. There is no `unexport` route
+  and no chip-wide operation. A channel that already exists is usable without
+  `:export`; `:export` is required only to create a missing one.
+- **DDC/CI is layered on the I²C allowlist.** Every DDC pair must be an exact
+  `--i2c-allow` entry and the address must be `0x37`. Reads are allowed once
+  listed; writes additionally need the exact `:write` suffix. Only brightness,
+  contrast, and input source are exposed. The node never scans a DDC bus.
+- **PMBus never probes.** Identification is only for an explicit
+  `GET /buses/pmbus/{bus}/{addr}` on an already-allowlisted address. There is
+  no PMBus write or auto-detection, and a failed revision read is typed
+  `bus.unavailable`.
+- **PEC is explicit and verified.** `--i2c-pec` is off by default. If the
+  adapter does not advertise SMBus PEC, the request fails typed rather than
+  silently issuing a non-PEC transaction.
 - **Path validation.** 1-Wire ids must match exactly two hex family digits,
   `-`, and twelve hex id digits. SPI paths must be absolute direct children of
-  `/dev` named `spidevX.Y` with digits. Neither path accepts `.`/`..`, extra
-  components, or non-numeric route segments.
+  `/dev` named `spidevX.Y` with digits. IIO device names normalize to
+  `iio:deviceN` and channels reject `/`, `\`, `:`, and `.`; PWM chips normalize
+  to `pwmchipN` and reject non-`/sys/class/pwm` paths. No route accepts `.`/`..`
+  or extra path components.
 - **Kernel sysfs links are intentional.** Real `/sys/bus/w1/devices/<id>`
   entries are symlinks to the device directory. The id basename is validated
   first, then the kernel-owned link is followed. No user-controlled path
@@ -249,12 +373,12 @@ Bodies use `{ok:false,supported,configured,available:false,code,error,remediatio
 |---|---|---|
 | `bus.not-configured` | 503 | No allowlist/flag enables this protocol |
 | `bus.unavailable` | 503 | Configured bus/device/sysfs entry is absent, unreadable, or no longer present |
-| `bus.not-allowed` | 403 | Exact bus/address/path/GPIO line/CAN interface is not allowlisted or not send-enabled |
-| `bus.permission-denied` | 403 | Kernel denied the GPIO chip/device (group/ACL) |
+| `bus.not-allowed` | 403 | Exact bus/address/path/GPIO line/CAN interface/IIO pair/PWM pair/DDC pair is not allowlisted, or PWM lacks `:export`, or DDC lacks `:write` |
+| `bus.permission-denied` | 403 | Kernel denied the GPIO chip/device, sysfs file, or bus node (group/ACL) |
 | `bus.busy` | 409 | GPIO line write/pulse or CAN send already in flight; kernel `EBUSY` |
-| `bus.invalid-request` | 400 | Malformed id/path/JSON/operation or a bound violation |
+| `bus.invalid-request` | 400 | Malformed id/path/JSON/operation or a bound violation (including a PWM duty above its period and unsupported DDC VCP codes) |
 | `bus.io-failed` | 502 | Kernel/backend I/O failed after the request was accepted |
-| `bus.unsupported` | 501 | Non-Linux backend or missing `i2cdetect` |
+| `bus.unsupported` | 501 | Non-Linux backend, missing `i2cdetect`, an adapter without SMBus PEC, an unsupported SMBus operation, or a display rejecting a VCP read |
 | `bus.timeout` | 504 | Bounded `i2cdetect`/backend operation deadline expired |
 
 Reserved/broadcast I²C addresses are `bus.invalid-request`; an unlisted but
@@ -277,8 +401,9 @@ and fake-backend tests still compile.
 
 ## Tests
 
-`cargo test -p ozma-node --lib buses` — 49 passed, 3 ignored (live i2c-stub,
-gpio-sim, and vcan).
+`cargo test -p ozma-node --lib buses` — 72 passed, 6 ignored (live i2c-stub
+read/write/detect, live i2c-stub PEC/SMBus-block typed unsupported, gpio-sim,
+vcan, and live IIO/PWM typed unavailable on a host without those sysfs roots).
 
 Coverage:
 
@@ -308,9 +433,27 @@ Coverage:
   BRS/DLC bounds, FD/extended normalization, `?limit` and buffer bounds, frames
   metadata, read-only send rejection, busy/permission mapping, `ip` JSON
   parsing without inventing absent fields, unconfigured behavior.
+- **IIO:** exact pair parsing/device normalization/channel traversal rejection;
+  fixture listing, device name, raw/scale/offset/type/sampling; processed value
+  from `_input` and from `(raw+offset)*scale`; missing/unlisted/unavailable
+  channels; unconfigured behavior; live typed unavailable with no IIO root.
+- **PWM:** exact `CHIP:CHANNEL[:export]` parsing/normalization/traversal
+  rejection; fixture list/detail; exact period/duty/enable sysfs write
+  read-back; period shrink below the current duty; export opt-in required and
+  no automatic export; bounds and unknown-field rejection; `unexport` sentinel
+  proves it is never written; live typed unavailable with no PWM root.
+- **SMBus/PMBus/PEC:** `smbus-block` read/write normalization and 32-byte
+  bounds; PEC opt-in plumbing and response flag; live i2c-stub typed
+  `bus.unsupported` for adapters without PEC or SMBus block; PMBus revision
+  identification, MFR strings, linear VOUT conversion, raw IOUT/temperature,
+  non-PMBus/unlisted/unconfigured typed errors.
+- **DDC/CI:** exact `BUS:0x37[:write]` parsing, I²C membership cross-check, VCP
+  code restriction, request/reply framing and checksum, fake get/set/
+  capabilities, read-only write rejection, value bounds, and unconfigured
+  behavior.
 - **Router/config:** default/unconfigured state, full CLI parsing including
-  GPIO/CAN, transfer/block/device/frame bounds, route presence, 404/405 shapes,
-  typed `bus.not-configured` for every implemented route.
+  IIO/PWM/DDC/PEC, transfer/block/device/frame bounds, route presence, 404/405
+  shapes, typed `bus.not-configured` for every implemented route.
 
 ### Live i2c-stub evidence
 
@@ -445,11 +588,60 @@ $ ip link show vcan0
 Device "vcan0" does not exist.
 ```
 
+### Live IIO/PWM typed evidence
+
+This host has neither `/sys/bus/iio/devices` nor `/sys/class/pwm`. The ignored
+tests used the kernel roots with an explicit allowlist, loaded no modules, and
+asserted the typed unavailable path:
+
+```text
+$ cargo test -p ozma-node --lib \
+    buses::iio::tests::live_iio_root_is_typed_unavailable -- --ignored --nocapture
+running 1 test
+test buses::iio::tests::live_iio_root_is_typed_unavailable ... ok
+
+$ cargo test -p ozma-node --lib \
+    buses::pwm::tests::live_pwm_root_is_typed_unavailable -- --ignored --nocapture
+running 1 test
+test buses::pwm::tests::live_pwm_root_is_typed_unavailable ... ok
+```
+
+Both return `bus.unavailable` before any sysfs write. IIO/PWM write behavior is
+covered only by the temp-directory sysfs fixtures; no physical PWM or IIO device
+was touched.
+
+### Live i2c-stub PEC/SMBus-block evidence
+
+`i2c-stub` advertises neither SMBus PEC nor SMBus block transfers
+(`i2cdetect -F 22` reports both `no`). The ignored real-backend test asserted
+the node fails typed instead of silently dropping PEC or changing the
+transaction:
+
+```text
+$ sudo modprobe i2c-stub chip_addr=0x50
+$ sudo env OZMA_LIVE_I2C_BUS=22 \
+    ./target/debug/deps/ozma_node-<hash> \
+    --exact buses::i2c::tests::live_i2c_stub_pec_and_smbus_block_are_typed_unsupported \
+    --ignored --nocapture
+running 1 test
+test buses::i2c::tests::live_i2c_stub_pec_and_smbus_block_are_typed_unsupported ... ok
+```
+
+The existing i2c-stub byte/word/I²C-block/detect test also remained green. The
+adapter was removed with `sudo modprobe -r i2c_stub`; `/dev/i2c-22` is absent.
+SMBus block/PEC success paths are exercised by fake-backend tests because the
+available virtual adapter does not implement them.
+
+DDC/CI has no safe virtual sink on this host (the only `/dev/i2c-*` nodes are
+real adapters and the DDC address is a physical display target), so get/set/
+capabilities and framing are covered only by fakes and unit tests. No DDC bus
+was opened or written.
+
 No `spidev` or 1-Wire hardware exists on this host (`/dev/spidev*` and
 `/sys/bus/w1/devices/` are absent), so live 1-Wire/SPI evidence is the typed
 `bus.unavailable` path exercised by the fixture/fake tests. No virtual spidev or
-w1 module was loaded. Real GPIO lines (`gpiochip0/1`) and physical CAN
-interfaces were never opened or modified.
+w1 module was loaded. Real GPIO lines (`gpiochip0/1`), physical CAN interfaces,
+and real I²C devices/DDC buses were never opened or modified.
 
 ## Remaining gaps
 
@@ -473,11 +665,27 @@ interfaces were never opened or modified.
 - CAN status depends on `iproute2` (`ip -details -statistics -json`); the crate
   is built without socketcan's netlink feature, so there is no in-process
   bitrate/state query.
-- I²C supports only 7-bit user addresses, SMBus byte/word/block transactions,
-  and no PEC, 10-bit addressing, SMBus process calls, or raw `I2C_RDWR`
-  combined transfers.
-- I²C detection shells out to `i2cdetect`; there is no in-process scan and no
-  per-address identify operation.
+- I²C supports only 7-bit user addresses, SMBus byte/word/I²C-block/SMBus-block
+  transactions, and opt-in PEC. There is no 10-bit addressing, SMBus process
+  call, or raw multi-message `I2C_RDWR` combined transfer exposed as a route.
+  PEC support is verified with `i2cdetect -F`; adapters that cannot implement
+  PEC return `bus.unsupported`.
+- I²C detection shells out to `i2cdetect`; there is no in-process scan. PMBus
+  identification is best-effort and standard-register only; it does not parse
+  device-specific IOUT/temperature coefficients and does not expose PMBus
+  writes/configuration.
+- IIO is read-only and channel-scoped. There is no trigger, buffer, event,
+  write, calibration, or sampling-frequency write, and no channel enumeration
+  outside the allowlist.
+- PWM has no unexport, polarity, capture, or chip-wide operation. Writes are
+  direct `period`/`duty_cycle`/`enable` sysfs writes; there is no atomic
+  multi-file transaction, so a crash mid-sequence can leave the channel at an
+  intermediate valid value.
+- DDC/CI supports only brightness, contrast, and input source, one capabilities
+  fragment per request, and no multi-monitor discovery. The real backend reads
+  fixed bounded reply sizes (11 bytes get-VCP, 35 bytes capabilities); a monitor
+  that returns a shorter capabilities fragment may need a retry or a different
+  read strategy. There is no live DDC evidence on this host.
 - SPI is one full-duplex `SPI_IOC_MESSAGE` per request; no multi-segment
   transfers, explicit CS changes, LSB-first flag, dual/quad modes, or partial
   reads independent of TX length.

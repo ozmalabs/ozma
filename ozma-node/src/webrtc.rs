@@ -52,12 +52,12 @@
 //!   program that speaks the protocol);
 //! * [`WebRtcBackend::Native`] — the sibling `ozma-webrtc-native` Rust binary.
 //!
-//! The native helper is **video-only**. It accepts the audio argv for
-//! compatibility but answers an offered Opus m-line `inactive`, so the node
-//! never reports native audio as configured or produced even when an audio
-//! source is supplied. Native selection is explicit (`--webrtc-native`,
-//! `OZMA_WEBRTC_NATIVE`, or `--webrtc-helper ozma-webrtc-native`); the node
-//! never silently substitutes it for a configured Python helper.
+//! The native helper supports video and, when `--audio-source` is supplied,
+//! Opus audio. Audio remains configuration intent only: the node never claims
+//! that the monitor opened or that samples were produced. Native selection is
+//! explicit (`--webrtc-native`, `OZMA_WEBRTC_NATIVE`, or
+//! `--webrtc-helper ozma-webrtc-native`); the node never silently substitutes
+//! it for a configured Python helper.
 
 use std::fmt;
 use std::io;
@@ -138,7 +138,7 @@ pub enum WebRtcBackend {
     /// The historical GStreamer/Python worker (or another explicit program).
     #[default]
     External,
-    /// The native Rust `ozma-webrtc-native` helper (video-only).
+    /// The native Rust `ozma-webrtc-native` helper.
     Native,
 }
 
@@ -151,9 +151,11 @@ impl WebRtcBackend {
         }
     }
 
-    /// True when this helper cannot carry audio today.
+    /// Retained for compatibility. Both backends can carry audio when an
+    /// audio source is configured; the native helper supports Opus.
     pub fn is_video_only(self) -> bool {
-        self == Self::Native
+        let _ = self;
+        false
     }
 }
 
@@ -265,10 +267,9 @@ impl WebRtcConfig {
 
     /// Whether this helper can carry audio.
     ///
-    /// The native helper is video-only even if audio flags were forwarded, so
-    /// configuration intent must not be reported as audio support.
+    /// Both backends support audio when a source is configured.
     pub fn audio_supported(&self) -> bool {
-        !self.backend.is_video_only()
+        true
     }
 
     /// True when any ICE server was configured.
@@ -1505,7 +1506,8 @@ impl WebRtcControl {
     /// This is only the PulseAudio/PipeWire monitor name; it is not proof that
     /// the worker opened the source or produced samples. The native helper is
     /// video-only, so it reports `None` even when the argv carried an audio
-    /// source for compatibility.
+    /// source. Native audio is supported, so this reports the configured
+    /// monitor as intent without claiming samples.
     pub fn audio_source(&self) -> Option<String> {
         let inner = self.lock();
         if inner.status.backend().is_video_only() {
@@ -2632,14 +2634,14 @@ mod tests {
         let status = helper.status();
         assert_eq!(status.backend(), WebRtcBackend::Native);
         assert!(
-            !status.audio_configured(),
-            "the native helper is video-only even when argv carries an audio source"
+            status.audio_configured(),
+            "the native helper reports configured audio intent when argv carries a source"
         );
 
         let control = WebRtcControl::from_helper(helper);
         assert_eq!(control.backend(), WebRtcBackend::Native);
-        assert!(!control.audio_configured());
-        assert_eq!(control.audio_source(), None);
+        assert!(control.audio_configured());
+        assert_eq!(control.audio_source().as_deref(), Some("ozma-vm1.monitor"));
     }
 
     #[cfg(unix)]
@@ -2691,7 +2693,7 @@ for line in reader:
         assert_eq!(helper.status().status_name(), "running");
         assert_eq!(helper.status().backend(), WebRtcBackend::Native);
         assert!(helper.status().helper_pid().is_some());
-        assert!(!helper.status().audio_configured());
+        assert!(helper.status().audio_configured());
 
         let answer = helper
             .offer_answer("v=0 offer")

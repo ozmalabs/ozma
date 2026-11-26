@@ -12234,7 +12234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_reports_native_backend_without_claiming_audio() {
+    async fn connection_reports_native_backend_audio_intent() {
         let state = ConnectionState::new(
             ConnectionInfo::new(
                 "node-a._ozma._udp.local.",
@@ -12255,11 +12255,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["webrtc"], "failed");
         assert_eq!(body["webrtc_backend"], "native");
-        assert_eq!(body["webrtc_audio_configured"], false);
-        assert!(
-            body["webrtc_audio_source"].is_null(),
-            "native is video-only and must not report an audio monitor: {body}"
-        );
+        assert_eq!(body["webrtc_audio_configured"], true);
+        assert_eq!(body["webrtc_audio_source"], "ozma-vm1.monitor");
     }
 
     #[tokio::test]

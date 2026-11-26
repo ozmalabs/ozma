@@ -1275,6 +1275,52 @@ pub struct Args {
     )]
     pub can_send_allow: Vec<String>,
 
+    /// Exact read-only IIO `DEVICE:CHANNEL` allowlist (repeatable or
+    /// comma-separated), e.g. `iio:device0:voltage0`.
+    #[arg(
+        long,
+        env = "OZMA_IIO_ALLOW",
+        value_name = "DEVICE:CHANNEL",
+        value_delimiter = ','
+    )]
+    pub iio_allow: Vec<String>,
+
+    /// Optional explicit IIO sysfs root for staging/tests (default
+    /// `/sys/bus/iio/devices`).
+    #[arg(long, env = "OZMA_IIO_ROOT", value_name = "PATH")]
+    pub iio_root: Option<String>,
+
+    /// Exact PWM `CHIP:CHANNEL[:export]` allowlist (repeatable or
+    /// comma-separated). `:export` permits creating a missing channel; there is
+    /// no unexport operation.
+    #[arg(
+        long,
+        env = "OZMA_PWM_ALLOW",
+        value_name = "CHIP:CHANNEL[:export]",
+        value_delimiter = ','
+    )]
+    pub pwm_allow: Vec<String>,
+
+    /// Optional explicit PWM sysfs root for staging/tests (default
+    /// `/sys/class/pwm`).
+    #[arg(long, env = "OZMA_PWM_ROOT", value_name = "PATH")]
+    pub pwm_root: Option<String>,
+
+    /// Exact DDC/CI `BUS:ADDR[:write]` allowlist (repeatable or
+    /// comma-separated). Every pair must also be in --i2c-allow; `:write` opts
+    /// that exact display into bounded VCP writes.
+    #[arg(
+        long,
+        env = "OZMA_DDC_ALLOW",
+        value_name = "BUS:ADDR[:write]",
+        value_delimiter = ','
+    )]
+    pub ddc_allow: Vec<String>,
+
+    /// Opt in to SMBus Packet Error Checking on allowlisted I²C transactions.
+    #[arg(long, env = "OZMA_I2C_PEC")]
+    pub i2c_pec: bool,
+
     /// Maximum recent CAN frames buffered per allowlisted interface.
     #[arg(
         long,
@@ -3565,13 +3611,19 @@ async fn run() -> std::process::ExitCode {
     set_capability(&mut args, &mut config, "serial", serial_available);
     // Opt-in low-speed buses. Nothing is probed or opened without an explicit
     // allowlist; the default state keeps every route at typed 503.
-    let bus_config = match ozma_node::buses::BusConfig::from_cli_full(
+    let bus_config = match ozma_node::buses::BusConfig::from_cli_all(
         args.onewire.as_deref(),
         &args.i2c_allow,
         &args.spi_allow,
         &args.gpio_allow,
         &args.can_allow,
         &args.can_send_allow,
+        &args.iio_allow,
+        args.iio_root.as_deref(),
+        &args.pwm_allow,
+        args.pwm_root.as_deref(),
+        &args.ddc_allow,
+        args.i2c_pec,
         args.bus_max_transfer_bytes,
         args.bus_max_block_bytes,
         args.bus_max_devices,
@@ -3605,7 +3657,10 @@ async fn run() -> std::process::ExitCode {
         || bus_status.i2c.configured
         || bus_status.spi.configured
         || bus_status.gpio.configured
-        || bus_status.can.configured;
+        || bus_status.can.configured
+        || bus_status.iio.configured
+        || bus_status.pwm.configured
+        || bus_status.ddc.configured;
     set_capability(&mut args, &mut config, "buses", buses_configured);
     // Opt-in application control. Nothing is signalled unless this flag is
     // present; without it the routes stay mounted and return a typed 503.

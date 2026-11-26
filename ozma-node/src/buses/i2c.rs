@@ -52,6 +52,8 @@ pub fn is_user_address(address: u8) -> bool {
 #[derive(Clone, Debug)]
 pub struct I2cConfig {
     allow: BTreeMap<u16, BTreeSet<u8>>,
+    /// Opt-in SMBus Packet Error Checking for every transaction.
+    pec: bool,
     /// `i2cdetect` deadline. The subprocess is killed when it expires.
     pub detect_timeout: Duration,
 }
@@ -60,6 +62,7 @@ impl Default for I2cConfig {
     fn default() -> Self {
         Self {
             allow: BTreeMap::new(),
+            pec: false,
             detect_timeout: Duration::from_millis(DEFAULT_DETECT_TIMEOUT_MS),
         }
     }
@@ -135,6 +138,18 @@ impl I2cConfig {
     /// True when at least one exact pair is allowlisted.
     pub fn is_configured(&self) -> bool {
         !self.allow.is_empty()
+    }
+
+    /// Opt in/out of SMBus PEC. PEC is a per-transaction kernel option; no
+    /// address is added or probed by enabling it.
+    pub fn with_pec(mut self, pec: bool) -> Self {
+        self.pec = pec;
+        self
+    }
+
+    /// True when SMBus PEC was explicitly requested with `--i2c-pec`.
+    pub fn pec_enabled(&self) -> bool {
+        self.pec
     }
 
     /// Exact allowlist check used before any open or CLI invocation.
@@ -220,7 +235,12 @@ pub(crate) fn device_path(bus: u16) -> String {
 pub enum I2cOp {
     Byte,
     Word,
+    /// SMBus I²C block transfer with an explicit length.
     Block,
+    /// SMBus block transfer with a device-supplied count byte. This is the
+    /// only block form that supports PEC on the wire.
+    #[serde(rename = "smbus-block", alias = "smbus_block")]
+    SmbusBlock,
 }
 
 impl I2cOp {
@@ -229,6 +249,7 @@ impl I2cOp {
             Self::Byte => "byte",
             Self::Word => "word",
             Self::Block => "block",
+            Self::SmbusBlock => "smbus-block",
         }
     }
 }
@@ -242,7 +263,8 @@ pub struct I2cReadRequest {
     /// `byte` (absent means the no-register `read_byte` transaction).
     #[serde(default)]
     pub register: Option<u8>,
-    /// Block length in bytes. Required for `block`, rejected otherwise.
+    /// Block length in bytes. Required for `block`; an optional upper bound
+    /// for `smbus-block`, rejected otherwise.
     #[serde(default)]
     pub length: Option<usize>,
 }
@@ -270,6 +292,7 @@ pub enum I2cReadOp {
     Byte { register: Option<u8> },
     Word { register: u8 },
     Block { register: u8, length: usize },
+    SmbusBlock { register: u8, length: usize },
 }
 
 impl I2cReadOp {
@@ -278,13 +301,16 @@ impl I2cReadOp {
             Self::Byte { .. } => "byte",
             Self::Word { .. } => "word",
             Self::Block { .. } => "block",
+            Self::SmbusBlock { .. } => "smbus-block",
         }
     }
 
     pub fn register(&self) -> Option<u8> {
         match self {
             Self::Byte { register } => *register,
-            Self::Word { register } | Self::Block { register, .. } => Some(*register),
+            Self::Word { register }
+            | Self::Block { register, .. }
+            | Self::SmbusBlock { register, .. } => Some(*register),
         }
     }
 }
@@ -295,6 +321,7 @@ pub enum I2cWriteOp {
     Byte { register: Option<u8>, value: u8 },
     Word { register: u8, value: u16 },
     Block { register: u8, data: Vec<u8> },
+    SmbusBlock { register: u8, data: Vec<u8> },
 }
 
 impl I2cWriteOp {
@@ -303,13 +330,16 @@ impl I2cWriteOp {
             Self::Byte { .. } => "byte",
             Self::Word { .. } => "word",
             Self::Block { .. } => "block",
+            Self::SmbusBlock { .. } => "smbus-block",
         }
     }
 
     pub fn register(&self) -> Option<u8> {
         match self {
             Self::Byte { register, .. } => *register,
-            Self::Word { register, .. } | Self::Block { register, .. } => Some(*register),
+            Self::Word { register, .. }
+            | Self::Block { register, .. }
+            | Self::SmbusBlock { register, .. } => Some(*register),
         }
     }
 
@@ -317,7 +347,7 @@ impl I2cWriteOp {
         match self {
             Self::Byte { .. } => 1,
             Self::Word { .. } => 2,
-            Self::Block { data, .. } => data.len(),
+            Self::Block { data, .. } | Self::SmbusBlock { data, .. } => data.len(),
         }
     }
 }
@@ -357,6 +387,18 @@ impl I2cReadRequest {
                     )));
                 }
                 Ok(I2cReadOp::Block { register, length })
+            }
+            I2cOp::SmbusBlock => {
+                let register = self.register.ok_or_else(|| {
+                    invalid_request("smbus-block reads require a `register` command byte")
+                })?;
+                let length = self.length.unwrap_or(max_block_bytes);
+                if !(1..=max_block_bytes).contains(&length) {
+                    return Err(invalid_request(format!(
+                        "smbus-block length must be between 1 and {max_block_bytes} bytes"
+                    )));
+                }
+                Ok(I2cReadOp::SmbusBlock { register, length })
             }
         }
     }
@@ -411,6 +453,26 @@ impl I2cWriteRequest {
                 }
                 Ok(I2cWriteOp::Block { register, data })
             }
+            I2cOp::SmbusBlock => {
+                if self.value.is_some() {
+                    return Err(invalid_request(
+                        "smbus-block writes reject `value`; use `data`",
+                    ));
+                }
+                let register = self.register.ok_or_else(|| {
+                    invalid_request("smbus-block writes require a `register` command byte")
+                })?;
+                let data = self
+                    .data
+                    .ok_or_else(|| invalid_request("smbus-block writes require `data` as hex"))?;
+                let data = parse_hex_bytes(&data, max_block_bytes)?;
+                if data.is_empty() {
+                    return Err(invalid_request(
+                        "smbus-block writes require at least one data byte",
+                    ));
+                }
+                Ok(I2cWriteOp::SmbusBlock { register, data })
+            }
         }
     }
 }
@@ -420,10 +482,11 @@ impl I2cWriteRequest {
 pub trait I2cBackend: Send + Sync {
     /// Run a bounded read-only quick scan and return detected user addresses.
     fn detect(&self, bus: u16, timeout: Duration) -> Result<Vec<u8>, BusError>;
-    /// Perform a normalized SMBus read.
-    fn read(&self, bus: u16, address: u8, op: &I2cReadOp) -> Result<Vec<u8>, BusError>;
-    /// Perform a normalized SMBus write.
-    fn write(&self, bus: u16, address: u8, op: &I2cWriteOp) -> Result<(), BusError>;
+    /// Perform a normalized SMBus read. `pec` is the operator's explicit
+    /// `--i2c-pec` opt-in and is passed through to the kernel SMBus ioctl.
+    fn read(&self, bus: u16, address: u8, op: &I2cReadOp, pec: bool) -> Result<Vec<u8>, BusError>;
+    /// Perform a normalized SMBus write. `pec` behaves as for [`Self::read`].
+    fn write(&self, bus: u16, address: u8, op: &I2cWriteOp, pec: bool) -> Result<(), BusError>;
 }
 
 /// Real Linux `i2c-dev` backend using the safe `i2cdev` wrapper.
@@ -444,28 +507,28 @@ impl I2cBackend for RealI2cBackend {
         }
     }
 
-    fn read(&self, bus: u16, address: u8, op: &I2cReadOp) -> Result<Vec<u8>, BusError> {
+    fn read(&self, bus: u16, address: u8, op: &I2cReadOp, pec: bool) -> Result<Vec<u8>, BusError> {
         #[cfg(target_os = "linux")]
         {
-            read_real(bus, address, op)
+            read_real(bus, address, op, pec)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (bus, address, op);
+            let _ = (bus, address, op, pec);
             Err(BusError::Unsupported {
                 detail: "I2C is only implemented on Linux i2c-dev".to_owned(),
             })
         }
     }
 
-    fn write(&self, bus: u16, address: u8, op: &I2cWriteOp) -> Result<(), BusError> {
+    fn write(&self, bus: u16, address: u8, op: &I2cWriteOp, pec: bool) -> Result<(), BusError> {
         #[cfg(target_os = "linux")]
         {
-            write_real(bus, address, op)
+            write_real(bus, address, op, pec)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (bus, address, op);
+            let _ = (bus, address, op, pec);
             Err(BusError::Unsupported {
                 detail: "I2C is only implemented on Linux i2c-dev".to_owned(),
             })
@@ -474,14 +537,122 @@ impl I2cBackend for RealI2cBackend {
 }
 
 #[cfg(target_os = "linux")]
-fn read_real(bus: u16, address: u8, op: &I2cReadOp) -> Result<Vec<u8>, BusError> {
-    use i2cdev::core::I2CDevice;
+fn open_real(bus: u16, address: u8, pec: bool) -> Result<i2cdev::linux::LinuxI2CDevice, BusError> {
     use i2cdev::linux::LinuxI2CDevice;
 
     let path = device_path(bus);
     let context = format!("{path} address 0x{address:02x}");
     let mut device = LinuxI2CDevice::new(&path, address as u16)
         .map_err(|error| map_i2c_error(&format!("opening {context}"), error))?;
+    // The kernel accepts I2C_PEC even on adapters that cannot implement it.
+    // `--i2c-pec` is an explicit assertion that PEC is on the wire, so verify
+    // the adapter functionality first and fail typed instead of silently
+    // degrading to a non-PEC transaction. `i2cdetect -F` only queries adapter
+    // capabilities; it does not address any device.
+    if pec && !pec_supported(bus)? {
+        return Err(BusError::Unsupported {
+            detail: format!(
+                "{path} does not advertise SMBus PEC; remove --i2c-pec for this adapter"
+            ),
+        });
+    }
+    device
+        .set_smbus_pec(pec)
+        .map_err(|error| map_i2c_error(&format!("{context} set PEC={pec}"), error))?;
+    Ok(device)
+}
+
+#[cfg(target_os = "linux")]
+fn pec_supported(bus: u16) -> Result<bool, BusError> {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<BTreeMap<u16, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Some(value) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&bus)
+        .copied()
+    {
+        return Ok(value);
+    }
+
+    let mut child = Command::new("i2cdetect")
+        .arg("-F")
+        .arg(bus.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => BusError::Unsupported {
+                detail: "i2cdetect was not found on PATH; install i2c-tools to verify --i2c-pec"
+                    .to_owned(),
+            },
+            _ => io_failed(format!(
+                "could not start i2cdetect -F on bus {bus}: {error}"
+            )),
+        })?;
+    let deadline = Instant::now() + Duration::from_millis(DEFAULT_DETECT_TIMEOUT_MS);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(BusError::Timeout {
+                        detail: format!(
+                            "i2cdetect -F on bus {bus} exceeded {DEFAULT_DETECT_TIMEOUT_MS} ms"
+                        ),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io_failed(format!(
+                    "could not wait for i2cdetect -F on bus {bus}: {error}"
+                )));
+            }
+        }
+    };
+    let mut stdout = String::new();
+    if let Some(pipe) = child.stdout.take() {
+        use std::io::Read as _;
+        let _ = pipe
+            .take(MAX_DETECT_OUTPUT_BYTES as u64)
+            .read_to_string(&mut stdout);
+    }
+    if !status.success() {
+        return Err(BusError::Unsupported {
+            detail: format!("i2cdetect -F on bus {bus} exited with {status}"),
+        });
+    }
+    let supported = stdout.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("smbus pec")
+            && line
+                .split_whitespace()
+                .last()
+                .is_some_and(|value| value.eq_ignore_ascii_case("yes"))
+    });
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(bus, supported);
+    Ok(supported)
+}
+
+#[cfg(target_os = "linux")]
+fn read_real(bus: u16, address: u8, op: &I2cReadOp, pec: bool) -> Result<Vec<u8>, BusError> {
+    use i2cdev::core::I2CDevice;
+
+    let path = device_path(bus);
+    let context = format!("{path} address 0x{address:02x}");
+    let mut device = open_real(bus, address, pec)?;
     match op {
         I2cReadOp::Byte {
             register: Some(register),
@@ -500,18 +671,23 @@ fn read_real(bus: u16, address: u8, op: &I2cReadOp) -> Result<Vec<u8>, BusError>
         I2cReadOp::Block { register, length } => device
             .smbus_read_i2c_block_data(*register, *length as u8)
             .map_err(|error| map_i2c_error(&format!("{context} read block"), error)),
+        I2cReadOp::SmbusBlock { register, length } => device
+            .smbus_read_block_data(*register)
+            .map(|mut data| {
+                data.truncate(*length);
+                data
+            })
+            .map_err(|error| map_i2c_error(&format!("{context} read smbus-block"), error)),
     }
 }
 
 #[cfg(target_os = "linux")]
-fn write_real(bus: u16, address: u8, op: &I2cWriteOp) -> Result<(), BusError> {
+fn write_real(bus: u16, address: u8, op: &I2cWriteOp, pec: bool) -> Result<(), BusError> {
     use i2cdev::core::I2CDevice;
-    use i2cdev::linux::LinuxI2CDevice;
 
     let path = device_path(bus);
     let context = format!("{path} address 0x{address:02x}");
-    let mut device = LinuxI2CDevice::new(&path, address as u16)
-        .map_err(|error| map_i2c_error(&format!("opening {context}"), error))?;
+    let mut device = open_real(bus, address, pec)?;
     let result = match op {
         I2cWriteOp::Byte {
             register: Some(register),
@@ -523,6 +699,7 @@ fn write_real(bus: u16, address: u8, op: &I2cWriteOp) -> Result<(), BusError> {
         } => device.smbus_write_byte(*value),
         I2cWriteOp::Word { register, value } => device.smbus_write_word_data(*register, *value),
         I2cWriteOp::Block { register, data } => device.smbus_write_i2c_block_data(*register, data),
+        I2cWriteOp::SmbusBlock { register, data } => device.smbus_write_block_data(*register, data),
     };
     result.map_err(|error| map_i2c_error(&format!("{context} write"), error))
 }
@@ -540,6 +717,8 @@ fn map_i2c_error(context: &str, error: i2cdev::linux::LinuxI2CError) -> BusError
         || matches!(error.raw_os_error(), Some(libc::ENXIO) | Some(libc::ENODEV))
     {
         unavailable(detail)
+    } else if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+        BusError::Unsupported { detail }
     } else {
         io_failed(detail)
     }
@@ -705,6 +884,8 @@ pub struct I2cReadResponse {
     /// Exact returned bytes, lower-case hex.
     pub data: String,
     pub encoding: &'static str,
+    /// SMBus PEC was enabled for this transaction (`--i2c-pec`).
+    pub pec: bool,
 }
 
 /// `POST /buses/i2c/{bus}/{addr}/write` response.
@@ -719,6 +900,8 @@ pub struct I2cWriteResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub register: Option<u8>,
     pub bytes: usize,
+    /// SMBus PEC was enabled for this transaction (`--i2c-pec`).
+    pub pec: bool,
 }
 
 impl BusState {
@@ -828,7 +1011,8 @@ impl BusState {
             });
         }
         let op = request.into_op(self.inner.config.max_block_bytes)?;
-        let mut data = self.inner.i2c.read(bus, address, &op)?;
+        let pec = self.inner.config.i2c.pec_enabled();
+        let mut data = self.inner.i2c.read(bus, address, &op, pec)?;
         match &op {
             I2cReadOp::Byte { .. } if data.len() != 1 => {
                 return Err(io_failed(format!(
@@ -844,7 +1028,7 @@ impl BusState {
             }
             _ => {}
         }
-        if let I2cReadOp::Block { length, .. } = &op {
+        if let I2cReadOp::Block { length, .. } | I2cReadOp::SmbusBlock { length, .. } = &op {
             data.truncate(*length);
         }
         let value = match &op {
@@ -856,7 +1040,7 @@ impl BusState {
                 ];
                 Some(u32::from(u16::from_le_bytes(bytes)))
             }
-            I2cReadOp::Block { .. } => None,
+            I2cReadOp::Block { .. } | I2cReadOp::SmbusBlock { .. } => None,
         };
         Ok(I2cReadResponse {
             ok: true,
@@ -870,6 +1054,7 @@ impl BusState {
             value,
             data: super::encode_hex(&data),
             encoding: "hex",
+            pec,
         })
     }
 
@@ -892,7 +1077,8 @@ impl BusState {
             });
         }
         let op = request.into_op(self.inner.config.max_block_bytes)?;
-        self.inner.i2c.write(bus, address, &op)?;
+        let pec = self.inner.config.i2c.pec_enabled();
+        self.inner.i2c.write(bus, address, &op, pec)?;
         Ok(I2cWriteResponse {
             ok: true,
             supported: true,
@@ -902,6 +1088,7 @@ impl BusState {
             op: op.op_name(),
             register: op.register(),
             bytes: op.byte_len(),
+            pec,
         })
     }
 }
@@ -1015,8 +1202,8 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Call {
         Detect(u16),
-        Read(u16, u8, I2cReadOp),
-        Write(u16, u8, I2cWriteOp),
+        Read(u16, u8, I2cReadOp, bool),
+        Write(u16, u8, I2cWriteOp, bool),
     }
 
     #[derive(Default)]
@@ -1063,15 +1250,21 @@ mod tests {
             Ok(inner.detected.clone())
         }
 
-        fn read(&self, bus: u16, address: u8, op: &I2cReadOp) -> Result<Vec<u8>, BusError> {
+        fn read(
+            &self,
+            bus: u16,
+            address: u8,
+            op: &I2cReadOp,
+            pec: bool,
+        ) -> Result<Vec<u8>, BusError> {
             let mut inner = self.inner.lock().unwrap();
-            inner.calls.push(Call::Read(bus, address, op.clone()));
+            inner.calls.push(Call::Read(bus, address, op.clone(), pec));
             inner.reads.pop_front().unwrap_or_else(|| Ok(vec![0x5a]))
         }
 
-        fn write(&self, bus: u16, address: u8, op: &I2cWriteOp) -> Result<(), BusError> {
+        fn write(&self, bus: u16, address: u8, op: &I2cWriteOp, pec: bool) -> Result<(), BusError> {
             let mut inner = self.inner.lock().unwrap();
-            inner.calls.push(Call::Write(bus, address, op.clone()));
+            inner.calls.push(Call::Write(bus, address, op.clone(), pec));
             inner.writes.pop_front().unwrap_or(Ok(()))
         }
     }
@@ -1267,11 +1460,11 @@ mod tests {
         let calls = fake.calls();
         assert_eq!(
             calls[0],
-            Call::Read(1, 0x50, I2cReadOp::Byte { register: Some(0) })
+            Call::Read(1, 0x50, I2cReadOp::Byte { register: Some(0) }, false)
         );
         assert_eq!(
             calls[1],
-            Call::Read(1, 0x50, I2cReadOp::Word { register: 0 })
+            Call::Read(1, 0x50, I2cReadOp::Word { register: 0 }, false)
         );
         assert_eq!(
             calls[2],
@@ -1281,7 +1474,8 @@ mod tests {
                 I2cReadOp::Block {
                     register: 0,
                     length: 3
-                }
+                },
+                false
             )
         );
     }
@@ -1327,7 +1521,8 @@ mod tests {
                 I2cWriteOp::Byte {
                     register: Some(1),
                     value: 255
-                }
+                },
+                false
             )
         );
         assert_eq!(
@@ -1338,7 +1533,8 @@ mod tests {
                 I2cWriteOp::Word {
                     register: 2,
                     value: 4660
-                }
+                },
+                false
             )
         );
         assert_eq!(
@@ -1349,7 +1545,8 @@ mod tests {
                 I2cWriteOp::Block {
                     register: 3,
                     data: vec![0xde, 0xad, 0xbe, 0xef]
-                }
+                },
+                false
             )
         );
 
@@ -1484,6 +1681,97 @@ mod tests {
         assert!(fake.calls().is_empty());
     }
 
+    #[tokio::test]
+    async fn smbus_block_and_pec_are_bounded_and_explicit() {
+        let fake = FakeI2c::default();
+        fake.queue_read(Ok(vec![1, 2, 3, 4, 5]));
+        let app = router(state(config(), fake.clone()));
+
+        let (status, body) = post(
+            &app,
+            "/buses/i2c/1/0x50/read",
+            json!({"op": "smbus-block", "register": 0x20, "length": 4}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["op"], "smbus-block");
+        assert_eq!(body["data"], "01020304");
+        assert_eq!(body["bytes"], 4);
+        assert_eq!(body["pec"], false);
+        assert_eq!(
+            fake.calls(),
+            vec![Call::Read(
+                1,
+                0x50,
+                I2cReadOp::SmbusBlock {
+                    register: 0x20,
+                    length: 4
+                },
+                false
+            )]
+        );
+
+        let fake = FakeI2c::default();
+        let app = router(state(config(), fake.clone()));
+        let (status, body) = post(
+            &app,
+            "/buses/i2c/1/0x52/write",
+            json!({"op": "smbus-block", "register": 0x21, "data": "aa bb"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["op"], "smbus-block");
+        assert_eq!(body["bytes"], 2);
+        assert_eq!(
+            fake.calls(),
+            vec![Call::Write(
+                1,
+                0x52,
+                I2cWriteOp::SmbusBlock {
+                    register: 0x21,
+                    data: vec![0xaa, 0xbb]
+                },
+                false
+            )]
+        );
+
+        let fake = FakeI2c::default();
+        let pec_config = config().with_i2c_pec(true);
+        let app = router(state(pec_config, fake.clone()));
+        let (status, body) = post(
+            &app,
+            "/buses/i2c/1/0x50/read",
+            json!({"op": "byte", "register": 0x10}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["pec"], true);
+        assert_eq!(
+            fake.calls(),
+            vec![Call::Read(
+                1,
+                0x50,
+                I2cReadOp::Byte {
+                    register: Some(0x10)
+                },
+                true
+            )]
+        );
+
+        let fake = FakeI2c::default();
+        let app = router(state(config(), fake.clone()));
+        for body in [
+            json!({"op": "smbus-block"}),
+            json!({"op": "smbus-block", "register": 0, "length": 0}),
+            json!({"op": "smbus-block", "register": 0, "length": 33}),
+        ] {
+            let (status, response) = post(&app, "/buses/i2c/1/0x50/read", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(response["code"], "bus.invalid-request");
+        }
+        assert!(fake.calls().is_empty());
+    }
+
     /// Live evidence against the Linux `i2c-stub` virtual adapter.
     ///
     /// This test is ignored by default and requires an explicitly created stub
@@ -1496,6 +1784,70 @@ mod tests {
     ///     buses::i2c::tests::live_i2c_stub_real_backend -- --ignored --nocapture
     /// sudo modprobe -r i2c_stub
     /// ```
+    /// Live typed evidence that `i2c-stub` advertises neither SMBus block nor
+    /// PEC. The code path is exercised by the fake tests; this test proves the
+    /// real backend surfaces `bus.unsupported` rather than silently dropping
+    /// PEC or performing a different transaction.
+    ///
+    /// ```text
+    /// sudo modprobe i2c-stub chip_addr=0x50
+    /// sudo env OZMA_LIVE_I2C_BUS=22 cargo test -p ozma-node --lib \
+    ///     buses::i2c::tests::live_i2c_stub_pec_and_smbus_block_are_typed_unsupported \
+    ///     -- --ignored --nocapture
+    /// sudo modprobe -r i2c_stub
+    /// ```
+    #[test]
+    #[ignore = "requires a live Linux i2c-stub bus; set OZMA_LIVE_I2C_BUS"]
+    fn live_i2c_stub_pec_and_smbus_block_are_typed_unsupported() {
+        let bus: u16 = std::env::var("OZMA_LIVE_I2C_BUS")
+            .expect("set OZMA_LIVE_I2C_BUS to the i2c-stub adapter number")
+            .parse()
+            .expect("numeric OZMA_LIVE_I2C_BUS");
+        let allow = format!("{bus}:0x50");
+        let config = BusConfig::new()
+            .with_i2c_allow(&[allow])
+            .expect("valid allowlist")
+            .with_i2c_pec(true);
+        let state = BusState::new(config).expect("valid state");
+        let bus = bus.to_string();
+
+        let error = state
+            .i2c_read(
+                &bus,
+                "0x50",
+                I2cReadRequest {
+                    op: I2cOp::Byte,
+                    register: Some(0x10),
+                    length: None,
+                },
+            )
+            .expect_err("i2c-stub does not advertise SMBus PEC");
+        assert!(
+            matches!(error, BusError::Unsupported { .. }),
+            "expected typed unsupported for PEC, got {error:?}"
+        );
+
+        let config = BusConfig::new()
+            .with_i2c_allow(&[format!("{bus}:0x50")])
+            .expect("valid allowlist");
+        let state = BusState::new(config).expect("valid state");
+        let error = state
+            .i2c_read(
+                &bus,
+                "0x50",
+                I2cReadRequest {
+                    op: I2cOp::SmbusBlock,
+                    register: Some(0x10),
+                    length: Some(4),
+                },
+            )
+            .expect_err("i2c-stub does not advertise SMBus block reads");
+        assert!(
+            matches!(error, BusError::Unsupported { .. }),
+            "expected typed unsupported for SMBus block, got {error:?}"
+        );
+    }
+
     #[test]
     #[ignore = "requires a live Linux i2c-stub bus; set OZMA_LIVE_I2C_BUS"]
     fn live_i2c_stub_real_backend_read_write_detect() {

@@ -18,12 +18,20 @@
 //! * `--can-allow IFACE[:send]` is the complete set of CAN interfaces. Capture
 //!   and status are read-only; `:send` (or `--can-send-allow`) opts one exact
 //!   interface into transmission. No bus-off/restart operation exists.
+//! * `--iio-allow DEVICE:CHANNEL` is a read-only IIO sysfs allowlist.
+//! * `--pwm-allow CHIP:CHANNEL[:export]` is the complete PWM sysfs allowlist;
+//!   writes are bounded and `:export` is the only way a missing channel is
+//!   created. There is no unexport operation.
+//! * `--ddc-allow BUS:ADDR[:write]` is the DDC/CI allowlist. Every pair must
+//!   already appear in `--i2c-allow`; writes additionally need `:write`.
+//! * `GET /buses/pmbus/{bus}/{addr}` is best-effort PMBus identification for an
+//!   already-allowlisted I²C address; it never probes another address.
 //!
-//! Bounds are explicit: one SPI transfer, one I²C block, one GPIO pulse, one
-//! CAN frame/capture buffer, the number of listed devices, and the
-//! `i2cdetect`/`ip` deadlines. Every route returns a typed `bus.*` failure
-//! instead of an empty success. The router contains no authentication: mount it
-//! **behind** the node bearer guard.
+//! Bounds are explicit: one SPI transfer, one I²C/SMBus block, one GPIO pulse,
+//! one CAN frame/capture buffer, one PWM period/duty pair, the number of listed
+//! devices, and the `i2cdetect`/`ip` deadlines. Every route returns a typed
+//! `bus.*` failure instead of an empty success. The router contains no
+//! authentication: mount it **behind** the node bearer guard.
 //!
 //! `BusState` is mounted by `controller_compat::compat_router` via
 //! `.merge(crate::buses::router(state.buses.clone()))` and built in `main` with
@@ -32,9 +40,13 @@
 //! `bus.not-configured` 503 and no device or socket is opened.
 
 pub mod can;
+pub mod ddc;
 pub mod gpio;
 pub mod i2c;
+pub mod iio;
 pub mod onewire;
+pub mod pmbus;
+pub mod pwm;
 pub mod spi;
 
 use std::path::{Component, Path};
@@ -146,13 +158,13 @@ impl BusError {
     pub fn remediation(&self) -> &'static str {
         match self {
             Self::NotConfigured => {
-                "Start the node with --onewire, --i2c-allow BUS:ADDR,..., --spi-allow /dev/spidevX.Y, --gpio-allow CHIP:LINE[:input|output], and/or --can-allow IFACE[:send]; nothing is probed without an explicit allowlist."
+                "Start the node with --onewire, --i2c-allow BUS:ADDR,..., --spi-allow /dev/spidevX.Y, --gpio-allow CHIP:LINE[:input|output], --can-allow IFACE[:send], --iio-allow DEVICE:CHANNEL, --pwm-allow CHIP:CHANNEL[:export], and/or --ddc-allow BUS:ADDR[:write]; nothing is probed without an explicit allowlist."
             }
             Self::Unavailable { .. } => {
-                "Check the explicit sysfs root, device node, GPIO chip, or CAN interface; the node never falls back to a different bus, chip, or interface."
+                "Check the explicit sysfs root, device node, GPIO chip, PWM channel/export, IIO channel, or CAN interface; the node never falls back to a different bus, chip, or interface."
             }
             Self::NotAllowed { .. } => {
-                "Add the exact bus/address pair, /dev/spidevX.Y path, GPIO chip/line, or CAN interface to the corresponding --*-allow flag. The node never probes unlisted hardware."
+                "Add the exact bus/address pair, /dev/spidevX.Y path, GPIO chip/line, CAN interface, IIO device/channel, PWM chip/channel (plus :export if needed), or DDC pair (plus :write) to the corresponding --*-allow flag. The node never probes unlisted hardware."
             }
             Self::PermissionDenied { .. } => {
                 "Grant the node user access to the named /dev/gpiochipN, CAN interface, or bus node (group/ACL), then retry; the exact allowlist entry is already present."
@@ -232,6 +244,12 @@ pub struct BusConfig {
     pub gpio: gpio::GpioConfig,
     /// Exact CAN interface allowlist and per-interface send opt-in.
     pub can: can::CanConfig,
+    /// Read-only IIO device/channel allowlist.
+    pub iio: iio::IioConfig,
+    /// Exact PWM chip/channel allowlist and per-channel export opt-in.
+    pub pwm: pwm::PwmConfig,
+    /// Exact DDC/CI bus/address allowlist and per-pair write opt-in.
+    pub ddc: ddc::DdcConfig,
     /// Maximum bytes in one SPI transfer (and the hex payload bound).
     pub max_transfer_bytes: usize,
     /// Maximum SMBus block bytes.
@@ -250,6 +268,9 @@ impl Default for BusConfig {
             spi: spi::SpiConfig::default(),
             gpio: gpio::GpioConfig::default(),
             can: can::CanConfig::default(),
+            iio: iio::IioConfig::default(),
+            pwm: pwm::PwmConfig::default(),
+            ddc: ddc::DdcConfig::default(),
             max_transfer_bytes: DEFAULT_MAX_TRANSFER_BYTES,
             max_block_bytes: DEFAULT_MAX_BLOCK_BYTES,
             max_devices: DEFAULT_MAX_DEVICES,
@@ -306,6 +327,49 @@ impl BusConfig {
         send_entries: &[String],
     ) -> Result<Self, BusError> {
         self.can = can::CanConfig::from_allow_entries(entries, send_entries)?;
+        Ok(self)
+    }
+
+    /// Opt in/out of SMBus PEC on every I²C transaction.
+    pub fn with_i2c_pec(mut self, pec: bool) -> Self {
+        self.i2c = self.i2c.clone().with_pec(pec);
+        self
+    }
+
+    /// Replace the read-only IIO allowlist. Each string may contain
+    /// comma/space separated `DEVICE:CHANNEL` entries.
+    pub fn with_iio_allow(mut self, entries: &[String]) -> Result<Self, BusError> {
+        let root = self.iio.root().to_path_buf();
+        self.iio = iio::IioConfig::from_entries(entries)?.with_root(root)?;
+        Ok(self)
+    }
+
+    /// Set the IIO sysfs root (default `/sys/bus/iio/devices`).
+    pub fn with_iio_root(mut self, root: impl Into<std::path::PathBuf>) -> Result<Self, BusError> {
+        let root = root.into();
+        self.iio = self.iio.clone().with_root(root)?;
+        Ok(self)
+    }
+
+    /// Replace the PWM allowlist. Each string may contain comma/space
+    /// separated `CHIP:CHANNEL[:export]` entries.
+    pub fn with_pwm_allow(mut self, entries: &[String]) -> Result<Self, BusError> {
+        let root = self.pwm.root().to_path_buf();
+        self.pwm = pwm::PwmConfig::from_entries(entries)?.with_root(root)?;
+        Ok(self)
+    }
+
+    /// Set the PWM sysfs root (default `/sys/class/pwm`).
+    pub fn with_pwm_root(mut self, root: impl Into<std::path::PathBuf>) -> Result<Self, BusError> {
+        let root = root.into();
+        self.pwm = self.pwm.clone().with_root(root)?;
+        Ok(self)
+    }
+
+    /// Replace the DDC/CI allowlist. Each entry must also be in the I²C
+    /// allowlist; [`BusConfig::validate`] enforces that cross-check.
+    pub fn with_ddc_allow(mut self, entries: &[String]) -> Result<Self, BusError> {
+        self.ddc = ddc::DdcConfig::from_entries(entries)?;
         Ok(self)
     }
 
@@ -391,6 +455,52 @@ impl BusConfig {
         max_devices: usize,
         max_can_frames: usize,
     ) -> Result<Self, BusError> {
+        Self::from_cli_all(
+            onewire,
+            i2c_allow,
+            spi_allow,
+            gpio_allow,
+            can_allow,
+            can_send_allow,
+            &[],
+            None,
+            &[],
+            None,
+            &[],
+            false,
+            max_transfer_bytes,
+            max_block_bytes,
+            max_devices,
+            max_can_frames,
+        )
+    }
+
+    /// Build from every bus CLI value, including IIO, PWM, PMBus/PEC, and
+    /// DDC/CI.
+    ///
+    /// `iio_root`/`pwm_root` follow the same optional-path convention as the
+    /// 1-Wire root: `None` keeps the kernel default, and an explicit absolute
+    /// path is used for staging/tests. DDC entries are cross-checked against
+    /// the final I²C allowlist in [`Self::validate`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_cli_all(
+        onewire: Option<&str>,
+        i2c_allow: &[String],
+        spi_allow: &[String],
+        gpio_allow: &[String],
+        can_allow: &[String],
+        can_send_allow: &[String],
+        iio_allow: &[String],
+        iio_root: Option<&str>,
+        pwm_allow: &[String],
+        pwm_root: Option<&str>,
+        ddc_allow: &[String],
+        i2c_pec: bool,
+        max_transfer_bytes: usize,
+        max_block_bytes: usize,
+        max_devices: usize,
+        max_can_frames: usize,
+    ) -> Result<Self, BusError> {
         let mut config = Self::default()
             .with_limits(max_transfer_bytes, max_block_bytes, max_devices)
             .with_max_can_frames(max_can_frames);
@@ -402,10 +512,19 @@ impl BusConfig {
             };
             config.onewire = Some(OneWireConfig::new(root)?);
         }
-        config.i2c = i2c::I2cConfig::from_entries(i2c_allow)?;
+        config.i2c = i2c::I2cConfig::from_entries(i2c_allow)?.with_pec(i2c_pec);
         config.spi = spi::SpiConfig::from_entries(spi_allow)?;
         config.gpio = gpio::GpioConfig::from_entries(gpio_allow)?;
         config.can = can::CanConfig::from_allow_entries(can_allow, can_send_allow)?;
+        config.iio = iio::IioConfig::from_entries(iio_allow)?;
+        if let Some(root) = iio_root.map(str::trim).filter(|root| !root.is_empty()) {
+            config.iio = config.iio.with_root(root)?;
+        }
+        config.pwm = pwm::PwmConfig::from_entries(pwm_allow)?;
+        if let Some(root) = pwm_root.map(str::trim).filter(|root| !root.is_empty()) {
+            config.pwm = config.pwm.with_root(root)?;
+        }
+        config.ddc = ddc::DdcConfig::from_entries(ddc_allow)?;
         config.validate()?;
         Ok(config)
     }
@@ -439,6 +558,9 @@ impl BusConfig {
         self.spi.validate()?;
         self.gpio.validate()?;
         self.can.validate()?;
+        self.iio.validate()?;
+        self.pwm.validate()?;
+        self.ddc.validate()?;
         if self.i2c.total_addresses() > self.max_devices {
             return Err(invalid_request(format!(
                 "I2C allowlist contains {} addresses, above the max-devices bound of {}",
@@ -467,6 +589,45 @@ impl BusConfig {
                 self.max_devices
             )));
         }
+        if self.iio.total_channels() > self.max_devices {
+            return Err(invalid_request(format!(
+                "IIO allowlist contains {} channels, above the max-devices bound of {}",
+                self.iio.total_channels(),
+                self.max_devices
+            )));
+        }
+        if self.pwm.total_channels() > self.max_devices {
+            return Err(invalid_request(format!(
+                "PWM allowlist contains {} channels, above the max-devices bound of {}",
+                self.pwm.total_channels(),
+                self.max_devices
+            )));
+        }
+        if self.ddc.total_addresses() > self.max_devices {
+            return Err(invalid_request(format!(
+                "DDC allowlist contains {} addresses, above the max-devices bound of {}",
+                self.ddc.total_addresses(),
+                self.max_devices
+            )));
+        }
+        // DDC is a protocol layered on I²C: every DDC pair must already be an
+        // exact I²C allowlist entry. This can only narrow, never widen, the I²C
+        // surface.
+        for bus in self.ddc.bus_numbers() {
+            for address in self
+                .ddc
+                .addresses(bus)
+                .into_iter()
+                .flatten()
+                .map(|(a, _)| *a)
+            {
+                if !self.i2c.allows(bus, address) {
+                    return Err(invalid_request(format!(
+                        "DDC bus {bus} address 0x{address:02x} is not present in --i2c-allow; add --i2c-allow {bus}:0x{address:02x} first"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -480,6 +641,9 @@ pub struct BusLimits {
     pub max_can_frames: usize,
     pub min_pulse_ms: u64,
     pub max_pulse_ms: u64,
+    pub max_pwm_period_ns: u64,
+    pub max_pwm_channel: u32,
+    pub max_ddc_capabilities_bytes: usize,
 }
 
 /// 1-Wire facts in `GET /buses/status`.
@@ -502,6 +666,8 @@ pub struct I2cStatus {
     pub buses: usize,
     pub addresses: usize,
     pub available_buses: usize,
+    /// SMBus PEC was opted into with `--i2c-pec`.
+    pub pec: bool,
 }
 
 /// SPI facts in `GET /buses/status`. This only stats allowlisted nodes.
@@ -531,6 +697,44 @@ pub struct CanStatusSummary {
     pub available_interfaces: usize,
 }
 
+/// IIO facts in `GET /buses/status`. This only stats allowlisted devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct IioStatus {
+    pub configured: bool,
+    pub devices: usize,
+    pub channels: usize,
+    pub available_devices: usize,
+}
+
+/// PWM facts in `GET /buses/status`. This only stats allowlisted chips/channels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PwmStatus {
+    pub configured: bool,
+    pub chips: usize,
+    pub channels: usize,
+    pub export_channels: usize,
+    pub exported_channels: usize,
+    pub available_chips: usize,
+}
+
+/// DDC/CI facts in `GET /buses/status`. This only stats bus device nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct DdcStatus {
+    pub configured: bool,
+    pub addresses: usize,
+    pub write_addresses: usize,
+    pub available_buses: usize,
+}
+
+/// PMBus uses the I²C allowlist; this advertises that identification is
+/// available for every allowlisted address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PmbusStatus {
+    pub configured: bool,
+    pub addresses: usize,
+    pub pec: bool,
+}
+
 /// `GET /buses/status` response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BusStatus {
@@ -543,6 +747,10 @@ pub struct BusStatus {
     pub spi: SpiStatus,
     pub gpio: GpioStatus,
     pub can: CanStatusSummary,
+    pub iio: IioStatus,
+    pub pwm: PwmStatus,
+    pub ddc: DdcStatus,
+    pub pmbus: PmbusStatus,
     pub limits: BusLimits,
 }
 
@@ -553,6 +761,7 @@ struct BusInner {
     spi: Arc<dyn spi::SpiBackend>,
     gpio: Arc<dyn gpio::GpioBackend>,
     can: Arc<dyn can::CanBackend>,
+    ddc: Arc<dyn ddc::DdcBackend>,
     /// Per-line mutual exclusion for GPIO writes/pulses.
     gpio_locks: std::sync::Mutex<std::collections::BTreeSet<(String, u32)>>,
     /// Per-interface mutual exclusion for outbound CAN sockets.
@@ -609,6 +818,19 @@ impl BusState {
         gpio: Arc<dyn gpio::GpioBackend>,
         can: Arc<dyn can::CanBackend>,
     ) -> Result<Self, BusError> {
+        Self::with_all_backends_and_ddc(config, i2c, spi, gpio, can, Arc::new(ddc::RealDdcBackend))
+    }
+
+    /// Build a service with every backend explicit, including the DDC/CI
+    /// backend used by tests.
+    pub fn with_all_backends_and_ddc(
+        config: BusConfig,
+        i2c: Arc<dyn i2c::I2cBackend>,
+        spi: Arc<dyn spi::SpiBackend>,
+        gpio: Arc<dyn gpio::GpioBackend>,
+        can: Arc<dyn can::CanBackend>,
+        ddc: Arc<dyn ddc::DdcBackend>,
+    ) -> Result<Self, BusError> {
         config.validate()?;
         let onewire = config.onewire.clone().map(OneWire::new);
         Ok(Self {
@@ -619,6 +841,7 @@ impl BusState {
                 spi,
                 gpio,
                 can,
+                ddc,
                 gpio_locks: std::sync::Mutex::new(std::collections::BTreeSet::new()),
                 can_send_locks: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             }),
@@ -639,6 +862,9 @@ impl BusState {
             max_can_frames: self.inner.config.max_can_frames,
             min_pulse_ms: MIN_GPIO_PULSE_MS,
             max_pulse_ms: MAX_GPIO_PULSE_MS,
+            max_pwm_period_ns: pwm::MAX_PWM_PERIOD_NS,
+            max_pwm_channel: pwm::MAX_PWM_CHANNEL,
+            max_ddc_capabilities_bytes: ddc::MAX_DDC_CAPABILITIES_BYTES,
         }
     }
 
@@ -717,6 +943,55 @@ impl BusState {
             .filter(|iface| can::interface_present(iface))
             .count();
 
+        let iio_devices = self.inner.config.iio.devices().count();
+        let iio_available_devices = self
+            .inner
+            .config
+            .iio
+            .devices()
+            .filter(|device| self.inner.config.iio.root().join(device).is_dir())
+            .count();
+
+        let pwm_chips = self.inner.config.pwm.chips().count();
+        let pwm_available_chips = self
+            .inner
+            .config
+            .pwm
+            .chips()
+            .filter(|chip| self.inner.config.pwm.root().join(chip).is_dir())
+            .count();
+        let mut pwm_exported = 0usize;
+        for chip in self.inner.config.pwm.chips() {
+            for channel in self
+                .inner
+                .config
+                .pwm
+                .channels(chip)
+                .into_iter()
+                .flatten()
+                .map(|(c, _)| *c)
+            {
+                let dir = self
+                    .inner
+                    .config
+                    .pwm
+                    .root()
+                    .join(chip)
+                    .join(format!("pwm{channel}"));
+                if dir.is_dir() {
+                    pwm_exported += 1;
+                }
+            }
+        }
+
+        let ddc_available_buses = self
+            .inner
+            .config
+            .ddc
+            .bus_numbers()
+            .filter(|bus| Path::new(&i2c::device_path(*bus)).exists())
+            .count();
+
         BusStatus {
             ok: true,
             supported: true,
@@ -727,6 +1002,7 @@ impl BusState {
                 buses,
                 addresses,
                 available_buses,
+                pec: self.inner.config.i2c.pec_enabled(),
             },
             spi: SpiStatus {
                 configured: self.inner.config.spi.is_configured(),
@@ -745,6 +1021,31 @@ impl BusState {
                 interfaces: can_interfaces.len(),
                 send_interfaces: self.inner.config.can.send_ifaces().count(),
                 available_interfaces,
+            },
+            iio: IioStatus {
+                configured: self.inner.config.iio.is_configured(),
+                devices: iio_devices,
+                channels: self.inner.config.iio.total_channels(),
+                available_devices: iio_available_devices,
+            },
+            pwm: PwmStatus {
+                configured: self.inner.config.pwm.is_configured(),
+                chips: pwm_chips,
+                channels: self.inner.config.pwm.total_channels(),
+                export_channels: self.inner.config.pwm.export_channels(),
+                exported_channels: pwm_exported,
+                available_chips: pwm_available_chips,
+            },
+            ddc: DdcStatus {
+                configured: self.inner.config.ddc.is_configured(),
+                addresses: self.inner.config.ddc.total_addresses(),
+                write_addresses: self.inner.config.ddc.write_addresses(),
+                available_buses: ddc_available_buses,
+            },
+            pmbus: PmbusStatus {
+                configured: self.inner.config.i2c.is_configured(),
+                addresses: self.inner.config.i2c.total_addresses(),
+                pec: self.inner.config.i2c.pec_enabled(),
             },
             limits: self.limits(),
         }
@@ -833,7 +1134,11 @@ pub fn router(state: BusState) -> Router {
         .merge(i2c::router(state.clone()))
         .merge(spi::router(state.clone()))
         .merge(gpio::router(state.clone()))
-        .merge(can::router(state))
+        .merge(can::router(state.clone()))
+        .merge(iio::router(state.clone()))
+        .merge(pwm::router(state.clone()))
+        .merge(ddc::router(state.clone()))
+        .merge(pmbus::router(state))
 }
 
 async fn status_handler(axum::extract::State(state): axum::extract::State<BusState>) -> Response {
@@ -1002,6 +1307,10 @@ mod tests {
         assert!(!config.spi.is_configured());
         assert!(!config.gpio.is_configured());
         assert!(!config.can.is_configured());
+        assert!(!config.iio.is_configured());
+        assert!(!config.pwm.is_configured());
+        assert!(!config.ddc.is_configured());
+        assert!(!config.i2c.pec_enabled());
         assert_eq!(config.max_transfer_bytes, DEFAULT_MAX_TRANSFER_BYTES);
         assert_eq!(config.max_block_bytes, DEFAULT_MAX_BLOCK_BYTES);
         assert_eq!(config.max_devices, DEFAULT_MAX_DEVICES);
@@ -1064,6 +1373,61 @@ mod tests {
     }
 
     #[test]
+    fn full_cli_parses_iio_pwm_ddc_and_pec() {
+        let config = BusConfig::from_cli_all(
+            None,
+            &entries(&["1:0x37"]),
+            &[],
+            &[],
+            &[],
+            &[],
+            &entries(&["iio:device0:voltage0"]),
+            Some("/tmp/ozma-iio"),
+            &entries(&["pwmchip0:0:export"]),
+            Some("/tmp/ozma-pwm"),
+            &entries(&["1:0x37:write"]),
+            true,
+            DEFAULT_MAX_TRANSFER_BYTES,
+            DEFAULT_MAX_BLOCK_BYTES,
+            DEFAULT_MAX_DEVICES,
+            32,
+        )
+        .unwrap();
+        assert!(config.i2c.pec_enabled());
+        assert!(config.iio.allows("iio:device0", "voltage0"));
+        assert_eq!(config.iio.root(), Path::new("/tmp/ozma-iio"));
+        assert!(config.pwm.allows("pwmchip0", 0));
+        assert!(config.pwm.export_allowed("pwmchip0", 0));
+        assert_eq!(config.pwm.root(), Path::new("/tmp/ozma-pwm"));
+        assert!(config.ddc.write_allowed(1, 0x37));
+        assert_eq!(config.ddc.total_addresses(), 1);
+    }
+
+    #[test]
+    fn ddc_cannot_widen_the_i2c_allowlist() {
+        let entries = entries(&["1:0x37"]);
+        let config = BusConfig::from_cli_all(
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            &entries,
+            false,
+            DEFAULT_MAX_TRANSFER_BYTES,
+            DEFAULT_MAX_BLOCK_BYTES,
+            DEFAULT_MAX_DEVICES,
+            32,
+        );
+        assert!(matches!(config, Err(BusError::InvalidRequest { .. })));
+    }
+
+    #[test]
     fn bounds_and_allowlist_size_are_enforced() {
         for config in [
             BusConfig::new().with_limits(0, 32, 64),
@@ -1123,6 +1487,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_reports_configured_iio_pwm_ddc_and_pmbus() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let iio_root = temp.path().join("iio");
+        std::fs::create_dir_all(iio_root.join("iio:device0")).unwrap();
+        let pwm_root = temp.path().join("pwm");
+        std::fs::create_dir_all(pwm_root.join("pwmchip0/pwm0")).unwrap();
+        std::fs::write(pwm_root.join("pwmchip0/pwm0/period"), "1000\n").unwrap();
+        std::fs::write(pwm_root.join("pwmchip0/pwm0/duty_cycle"), "500\n").unwrap();
+        std::fs::write(pwm_root.join("pwmchip0/pwm0/enable"), "0\n").unwrap();
+
+        let config = BusConfig::new()
+            .with_i2c_allow(&entries(&["1:0x37"]))
+            .unwrap()
+            .with_i2c_pec(true)
+            .with_iio_root(&iio_root)
+            .unwrap()
+            .with_iio_allow(&entries(&["iio:device0:voltage0"]))
+            .unwrap()
+            .with_pwm_root(&pwm_root)
+            .unwrap()
+            .with_pwm_allow(&entries(&["pwmchip0:0:export"]))
+            .unwrap()
+            .with_ddc_allow(&entries(&["1:0x37:write"]))
+            .unwrap();
+        let app = router(BusState::new(config).unwrap());
+        let (status, body) = get(&app, "/buses/status").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["iio"]["configured"], true);
+        assert_eq!(body["iio"]["devices"], 1);
+        assert_eq!(body["iio"]["channels"], 1);
+        assert_eq!(body["iio"]["available_devices"], 1);
+        assert_eq!(body["pwm"]["configured"], true);
+        assert_eq!(body["pwm"]["export_channels"], 1);
+        assert_eq!(body["pwm"]["exported_channels"], 1);
+        assert_eq!(body["ddc"]["configured"], true);
+        assert_eq!(body["ddc"]["write_addresses"], 1);
+        assert_eq!(body["pmbus"]["configured"], true);
+        assert_eq!(body["pmbus"]["pec"], true);
+        assert_eq!(body["i2c"]["pec"], true);
+    }
+
+    #[tokio::test]
     async fn router_shapes_and_unconfigured_status_are_typed() {
         let app = router(BusState::default());
 
@@ -1135,6 +1541,11 @@ mod tests {
         assert_eq!(body["spi"]["configured"], false);
         assert_eq!(body["gpio"]["configured"], false);
         assert_eq!(body["can"]["configured"], false);
+        assert_eq!(body["iio"]["configured"], false);
+        assert_eq!(body["pwm"]["configured"], false);
+        assert_eq!(body["ddc"]["configured"], false);
+        assert_eq!(body["pmbus"]["configured"], false);
+        assert_eq!(body["i2c"]["pec"], false);
         assert_eq!(
             body["limits"]["max_transfer_bytes"],
             DEFAULT_MAX_TRANSFER_BYTES
@@ -1154,6 +1565,16 @@ mod tests {
             "/buses/can",
             "/buses/can/vcan0/status",
             "/buses/can/vcan0/frames",
+            "/buses/iio",
+            "/buses/iio/iio:device0",
+            "/buses/iio/iio:device0/voltage0",
+            "/buses/pwm",
+            "/buses/pwm/pwmchip0/0",
+            "/buses/ddc",
+            "/buses/ddc/1/0x37",
+            "/buses/ddc/1/0x37/vcp/0x10",
+            "/buses/ddc/1/0x37/capabilities",
+            "/buses/pmbus/1/0x50",
         ] {
             let (status, body) = get(&app, uri).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
@@ -1167,6 +1588,11 @@ mod tests {
             ("/buses/spi/dev/spidev0.0/transfer", json!({"tx": "00"})),
             ("/buses/gpio/gpiochip0/0/set", json!({"value": 1})),
             ("/buses/can/vcan0/send", json!({"id": 1})),
+            (
+                "/buses/pwm/pwmchip0/0/set",
+                json!({"period_ns": 1000, "duty_ns": 500}),
+            ),
+            ("/buses/ddc/1/0x37/vcp/0x10/set", json!({"value": 1})),
         ] {
             let (status, body) = post(&app, uri, body).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
